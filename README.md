@@ -13,7 +13,8 @@
 - `openACE` 负责本地扫描、blob/checkpoint 缓存、增量同步、daemon 生命周期、MCP 工具、有界并发、取消和诊断。
 - 上游 Context Engine 账号负责语义索引、embedding、ranking、格式化检索、quota 和 tenant 授权。
 - 用户必须提供自己的上游凭据，例如 `AUGMENT_SESSION_AUTH`、`AUGMENT_TOKEN + AUGMENT_TENANT` 或显式 session 文件。
-- 默认实现路径是 clean adapter，兼容公开文档和可观察到的 Context Engine 协议线索。已观察到的 blob/checkpoint/upload 链路只是技术依据，不代表稳定官方 API。
+- 默认实现路径是以 Augment Code 插件 codebase retrieval 可观察行为为核心参考的 clean adapter，不是重新实现或包装 `auggie --mcp`。
+- `auggie --mcp` 只作为官方公开接入路径、认证/session 行为和 fallback adapter 的参考。已观察到的 blob/checkpoint/upload 链路只是技术依据，不代表稳定官方 API。
 - MVP 默认不复用插件运行时。VSCode 插件桥接最多作为后续 experimental adapter 讨论。
 - 项目不得 vendor、复制或分发 proprietary IDE 插件代码。
 
