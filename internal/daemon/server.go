@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -22,6 +23,7 @@ type Syncer interface {
 type Server struct {
 	syncer Syncer
 	mu     sync.Mutex
+	tasks  *TaskStore
 }
 
 type syncRequest struct {
@@ -35,7 +37,9 @@ type retrieveRequest struct {
 }
 
 func NewServer(syncer Syncer) *Server {
-	return &Server{syncer: syncer}
+	server := &Server{syncer: syncer}
+	server.tasks = NewTaskStore(server.runTask, defaultTaskQueueSize)
+	return server
 }
 
 func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
@@ -75,6 +79,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/readyz", s.health)
 	mux.HandleFunc("/v1/sync", s.sync)
 	mux.HandleFunc("/v1/retrieve", s.retrieve)
+	mux.HandleFunc("/v1/tasks", s.tasksCollection)
+	mux.HandleFunc("/v1/tasks/", s.taskItem)
 	return mux
 }
 
@@ -103,10 +109,7 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "directory_path is required")
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	result, err := s.syncer.Sync(r.Context(), req.DirectoryPath)
+	result, err := s.runSync(r.Context(), req.DirectoryPath)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -132,15 +135,96 @@ func (s *Server) retrieve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "information_request is required")
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	result, err := s.syncer.Retrieve(r.Context(), req.DirectoryPath, req.InformationRequest, req.MaxOutputLength)
+	result, err := s.runRetrieve(r.Context(), req.DirectoryPath, req.InformationRequest, req.MaxOutputLength)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) tasksCollection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req TaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	task, err := s.tasks.Submit(req)
+	if err != nil {
+		if errors.Is(err, ErrTaskQueueFull) {
+			writeError(w, http.StatusTooManyRequests, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, task)
+}
+
+func (s *Server) taskItem(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/v1/tasks/")
+	if path == "" {
+		writeError(w, http.StatusNotFound, "task id is required")
+		return
+	}
+	if id, ok := strings.CutSuffix(path, "/cancel"); ok {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if strings.Contains(id, "/") || id == "" {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
+		task, found := s.tasks.Cancel(id)
+		if !found {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, task)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if strings.Contains(path, "/") {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	task, found := s.tasks.Get(path)
+	if !found {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, task)
+}
+
+func (s *Server) runTask(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	switch req.Kind {
+	case TaskKindSync:
+		return s.runSync(ctx, req.DirectoryPath)
+	case TaskKindRetrieve:
+		return s.runRetrieve(ctx, req.DirectoryPath, req.InformationRequest, req.MaxOutputLength)
+	default:
+		return workspace.Result{}, fmt.Errorf("unknown task kind: %s", req.Kind)
+	}
+}
+
+func (s *Server) runSync(ctx context.Context, dir string) (workspace.Result, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.syncer.Sync(ctx, dir)
+}
+
+func (s *Server) runRetrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.syncer.Retrieve(ctx, dir, query, maxOutputLen)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

@@ -77,6 +77,9 @@ go run ./cmd/openace-daemon
 - `GET /readyz`
 - `POST /v1/sync`
 - `POST /v1/retrieve`
+- `POST /v1/tasks`
+- `GET /v1/tasks/{id}`
+- `POST /v1/tasks/{id}/cancel`
 
 可选认证方式：
 
@@ -92,6 +95,10 @@ go run ./cmd/openace-daemon
 
 - `codebase_retrieval`: 扫描并同步 workspace 后，调用 ACE 检索代码。
 - `sync_workspace`: 只执行扫描、缺失 blob 上传和 checkpoint。
+- `start_codebase_retrieval`: daemon 模式下提交异步代码检索任务。
+- `start_sync_workspace`: daemon 模式下提交异步 workspace 同步任务。
+- `task_status`: daemon 模式下查询任务状态和结果。
+- `cancel_task`: daemon 模式下取消 queued/running 任务。
 
 ## 许可证
 

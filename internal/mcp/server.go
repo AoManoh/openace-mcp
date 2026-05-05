@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/AoManoh/openace-mcp/internal/daemon"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
@@ -17,8 +18,15 @@ type Syncer interface {
 	Sync(context.Context, string) (workspace.Result, error)
 }
 
+type Tasker interface {
+	CancelTask(context.Context, string) (daemon.TaskSnapshot, error)
+	StartTask(context.Context, daemon.TaskRequest) (daemon.TaskSnapshot, error)
+	TaskStatus(context.Context, string) (daemon.TaskSnapshot, error)
+}
+
 type Server struct {
 	syncer Syncer
+	tasker Tasker
 }
 
 type rpcRequest struct {
@@ -55,8 +63,16 @@ type syncArgs struct {
 	DirectoryPath string `json:"directory_path"`
 }
 
+type taskIDArgs struct {
+	TaskID string `json:"task_id"`
+}
+
 func NewServer(syncer Syncer) *Server {
-	return &Server{syncer: syncer}
+	server := &Server{syncer: syncer}
+	if tasker, ok := syncer.(Tasker); ok {
+		server.tasker = tasker
+	}
+	return server
 }
 
 func (s *Server) Run(ctx context.Context, in io.Reader, out io.Writer) error {
@@ -103,7 +119,11 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
 			},
 		})
 	case "tools/list":
-		return ok(req.ID, map[string]any{"tools": []any{retrievalTool(), syncTool()}})
+		tools := []any{retrievalTool(), syncTool()}
+		if s.tasker != nil {
+			tools = append(tools, startRetrievalTool(), startSyncTool(), taskStatusTool(), cancelTaskTool())
+		}
+		return ok(req.ID, map[string]any{"tools": tools})
 	case "tools/call":
 		return s.callTool(ctx, req)
 	default:
@@ -156,6 +176,81 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 			return toolError(req.ID, err.Error())
 		}
 		return ok(req.ID, toolResult("Workspace synced.\n"+result.Summary(), false))
+	case "start_codebase_retrieval", "start-codebase-retrieval":
+		if s.tasker == nil {
+			return toolError(req.ID, "task tools require OPENACE_DAEMON_ADDR")
+		}
+		var args retrievalArgs
+		if err := json.Unmarshal(params.Arguments, &args); err != nil {
+			return fail(req.ID, -32602, err.Error())
+		}
+		if args.InformationRequest == "" {
+			return toolError(req.ID, "information_request is required")
+		}
+		if args.DirectoryPath == "" {
+			return toolError(req.ID, "directory_path is required")
+		}
+		task, err := s.tasker.StartTask(ctx, daemon.TaskRequest{
+			Kind:               daemon.TaskKindRetrieve,
+			DirectoryPath:      args.DirectoryPath,
+			InformationRequest: args.InformationRequest,
+			MaxOutputLength:    args.MaxOutputLength,
+		})
+		if err != nil {
+			return toolError(req.ID, err.Error())
+		}
+		return ok(req.ID, toolResult(jsonText(task), false))
+	case "start_sync_workspace", "start-sync-workspace":
+		if s.tasker == nil {
+			return toolError(req.ID, "task tools require OPENACE_DAEMON_ADDR")
+		}
+		var args syncArgs
+		if err := json.Unmarshal(params.Arguments, &args); err != nil {
+			return fail(req.ID, -32602, err.Error())
+		}
+		if args.DirectoryPath == "" {
+			return toolError(req.ID, "directory_path is required")
+		}
+		task, err := s.tasker.StartTask(ctx, daemon.TaskRequest{
+			Kind:          daemon.TaskKindSync,
+			DirectoryPath: args.DirectoryPath,
+		})
+		if err != nil {
+			return toolError(req.ID, err.Error())
+		}
+		return ok(req.ID, toolResult(jsonText(task), false))
+	case "task_status", "task-status":
+		if s.tasker == nil {
+			return toolError(req.ID, "task tools require OPENACE_DAEMON_ADDR")
+		}
+		var args taskIDArgs
+		if err := json.Unmarshal(params.Arguments, &args); err != nil {
+			return fail(req.ID, -32602, err.Error())
+		}
+		if args.TaskID == "" {
+			return toolError(req.ID, "task_id is required")
+		}
+		task, err := s.tasker.TaskStatus(ctx, args.TaskID)
+		if err != nil {
+			return toolError(req.ID, err.Error())
+		}
+		return ok(req.ID, toolResult(jsonText(task), false))
+	case "cancel_task", "cancel-task":
+		if s.tasker == nil {
+			return toolError(req.ID, "task tools require OPENACE_DAEMON_ADDR")
+		}
+		var args taskIDArgs
+		if err := json.Unmarshal(params.Arguments, &args); err != nil {
+			return fail(req.ID, -32602, err.Error())
+		}
+		if args.TaskID == "" {
+			return toolError(req.ID, "task_id is required")
+		}
+		task, err := s.tasker.CancelTask(ctx, args.TaskID)
+		if err != nil {
+			return toolError(req.ID, err.Error())
+		}
+		return ok(req.ID, toolResult(jsonText(task), false))
 	default:
 		return toolError(req.ID, "unknown tool: "+params.Name)
 	}
@@ -191,6 +286,64 @@ func syncTool() map[string]any {
 	}
 }
 
+func startRetrievalTool() map[string]any {
+	return map[string]any{
+		"name":        "start_codebase_retrieval",
+		"description": "Submit an asynchronous ACE codebase retrieval task to the local openACE daemon.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"information_request": map[string]any{"type": "string"},
+				"directory_path":      map[string]any{"type": "string"},
+				"max_output_length":   map[string]any{"type": "integer"},
+			},
+			"required": []string{"information_request", "directory_path"},
+		},
+	}
+}
+
+func startSyncTool() map[string]any {
+	return map[string]any{
+		"name":        "start_sync_workspace",
+		"description": "Submit an asynchronous workspace sync task to the local openACE daemon.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"directory_path": map[string]any{"type": "string"},
+			},
+			"required": []string{"directory_path"},
+		},
+	}
+}
+
+func taskStatusTool() map[string]any {
+	return map[string]any{
+		"name":        "task_status",
+		"description": "Get status and result for an openACE daemon task.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"task_id": map[string]any{"type": "string"},
+			},
+			"required": []string{"task_id"},
+		},
+	}
+}
+
+func cancelTaskTool() map[string]any {
+	return map[string]any{
+		"name":        "cancel_task",
+		"description": "Cancel a queued or running openACE daemon task.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"task_id": map[string]any{"type": "string"},
+			},
+			"required": []string{"task_id"},
+		},
+	}
+}
+
 func ok(id *json.RawMessage, result any) rpcResponse {
 	return rpcResponse{JSONRPC: "2.0", ID: id, Result: result}
 }
@@ -211,4 +364,12 @@ func toolResult(text string, isError bool) map[string]any {
 		result["isError"] = true
 	}
 	return result
+}
+
+func jsonText(value any) string {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err.Error()
+	}
+	return string(data)
 }

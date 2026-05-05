@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -43,6 +44,24 @@ func (c *Client) Retrieve(ctx context.Context, dir string, query string, maxOutp
 	return result, err
 }
 
+func (c *Client) StartTask(ctx context.Context, req TaskRequest) (TaskSnapshot, error) {
+	var result TaskSnapshot
+	err := c.post(ctx, "/v1/tasks", req, &result)
+	return result, err
+}
+
+func (c *Client) TaskStatus(ctx context.Context, id string) (TaskSnapshot, error) {
+	var result TaskSnapshot
+	err := c.get(ctx, "/v1/tasks/"+url.PathEscape(id), &result)
+	return result, err
+}
+
+func (c *Client) CancelTask(ctx context.Context, id string) (TaskSnapshot, error) {
+	var result TaskSnapshot
+	err := c.post(ctx, "/v1/tasks/"+url.PathEscape(id)+"/cancel", map[string]any{}, &result)
+	return result, err
+}
+
 func (c *Client) post(ctx context.Context, path string, reqBody any, out any) error {
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
@@ -54,7 +73,19 @@ func (c *Client) post(ctx context.Context, path string, reqBody any, out any) er
 	}
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("user-agent", "openace-mcp-shim/0.1")
+	return c.do(req, path, out)
+}
 
+func (c *Client) get(ctx context.Context, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("user-agent", "openace-mcp-shim/0.1")
+	return c.do(req, path, out)
+}
+
+func (c *Client) do(req *http.Request, path string, out any) error {
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
