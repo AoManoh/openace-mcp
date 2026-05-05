@@ -31,7 +31,7 @@
 
 ```bash
 go test ./...
-go build ./cmd/openace-mcp
+go build ./cmd/openace-mcp ./cmd/openace-daemon
 ```
 
 ## MCP 配置示例
@@ -46,6 +46,37 @@ go build ./cmd/openace-mcp
   }
 }
 ```
+
+## Daemon 模式
+
+启动常驻 daemon：
+
+```bash
+go run ./cmd/openace-daemon
+```
+
+让 MCP shim 代理到 daemon：
+
+```json
+{
+  "mcpServers": {
+    "openace": {
+      "command": "go",
+      "args": ["run", "/home/oh/projects/openace-mcp/cmd/openace-mcp"],
+      "env": {
+        "OPENACE_DAEMON_ADDR": "127.0.0.1:8765"
+      }
+    }
+  }
+}
+```
+
+当前 daemon 暴露：
+
+- `GET /healthz`
+- `GET /readyz`
+- `POST /v1/sync`
+- `POST /v1/retrieve`
 
 可选认证方式：
 

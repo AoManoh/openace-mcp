@@ -11,6 +11,7 @@ coverage/
 .cache/
 .turbo/
 /openace-mcp
+/openace-daemon
 
 # Runtime logs
 *.log
