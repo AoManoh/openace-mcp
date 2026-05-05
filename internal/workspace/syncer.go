@@ -256,12 +256,30 @@ func saveState(path string, st state) error {
 }
 
 func stateFile(root string) (string, error) {
-	cache, err := os.UserCacheDir()
+	cache, err := cacheRoot()
 	if err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256([]byte(root))
-	return filepath.Join(cache, "openace-mcp", "workspaces", hex.EncodeToString(sum[:])+".json"), nil
+	return filepath.Join(cache, "workspaces", hex.EncodeToString(sum[:])+".json"), nil
+}
+
+func cacheRoot() (string, error) {
+	if dir := strings.TrimSpace(os.Getenv("OPENACE_CACHE_DIR")); dir != "" {
+		if strings.HasPrefix(dir, "~/") {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "", err
+			}
+			dir = filepath.Join(home, strings.TrimPrefix(dir, "~/"))
+		}
+		return filepath.Abs(dir)
+	}
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(cache, "openace-mcp"), nil
 }
 
 func diff(old map[string]string, current map[string]string) ([]string, []string) {

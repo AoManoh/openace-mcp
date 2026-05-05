@@ -84,6 +84,10 @@ go run ./cmd/openace-daemon
 - 或设置 `OPENACE_SESSION_FILE` 指向本地 session 文件。
 - 或设置 `AUGMENT_TOKEN` 与 `AUGMENT_TENANT`。
 
+可选缓存设置：
+
+- `OPENACE_CACHE_DIR`：指定 workspace checkpoint/cache 目录。建议不同账号、tenant 或验证批次使用独立缓存目录，避免复用旧 checkpoint 影响验证结论。
+
 当前工具：
 
 - `codebase_retrieval`: 扫描并同步 workspace 后，调用 ACE 检索代码。
