@@ -10,6 +10,7 @@ build/
 coverage/
 .cache/
 .turbo/
+/openace-mcp
 
 # Runtime logs
 *.log
@@ -35,3 +36,4 @@ pnpm-debug.log*
 !/docs/requirements/2026-05-05-project-kickoff.md
 !/docs/references/2026-05-05-openace-context-engine.md
 !/docs/work-logs/2026-05-05.md
+!/docs/work-logs/2026-05-06.md
