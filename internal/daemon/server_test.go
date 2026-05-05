@@ -23,6 +23,7 @@ func (fakeSyncer) Retrieve(ctx context.Context, dir string, query string, maxOut
 }
 
 func TestServerTaskLifecycle(t *testing.T) {
+	t.Setenv("OPENACE_DAEMON_TOKEN", "")
 	server := httptest.NewServer(NewServer(fakeSyncer{}).routes())
 	defer server.Close()
 
@@ -41,6 +42,89 @@ func TestServerTaskLifecycle(t *testing.T) {
 	}
 	if completed.Result.Text != "retrieved" {
 		t.Fatalf("unexpected task result: %+v", completed.Result)
+	}
+}
+
+func TestServerListsTasks(t *testing.T) {
+	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	server := httptest.NewServer(NewServer(fakeSyncer{}).routes())
+	defer server.Close()
+
+	first := postTask(t, server.URL, TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/one"})
+	second := postTask(t, server.URL, TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/two"})
+
+	resp, err := http.Get(server.URL + "/v1/tasks?limit=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %s", resp.Status)
+	}
+	var list struct {
+		Tasks []TaskSnapshot `json:"tasks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Tasks) != 1 {
+		t.Fatalf("expected 1 listed task, got %d", len(list.Tasks))
+	}
+	if list.Tasks[0].ID != second.ID {
+		t.Fatalf("newest task should be listed first: got %s want %s", list.Tasks[0].ID, second.ID)
+	}
+	if list.Tasks[0].ID == first.ID {
+		t.Fatalf("limit should exclude older task %s", first.ID)
+	}
+}
+
+func TestServerOptionalBearerAuth(t *testing.T) {
+	t.Setenv("OPENACE_DAEMON_TOKEN", "local-test-token")
+	server := httptest.NewServer(NewServer(fakeSyncer{}).routes())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized request status = %s", resp.Status)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/healthz", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("authorization", "Bearer local-test-token")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("authorized request status = %s", resp.Status)
+	}
+}
+
+func TestValidateListenAddrRequiresLoopbackByDefault(t *testing.T) {
+	t.Setenv("OPENACE_ALLOW_REMOTE_DAEMON", "")
+	for _, addr := range []string{"127.0.0.1:8765", "localhost:8765", "[::1]:8765"} {
+		if err := validateListenAddr(addr); err != nil {
+			t.Fatalf("loopback addr %q rejected: %v", addr, err)
+		}
+	}
+	for _, addr := range []string{"0.0.0.0:8765", ":8765", "http://127.0.0.1:8765"} {
+		if err := validateListenAddr(addr); err == nil {
+			t.Fatalf("non-loopback or URL addr %q should be rejected", addr)
+		}
+	}
+}
+
+func TestValidateListenAddrCanAllowRemoteExplicitly(t *testing.T) {
+	t.Setenv("OPENACE_ALLOW_REMOTE_DAEMON", "1")
+	if err := validateListenAddr("0.0.0.0:8765"); err != nil {
+		t.Fatalf("remote addr should be allowed when explicit: %v", err)
 	}
 }
 

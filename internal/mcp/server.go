@@ -20,6 +20,7 @@ type Syncer interface {
 
 type Tasker interface {
 	CancelTask(context.Context, string) (daemon.TaskSnapshot, error)
+	ListTasks(context.Context, int) ([]daemon.TaskSnapshot, error)
 	StartTask(context.Context, daemon.TaskRequest) (daemon.TaskSnapshot, error)
 	TaskStatus(context.Context, string) (daemon.TaskSnapshot, error)
 }
@@ -65,6 +66,10 @@ type syncArgs struct {
 
 type taskIDArgs struct {
 	TaskID string `json:"task_id"`
+}
+
+type listTasksArgs struct {
+	Limit int `json:"limit,omitempty"`
 }
 
 func NewServer(syncer Syncer) *Server {
@@ -121,7 +126,7 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
 	case "tools/list":
 		tools := []any{retrievalTool(), syncTool()}
 		if s.tasker != nil {
-			tools = append(tools, startRetrievalTool(), startSyncTool(), taskStatusTool(), cancelTaskTool())
+			tools = append(tools, startRetrievalTool(), startSyncTool(), taskStatusTool(), listTasksTool(), cancelTaskTool())
 		}
 		return ok(req.ID, map[string]any{"tools": tools})
 	case "tools/call":
@@ -235,6 +240,21 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 			return toolError(req.ID, err.Error())
 		}
 		return ok(req.ID, toolResult(jsonText(task), false))
+	case "list_tasks", "list-tasks":
+		if s.tasker == nil {
+			return toolError(req.ID, "task tools require OPENACE_DAEMON_ADDR")
+		}
+		var args listTasksArgs
+		if len(params.Arguments) > 0 {
+			if err := json.Unmarshal(params.Arguments, &args); err != nil {
+				return fail(req.ID, -32602, err.Error())
+			}
+		}
+		tasks, err := s.tasker.ListTasks(ctx, args.Limit)
+		if err != nil {
+			return toolError(req.ID, err.Error())
+		}
+		return ok(req.ID, toolResult(jsonText(map[string]any{"tasks": tasks}), false))
 	case "cancel_task", "cancel-task":
 		if s.tasker == nil {
 			return toolError(req.ID, "task tools require OPENACE_DAEMON_ADDR")
@@ -326,6 +346,19 @@ func taskStatusTool() map[string]any {
 				"task_id": map[string]any{"type": "string"},
 			},
 			"required": []string{"task_id"},
+		},
+	}
+}
+
+func listTasksTool() map[string]any {
+	return map[string]any{
+		"name":        "list_tasks",
+		"description": "List recent openACE daemon tasks for diagnostics and pressure-test observation.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"limit": map[string]any{"type": "integer"},
+			},
 		},
 	}
 }

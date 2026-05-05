@@ -28,6 +28,10 @@ func (fakeTasker) StartTask(ctx context.Context, req daemon.TaskRequest) (daemon
 	return daemon.TaskSnapshot{ID: "task-1", Kind: req.Kind, State: daemon.TaskStateQueued, DirectoryPath: req.DirectoryPath}, nil
 }
 
+func (fakeTasker) ListTasks(ctx context.Context, limit int) ([]daemon.TaskSnapshot, error) {
+	return []daemon.TaskSnapshot{{ID: "task-1", State: daemon.TaskStateCompleted}}, nil
+}
+
 func (fakeTasker) TaskStatus(ctx context.Context, id string) (daemon.TaskSnapshot, error) {
 	return daemon.TaskSnapshot{ID: id, State: daemon.TaskStateCompleted}, nil
 }
@@ -46,6 +50,9 @@ func TestToolsListOnlyIncludesTaskToolsForTasker(t *testing.T) {
 	if !strings.Contains(withTasks, "start_codebase_retrieval") {
 		t.Fatalf("daemon tasker should list task tools: %s", withTasks)
 	}
+	if !strings.Contains(withTasks, "list_tasks") {
+		t.Fatalf("daemon tasker should list task diagnostics tool: %s", withTasks)
+	}
 }
 
 func TestStartRetrievalTaskTool(t *testing.T) {
@@ -55,6 +62,16 @@ func TestStartRetrievalTaskTool(t *testing.T) {
 	}
 	if !strings.Contains(out, "queued") {
 		t.Fatalf("task response should include task state: %s", out)
+	}
+}
+
+func TestListTasksTool(t *testing.T) {
+	out := runMCP(t, NewServer(fakeTasker{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_tasks","arguments":{"limit":5}}}`)
+	if !strings.Contains(out, "task-1") {
+		t.Fatalf("list response should include task id: %s", out)
+	}
+	if !strings.Contains(out, "completed") {
+		t.Fatalf("list response should include task state: %s", out)
 	}
 }
 

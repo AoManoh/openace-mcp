@@ -6,7 +6,7 @@
 
 这是在 `aug2api` 讨论过程中产生的新独立项目需求，不是 `aug2api` 子模块、拆分项目或代码迁移目标。首期路线涉及复用插件 ACE 调用过程，但仓库可见性不阻塞当前推进，先跑通 MCP 主流程。
 
-当前阶段：最小 Go MCP 主流程、daemon + shim、异步任务 API 和大仓库压力测试已跑通。MCP stdio 可以完成初始化、工具列表、workspace 扫描、blob/checkpoint 同步，并通过 `codebase_retrieval` 返回 ACE 检索结果。
+当前阶段：最小 Go MCP 主流程、daemon + shim、异步任务 API、任务诊断和大仓库压力测试已跑通。MCP stdio 可以完成初始化、工具列表、workspace 扫描、blob/checkpoint 同步，并通过 `codebase_retrieval` 返回 ACE 检索结果。大仓库建议默认使用 daemon 异步工具，避免 MCP 客户端同步等待超时。
 
 ## 边界
 
@@ -15,7 +15,7 @@
 - 用户必须提供自己的上游凭据，例如 `AUGMENT_SESSION_AUTH`、`AUGMENT_TOKEN + AUGMENT_TENANT` 或显式 session 文件。
 - 默认实现路径是复用/提取 Augment Code 插件已稳定调用 ACE 的过程，不是重新实现或包装 `auggie --mcp`。
 - `auggie --mcp` 只作为对照样本和 fallback adapter 参考。已观察到的 blob/checkpoint/upload 链路需要以插件主流程验证为准。
-- 最小业务主流程已经跑通，下一步优化 daemon、缓存、并发上限、取消、超时和发布形态。
+- 当前 MCP 主流程已经跑通并完成大仓库并发压力验收，后续优化不阻塞当前使用。
 
 ## 当前入口
 
@@ -27,7 +27,9 @@
 
 文档记录不阻塞编码；当前以真实运行结果推进下一阶段。
 
-## 本地验证
+## 安装
+
+本地开发验证：
 
 ```bash
 go test ./...
@@ -36,7 +38,16 @@ go vet ./...
 go build ./cmd/openace-mcp ./cmd/openace-daemon
 ```
 
+在线安装可使用 Go module；网络较慢时加 GOPROXY 镜像：
+
+```bash
+GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/openace-mcp@latest
+GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/openace-daemon@latest
+```
+
 ## MCP 配置示例
+
+直接 stdio 模式适合小仓库或 smoke test：
 
 ```json
 {
@@ -51,9 +62,12 @@ go build ./cmd/openace-mcp ./cmd/openace-daemon
 
 ## Daemon 模式
 
-启动常驻 daemon：
+启动常驻 daemon。上游 ACE 凭据必须给 `openace-daemon` 进程，而不是只给 MCP shim：
 
 ```bash
+export AUGMENT_TOKEN="..."
+export AUGMENT_TENANT="..."
+export OPENACE_DAEMON_LISTEN_ADDR=127.0.0.1:8765
 go run ./cmd/openace-daemon
 ```
 
@@ -73,6 +87,10 @@ go run ./cmd/openace-daemon
 }
 ```
 
+如果需要给本机 daemon 加一层本地 bearer token，daemon 和 shim 同时设置同一个 `OPENACE_DAEMON_TOKEN`。
+
+默认只允许 daemon 监听 loopback 地址，例如 `127.0.0.1:8765` 或 `localhost:8765`。如需绑定 `0.0.0.0`，必须显式设置 `OPENACE_ALLOW_REMOTE_DAEMON=1`，并自行配置网络访问控制；这不是默认推荐形态。
+
 当前 daemon 暴露：
 
 - `GET /healthz`
@@ -80,6 +98,7 @@ go run ./cmd/openace-daemon
 - `POST /v1/sync`
 - `POST /v1/retrieve`
 - `POST /v1/tasks`
+- `GET /v1/tasks`
 - `GET /v1/tasks/{id}`
 - `POST /v1/tasks/{id}/cancel`
 
@@ -92,6 +111,19 @@ go run ./cmd/openace-daemon
 可选缓存设置：
 
 - `OPENACE_CACHE_DIR`：指定 workspace checkpoint/cache 目录。建议不同账号、tenant 或验证批次使用独立缓存目录，避免复用旧 checkpoint 影响验证结论。
+- `OPENACE_CACHE_NAMESPACE`：在同一个 cache 目录下按账号、tenant 或压测批次隔离 workspace state，默认 `default`。
+
+大仓库调参：
+
+- `OPENACE_UPLOAD_BATCH_BYTES`：单次 batch-upload 估算上限，默认 `1048576`。
+- `OPENACE_FIND_MISSING_BATCH_SIZE`：单次 find-missing blob 数量，默认 `1000`。
+- `OPENACE_MAX_FILE_BYTES`：单文件索引上限，默认 `1048576`。
+
+扫描安全：
+
+- 默认跳过 `.gitignore` / `.ignore` 命中的文件和目录。
+- 默认跳过 `.env*`、`.npmrc`、`.netrc`、`session.json`、`credentials.json`、私钥和证书类文件。
+- 只索引非空、未超过上限、非二进制且 UTF-8 合法的文本文件。
 
 当前工具：
 
@@ -100,16 +132,17 @@ go run ./cmd/openace-daemon
 - `start_codebase_retrieval`: daemon 模式下提交异步代码检索任务。
 - `start_sync_workspace`: daemon 模式下提交异步 workspace 同步任务。
 - `task_status`: daemon 模式下查询任务状态和结果。
+- `list_tasks`: daemon 模式下列出最近任务，列表不返回完整检索文本，避免诊断接口放大内存和输出。
 - `cancel_task`: daemon 模式下取消 queued/running 任务。
 
 ## 压力测试基线
 
 已用 `/home/oh/projects/mailing` 做真实 ACE 压力验证：
 
-- 仓库体量约 5.0GB，`rg --files` 可见 5937 个文件，openACE 当前文本扫描后参与索引 2667 个文件。
-- 冷缓存 5 并发 MCP shim 宽泛检索全部 completed，首个任务完成 workspace 同步并上传 129 个 blob，后续任务复用 checkpoint/cache。
-- 暖缓存 daemon 重启后 5 并发全部 completed，总耗时约 30 秒，全部 `uploaded=0 added=0 deleted=0`。
-- daemon 压测期间保持存活，RSS 约 270-290MB。
+- 仓库体量约 5.0GB，`rg --files` 可见 5937 个文件，openACE 当前过滤后参与索引 2557 个文本文件。
+- 冷缓存 5 并发 MCP shim 宽泛检索全部 completed，耗时 55.1 秒，daemon RSS 高峰约 20.9MB。
+- 暖缓存 daemon 重启后 5 并发全部 completed，耗时 30.0 秒，全部 `uploaded=0 added=0 deleted=0`，daemon RSS 高峰约 20.8MB。
+- daemon 压测期间保持存活；扫描与上传支持取消，任务列表可通过 `list_tasks` 找回。
 - 当前并发模型是并发提交任务、daemon 串行执行同步/检索；这是稳定性优先的 MVP，不是最终并行吞吐模型。
 
 ## 许可证

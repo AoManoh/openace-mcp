@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,9 +24,10 @@ type Syncer interface {
 }
 
 type Server struct {
-	syncer Syncer
-	mu     sync.Mutex
-	tasks  *TaskStore
+	syncer    Syncer
+	mu        sync.Mutex
+	tasks     *TaskStore
+	authToken string
 }
 
 type syncRequest struct {
@@ -37,7 +41,10 @@ type retrieveRequest struct {
 }
 
 func NewServer(syncer Syncer) *Server {
-	server := &Server{syncer: syncer}
+	server := &Server{
+		syncer:    syncer,
+		authToken: strings.TrimSpace(os.Getenv("OPENACE_DAEMON_TOKEN")),
+	}
 	server.tasks = NewTaskStore(server.runTask, defaultTaskQueueSize)
 	return server
 }
@@ -45,6 +52,9 @@ func NewServer(syncer Syncer) *Server {
 func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 	if strings.TrimSpace(addr) == "" {
 		addr = DefaultAddr
+	}
+	if err := validateListenAddr(addr); err != nil {
+		return err
 	}
 	httpServer := &http.Server{
 		Addr:              addr,
@@ -73,6 +83,32 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 	}
 }
 
+func validateListenAddr(addr string) error {
+	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
+		return fmt.Errorf("daemon listen addr must be host:port, got URL %q", addr)
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid daemon listen addr %q: %w", addr, err)
+	}
+	if isRemoteDaemonAllowed() {
+		return nil
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("refusing non-loopback daemon listen addr %q; set OPENACE_ALLOW_REMOTE_DAEMON=1 only after adding network-level access control", addr)
+}
+
+func isRemoteDaemonAllowed() bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv("OPENACE_ALLOW_REMOTE_DAEMON")))
+	return value == "1" || value == "true" || value == "yes"
+}
+
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.health)
@@ -81,7 +117,16 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/v1/retrieve", s.retrieve)
 	mux.HandleFunc("/v1/tasks", s.tasksCollection)
 	mux.HandleFunc("/v1/tasks/", s.taskItem)
-	return mux
+	if s.authToken == "" {
+		return mux
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("authorization") != "Bearer "+s.authToken {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -144,7 +189,13 @@ func (s *Server) retrieve(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) tasksCollection(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+	switch r.Method {
+	case http.MethodGet:
+		limit := parsePositiveInt(r.URL.Query().Get("limit"))
+		writeJSON(w, http.StatusOK, map[string]any{"tasks": s.tasks.List(limit)})
+		return
+	case http.MethodPost:
+	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
@@ -163,6 +214,14 @@ func (s *Server) tasksCollection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, task)
+}
+
+func parsePositiveInt(value string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 func (s *Server) taskItem(w http.ResponseWriter, r *http.Request) {

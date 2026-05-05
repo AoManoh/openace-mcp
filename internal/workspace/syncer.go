@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -17,8 +19,9 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/ace"
 )
 
-const maxUploadBatchBytes = 1 << 20
-const maxFindMissingBatchSize = 1000
+const defaultUploadBatchBytes = 1 << 20
+const defaultFindMissingBatchSize = 1000
+const defaultMaxFileBytes = 1 << 20
 
 type ACEClient interface {
 	FindMissing(context.Context, []string) ([]string, []string, error)
@@ -47,9 +50,9 @@ type state struct {
 }
 
 type fileBlob struct {
+	AbsPath  string
 	RelPath  string
 	BlobName string
-	Content  []byte
 }
 
 func NewSyncer(client ACEClient) *Syncer {
@@ -77,7 +80,7 @@ func (s *Syncer) Sync(ctx context.Context, dir string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	files, err := scan(root)
+	files, err := scan(ctx, root)
 	if err != nil {
 		return Result{}, err
 	}
@@ -105,7 +108,7 @@ func (s *Syncer) Sync(ctx context.Context, dir string) (Result, error) {
 		deleted = nil
 	}
 
-	unknown, nonindexed, err := findMissingBatched(ctx, s.client, allNames, maxFindMissingBatchSize)
+	unknown, nonindexed, err := findMissingBatched(ctx, s.client, allNames, findMissingBatchSize())
 	if err != nil {
 		return Result{}, err
 	}
@@ -116,14 +119,24 @@ func (s *Syncer) Sync(ctx context.Context, dir string) (Result, error) {
 		if !ok {
 			continue
 		}
+		content, ok, err := readIndexableContent(ctx, file.AbsPath, int64(maxFileBytes()))
+		if err != nil {
+			return Result{}, err
+		}
+		if !ok {
+			return Result{}, fmt.Errorf("file is no longer indexable during sync: %s", file.RelPath)
+		}
+		if currentName := blobName(file.RelPath, content); currentName != file.BlobName {
+			return Result{}, fmt.Errorf("file changed during sync: %s", file.RelPath)
+		}
 		uploads = append(uploads, ace.BlobUpload{
 			BlobName: file.BlobName,
 			Path:     file.RelPath,
-			Content:  string(file.Content),
+			Content:  string(content),
 		})
 	}
 	if len(uploads) > 0 {
-		if err := batchUpload(ctx, s.client, uploads, maxUploadBatchBytes); err != nil {
+		if err := batchUpload(ctx, s.client, uploads, uploadBatchBytes()); err != nil {
 			return Result{}, err
 		}
 	}
@@ -150,49 +163,53 @@ func (s *Syncer) Sync(ctx context.Context, dir string) (Result, error) {
 	}, nil
 }
 
-func scan(root string) ([]fileBlob, error) {
-	maxBytes := int64(1 << 20)
+func scan(ctx context.Context, root string) ([]fileBlob, error) {
+	maxBytes := int64(maxFileBytes())
+	rules := loadIgnoreRules(root)
 	var files []fileBlob
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			return err
 		}
 		name := d.Name()
+		rel := ""
+		if path != root {
+			var relErr error
+			rel, relErr = filepath.Rel(root, path)
+			if relErr != nil {
+				return relErr
+			}
+			rel = filepath.ToSlash(rel)
+		}
 		if d.IsDir() {
-			if shouldSkipDir(name) && path != root {
+			if path != root && (shouldSkipDir(name) || rules.Match(rel, true)) {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if rel == "" {
+			rel = name
+		}
+		if shouldSkipFile(rel, name) || rules.Match(rel, false) {
 			return nil
 		}
 		if d.Type()&fs.ModeType != 0 {
 			return nil
 		}
-		info, err := d.Info()
+		content, ok, err := readIndexableContent(ctx, path, maxBytes)
 		if err != nil {
 			return err
 		}
-		if info.Size() == 0 || info.Size() > maxBytes {
+		if !ok {
 			return nil
 		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		if looksBinary(content) {
-			return nil
-		}
-		if !utf8.Valid(content) {
-			return nil
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
 		files = append(files, fileBlob{
+			AbsPath:  path,
 			RelPath:  rel,
 			BlobName: blobName(rel, content),
-			Content:  content,
 		})
 		return nil
 	})
@@ -205,7 +222,7 @@ func scan(root string) ([]fileBlob, error) {
 
 func findMissingBatched(ctx context.Context, client ACEClient, blobNames []string, batchSize int) ([]string, []string, error) {
 	if batchSize <= 0 {
-		batchSize = maxFindMissingBatchSize
+		batchSize = defaultFindMissingBatchSize
 	}
 	var unknown []string
 	var nonindexed []string
@@ -236,7 +253,7 @@ func batchUpload(ctx context.Context, client ACEClient, uploads []ace.BlobUpload
 
 func uploadBatches(uploads []ace.BlobUpload, maxBytes int) [][]ace.BlobUpload {
 	if maxBytes <= 0 {
-		maxBytes = maxUploadBatchBytes
+		maxBytes = defaultUploadBatchBytes
 	}
 	var batches [][]ace.BlobUpload
 	var current []ace.BlobUpload
@@ -257,12 +274,45 @@ func uploadBatches(uploads []ace.BlobUpload, maxBytes int) [][]ace.BlobUpload {
 	return batches
 }
 
+func uploadBatchBytes() int {
+	return positiveIntEnv("OPENACE_UPLOAD_BATCH_BYTES", defaultUploadBatchBytes)
+}
+
+func findMissingBatchSize() int {
+	return positiveIntEnv("OPENACE_FIND_MISSING_BATCH_SIZE", defaultFindMissingBatchSize)
+}
+
+func maxFileBytes() int {
+	return positiveIntEnv("OPENACE_MAX_FILE_BYTES", defaultMaxFileBytes)
+}
+
+func positiveIntEnv(name string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
 func uploadPayloadSize(upload ace.BlobUpload) int {
+	payload := map[string]string{
+		"blob_name": upload.BlobName,
+		"path":      upload.Path,
+		"content":   upload.Content,
+	}
+	data, err := json.Marshal(payload)
+	if err == nil {
+		return len(data) + 1
+	}
 	return len(upload.BlobName) + len(upload.Path) + len(upload.Content) + 128
 }
 
 func uploadBatchSize(uploads []ace.BlobUpload) int {
-	total := 0
+	total := len(`{"blobs":[]}`)
 	for _, upload := range uploads {
 		total += uploadPayloadSize(upload)
 	}
@@ -285,11 +335,170 @@ func lastUploadPath(uploads []ace.BlobUpload) string {
 
 func shouldSkipDir(name string) bool {
 	switch name {
-	case ".git", "node_modules", ".next", "dist", "build", "target", ".cache", ".venv", "venv", "__pycache__":
+	case ".git", "node_modules", ".next", "dist", "build", "target", ".cache", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".idea", ".vscode", "coverage", "tmp", ".turbo", ".parcel-cache", ".pnpm-store":
 		return true
 	default:
 		return false
 	}
+}
+
+func shouldSkipFile(rel string, name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	rel = strings.ToLower(filepath.ToSlash(rel))
+	if strings.HasPrefix(name, ".env") {
+		return true
+	}
+	switch name {
+	case ".npmrc", ".pypirc", ".netrc", ".dockercfg", "session.json", "credentials", "credentials.json", "service-account.json", "token", "tokens.json", "secret.json", "secrets.json", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519":
+		return true
+	}
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".pem", ".key", ".p12", ".pfx", ".jks", ".kdb":
+		return true
+	}
+	if (strings.HasPrefix(rel, ".augment/") || strings.Contains(rel, "/.augment/")) && name == "session.json" {
+		return true
+	}
+	return false
+}
+
+func readIndexableContent(ctx context.Context, path string, maxBytes int64) ([]byte, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, false, err
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxBytes {
+		return nil, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if looksBinary(content) || !utf8.Valid(content) {
+		return nil, false, nil
+	}
+	return content, true, nil
+}
+
+type ignoreRules []ignoreRule
+
+type ignoreRule struct {
+	pattern  string
+	negated  bool
+	dirOnly  bool
+	anchored bool
+}
+
+func loadIgnoreRules(root string) ignoreRules {
+	var rules ignoreRules
+	for _, name := range []string{".gitignore", ".ignore"} {
+		data, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			continue
+		}
+		rules = append(rules, parseIgnoreRules(string(data))...)
+	}
+	return rules
+}
+
+func parseIgnoreRules(data string) ignoreRules {
+	var rules ignoreRules
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		negated := strings.HasPrefix(line, "!")
+		if negated {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "!"))
+		}
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		anchored := strings.HasPrefix(line, "/")
+		line = strings.TrimPrefix(line, "/")
+		dirOnly := strings.HasSuffix(line, "/")
+		line = strings.TrimSuffix(line, "/")
+		line = filepath.ToSlash(filepath.Clean(line))
+		line = strings.TrimPrefix(line, "./")
+		if line == "" || line == "." {
+			continue
+		}
+		rules = append(rules, ignoreRule{
+			pattern:  line,
+			negated:  negated,
+			dirOnly:  dirOnly,
+			anchored: anchored,
+		})
+	}
+	return rules
+}
+
+func (rules ignoreRules) Match(rel string, isDir bool) bool {
+	rel = pathpkg.Clean(filepath.ToSlash(rel))
+	if rel == "." || rel == "" {
+		return false
+	}
+	ignored := false
+	for _, rule := range rules {
+		if rule.matches(rel, isDir) {
+			ignored = !rule.negated
+		}
+	}
+	return ignored
+}
+
+func (rule ignoreRule) matches(rel string, isDir bool) bool {
+	pattern := rule.pattern
+	if rule.dirOnly && !isDir && !hasPathPrefix(rel, pattern) {
+		return false
+	}
+	if strings.Contains(pattern, "/") || rule.anchored {
+		if rule.anchored {
+			return matchPath(pattern, rel) || hasPathPrefix(rel, pattern)
+		}
+		for _, candidate := range suffixCandidates(rel) {
+			if matchPath(pattern, candidate) || hasPathPrefix(candidate, pattern) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, segment := range strings.Split(rel, "/") {
+		if matchPath(pattern, segment) {
+			return true
+		}
+	}
+	return false
+}
+
+func suffixCandidates(rel string) []string {
+	parts := strings.Split(rel, "/")
+	candidates := make([]string, 0, len(parts))
+	for i := range parts {
+		candidates = append(candidates, strings.Join(parts[i:], "/"))
+	}
+	return candidates
+}
+
+func matchPath(pattern string, value string) bool {
+	if ok, err := pathpkg.Match(pattern, value); err == nil && ok {
+		return true
+	}
+	return pattern == value
+}
+
+func hasPathPrefix(rel string, prefix string) bool {
+	return rel == prefix || strings.HasPrefix(rel, prefix+"/")
 }
 
 func looksBinary(data []byte) bool {
@@ -326,20 +535,43 @@ func loadState(root string) (state, string, error) {
 	}
 	var st state
 	if err := json.Unmarshal(data, &st); err != nil {
-		return state{}, "", err
+		backup := path + ".corrupt-" + time.Now().UTC().Format("20060102150405")
+		_ = os.Rename(path, backup)
+		return state{}, path, nil
 	}
 	return st, path, nil
 }
 
 func saveState(path string, st state) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	tmp, err := os.CreateTemp(dir, ".state-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func stateFile(root string) (string, error) {
@@ -348,7 +580,25 @@ func stateFile(root string) (string, error) {
 		return "", err
 	}
 	sum := sha256.Sum256([]byte(root))
-	return filepath.Join(cache, "workspaces", hex.EncodeToString(sum[:])+".json"), nil
+	return filepath.Join(cache, "workspaces", cacheNamespace(), hex.EncodeToString(sum[:])+".json"), nil
+}
+
+func cacheNamespace() string {
+	namespace := strings.TrimSpace(os.Getenv("OPENACE_CACHE_NAMESPACE"))
+	if namespace == "" {
+		return "default"
+	}
+	namespace = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' {
+			return r
+		}
+		return '-'
+	}, namespace)
+	namespace = strings.Trim(namespace, ".-")
+	if namespace == "" {
+		return "default"
+	}
+	return namespace
 }
 
 func cacheRoot() (string, error) {

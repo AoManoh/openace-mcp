@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 )
 
 const defaultTaskQueueSize = 16
+const defaultTaskHistoryLimit = 128
 
 type TaskKind string
 
@@ -107,6 +109,7 @@ func (s *TaskStore) Submit(req TaskRequest) (TaskSnapshot, error) {
 
 	s.mu.Lock()
 	s.tasks[id] = record
+	s.pruneLocked(defaultTaskHistoryLimit)
 	snapshot := cloneTask(record.snapshot)
 	s.mu.Unlock()
 
@@ -129,6 +132,45 @@ func (s *TaskStore) Get(id string) (TaskSnapshot, bool) {
 		return TaskSnapshot{}, false
 	}
 	return cloneTask(record.snapshot), true
+}
+
+func (s *TaskStore) List(limit int) []TaskSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tasks := make([]TaskSnapshot, 0, len(s.tasks))
+	for _, record := range s.tasks {
+		tasks = append(tasks, cloneTaskSummary(record.snapshot))
+	}
+	sort.Slice(tasks, func(i, j int) bool {
+		return tasks[i].SubmittedAt.After(tasks[j].SubmittedAt)
+	})
+	if limit > 0 && len(tasks) > limit {
+		tasks = tasks[:limit]
+	}
+	return tasks
+}
+
+func (s *TaskStore) pruneLocked(max int) {
+	if max <= 0 || len(s.tasks) <= max {
+		return
+	}
+	type terminalTask struct {
+		id          string
+		submittedAt time.Time
+	}
+	var terminals []terminalTask
+	for id, record := range s.tasks {
+		if isTerminal(record.snapshot.State) {
+			terminals = append(terminals, terminalTask{id: id, submittedAt: record.snapshot.SubmittedAt})
+		}
+	}
+	sort.Slice(terminals, func(i, j int) bool {
+		return terminals[i].submittedAt.Before(terminals[j].submittedAt)
+	})
+	for len(s.tasks) > max && len(terminals) > 0 {
+		delete(s.tasks, terminals[0].id)
+		terminals = terminals[1:]
+	}
 }
 
 func (s *TaskStore) Cancel(id string) (TaskSnapshot, bool) {
@@ -237,6 +279,18 @@ func cloneTask(in TaskSnapshot) TaskSnapshot {
 		out.Result = &result
 	}
 	return out
+}
+
+func cloneTaskSummary(in TaskSnapshot) TaskSnapshot {
+	out := cloneTask(in)
+	if out.Result != nil {
+		out.Result.Text = ""
+	}
+	return out
+}
+
+func isTerminal(state TaskState) bool {
+	return state == TaskStateCompleted || state == TaskStateFailed || state == TaskStateCancelled
 }
 
 func newTaskID() (string, error) {

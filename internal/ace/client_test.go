@@ -42,3 +42,30 @@ func TestBlobsPayloadKeepsCheckpoint(t *testing.T) {
 		t.Fatalf("deleted_blobs = %#v", got)
 	}
 }
+
+func TestTrimForErrorRedactsSensitiveValues(t *testing.T) {
+	t.Setenv("AUGMENT_TOKEN", "fake-token-value-abcdefghijklmnopqrstuvwxyz")
+	t.Setenv("AUGMENT_TENANT", "https://tenant.example.invalid/")
+
+	text := trimForError([]byte(`{"accessToken":"fake-token-value-abcdefghijklmnopqrstuvwxyz","url":"https://tenant.example.invalid/","authorization":"Bearer fake-token-value-abcdefghijklmnopqrstuvwxyz"}`))
+	if bytes.Contains([]byte(text), []byte("fake-token-value")) {
+		t.Fatalf("token was not redacted: %s", text)
+	}
+	if bytes.Contains([]byte(text), []byte("tenant.example.invalid")) {
+		t.Fatalf("tenant was not redacted: %s", text)
+	}
+	if !bytes.Contains([]byte(text), []byte("[REDACTED]")) {
+		t.Fatalf("redacted marker missing: %s", text)
+	}
+}
+
+func TestRetryableIncludesTransientGatewayStatuses(t *testing.T) {
+	for _, status := range []int{499, 429, 500, 502, 503} {
+		if !retryable(apiError{endpoint: "agents/codebase-retrieval", status: status}) {
+			t.Fatalf("status %d should be retryable", status)
+		}
+	}
+	if retryable(apiError{endpoint: "agents/codebase-retrieval", status: 400}) {
+		t.Fatal("status 400 should not be retryable")
+	}
+}

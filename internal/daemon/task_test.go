@@ -64,6 +64,63 @@ func TestTaskStoreCancelsRunningTask(t *testing.T) {
 	}
 }
 
+func TestTaskStoreListsNewestTasksFirst(t *testing.T) {
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+		return workspace.Result{}, nil
+	}, 4)
+
+	first, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	second, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tasks := store.List(1)
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 listed task, got %d", len(tasks))
+	}
+	if tasks[0].ID != second.ID {
+		t.Fatalf("newest task should be listed first: got %s want %s", tasks[0].ID, second.ID)
+	}
+	if tasks[0].ID == first.ID {
+		t.Fatalf("limit should exclude older task %s", first.ID)
+	}
+}
+
+func TestTaskStoreListOmitsResultText(t *testing.T) {
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+		return workspace.Result{Text: "large retrieval text", FileCount: 1}, nil
+	}, 2)
+
+	task, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/workspace"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = waitForTaskState(t, store, task.ID, TaskStateCompleted)
+
+	tasks := store.List(10)
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(tasks))
+	}
+	if tasks[0].Result == nil {
+		t.Fatal("summary should include result metadata")
+	}
+	if tasks[0].Result.Text != "" {
+		t.Fatalf("list should omit result text, got %q", tasks[0].Result.Text)
+	}
+	detail, ok := store.Get(task.ID)
+	if !ok {
+		t.Fatal("task should exist")
+	}
+	if detail.Result == nil || detail.Result.Text == "" {
+		t.Fatalf("detail should retain result text: %+v", detail)
+	}
+}
+
 func waitForTaskState(t *testing.T, store *TaskStore, id string, want TaskState) TaskSnapshot {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

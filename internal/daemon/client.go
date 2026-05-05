@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,14 +19,16 @@ import (
 type Client struct {
 	baseURL string
 	http    *http.Client
+	token   string
 }
 
 func NewClient(addr string) *Client {
 	return &Client{
 		baseURL: baseURL(addr),
 		http: &http.Client{
-			Timeout: 3 * time.Minute,
+			Timeout: 30 * time.Minute,
 		},
+		token: strings.TrimSpace(os.Getenv("OPENACE_DAEMON_TOKEN")),
 	}
 }
 
@@ -50,6 +54,18 @@ func (c *Client) StartTask(ctx context.Context, req TaskRequest) (TaskSnapshot, 
 	return result, err
 }
 
+func (c *Client) ListTasks(ctx context.Context, limit int) ([]TaskSnapshot, error) {
+	path := "/v1/tasks"
+	if limit > 0 {
+		path += "?limit=" + strconv.Itoa(limit)
+	}
+	var result struct {
+		Tasks []TaskSnapshot `json:"tasks"`
+	}
+	err := c.get(ctx, path, &result)
+	return result.Tasks, err
+}
+
 func (c *Client) TaskStatus(ctx context.Context, id string) (TaskSnapshot, error) {
 	var result TaskSnapshot
 	err := c.get(ctx, "/v1/tasks/"+url.PathEscape(id), &result)
@@ -73,6 +89,7 @@ func (c *Client) post(ctx context.Context, path string, reqBody any, out any) er
 	}
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("user-agent", "openace-mcp-shim/0.1")
+	c.authorize(req)
 	return c.do(req, path, out)
 }
 
@@ -82,7 +99,14 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 		return err
 	}
 	req.Header.Set("user-agent", "openace-mcp-shim/0.1")
+	c.authorize(req)
 	return c.do(req, path, out)
+}
+
+func (c *Client) authorize(req *http.Request) {
+	if c.token != "" {
+		req.Header.Set("authorization", "Bearer "+c.token)
+	}
 }
 
 func (c *Client) do(req *http.Request, path string, out any) error {

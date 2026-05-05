@@ -11,6 +11,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -195,7 +197,7 @@ func (c *Client) postOnce(ctx context.Context, session auth.Session, endpoint st
 func retryable(err error) bool {
 	var api apiError
 	if errors.As(err, &api) {
-		return api.status == http.StatusTooManyRequests || api.status >= 500
+		return api.status == 499 || api.status == http.StatusTooManyRequests || api.status >= 500
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
@@ -261,9 +263,34 @@ func blobsPayload(checkpointID string, added []string, deleted []string) map[str
 }
 
 func trimForError(data []byte) string {
-	text := strings.TrimSpace(string(data))
+	text := redactSensitive(strings.TrimSpace(string(data)))
 	if len(text) > 500 {
 		return text[:500]
+	}
+	return text
+}
+
+var sensitivePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)(authorization["':=\s]+bearer\s+)[A-Za-z0-9._-]+`),
+	regexp.MustCompile(`(?i)(accessToken["'\s:=]+)["']?[A-Za-z0-9._-]{20,}`),
+	regexp.MustCompile(`(?i)(token["'\s:=]+)["']?[A-Za-z0-9._-]{20,}`),
+	regexp.MustCompile(`(?i)https://d[0-9]+\.api\.augmentcode\.com/?`),
+}
+
+func redactSensitive(text string) string {
+	for _, value := range []string{
+		os.Getenv("AUGMENT_TOKEN"),
+		os.Getenv("AUGMENT_TENANT"),
+		os.Getenv("SR_TOKEN"),
+		os.Getenv("SR_TENANT"),
+	} {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			text = strings.ReplaceAll(text, value, "[REDACTED]")
+		}
+	}
+	for _, pattern := range sensitivePatterns {
+		text = pattern.ReplaceAllString(text, "${1}[REDACTED]")
 	}
 	return text
 }

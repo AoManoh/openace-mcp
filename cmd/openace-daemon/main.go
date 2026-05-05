@@ -17,7 +17,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	addr := os.Getenv("OPENACE_DAEMON_ADDR")
+	addr := os.Getenv("OPENACE_DAEMON_LISTEN_ADDR")
+	if addr == "" {
+		addr = os.Getenv("OPENACE_DAEMON_ADDR")
+	}
 	if addr == "" {
 		addr = daemon.DefaultAddr
 	}

@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,6 +29,55 @@ func TestStateFileUsesOpenACECacheDir(t *testing.T) {
 	}
 }
 
+func TestStateFileUsesCacheNamespace(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", cacheDir)
+	t.Setenv("OPENACE_CACHE_NAMESPACE", "tenant/a")
+
+	path, err := stateFile("/tmp/workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(cacheDir, "workspaces", "tenant-a") + string(os.PathSeparator)
+	if !strings.HasPrefix(path, want) {
+		t.Fatalf("state file %q does not use namespace prefix %q", path, want)
+	}
+}
+
+func TestLoadStateRecoversCorruptState(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", cacheDir)
+
+	_, path, err := loadState("/tmp/workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	st, gotPath, err := loadState("/tmp/workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != path {
+		t.Fatalf("state path changed: %s != %s", gotPath, path)
+	}
+	if st.CheckpointID != "" {
+		t.Fatalf("corrupt state should be reset: %#v", st)
+	}
+	matches, err := filepath.Glob(path + ".corrupt-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected corrupt backup, got %#v", matches)
+	}
+}
+
 func TestScanSkipsInvalidUTF8(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "valid.txt"), []byte("hello"), 0o600); err != nil {
@@ -37,7 +87,7 @@ func TestScanSkipsInvalidUTF8(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	files, err := scan(root)
+	files, err := scan(context.Background(), root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,6 +99,80 @@ func TestScanSkipsInvalidUTF8(t *testing.T) {
 	}
 }
 
+func TestScanHonorsCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := scan(ctx, t.TempDir())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestScanSkipsSecretLikeFiles(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"main.go":       "package main\n",
+		".env":          "AUGMENT_TOKEN=fake-token\n",
+		"id_ed25519":    "private-key\n",
+		"cert.pem":      "private-cert\n",
+		".npmrc":        "//registry/:_authToken=fake-token\n",
+		"session.json":  `{"accessToken":"fake"}`,
+		"nested/.envrc": "export SECRET=fake\n",
+	}
+	for rel, content := range files {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	scanned, err := scan(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scanned) != 1 || scanned[0].RelPath != "main.go" {
+		t.Fatalf("expected only main.go to be scanned, got %#v", scanned)
+	}
+}
+
+func TestScanHonorsRootGitignore(t *testing.T) {
+	root := t.TempDir()
+	for rel, content := range map[string]string{
+		".gitignore":       "ignored.txt\nlogs/\n*.tmp\n!important.tmp\n",
+		"kept.go":          "package kept\n",
+		"ignored.txt":      "ignored\n",
+		"logs/app.log":     "ignored\n",
+		"scratch.tmp":      "ignored\n",
+		"important.tmp":    "kept\n",
+		"nested/other.txt": "kept\n",
+	} {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	scanned, err := scan(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rels []string
+	for _, file := range scanned {
+		rels = append(rels, file.RelPath)
+	}
+	got := strings.Join(rels, ",")
+	if got != ".gitignore,important.tmp,kept.go,nested/other.txt" {
+		t.Fatalf("unexpected scanned files: %s", got)
+	}
+}
+
 func TestUploadBatchesSplitsByEstimatedPayloadSize(t *testing.T) {
 	uploads := []ace.BlobUpload{
 		{BlobName: "a", Path: "a.go", Content: strings.Repeat("a", 60)},
@@ -56,7 +180,7 @@ func TestUploadBatchesSplitsByEstimatedPayloadSize(t *testing.T) {
 		{BlobName: "c", Path: "c.go", Content: strings.Repeat("c", 60)},
 	}
 
-	batches := uploadBatches(uploads, 220)
+	batches := uploadBatches(uploads, 160)
 	if len(batches) != 3 {
 		t.Fatalf("expected 3 batches, got %d: %#v", len(batches), batches)
 	}
@@ -64,6 +188,38 @@ func TestUploadBatchesSplitsByEstimatedPayloadSize(t *testing.T) {
 		if len(batch) != 1 {
 			t.Fatalf("batch %d should have 1 upload, got %d", i, len(batch))
 		}
+	}
+}
+
+func TestBatchConfigReadsPositiveEnvironmentValues(t *testing.T) {
+	t.Setenv("OPENACE_UPLOAD_BATCH_BYTES", "12345")
+	t.Setenv("OPENACE_FIND_MISSING_BATCH_SIZE", "77")
+	t.Setenv("OPENACE_MAX_FILE_BYTES", "99")
+
+	if got := uploadBatchBytes(); got != 12345 {
+		t.Fatalf("upload batch bytes = %d", got)
+	}
+	if got := findMissingBatchSize(); got != 77 {
+		t.Fatalf("find-missing batch size = %d", got)
+	}
+	if got := maxFileBytes(); got != 99 {
+		t.Fatalf("max file bytes = %d", got)
+	}
+}
+
+func TestBatchConfigFallsBackForInvalidEnvironmentValues(t *testing.T) {
+	t.Setenv("OPENACE_UPLOAD_BATCH_BYTES", "-1")
+	t.Setenv("OPENACE_FIND_MISSING_BATCH_SIZE", "not-a-number")
+	t.Setenv("OPENACE_MAX_FILE_BYTES", "0")
+
+	if got := uploadBatchBytes(); got != defaultUploadBatchBytes {
+		t.Fatalf("upload batch bytes fallback = %d", got)
+	}
+	if got := findMissingBatchSize(); got != defaultFindMissingBatchSize {
+		t.Fatalf("find-missing batch size fallback = %d", got)
+	}
+	if got := maxFileBytes(); got != defaultMaxFileBytes {
+		t.Fatalf("max file bytes fallback = %d", got)
 	}
 }
 
@@ -75,7 +231,7 @@ func TestBatchUploadSendsEveryBatch(t *testing.T) {
 		{BlobName: "c", Path: "c.go", Content: strings.Repeat("c", 60)},
 	}
 
-	if err := batchUpload(context.Background(), client, uploads, 220); err != nil {
+	if err := batchUpload(context.Background(), client, uploads, 160); err != nil {
 		t.Fatal(err)
 	}
 
