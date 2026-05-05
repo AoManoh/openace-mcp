@@ -6,7 +6,7 @@
 
 这是在 `aug2api` 讨论过程中产生的新独立项目需求，不是 `aug2api` 子模块、拆分项目或代码迁移目标。首期路线涉及复用插件 ACE 调用过程，但仓库可见性不阻塞当前推进，先跑通 MCP 主流程。
 
-当前阶段：最小 Go MCP 主流程已跑通。MCP stdio 可以完成初始化、工具列表、workspace 扫描、blob/checkpoint 同步，并通过 `codebase_retrieval` 返回 ACE 检索结果。
+当前阶段：最小 Go MCP 主流程、daemon + shim、异步任务 API 和大仓库压力测试已跑通。MCP stdio 可以完成初始化、工具列表、workspace 扫描、blob/checkpoint 同步，并通过 `codebase_retrieval` 返回 ACE 检索结果。
 
 ## 边界
 
@@ -31,6 +31,8 @@
 
 ```bash
 go test ./...
+go test -race ./internal/daemon ./internal/mcp
+go vet ./...
 go build ./cmd/openace-mcp ./cmd/openace-daemon
 ```
 
@@ -99,6 +101,16 @@ go run ./cmd/openace-daemon
 - `start_sync_workspace`: daemon 模式下提交异步 workspace 同步任务。
 - `task_status`: daemon 模式下查询任务状态和结果。
 - `cancel_task`: daemon 模式下取消 queued/running 任务。
+
+## 压力测试基线
+
+已用 `/home/oh/projects/mailing` 做真实 ACE 压力验证：
+
+- 仓库体量约 5.0GB，`rg --files` 可见 5937 个文件，openACE 当前文本扫描后参与索引 2667 个文件。
+- 冷缓存 5 并发 MCP shim 宽泛检索全部 completed，首个任务完成 workspace 同步并上传 129 个 blob，后续任务复用 checkpoint/cache。
+- 暖缓存 daemon 重启后 5 并发全部 completed，总耗时约 30 秒，全部 `uploaded=0 added=0 deleted=0`。
+- daemon 压测期间保持存活，RSS 约 270-290MB。
+- 当前并发模型是并发提交任务、daemon 串行执行同步/检索；这是稳定性优先的 MVP，不是最终并行吞吐模型。
 
 ## 许可证
 

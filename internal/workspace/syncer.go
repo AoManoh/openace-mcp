@@ -12,9 +12,13 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/AoManoh/openace-mcp/internal/ace"
 )
+
+const maxUploadBatchBytes = 1 << 20
+const maxFindMissingBatchSize = 1000
 
 type ACEClient interface {
 	FindMissing(context.Context, []string) ([]string, []string, error)
@@ -101,7 +105,7 @@ func (s *Syncer) Sync(ctx context.Context, dir string) (Result, error) {
 		deleted = nil
 	}
 
-	unknown, nonindexed, err := s.client.FindMissing(ctx, allNames)
+	unknown, nonindexed, err := findMissingBatched(ctx, s.client, allNames, maxFindMissingBatchSize)
 	if err != nil {
 		return Result{}, err
 	}
@@ -119,7 +123,7 @@ func (s *Syncer) Sync(ctx context.Context, dir string) (Result, error) {
 		})
 	}
 	if len(uploads) > 0 {
-		if err := s.client.BatchUpload(ctx, uploads); err != nil {
+		if err := batchUpload(ctx, s.client, uploads, maxUploadBatchBytes); err != nil {
 			return Result{}, err
 		}
 	}
@@ -177,6 +181,9 @@ func scan(root string) ([]fileBlob, error) {
 		if looksBinary(content) {
 			return nil
 		}
+		if !utf8.Valid(content) {
+			return nil
+		}
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
@@ -194,6 +201,86 @@ func scan(root string) ([]fileBlob, error) {
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].RelPath < files[j].RelPath })
 	return files, nil
+}
+
+func findMissingBatched(ctx context.Context, client ACEClient, blobNames []string, batchSize int) ([]string, []string, error) {
+	if batchSize <= 0 {
+		batchSize = maxFindMissingBatchSize
+	}
+	var unknown []string
+	var nonindexed []string
+	for start := 0; start < len(blobNames); start += batchSize {
+		end := start + batchSize
+		if end > len(blobNames) {
+			end = len(blobNames)
+		}
+		batchUnknown, batchNonindexed, err := client.FindMissing(ctx, blobNames[start:end])
+		if err != nil {
+			return nil, nil, err
+		}
+		unknown = append(unknown, batchUnknown...)
+		nonindexed = append(nonindexed, batchNonindexed...)
+	}
+	return uniqueStrings(unknown), uniqueStrings(nonindexed), nil
+}
+
+func batchUpload(ctx context.Context, client ACEClient, uploads []ace.BlobUpload, maxBytes int) error {
+	batches := uploadBatches(uploads, maxBytes)
+	for i, batch := range batches {
+		if err := client.BatchUpload(ctx, batch); err != nil {
+			return fmt.Errorf("upload batch %d/%d files=%d bytes=%d first=%s last=%s: %w", i+1, len(batches), len(batch), uploadBatchSize(batch), firstUploadPath(batch), lastUploadPath(batch), err)
+		}
+	}
+	return nil
+}
+
+func uploadBatches(uploads []ace.BlobUpload, maxBytes int) [][]ace.BlobUpload {
+	if maxBytes <= 0 {
+		maxBytes = maxUploadBatchBytes
+	}
+	var batches [][]ace.BlobUpload
+	var current []ace.BlobUpload
+	currentBytes := 0
+	for _, upload := range uploads {
+		size := uploadPayloadSize(upload)
+		if len(current) > 0 && currentBytes+size > maxBytes {
+			batches = append(batches, current)
+			current = nil
+			currentBytes = 0
+		}
+		current = append(current, upload)
+		currentBytes += size
+	}
+	if len(current) > 0 {
+		batches = append(batches, current)
+	}
+	return batches
+}
+
+func uploadPayloadSize(upload ace.BlobUpload) int {
+	return len(upload.BlobName) + len(upload.Path) + len(upload.Content) + 128
+}
+
+func uploadBatchSize(uploads []ace.BlobUpload) int {
+	total := 0
+	for _, upload := range uploads {
+		total += uploadPayloadSize(upload)
+	}
+	return total
+}
+
+func firstUploadPath(uploads []ace.BlobUpload) string {
+	if len(uploads) == 0 {
+		return ""
+	}
+	return uploads[0].Path
+}
+
+func lastUploadPath(uploads []ace.BlobUpload) string {
+	if len(uploads) == 0 {
+		return ""
+	}
+	return uploads[len(uploads)-1].Path
 }
 
 func shouldSkipDir(name string) bool {
