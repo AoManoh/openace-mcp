@@ -26,3 +26,7 @@
 3. `docs/references/2026-05-05-openace-context-engine.md`
 
 在用户审核并确认 `AGENTS.md`、项目启动需求文档和被引用的 Context Engine 调研文档可作为当前项目事实之前，不得开始编码。
+
+## 许可证
+
+本项目采用 MIT License。Copyright (c) 2026 aomanoh.
