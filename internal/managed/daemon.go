@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,13 +22,19 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 	if healthy(ctx, client) {
 		return client, nil
 	}
-	if err := startDaemon(addr); err != nil {
+	managedAddr := managedDaemonAddr(addr)
+	managedClient := daemon.NewClient(managedAddr)
+	if managedAddr != addr && healthy(ctx, managedClient) {
+		return managedClient, nil
+	}
+	logPath, err := startDaemon(managedAddr)
+	if err != nil {
 		return nil, err
 	}
-	if err := waitReady(ctx, client, startupTimeout()); err != nil {
-		return nil, err
+	if err := waitReady(ctx, managedClient, startupTimeout()); err != nil {
+		return nil, withDaemonLog(err, logPath)
 	}
-	return client, nil
+	return managedClient, nil
 }
 
 func daemonAddrFromEnv() string {
@@ -52,6 +59,10 @@ func listenAddr(addr string) string {
 		}
 	}
 	return strings.TrimRight(addr, "/")
+}
+
+func managedDaemonAddr(addr string) string {
+	return listenAddr(addr)
 }
 
 func startupTimeout() time.Duration {
@@ -94,23 +105,67 @@ func waitReady(ctx context.Context, client *daemon.Client, timeout time.Duration
 	}
 }
 
-func startDaemon(addr string) error {
+func startDaemon(addr string) (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("resolve current executable: %w", err)
+		return "", fmt.Errorf("resolve current executable: %w", err)
 	}
 	cmd := exec.Command(exe, "daemon")
 	cmd.Env = upsertEnv(os.Environ(), "OPENACE_DAEMON_LISTEN_ADDR", listenAddr(addr))
 	cmd.Stdin = nil
 	cmd.Stdout = io.Discard
-	cmd.Stderr = os.Stderr
+	logFile, logPath := daemonLogFile()
+	if logFile != nil {
+		defer logFile.Close()
+		cmd.Stderr = logFile
+	} else {
+		cmd.Stderr = io.Discard
+	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start managed daemon: %w", err)
+		return logPath, fmt.Errorf("start managed daemon: %w", err)
 	}
 	if err := cmd.Process.Release(); err != nil {
-		return fmt.Errorf("release managed daemon: %w", err)
+		return logPath, fmt.Errorf("release managed daemon: %w", err)
 	}
-	return nil
+	return logPath, nil
+}
+
+func daemonLogFile() (*os.File, string) {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return nil, ""
+	}
+	dir := filepath.Join(cache, "openace-mcp", "daemon-logs")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, ""
+	}
+	file, err := os.CreateTemp(dir, "managed-daemon-*.log")
+	if err != nil {
+		return nil, ""
+	}
+	return file, file.Name()
+}
+
+func withDaemonLog(err error, path string) error {
+	tail := daemonLogTail(path, 4096)
+	if tail == "" {
+		return err
+	}
+	return fmt.Errorf("%w; managed daemon stderr: %s", err, tail)
+}
+
+func daemonLogTail(path string, max int) string {
+	if path == "" || max <= 0 {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	if len(data) > max {
+		data = data[len(data)-max:]
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func upsertEnv(env []string, key string, value string) []string {
