@@ -60,6 +60,55 @@ GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/
 }
 ```
 
+## AI IDE 快速测试
+
+推荐用 daemon + MCP shim 测试，尤其是大仓库。`.env` 不会被程序自动加载；如果使用 `.env`，需要先在启动 daemon 的 shell 中执行 `set -a && source .env && set +a`。
+
+1. 安装二进制：
+
+```bash
+GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/openace-mcp@latest
+GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/openace-daemon@latest
+```
+
+2. 启动 daemon：
+
+```bash
+export AUGMENT_TOKEN="..."
+export AUGMENT_TENANT="..."
+export OPENACE_CACHE_DIR="$HOME/.cache/openace-mcp"
+export OPENACE_CACHE_NAMESPACE="default"
+export OPENACE_DAEMON_LISTEN_ADDR=127.0.0.1:8765
+export OPENACE_DAEMON_TOKEN="$(openssl rand -hex 16)"
+openace-daemon
+```
+
+如果不用 `OPENACE_DAEMON_TOKEN`，可以省略该变量；如果启用 token，AI IDE 的 MCP 配置里也必须设置同一个值。
+
+3. 在 AI IDE 中配置 MCP shim：
+
+```json
+{
+  "mcpServers": {
+    "openace": {
+      "command": "openace-mcp",
+      "env": {
+        "OPENACE_DAEMON_ADDR": "127.0.0.1:8765",
+        "OPENACE_DAEMON_TOKEN": "填入 daemon 启动时的同一个 token"
+      }
+    }
+  }
+}
+```
+
+如果 `go install` 后 AI IDE 找不到 `openace-mcp`，把 `command` 改成绝对路径，例如 `$HOME/go/bin/openace-mcp`。
+
+4. 测试建议：
+
+- 小仓库可直接调用 `codebase_retrieval`。
+- 大仓库优先调用 `start_codebase_retrieval`，再用 `task_status` 查询结果。
+- 忘记 task id 时调用 `list_tasks` 找回最近任务。
+
 ## Daemon 模式
 
 启动常驻 daemon。上游 ACE 凭据必须给 `openace-daemon` 进程，而不是只给 MCP shim：
