@@ -632,7 +632,7 @@ func listWorkspacesTool() map[string]any {
 func workspaceStatusTool() map[string]any {
 	return map[string]any{
 		"name":        "workspace_status",
-		"description": "Get checkpoint, file count, in-flight state, and last error for a workspace known by the local openACE daemon.",
+		"description": "Get checkpoint, file count, sync stage, watcher state, and last error for a workspace known by the local openACE daemon.",
 		"inputSchema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{

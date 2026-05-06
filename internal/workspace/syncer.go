@@ -79,21 +79,27 @@ type Result struct {
 }
 
 type WorkspaceStatus struct {
-	DirectoryPath  string     `json:"directory_path"`
-	CheckpointID   string     `json:"checkpoint_id,omitempty"`
-	FileCount      int        `json:"file_count"`
-	InFlight       bool       `json:"in_flight"`
-	Stage          IndexStage `json:"stage"`
-	LastSyncReason SyncReason `json:"last_sync_reason,omitempty"`
-	LastErrorStage IndexStage `json:"last_error_stage,omitempty"`
-	LastUploaded   int        `json:"last_uploaded,omitempty"`
-	LastAdded      int        `json:"last_added,omitempty"`
-	LastDeleted    int        `json:"last_deleted,omitempty"`
-	LastError      string     `json:"last_error,omitempty"`
-	LastStartedAt  *time.Time `json:"last_started_at,omitempty"`
-	LastFinishedAt *time.Time `json:"last_finished_at,omitempty"`
-	StageStartedAt *time.Time `json:"stage_started_at,omitempty"`
-	UpdatedAt      *time.Time `json:"updated_at,omitempty"`
+	DirectoryPath        string     `json:"directory_path"`
+	CheckpointID         string     `json:"checkpoint_id,omitempty"`
+	FileCount            int        `json:"file_count"`
+	InFlight             bool       `json:"in_flight"`
+	Stage                IndexStage `json:"stage"`
+	LastSyncReason       SyncReason `json:"last_sync_reason,omitempty"`
+	LastErrorStage       IndexStage `json:"last_error_stage,omitempty"`
+	LastUploaded         int        `json:"last_uploaded,omitempty"`
+	LastAdded            int        `json:"last_added,omitempty"`
+	LastDeleted          int        `json:"last_deleted,omitempty"`
+	WatchEnabled         bool       `json:"watch_enabled,omitempty"`
+	WatchPending         bool       `json:"watch_pending,omitempty"`
+	LastError            string     `json:"last_error,omitempty"`
+	WatchError           string     `json:"watch_error,omitempty"`
+	LastStartedAt        *time.Time `json:"last_started_at,omitempty"`
+	LastFinishedAt       *time.Time `json:"last_finished_at,omitempty"`
+	StageStartedAt       *time.Time `json:"stage_started_at,omitempty"`
+	LastWatchAt          *time.Time `json:"last_watch_at,omitempty"`
+	NextWatchAt          *time.Time `json:"next_watch_at,omitempty"`
+	LastBackgroundSyncAt *time.Time `json:"last_background_sync_at,omitempty"`
+	UpdatedAt            *time.Time `json:"updated_at,omitempty"`
 }
 
 type state struct {
@@ -136,6 +142,10 @@ func (s *Syncer) Retrieve(ctx context.Context, dir string, query string, maxOutp
 
 func (s *Syncer) Sync(ctx context.Context, dir string) (Result, error) {
 	return s.sync(ctx, dir, SyncReasonManual)
+}
+
+func (s *Syncer) SyncBackground(ctx context.Context, dir string) (Result, error) {
+	return s.sync(ctx, dir, SyncReasonBackground)
 }
 
 func (s *Syncer) sync(ctx context.Context, dir string, reason SyncReason) (Result, error) {
@@ -183,6 +193,26 @@ func (s *Syncer) ListWorkspaceStatuses(ctx context.Context) ([]WorkspaceStatus, 
 		return statuses[i].DirectoryPath < statuses[j].DirectoryPath
 	})
 	return statuses, nil
+}
+
+func (s *Syncer) WorkspaceChanged(ctx context.Context, dir string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	root, err := filepath.Abs(dir)
+	if err != nil {
+		return false, err
+	}
+	files, err := scan(ctx, root)
+	if err != nil {
+		return false, err
+	}
+	st, _, err := loadState(root)
+	if err != nil {
+		return false, err
+	}
+	current := blobMap(files)
+	return !sameBlobMap(st.BlobNames, current), nil
 }
 
 func (s *Syncer) syncSingleflight(ctx context.Context, root string, reason SyncReason) (Result, error) {
@@ -357,6 +387,9 @@ func cloneWorkspaceStatus(status WorkspaceStatus) WorkspaceStatus {
 	status.LastStartedAt = cloneTime(status.LastStartedAt)
 	status.LastFinishedAt = cloneTime(status.LastFinishedAt)
 	status.StageStartedAt = cloneTime(status.StageStartedAt)
+	status.LastWatchAt = cloneTime(status.LastWatchAt)
+	status.NextWatchAt = cloneTime(status.NextWatchAt)
+	status.LastBackgroundSyncAt = cloneTime(status.LastBackgroundSyncAt)
 	status.UpdatedAt = cloneTime(status.UpdatedAt)
 	return status
 }
@@ -383,11 +416,10 @@ func (s *Syncer) syncRoot(ctx context.Context, root string) (Result, error) {
 		st.BlobNames = map[string]string{}
 	}
 
-	current := make(map[string]string, len(files))
+	current := blobMap(files)
 	byName := make(map[string]fileBlob, len(files))
 	allNames := make([]string, 0, len(files))
 	for _, file := range files {
-		current[file.RelPath] = file.BlobName
 		byName[file.BlobName] = file
 		allNames = append(allNames, file.BlobName)
 	}
@@ -1125,6 +1157,26 @@ func diff(old map[string]string, current map[string]string) ([]string, []string)
 		}
 	}
 	return uniqueSorted(added), uniqueSorted(deleted)
+}
+
+func blobMap(files []fileBlob) map[string]string {
+	current := make(map[string]string, len(files))
+	for _, file := range files {
+		current[file.RelPath] = file.BlobName
+	}
+	return current
+}
+
+func sameBlobMap(left map[string]string, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for path, leftName := range left {
+		if right[path] != leftName {
+			return false
+		}
+	}
+	return true
 }
 
 func uniqueStrings(values []string) []string {

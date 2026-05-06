@@ -242,9 +242,13 @@ func TestScanHonorsNestedIgnoreAndOverridesParent(t *testing.T) {
 func TestScanAugmentignoreCanReincludeGitignoredAssets(t *testing.T) {
 	root := t.TempDir()
 	for rel, content := range map[string]string{
-		".gitignore":                 "/AGENTS.md\n/docs/\n/skills/\n",
-		".augmentignore":             "!AGENTS.md\n!docs/\n!docs/**\n!skills/\n!skills/**/\n!skills/**/*.md\n",
+		".gitignore":                 "/AGENTS.md\n/CLAUDE.md\n/.augment-guidelines\n/.augment/\n/docs/\n/skills/\n",
+		".augmentignore":             "!AGENTS.md\n!CLAUDE.md\n!.augment-guidelines\n!.augment/\n!.augment/rules/\n!.augment/rules/**/\n!.augment/rules/**/*.md\n!docs/\n!docs/**\n!skills/\n!skills/**/\n!skills/**/*.md\n",
 		"AGENTS.md":                  "project instructions\n",
+		"CLAUDE.md":                  "claude instructions\n",
+		".augment-guidelines":        "project guidelines\n",
+		".augment/rules/project.md":  "project rule\n",
+		".augment/rules/script.py":   "print('not included')\n",
 		"docs/decision.md":           "important project knowledge\n",
 		"skills/local/SKILL.md":      "local skill knowledge\n",
 		"skills/local/script.py":     "print('not included')\n",
@@ -269,7 +273,7 @@ func TestScanAugmentignoreCanReincludeGitignoredAssets(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := scannedRelPaths(scanned)
-	want := ".augmentignore,.gitignore,AGENTS.md,docs/decision.md,main.go,skills/local/SKILL.md"
+	want := ".augment-guidelines,.augment/rules/project.md,.augmentignore,.gitignore,AGENTS.md,CLAUDE.md,docs/decision.md,main.go,skills/local/SKILL.md"
 	if got != want {
 		t.Fatalf("unexpected scanned files:\n got: %s\nwant: %s", got, want)
 	}
@@ -672,6 +676,46 @@ func TestSyncerWorkspaceStatusRecordsFailureStage(t *testing.T) {
 	}
 	if !strings.Contains(status.LastError, "find-missing failed") {
 		t.Fatalf("failure status should retain error: %+v", status)
+	}
+}
+
+func TestSyncerWorkspaceChangedComparesCurrentScanToState(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	path := filepath.Join(root, "main.go")
+	if err := os.WriteFile(path, []byte("package main\nconst Version = 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	syncer := NewSyncer(&recordingClient{})
+	changed, err := syncer.WorkspaceChanged(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("workspace without state should require sync")
+	}
+
+	if _, err := syncer.Sync(context.Background(), root); err != nil {
+		t.Fatal(err)
+	}
+	changed, err = syncer.WorkspaceChanged(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("workspace should be unchanged immediately after sync")
+	}
+
+	if err := os.WriteFile(path, []byte("package main\nconst Version = 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err = syncer.WorkspaceChanged(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("workspace change should be detected")
 	}
 }
 

@@ -191,6 +191,13 @@ openace-mcp daemon
 | `OPENACE_TASK_QUEUE_SIZE` | daemon 异步任务队列容量，默认 `256`，最大 `4096` |
 | `OPENACE_TASK_HISTORY_LIMIT` | daemon 保留最近任务快照数量，默认 `1024`，最大 `8192` |
 | `OPENACE_TASK_STORE_DIR` | daemon 任务快照目录；默认位于 `OPENACE_CACHE_DIR/tasks/<namespace>` 或用户 cache 目录 |
+| `OPENACE_WATCH_MODE` | daemon 已见 workspace 后台增量检查模式，默认 `seen`；设为 `off` 可关闭 |
+| `OPENACE_WATCH_INTERVAL` | 后台检查无变化 workspace 的间隔，默认 `30s` |
+| `OPENACE_WATCH_DEBOUNCE` | workspace 被显式访问后首次后台检查的防抖时间，默认 `2s` |
+| `OPENACE_WATCH_TIMEOUT` | 单次后台检查和同步的超时，默认 `5m` |
+| `OPENACE_WATCH_BACKOFF_MIN` | 后台探测失败后的最小重试退避，默认 `5s` |
+| `OPENACE_WATCH_BACKOFF_MAX` | 后台探测失败后的最大重试退避，默认 `2m` |
+| `OPENACE_WATCH_MAX_WORKSPACES` | 单个 daemon 维护的已见 workspace 上限，默认 `64` |
 | `OPENACE_TOOL_TIMEOUT` | 同步 MCP 工具调用超时，默认 `110s`；大仓库长任务优先使用 `start_*` 异步工具 |
 | `OPENACE_RETRIEVAL_TIMEOUT` | 单次上游 ACE retrieval 超时，默认 `90s` |
 | `OPENACE_ALLOW_REMOTE_DAEMON` | 显式允许监听非 loopback 地址 |
@@ -236,6 +243,14 @@ Git ignore 和 openACE index ignore 是两条不同边界：`docs/`、`skills/` 
 目录被 `.gitignore` 排除时，需要先 re-include 目录本身，再 re-include 需要的子路径。上面的示例会让 openACE 索引 `AGENTS.md`、`CLAUDE.md`、`.augment-guidelines`、`.augment/rules/`、`docs/` 下 Markdown 资产和 `skills/` 下的 `SKILL.md` / `SPEC.md` 知识文件，但不会改变这些文件是否被 Git 提交。
 
 `.augmentignore` 不能绕过 hard safety denylist：`.env*`、session/token/credentials、私钥、证书和 keystore 类文件仍会被跳过。若你不希望 `.augmentignore` 本身进入 Git，可以把它加入项目 `.gitignore` 或 `.git/info/exclude`；openACE 仍会读取它作为本地索引策略。
+
+`AGENTS.md`、`CLAUDE.md`、`.augment-guidelines` 和 `.augment/rules/` 在官方插件中属于规则/指南上下文。openACE 当前作为 MCP retrieval adapter，会在用户显式 `.augmentignore` 授权后把这些文件作为可检索资产同步；完整的规则 prompt 注入、IDE 权限 UI 和编辑器事件通道不是本轮实现范围。
+
+## 后台增量与状态
+
+daemon 模式会记住已经被 `sync_workspace` / `codebase_retrieval` / `multi_codebase_retrieval` 显式访问过的 workspace，并在后台做增量检查。后台检查先在本地重新扫描索引范围并比较 blob 集；只有发现新增、删除或内容变化时，才触发后台 `sync` 进入 ACE 上传与 checkpoint 流程，避免无变化时反复消耗上游 quota。
+
+`workspace_status` 和 `list_workspaces` 会返回可解释状态字段：`stage` 表示当前同步阶段（`scanning` / `reconciling` / `uploading` / `checkpointing` / `ready` / `failed`），`last_sync_reason` 区分 `manual`、`retrieval` 和 `background`，watch 字段会展示后台检查是否启用、下次检查时间、最近检查时间、最近后台同步时间和探测错误。后台探测失败会按 `OPENACE_WATCH_BACKOFF_MIN` / `OPENACE_WATCH_BACKOFF_MAX` 退避重试。
 
 ## 安全与边界
 

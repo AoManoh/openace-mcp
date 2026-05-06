@@ -48,6 +48,34 @@ func (fakeWorkspaceSyncer) WorkspaceStatus(ctx context.Context, dir string) (wor
 	}, nil
 }
 
+type fakeWatchWorkspaceSyncer struct {
+	fakeSyncer
+}
+
+func (fakeWatchWorkspaceSyncer) WorkspaceChanged(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+func (fakeWatchWorkspaceSyncer) SyncBackground(context.Context, string) (workspace.Result, error) {
+	return workspace.Result{CheckpointID: "checkpoint-background", FileCount: 3}, nil
+}
+
+func (fakeWatchWorkspaceSyncer) ListWorkspaceStatuses(context.Context) ([]workspace.WorkspaceStatus, error) {
+	return []workspace.WorkspaceStatus{{
+		DirectoryPath: "/tmp/project",
+		CheckpointID:  "checkpoint",
+		FileCount:     3,
+	}}, nil
+}
+
+func (fakeWatchWorkspaceSyncer) WorkspaceStatus(ctx context.Context, dir string) (workspace.WorkspaceStatus, error) {
+	return workspace.WorkspaceStatus{
+		DirectoryPath: dir,
+		CheckpointID:  "checkpoint",
+		FileCount:     3,
+	}, nil
+}
+
 func TestServerTaskLifecycle(t *testing.T) {
 	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "")
@@ -222,6 +250,38 @@ func TestServerWorkspaceStatus(t *testing.T) {
 	}
 	if status.DirectoryPath != "/tmp/project" || status.FileCount != 3 {
 		t.Fatalf("unexpected workspace status: %+v", status)
+	}
+}
+
+func TestServerWorkspaceStatusIncludesWatchDiagnosticsForSeenWorkspace(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_WATCH_MODE", "seen")
+	t.Setenv("OPENACE_WATCH_DEBOUNCE", "1h")
+	syncer := fakeWatchWorkspaceSyncer{}
+	server := newDaemonHTTPTestServer(t, syncer)
+
+	if err := postSync(server.URL, "/tmp/project"); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(workspaceStatusRequest{DirectoryPath: "/tmp/project"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(server.URL+"/v1/workspace/status", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status response: %s", resp.Status)
+	}
+	var status workspace.WorkspaceStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatal(err)
+	}
+	if !status.WatchEnabled || !status.WatchPending || status.NextWatchAt == nil {
+		t.Fatalf("workspace status should include watch diagnostics: %+v", status)
 	}
 }
 

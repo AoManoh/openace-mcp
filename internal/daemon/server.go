@@ -29,9 +29,10 @@ type WorkspaceInspector interface {
 }
 
 type Server struct {
-	syncer    Syncer
-	tasks     *TaskStore
-	authToken string
+	syncer     Syncer
+	tasks      *TaskStore
+	reconciler *workspaceReconciler
+	authToken  string
 }
 
 type syncRequest struct {
@@ -54,6 +55,7 @@ func NewServer(syncer Syncer) *Server {
 		authToken: strings.TrimSpace(os.Getenv("OPENACE_DAEMON_TOKEN")),
 	}
 	server.tasks = NewTaskStore(server.runTask, 0)
+	server.reconciler = newWorkspaceReconciler(syncer)
 	return server
 }
 
@@ -97,10 +99,15 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s.tasks == nil {
-		return nil
+	if s.reconciler != nil {
+		if err := s.reconciler.Shutdown(ctx); err != nil {
+			return err
+		}
 	}
-	return s.tasks.Shutdown(ctx)
+	if s.tasks != nil {
+		return s.tasks.Shutdown(ctx)
+	}
+	return nil
 }
 
 func validateListenAddr(addr string) error {
@@ -225,6 +232,9 @@ func (s *Server) workspaces(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	for i := range statuses {
+		s.decorateWorkspaceStatus(&statuses[i])
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"workspaces": statuses})
 }
 
@@ -252,12 +262,19 @@ func (s *Server) workspaceStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	s.decorateWorkspaceStatus(&status)
 	writeJSON(w, http.StatusOK, status)
 }
 
 func (s *Server) workspaceInspector() (WorkspaceInspector, bool) {
 	inspector, ok := s.syncer.(WorkspaceInspector)
 	return inspector, ok
+}
+
+func (s *Server) decorateWorkspaceStatus(status *workspace.WorkspaceStatus) {
+	if s.reconciler != nil {
+		s.reconciler.Decorate(status)
+	}
 }
 
 func (s *Server) tasksCollection(w http.ResponseWriter, r *http.Request) {
@@ -353,11 +370,19 @@ func (s *Server) runTask(ctx context.Context, req TaskRequest) (workspace.Result
 }
 
 func (s *Server) runSync(ctx context.Context, dir string) (workspace.Result, error) {
+	s.observeWorkspace(dir)
 	return s.syncer.Sync(ctx, dir)
 }
 
 func (s *Server) runRetrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
+	s.observeWorkspace(dir)
 	return s.syncer.Retrieve(ctx, dir, query, maxOutputLen)
+}
+
+func (s *Server) observeWorkspace(dir string) {
+	if s.reconciler != nil {
+		s.reconciler.Observe(dir)
+	}
 }
 
 type multiRetrieveResult struct {
