@@ -569,8 +569,17 @@ func TestSyncerWorkspaceStatusTracksInflightAndCompletion(t *testing.T) {
 	if !status.InFlight {
 		t.Fatalf("workspace should be in flight: %+v", status)
 	}
+	if status.Stage != IndexStageReconciling {
+		t.Fatalf("workspace should expose reconciling stage while find-missing is blocked: %+v", status)
+	}
+	if status.LastSyncReason != SyncReasonManual {
+		t.Fatalf("workspace should record manual sync reason: %+v", status)
+	}
 	if status.LastStartedAt == nil {
 		t.Fatalf("workspace should include last_started_at: %+v", status)
+	}
+	if status.StageStartedAt == nil {
+		t.Fatalf("workspace should include stage_started_at: %+v", status)
 	}
 
 	client.release()
@@ -587,6 +596,12 @@ func TestSyncerWorkspaceStatusTracksInflightAndCompletion(t *testing.T) {
 	}
 	if status.CheckpointID != "checkpoint-1" || status.FileCount != 1 {
 		t.Fatalf("unexpected completed status: %+v", status)
+	}
+	if status.Stage != IndexStageReady {
+		t.Fatalf("successful sync should end in ready stage: %+v", status)
+	}
+	if status.LastUploaded != 1 || status.LastAdded != 1 || status.LastDeleted != 0 {
+		t.Fatalf("successful sync should expose last sync counters: %+v", status)
 	}
 	if status.LastError != "" {
 		t.Fatalf("successful sync should clear last error: %+v", status)
@@ -628,8 +643,35 @@ func TestSyncerWorkspaceStatusLoadsDiskState(t *testing.T) {
 	if status.CheckpointID != "checkpoint-disk" || status.FileCount != 1 {
 		t.Fatalf("unexpected disk status: %+v", status)
 	}
+	if status.Stage != IndexStageReady {
+		t.Fatalf("disk status with checkpoint should be ready: %+v", status)
+	}
 	if status.UpdatedAt == nil || !status.UpdatedAt.Equal(updated) {
 		t.Fatalf("unexpected updated_at: %+v", status)
+	}
+}
+
+func TestSyncerWorkspaceStatusRecordsFailureStage(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	syncer := NewSyncer(errorFindMissingClient{})
+	_, err := syncer.Sync(context.Background(), root)
+	if err == nil {
+		t.Fatal("sync should fail")
+	}
+	status, err := syncer.WorkspaceStatus(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Stage != IndexStageFailed || status.LastErrorStage != IndexStageReconciling {
+		t.Fatalf("failure status should retain failing stage: %+v", status)
+	}
+	if !strings.Contains(status.LastError, "find-missing failed") {
+		t.Fatalf("failure status should retain error: %+v", status)
 	}
 }
 
@@ -716,6 +758,24 @@ func (c *recordingClient) CheckpointBlobs(context.Context, string, []string, []s
 }
 
 func (c *recordingClient) CodebaseRetrieval(context.Context, string, ace.RetrievalOptions) (string, error) {
+	return "", nil
+}
+
+type errorFindMissingClient struct{}
+
+func (errorFindMissingClient) FindMissing(context.Context, []string) ([]string, []string, error) {
+	return nil, nil, errors.New("find-missing failed")
+}
+
+func (errorFindMissingClient) BatchUpload(context.Context, []ace.BlobUpload) error {
+	return nil
+}
+
+func (errorFindMissingClient) CheckpointBlobs(context.Context, string, []string, []string) (string, error) {
+	return "", nil
+}
+
+func (errorFindMissingClient) CodebaseRetrieval(context.Context, string, ace.RetrievalOptions) (string, error) {
 	return "", nil
 }
 

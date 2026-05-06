@@ -26,6 +26,26 @@ const defaultFindMissingBatchSize = 1000
 const defaultMaxFileBytes = 1 << 20
 const defaultRetrievalTimeout = 90 * time.Second
 
+type IndexStage string
+
+const (
+	IndexStageIdle          IndexStage = "idle"
+	IndexStageScanning      IndexStage = "scanning"
+	IndexStageReconciling   IndexStage = "reconciling"
+	IndexStageUploading     IndexStage = "uploading"
+	IndexStageCheckpointing IndexStage = "checkpointing"
+	IndexStageReady         IndexStage = "ready"
+	IndexStageFailed        IndexStage = "failed"
+)
+
+type SyncReason string
+
+const (
+	SyncReasonManual     SyncReason = "manual"
+	SyncReasonRetrieval  SyncReason = "retrieval"
+	SyncReasonBackground SyncReason = "background"
+)
+
 type ACEClient interface {
 	FindMissing(context.Context, []string) ([]string, []string, error)
 	BatchUpload(context.Context, []ace.BlobUpload) error
@@ -63,9 +83,16 @@ type WorkspaceStatus struct {
 	CheckpointID   string     `json:"checkpoint_id,omitempty"`
 	FileCount      int        `json:"file_count"`
 	InFlight       bool       `json:"in_flight"`
+	Stage          IndexStage `json:"stage"`
+	LastSyncReason SyncReason `json:"last_sync_reason,omitempty"`
+	LastErrorStage IndexStage `json:"last_error_stage,omitempty"`
+	LastUploaded   int        `json:"last_uploaded,omitempty"`
+	LastAdded      int        `json:"last_added,omitempty"`
+	LastDeleted    int        `json:"last_deleted,omitempty"`
 	LastError      string     `json:"last_error,omitempty"`
 	LastStartedAt  *time.Time `json:"last_started_at,omitempty"`
 	LastFinishedAt *time.Time `json:"last_finished_at,omitempty"`
+	StageStartedAt *time.Time `json:"stage_started_at,omitempty"`
 	UpdatedAt      *time.Time `json:"updated_at,omitempty"`
 }
 
@@ -90,7 +117,7 @@ func NewSyncer(client ACEClient) *Syncer {
 }
 
 func (s *Syncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (Result, error) {
-	sync, err := s.Sync(ctx, dir)
+	sync, err := s.sync(ctx, dir, SyncReasonRetrieval)
 	if err != nil {
 		return Result{}, err
 	}
@@ -108,11 +135,15 @@ func (s *Syncer) Retrieve(ctx context.Context, dir string, query string, maxOutp
 }
 
 func (s *Syncer) Sync(ctx context.Context, dir string) (Result, error) {
+	return s.sync(ctx, dir, SyncReasonManual)
+}
+
+func (s *Syncer) sync(ctx context.Context, dir string, reason SyncReason) (Result, error) {
 	root, err := filepath.Abs(dir)
 	if err != nil {
 		return Result{}, err
 	}
-	return s.syncSingleflight(ctx, root)
+	return s.syncSingleflight(ctx, root, reason)
 }
 
 func (s *Syncer) WorkspaceStatus(ctx context.Context, dir string) (WorkspaceStatus, error) {
@@ -154,7 +185,7 @@ func (s *Syncer) ListWorkspaceStatuses(ctx context.Context) ([]WorkspaceStatus, 
 	return statuses, nil
 }
 
-func (s *Syncer) syncSingleflight(ctx context.Context, root string) (Result, error) {
+func (s *Syncer) syncSingleflight(ctx context.Context, root string, reason SyncReason) (Result, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
@@ -187,7 +218,7 @@ func (s *Syncer) syncSingleflight(ctx context.Context, root string) (Result, err
 			waiters: 1,
 		}
 		s.inflight[root] = call
-		s.markSyncStartedLocked(root)
+		s.markSyncStartedLocked(root, reason)
 		s.mu.Unlock()
 
 		go s.runSyncCall(runCtx, root, call)
@@ -240,7 +271,7 @@ func (s *Syncer) releaseSyncCall(root string, call *syncCall) {
 	}
 }
 
-func (s *Syncer) markSyncStartedLocked(root string) {
+func (s *Syncer) markSyncStartedLocked(root string, reason SyncReason) {
 	if s.statuses == nil {
 		s.statuses = make(map[string]WorkspaceStatus)
 	}
@@ -248,7 +279,26 @@ func (s *Syncer) markSyncStartedLocked(root string) {
 	status := s.statuses[root]
 	status.DirectoryPath = root
 	status.InFlight = true
+	status.Stage = IndexStageScanning
+	status.StageStartedAt = &now
+	status.LastSyncReason = reason
+	status.LastErrorStage = ""
 	status.LastStartedAt = &now
+	s.statuses[root] = status
+}
+
+func (s *Syncer) markSyncStage(root string, stage IndexStage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.statuses == nil {
+		s.statuses = make(map[string]WorkspaceStatus)
+	}
+	now := time.Now().UTC()
+	status := s.statuses[root]
+	status.DirectoryPath = root
+	status.Stage = stage
+	status.StageStartedAt = &now
+	status.InFlight = true
 	s.statuses[root] = status
 }
 
@@ -262,13 +312,26 @@ func (s *Syncer) markSyncFinishedLocked(root string, result Result, err error) {
 	status.InFlight = false
 	status.LastFinishedAt = &now
 	if err != nil {
+		errorStage := status.Stage
+		if errorStage == "" || errorStage == IndexStageReady {
+			errorStage = IndexStageFailed
+		}
+		status.Stage = IndexStageFailed
+		status.StageStartedAt = &now
+		status.LastErrorStage = errorStage
 		status.LastError = err.Error()
 		s.statuses[root] = status
 		return
 	}
+	status.Stage = IndexStageReady
+	status.StageStartedAt = &now
 	status.CheckpointID = result.CheckpointID
 	status.FileCount = result.FileCount
+	status.LastUploaded = result.Uploaded
+	status.LastAdded = result.Added
+	status.LastDeleted = result.Deleted
 	status.LastError = ""
+	status.LastErrorStage = ""
 	status.UpdatedAt = &now
 	s.statuses[root] = status
 }
@@ -278,6 +341,10 @@ func workspaceStatusFromState(root string, st state) WorkspaceStatus {
 		DirectoryPath: root,
 		CheckpointID:  st.CheckpointID,
 		FileCount:     len(st.BlobNames),
+		Stage:         IndexStageIdle,
+	}
+	if st.CheckpointID != "" || len(st.BlobNames) > 0 {
+		status.Stage = IndexStageReady
 	}
 	if !st.UpdatedAt.IsZero() {
 		updated := st.UpdatedAt.UTC()
@@ -289,6 +356,7 @@ func workspaceStatusFromState(root string, st state) WorkspaceStatus {
 func cloneWorkspaceStatus(status WorkspaceStatus) WorkspaceStatus {
 	status.LastStartedAt = cloneTime(status.LastStartedAt)
 	status.LastFinishedAt = cloneTime(status.LastFinishedAt)
+	status.StageStartedAt = cloneTime(status.StageStartedAt)
 	status.UpdatedAt = cloneTime(status.UpdatedAt)
 	return status
 }
@@ -302,6 +370,7 @@ func cloneTime(value *time.Time) *time.Time {
 }
 
 func (s *Syncer) syncRoot(ctx context.Context, root string) (Result, error) {
+	s.markSyncStage(root, IndexStageScanning)
 	files, err := scan(ctx, root)
 	if err != nil {
 		return Result{}, err
@@ -330,12 +399,16 @@ func (s *Syncer) syncRoot(ctx context.Context, root string) (Result, error) {
 		deleted = nil
 	}
 
+	s.markSyncStage(root, IndexStageReconciling)
 	unknown, nonindexed, err := findMissingBatched(ctx, s.client, allNames, findMissingBatchSize())
 	if err != nil {
 		return Result{}, err
 	}
 	toUpload := uniqueStrings(append(unknown, nonindexed...))
 	uploads := make([]ace.BlobUpload, 0, len(toUpload))
+	if len(toUpload) > 0 {
+		s.markSyncStage(root, IndexStageUploading)
+	}
 	for _, name := range toUpload {
 		file, ok := byName[name]
 		if !ok {
@@ -364,6 +437,7 @@ func (s *Syncer) syncRoot(ctx context.Context, root string) (Result, error) {
 	}
 
 	if len(added) > 0 || len(deleted) > 0 || st.CheckpointID == "" {
+		s.markSyncStage(root, IndexStageCheckpointing)
 		checkpointID, err := s.client.CheckpointBlobs(ctx, st.CheckpointID, added, deleted)
 		if err != nil {
 			return Result{}, err
