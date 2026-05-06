@@ -11,7 +11,7 @@
 - daemon 异步任务使用可配置 worker pool，默认 4 个 worker。
 - daemon 任务快照已支持本地持久化，重启后仍可通过 `list_tasks` / `task_status` 找回最近任务。
 - 已在大仓库场景完成 5 并发冷/热缓存压力测试。
-- 默认扫描会跳过 `.gitignore` / `.ignore` 命中内容，并排除 `.env*`、session、credentials、私钥、证书等敏感文件。
+- 默认扫描会跳过 workspace 内 `.gitignore` / `.ignore` 命中内容，并排除 `.env*`、session、credentials、私钥、证书等敏感文件；需要索引被 Git 忽略的项目资产时，可用 `.augmentignore` 显式纳入。
 
 ## 你需要准备
 
@@ -188,7 +188,11 @@ openace-mcp daemon
 | `OPENACE_DAEMON_TOKEN` | 可选本地 bearer token |
 | `OPENACE_DAEMON_START_TIMEOUT` | auto 模式等待托管 daemon ready 的时间，默认 `10s` |
 | `OPENACE_TASK_WORKERS` | daemon 异步任务 worker 数，默认 `4`，最大 `32` |
+| `OPENACE_TASK_QUEUE_SIZE` | daemon 异步任务队列容量，默认 `256`，最大 `4096` |
+| `OPENACE_TASK_HISTORY_LIMIT` | daemon 保留最近任务快照数量，默认 `1024`，最大 `8192` |
 | `OPENACE_TASK_STORE_DIR` | daemon 任务快照目录；默认位于 `OPENACE_CACHE_DIR/tasks/<namespace>` 或用户 cache 目录 |
+| `OPENACE_TOOL_TIMEOUT` | 同步 MCP 工具调用超时，默认 `110s`；大仓库长任务优先使用 `start_*` 异步工具 |
+| `OPENACE_RETRIEVAL_TIMEOUT` | 单次上游 ACE retrieval 超时，默认 `90s` |
 | `OPENACE_ALLOW_REMOTE_DAEMON` | 显式允许监听非 loopback 地址 |
 | `OPENACE_UPLOAD_BATCH_BYTES` | batch-upload 估算上限，默认 `1048576` |
 | `OPENACE_FIND_MISSING_BATCH_SIZE` | find-missing 分批 blob 数，默认 `1000` |
@@ -202,11 +206,30 @@ source .env
 set +a
 ```
 
+## 索引范围与项目资产
+
+openACE 默认把 `.gitignore` / `.ignore` 当作索引排除规则，这能避免上传依赖目录、构建产物和多数不应进入代码检索的本地文件。它也支持 `.augmentignore` 作为索引策略覆盖层：`.augmentignore` 只影响 openACE 本地扫描和 ACE 同步，不会改变 Git 跟踪状态，也不会把私有文档写入公共 Git 历史。
+
+如果你的项目把 `docs/`、`skills/`、`AGENTS.md`、本地 runbook 或设计文档放在 `.gitignore` 里，但希望 AI 检索时能看到这些知识资产，可以在 workspace root 放置 `.augmentignore`：
+
+```gitignore
+!AGENTS.md
+!docs/
+!docs/**
+!skills/
+!skills/**/
+!skills/**/*.md
+```
+
+目录被 `.gitignore` 排除时，需要先 re-include 目录本身，再 re-include 需要的子路径。上面的示例会让 openACE 索引 `AGENTS.md`、`docs/` 下文本资产和 `skills/` 下的 Markdown 知识文件，但不会改变这些文件是否被 Git 提交。
+
+`.augmentignore` 不能绕过 hard safety denylist：`.env*`、session/token/credentials、私钥、证书和 keystore 类文件仍会被跳过。若你不希望 `.augmentignore` 本身进入 Git，可以把它加入项目 `.gitignore` 或 `.git/info/exclude`；openACE 仍会读取它作为本地索引策略。
+
 ## 安全与边界
 
 - openACE 不绕过 Augment / ACE 的认证、quota、tenant 或 rate limit。
 - 检索质量取决于你的上游 ACE 账号和服务状态。
-- 默认只索引 UTF-8 文本文件，并跳过常见敏感文件。
+- 默认只索引 UTF-8 文本文件，并跳过常见敏感文件；`.augmentignore` 只能覆盖索引排除规则，不能覆盖 hard safety denylist。
 - daemon 默认只允许 loopback 监听；远程暴露前必须自行加网络访问控制。
 
 ## 压力测试基线
