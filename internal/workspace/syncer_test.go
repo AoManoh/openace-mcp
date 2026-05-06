@@ -118,6 +118,8 @@ func TestScanSkipsSecretLikeFiles(t *testing.T) {
 		".env":          "AUGMENT_TOKEN=fake-token\n",
 		"id_ed25519":    "private-key\n",
 		"cert.pem":      "private-cert\n",
+		"cert.crt":      "public-cert\n",
+		"cert.cer":      "public-cert\n",
 		".npmrc":        "//registry/:_authToken=fake-token\n",
 		"session.json":  `{"accessToken":"fake"}`,
 		"nested/.envrc": "export SECRET=fake\n",
@@ -173,6 +175,141 @@ func TestScanHonorsRootGitignore(t *testing.T) {
 	if got != ".gitignore,important.tmp,kept.go,nested/other.txt" {
 		t.Fatalf("unexpected scanned files: %s", got)
 	}
+}
+
+func TestScanHonorsNestedGitignore(t *testing.T) {
+	root := t.TempDir()
+	for rel, content := range map[string]string{
+		"main.go":          "package main\n",
+		"sub/.gitignore":   "secret.txt\n",
+		"sub/secret.txt":   "secret\n",
+		"sub/visible.txt":  "visible\n",
+		"other/secret.txt": "visible elsewhere\n",
+	} {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	scanned, err := scan(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := scannedRelPaths(scanned)
+	if got != "main.go,other/secret.txt,sub/.gitignore,sub/visible.txt" {
+		t.Fatalf("unexpected scanned files: %s", got)
+	}
+}
+
+func TestScanHonorsNestedIgnoreAndOverridesParent(t *testing.T) {
+	root := t.TempDir()
+	for rel, content := range map[string]string{
+		".ignore":         "*.txt\n",
+		"root.txt":        "ignored\n",
+		"sub/.ignore":     "!keep.txt\n",
+		"sub/drop.txt":    "ignored\n",
+		"sub/keep.txt":    "kept\n",
+		"sub/keep.go":     "package keep\n",
+		"other/keep.txt":  "ignored\n",
+		"other/keep.go":   "package other\n",
+		"nested/main.go":  "package nested\n",
+		"nested/main.txt": "ignored\n",
+	} {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	scanned, err := scan(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := scannedRelPaths(scanned)
+	want := ".ignore,nested/main.go,other/keep.go,sub/.ignore,sub/keep.go,sub/keep.txt"
+	if got != want {
+		t.Fatalf("unexpected scanned files:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestScanAugmentignoreCanReincludeGitignoredAssets(t *testing.T) {
+	root := t.TempDir()
+	for rel, content := range map[string]string{
+		".gitignore":                 "/AGENTS.md\n/docs/\n/skills/\n",
+		".augmentignore":             "!AGENTS.md\n!docs/\n!docs/**\n!skills/\n!skills/**/\n!skills/**/*.md\n",
+		"AGENTS.md":                  "project instructions\n",
+		"docs/decision.md":           "important project knowledge\n",
+		"skills/local/SKILL.md":      "local skill knowledge\n",
+		"skills/local/script.py":     "print('not included')\n",
+		"main.go":                    "package main\n",
+		"docs/private/session.json":  `{"accessToken":"fake"}`,
+		"docs/private/id_ed25519":    "private-key\n",
+		"docs/private/tls.crt":       "certificate\n",
+		"docs/private/credentials":   "secret\n",
+		"docs/private/.env.override": "SECRET=fake\n",
+	} {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	scanned, err := scan(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := scannedRelPaths(scanned)
+	want := ".augmentignore,.gitignore,AGENTS.md,docs/decision.md,main.go,skills/local/SKILL.md"
+	if got != want {
+		t.Fatalf("unexpected scanned files:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestScanNestedAugmentignoreCanReincludeParentIgnoredFile(t *testing.T) {
+	root := t.TempDir()
+	for rel, content := range map[string]string{
+		".gitignore":         "sub/\n",
+		"main.go":            "package main\n",
+		"sub/.augmentignore": "!keep.md\n",
+		"sub/keep.md":        "important local knowledge\n",
+		"sub/drop.md":        "still ignored\n",
+	} {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	scanned, err := scan(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := scannedRelPaths(scanned)
+	want := ".gitignore,main.go,sub/keep.md"
+	if got != want {
+		t.Fatalf("unexpected scanned files:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func scannedRelPaths(files []fileBlob) string {
+	rels := make([]string, 0, len(files))
+	for _, file := range files {
+		rels = append(rels, file.RelPath)
+	}
+	return strings.Join(rels, ",")
 }
 
 func TestUploadBatchesSplitsByEstimatedPayloadSize(t *testing.T) {
@@ -526,6 +663,26 @@ func TestSyncerListsWorkspaceStatuses(t *testing.T) {
 	}
 }
 
+func TestRetrieveAppliesRetrievalTimeout(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	t.Setenv("OPENACE_RETRIEVAL_TIMEOUT", "10ms")
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &blockingRetrievalClient{started: make(chan struct{})}
+	_, err := NewSyncer(client).Retrieve(context.Background(), root, "find code", 0)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("retrieve error = %v, want deadline exceeded", err)
+	}
+	select {
+	case <-client.started:
+	default:
+		t.Fatal("retrieval did not start")
+	}
+}
+
 type recordingClient struct {
 	batches            [][]ace.BlobUpload
 	findMissingBatches [][]string
@@ -560,6 +717,35 @@ func (c *recordingClient) CheckpointBlobs(context.Context, string, []string, []s
 
 func (c *recordingClient) CodebaseRetrieval(context.Context, string, ace.RetrievalOptions) (string, error) {
 	return "", nil
+}
+
+type blockingRetrievalClient struct {
+	startOnce sync.Once
+	started   chan struct{}
+}
+
+func (c *blockingRetrievalClient) FindMissing(ctx context.Context, names []string) ([]string, []string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	return append([]string(nil), names...), nil, nil
+}
+
+func (c *blockingRetrievalClient) BatchUpload(ctx context.Context, uploads []ace.BlobUpload) error {
+	return ctx.Err()
+}
+
+func (c *blockingRetrievalClient) CheckpointBlobs(ctx context.Context, previous string, added []string, deleted []string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return "checkpoint-timeout", nil
+}
+
+func (c *blockingRetrievalClient) CodebaseRetrieval(ctx context.Context, query string, options ace.RetrievalOptions) (string, error) {
+	c.startOnce.Do(func() { close(c.started) })
+	<-ctx.Done()
+	return "", ctx.Err()
 }
 
 type blockingSyncClient struct {

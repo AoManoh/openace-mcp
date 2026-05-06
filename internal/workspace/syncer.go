@@ -24,6 +24,7 @@ import (
 const defaultUploadBatchBytes = 1 << 20
 const defaultFindMissingBatchSize = 1000
 const defaultMaxFileBytes = 1 << 20
+const defaultRetrievalTimeout = 90 * time.Second
 
 type ACEClient interface {
 	FindMissing(context.Context, []string) ([]string, []string, error)
@@ -93,7 +94,9 @@ func (s *Syncer) Retrieve(ctx context.Context, dir string, query string, maxOutp
 	if err != nil {
 		return Result{}, err
 	}
-	text, err := s.client.CodebaseRetrieval(ctx, query, ace.RetrievalOptions{
+	retrieveCtx, cancel := retrievalTimeoutContext(ctx)
+	defer cancel()
+	text, err := s.client.CodebaseRetrieval(retrieveCtx, query, ace.RetrievalOptions{
 		CheckpointID: sync.CheckpointID,
 		MaxOutputLen: maxOutputLen,
 	})
@@ -404,15 +407,22 @@ func scan(ctx context.Context, root string) ([]fileBlob, error) {
 			rel = filepath.ToSlash(rel)
 		}
 		if d.IsDir() {
-			if path != root && (shouldSkipDir(name) || rules.Match(rel, true)) {
-				return filepath.SkipDir
+			if path != root {
+				if shouldAlwaysSkipDir(name) {
+					return filepath.SkipDir
+				}
+				localRules := loadIgnoreRulesForDir(path, rel)
+				rules = append(rules, localRules...)
+				if rules.Match(rel, true) && !localRules.hasAugmentInclude() && !rules.hasAugmentDescendantInclude(rel) {
+					return filepath.SkipDir
+				}
 			}
 			return nil
 		}
 		if rel == "" {
 			rel = name
 		}
-		if shouldSkipFile(rel, name) || rules.Match(rel, false) {
+		if shouldAlwaysSkipFile(rel, name) || rules.Match(rel, false) {
 			return nil
 		}
 		if d.Type()&fs.ModeType != 0 {
@@ -505,6 +515,14 @@ func maxFileBytes() int {
 	return positiveIntEnv("OPENACE_MAX_FILE_BYTES", defaultMaxFileBytes)
 }
 
+func retrievalTimeout() time.Duration {
+	return positiveDurationEnv("OPENACE_RETRIEVAL_TIMEOUT", defaultRetrievalTimeout)
+}
+
+func retrievalTimeoutContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, retrievalTimeout())
+}
+
 func positiveIntEnv(name string, fallback int) int {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
@@ -515,6 +533,20 @@ func positiveIntEnv(name string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func positiveDurationEnv(name string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	if parsed, err := time.ParseDuration(value); err == nil && parsed > 0 {
+		return parsed
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return fallback
 }
 
 func uploadPayloadSize(upload ace.BlobUpload) int {
@@ -552,16 +584,16 @@ func lastUploadPath(uploads []ace.BlobUpload) string {
 	return uploads[len(uploads)-1].Path
 }
 
-func shouldSkipDir(name string) bool {
+func shouldAlwaysSkipDir(name string) bool {
 	switch name {
-	case ".git", "node_modules", ".next", "dist", "build", "target", ".cache", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".idea", ".vscode", "coverage", "tmp", ".turbo", ".parcel-cache", ".pnpm-store":
+	case ".git", ".hg", ".svn", ".jj":
 		return true
 	default:
 		return false
 	}
 }
 
-func shouldSkipFile(rel string, name string) bool {
+func shouldAlwaysSkipFile(rel string, name string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
 	rel = strings.ToLower(filepath.ToSlash(rel))
 	if strings.HasPrefix(name, ".env") {
@@ -572,7 +604,7 @@ func shouldSkipFile(rel string, name string) bool {
 		return true
 	}
 	switch strings.ToLower(filepath.Ext(name)) {
-	case ".pem", ".key", ".p12", ".pfx", ".jks", ".kdb":
+	case ".pem", ".key", ".p12", ".pfx", ".jks", ".kdb", ".crt", ".cer", ".der", ".csr", ".p7b", ".p7c":
 		return true
 	}
 	if (strings.HasPrefix(rel, ".augment/") || strings.Contains(rel, "/.augment/")) && name == "session.json" {
@@ -612,25 +644,77 @@ type ignoreRules []ignoreRule
 
 type ignoreRule struct {
 	pattern  string
+	base     string
+	layer    ignoreLayer
 	negated  bool
 	dirOnly  bool
 	anchored bool
 }
 
+type ignoreLayer int
+
+const (
+	ignoreLayerDefault ignoreLayer = iota
+	ignoreLayerGit
+	ignoreLayerAugment
+)
+
+const defaultIgnoreRuleData = `
+node_modules/
+.next/
+dist/
+build/
+target/
+.cache/
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.idea/
+.vscode/
+coverage/
+tmp/
+.turbo/
+.parcel-cache/
+.pnpm-store/
+`
+
 func loadIgnoreRules(root string) ignoreRules {
+	rules := parseIgnoreRulesWithBase(defaultIgnoreRuleData, "", ignoreLayerDefault)
+	return append(rules, loadIgnoreRulesForDir(root, "")...)
+}
+
+func loadIgnoreRulesForDir(dir string, base string) ignoreRules {
 	var rules ignoreRules
-	for _, name := range []string{".gitignore", ".ignore"} {
-		data, err := os.ReadFile(filepath.Join(root, name))
+	for _, spec := range []struct {
+		name  string
+		layer ignoreLayer
+	}{
+		{name: ".gitignore", layer: ignoreLayerGit},
+		{name: ".ignore", layer: ignoreLayerGit},
+		{name: ".augmentignore", layer: ignoreLayerAugment},
+	} {
+		data, err := os.ReadFile(filepath.Join(dir, spec.name))
 		if err != nil {
 			continue
 		}
-		rules = append(rules, parseIgnoreRules(string(data))...)
+		rules = append(rules, parseIgnoreRulesWithBase(string(data), base, spec.layer)...)
 	}
 	return rules
 }
 
 func parseIgnoreRules(data string) ignoreRules {
+	return parseIgnoreRulesWithBase(data, "", ignoreLayerGit)
+}
+
+func parseIgnoreRulesWithBase(data string, base string, layer ignoreLayer) ignoreRules {
 	var rules ignoreRules
+	base = filepath.ToSlash(filepath.Clean(base))
+	if base == "." {
+		base = ""
+	}
 	for _, line := range strings.Split(data, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -654,6 +738,8 @@ func parseIgnoreRules(data string) ignoreRules {
 		}
 		rules = append(rules, ignoreRule{
 			pattern:  line,
+			base:     base,
+			layer:    layer,
 			negated:  negated,
 			dirOnly:  dirOnly,
 			anchored: anchored,
@@ -669,28 +755,57 @@ func (rules ignoreRules) Match(rel string, isDir bool) bool {
 	}
 	ignored := false
 	for _, rule := range rules {
-		if rule.matches(rel, isDir) {
+		if rule.layer != ignoreLayerAugment && rule.matches(rel, isDir) {
+			ignored = !rule.negated
+		}
+	}
+	for _, rule := range rules {
+		if rule.layer == ignoreLayerAugment && rule.matches(rel, isDir) {
 			ignored = !rule.negated
 		}
 	}
 	return ignored
 }
 
-func (rule ignoreRule) matches(rel string, isDir bool) bool {
-	pattern := rule.pattern
-	if rule.dirOnly && !isDir && !hasPathPrefix(rel, pattern) {
+func (rules ignoreRules) hasAugmentInclude() bool {
+	for _, rule := range rules {
+		if rule.layer == ignoreLayerAugment && rule.negated {
+			return true
+		}
+	}
+	return false
+}
+
+func (rules ignoreRules) hasAugmentDescendantInclude(rel string) bool {
+	rel = pathpkg.Clean(filepath.ToSlash(rel))
+	if rel == "." || rel == "" {
 		return false
 	}
-	if strings.Contains(pattern, "/") || rule.anchored {
-		if rule.anchored {
-			return matchPath(pattern, rel) || hasPathPrefix(rel, pattern)
+	for _, rule := range rules {
+		if rule.layer == ignoreLayerAugment && rule.negated && rule.canMatchInside(rel) {
+			return true
 		}
-		for _, candidate := range suffixCandidates(rel) {
-			if matchPath(pattern, candidate) || hasPathPrefix(candidate, pattern) {
-				return true
-			}
-		}
+	}
+	return false
+}
+
+func (rule ignoreRule) matches(rel string, isDir bool) bool {
+	rel, ok := rule.relForBase(rel)
+	if !ok || rel == "" {
 		return false
+	}
+	if rule.dirOnly && rule.negated && !isDir {
+		return false
+	}
+	pattern := rule.pattern
+	if strings.Contains(pattern, "/") || rule.anchored {
+		if matchPath(pattern, rel) {
+			return true
+		}
+		return !rule.negated && hasPathPrefix(rel, pattern)
+	}
+	if rule.negated {
+		return matchPath(pattern, pathpkg.Base(rel))
 	}
 	for _, segment := range strings.Split(rel, "/") {
 		if matchPath(pattern, segment) {
@@ -700,20 +815,104 @@ func (rule ignoreRule) matches(rel string, isDir bool) bool {
 	return false
 }
 
-func suffixCandidates(rel string) []string {
-	parts := strings.Split(rel, "/")
-	candidates := make([]string, 0, len(parts))
-	for i := range parts {
-		candidates = append(candidates, strings.Join(parts[i:], "/"))
+func (rule ignoreRule) canMatchInside(dir string) bool {
+	if rule.base != "" {
+		if dir == rule.base {
+			return true
+		}
+		if strings.HasPrefix(dir, rule.base+"/") {
+			inside := strings.TrimPrefix(dir, rule.base+"/")
+			return patternCanMatchInside(rule.pattern, inside)
+		}
+		return strings.HasPrefix(rule.base, dir+"/")
 	}
-	return candidates
+	return patternCanMatchInside(rule.pattern, dir)
+}
+
+func patternCanMatchInside(pattern string, dir string) bool {
+	if dir == "" {
+		return true
+	}
+	if !strings.Contains(pattern, "/") {
+		return false
+	}
+	if matchPath(pattern, dir) || strings.HasPrefix(pattern, dir+"/") {
+		return true
+	}
+	if !hasDoubleStarSegment(pattern) {
+		return false
+	}
+	prefix := prefixBeforeDoubleStar(pattern)
+	return prefix == "" || dir == prefix || strings.HasPrefix(dir, prefix+"/") || strings.HasPrefix(prefix, dir+"/")
+}
+
+func prefixBeforeDoubleStar(pattern string) string {
+	segments := strings.Split(pattern, "/")
+	var prefix []string
+	for _, segment := range segments {
+		if segment == "**" {
+			break
+		}
+		prefix = append(prefix, segment)
+	}
+	return strings.Join(prefix, "/")
+}
+
+func (rule ignoreRule) relForBase(rel string) (string, bool) {
+	if rule.base == "" {
+		return rel, true
+	}
+	if rel == rule.base {
+		return "", false
+	}
+	prefix := rule.base + "/"
+	if !strings.HasPrefix(rel, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(rel, prefix), true
 }
 
 func matchPath(pattern string, value string) bool {
+	if hasDoubleStarSegment(pattern) && matchPathSegments(strings.Split(pattern, "/"), strings.Split(value, "/")) {
+		return true
+	}
 	if ok, err := pathpkg.Match(pattern, value); err == nil && ok {
 		return true
 	}
 	return pattern == value
+}
+
+func hasDoubleStarSegment(pattern string) bool {
+	for _, segment := range strings.Split(pattern, "/") {
+		if segment == "**" {
+			return true
+		}
+	}
+	return false
+}
+
+func matchPathSegments(patterns []string, values []string) bool {
+	if len(patterns) == 0 {
+		return len(values) == 0
+	}
+	if patterns[0] == "**" {
+		if matchPathSegments(patterns[1:], values) {
+			return true
+		}
+		for i := range values {
+			if matchPathSegments(patterns[1:], values[i+1:]) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(values) == 0 {
+		return false
+	}
+	if ok, err := pathpkg.Match(patterns[0], values[0]); (err == nil && ok) || patterns[0] == values[0] {
+		return matchPathSegments(patterns[1:], values[1:])
+	}
+	return false
 }
 
 func hasPathPrefix(rel string, prefix string) bool {
