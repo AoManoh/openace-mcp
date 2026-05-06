@@ -210,18 +210,30 @@ set +a
 
 openACE 默认把 `.gitignore` / `.ignore` 当作索引排除规则，这能避免上传依赖目录、构建产物和多数不应进入代码检索的本地文件。它也支持 `.augmentignore` 作为索引策略覆盖层：`.augmentignore` 只影响 openACE 本地扫描和 ACE 同步，不会改变 Git 跟踪状态，也不会把私有文档写入公共 Git 历史。
 
-如果你的项目把 `docs/`、`skills/`、`AGENTS.md`、本地 runbook 或设计文档放在 `.gitignore` 里，但希望 AI 检索时能看到这些知识资产，可以在 workspace root 放置 `.augmentignore`：
+Git ignore 和 openACE index ignore 是两条不同边界：`docs/`、`skills/` 可以继续保持 Git 忽略、不推送，但只要你显式选择，它们仍可作为本机 AI 知识资产进入 openACE 索引。推荐把真实 `.augmentignore` 当成本地配置，加入项目 `.gitignore` 或 `.git/info/exclude`，不要把私有索引策略误提交给公共仓库。
+
+如果你的项目把 `docs/`、`skills/`、`AGENTS.md`、`CLAUDE.md`、`.augment-guidelines`、`.augment/rules/`、本地 runbook 或设计文档放在 `.gitignore` 里，但希望 AI 检索时能看到这些知识资产，可以在 workspace root 放置 `.augmentignore`：
 
 ```gitignore
 !AGENTS.md
+!CLAUDE.md
+!.augment-guidelines
+!.augment/
+!.augment/rules/
+!.augment/rules/**/
+!.augment/rules/*.md
+!.augment/rules/**/*.md
 !docs/
-!docs/**
+!docs/**/
+!docs/*.md
+!docs/**/*.md
 !skills/
 !skills/**/
-!skills/**/*.md
+!skills/**/SKILL.md
+!skills/**/SPEC.md
 ```
 
-目录被 `.gitignore` 排除时，需要先 re-include 目录本身，再 re-include 需要的子路径。上面的示例会让 openACE 索引 `AGENTS.md`、`docs/` 下文本资产和 `skills/` 下的 Markdown 知识文件，但不会改变这些文件是否被 Git 提交。
+目录被 `.gitignore` 排除时，需要先 re-include 目录本身，再 re-include 需要的子路径。上面的示例会让 openACE 索引 `AGENTS.md`、`CLAUDE.md`、`.augment-guidelines`、`.augment/rules/`、`docs/` 下 Markdown 资产和 `skills/` 下的 `SKILL.md` / `SPEC.md` 知识文件，但不会改变这些文件是否被 Git 提交。
 
 `.augmentignore` 不能绕过 hard safety denylist：`.env*`、session/token/credentials、私钥、证书和 keystore 类文件仍会被跳过。若你不希望 `.augmentignore` 本身进入 Git，可以把它加入项目 `.gitignore` 或 `.git/info/exclude`；openACE 仍会读取它作为本地索引策略。
 

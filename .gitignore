@@ -24,7 +24,7 @@ pnpm-debug.log*
 # Reusable public automation should live under the owning skill directory.
 /scripts/
 /skills/
-/AGENTS.md
+/.augmentignore
 
 # Private governance outputs.
 # Local reports, work logs, requirements, references, debug notes and review
