@@ -91,6 +91,32 @@ func TestWorkspaceReconcilerBacksOffAfterProbeError(t *testing.T) {
 	}
 }
 
+func TestWorkspaceReconcilerDefersWhileWorkspaceSyncInFlight(t *testing.T) {
+	t.Setenv("OPENACE_WATCH_MODE", "seen")
+	t.Setenv("OPENACE_WATCH_INTERVAL", "50ms")
+	t.Setenv("OPENACE_WATCH_DEBOUNCE", "1ms")
+
+	syncer := newFakeWatchSyncer()
+	syncer.setInFlight(true)
+	reconciler := newWorkspaceReconciler(syncer)
+	defer shutdownReconciler(t, reconciler)
+
+	reconciler.Observe("/tmp/project")
+	syncer.waitForStatusCheck(t)
+	time.Sleep(20 * time.Millisecond)
+	if got := syncer.changeCheckCount(); got != 0 {
+		t.Fatalf("in-flight workspace should not be scanned by background watcher, got checks=%d", got)
+	}
+	if got := syncer.backgroundSyncCount(); got != 0 {
+		t.Fatalf("in-flight workspace should not be background synced, got %d", got)
+	}
+	status := workspace.WorkspaceStatus{DirectoryPath: "/tmp/project"}
+	reconciler.Decorate(&status)
+	if !status.WatchEnabled || !status.WatchScheduled || status.LastBackgroundSyncAt != nil {
+		t.Fatalf("in-flight deferral should only reschedule watcher: %+v", status)
+	}
+}
+
 func shutdownReconciler(t *testing.T, reconciler *workspaceReconciler) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -106,14 +132,18 @@ type fakeWatchSyncer struct {
 	changeErr       error
 	checks          int
 	backgroundSyncs int
+	statusChecks    int
 	checkCh         chan struct{}
 	syncCh          chan struct{}
+	statusCh        chan struct{}
+	inFlight        bool
 }
 
 func newFakeWatchSyncer() *fakeWatchSyncer {
 	return &fakeWatchSyncer{
-		checkCh: make(chan struct{}, 8),
-		syncCh:  make(chan struct{}, 8),
+		checkCh:  make(chan struct{}, 8),
+		syncCh:   make(chan struct{}, 8),
+		statusCh: make(chan struct{}, 8),
 	}
 }
 
@@ -125,6 +155,19 @@ func (s *fakeWatchSyncer) WorkspaceChanged(context.Context, string) (bool, error
 	s.mu.Unlock()
 	s.signal(s.checkCh)
 	return changed, err
+}
+
+func (s *fakeWatchSyncer) ListWorkspaceStatuses(context.Context) ([]workspace.WorkspaceStatus, error) {
+	return nil, nil
+}
+
+func (s *fakeWatchSyncer) WorkspaceStatus(ctx context.Context, dir string) (workspace.WorkspaceStatus, error) {
+	s.mu.Lock()
+	s.statusChecks++
+	inFlight := s.inFlight
+	s.mu.Unlock()
+	s.signal(s.statusCh)
+	return workspace.WorkspaceStatus{DirectoryPath: dir, InFlight: inFlight}, nil
 }
 
 func (s *fakeWatchSyncer) SyncBackground(context.Context, string) (workspace.Result, error) {
@@ -161,6 +204,18 @@ func (s *fakeWatchSyncer) setChangeError(err error) {
 	s.mu.Unlock()
 }
 
+func (s *fakeWatchSyncer) setInFlight(inFlight bool) {
+	s.mu.Lock()
+	s.inFlight = inFlight
+	s.mu.Unlock()
+}
+
+func (s *fakeWatchSyncer) changeCheckCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.checks
+}
+
 func (s *fakeWatchSyncer) backgroundSyncCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -173,6 +228,15 @@ func (s *fakeWatchSyncer) waitForChangeCheck(t *testing.T) {
 	case <-s.checkCh:
 	case <-time.After(2 * time.Second):
 		t.Fatal("workspace change check did not run")
+	}
+}
+
+func (s *fakeWatchSyncer) waitForStatusCheck(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.statusCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("workspace status check did not run")
 	}
 }
 

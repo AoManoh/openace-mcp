@@ -30,9 +30,10 @@ type backgroundSyncer interface {
 }
 
 type workspaceReconciler struct {
-	syncer   Syncer
-	detector workspaceChangeDetector
-	bgSyncer backgroundSyncer
+	syncer    Syncer
+	detector  workspaceChangeDetector
+	bgSyncer  backgroundSyncer
+	inspector WorkspaceInspector
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -87,6 +88,9 @@ func newWorkspaceReconciler(syncer Syncer) *workspaceReconciler {
 	}
 	if bgSyncer, ok := syncer.(backgroundSyncer); ok {
 		reconciler.bgSyncer = bgSyncer
+	}
+	if inspector, ok := syncer.(WorkspaceInspector); ok {
+		reconciler.inspector = inspector
 	}
 	go reconciler.run()
 	return reconciler
@@ -229,6 +233,11 @@ func (r *workspaceReconciler) reconcile(root string) {
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
 
+	if r.workspaceInFlight(ctx, root) {
+		r.deferReconcile(root, time.Now().UTC(), r.debounce)
+		return
+	}
+
 	changed, err := r.detector.WorkspaceChanged(ctx, root)
 	if err == nil && changed {
 		if r.bgSyncer != nil {
@@ -262,6 +271,32 @@ func (r *workspaceReconciler) reconcile(root string) {
 	}
 	state.pending = true
 	next := now.Add(r.interval)
+	state.nextWatchAt = &next
+}
+
+func (r *workspaceReconciler) workspaceInFlight(ctx context.Context, root string) bool {
+	if r.inspector == nil {
+		return false
+	}
+	status, err := r.inspector.WorkspaceStatus(ctx, root)
+	return err == nil && status.InFlight
+}
+
+func (r *workspaceReconciler) deferReconcile(root string, now time.Time, delay time.Duration) {
+	if delay <= 0 {
+		delay = r.debounce
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.states[root]
+	if state == nil {
+		return
+	}
+	state.running = false
+	state.pending = true
+	state.lastWatchAt = &now
+	state.lastError = ""
+	next := now.Add(delay)
 	state.nextWatchAt = &next
 }
 
