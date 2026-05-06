@@ -35,6 +35,13 @@ pnpm-debug.log*
 !/docs/_fragments/
 !/docs/_fragments/**
 !/docs/requirements/2026-05-05-project-kickoff.md
+!/docs/requirements/2026-05-06-daemon-shared-state.md
 !/docs/references/2026-05-05-openace-context-engine.md
+!/docs/development/2026-05-06-daemon-workspace-singleflight.md
+!/docs/development/2026-05-06-workspace-status.md
+!/docs/development/2026-05-06-task-worker-pool.md
+!/docs/development/2026-05-06-cross-workspace-retrieval.md
+!/docs/development/2026-05-06-async-cross-workspace-retrieval.md
+!/docs/development/2026-05-06-task-persistence.md
 !/docs/work-logs/2026-05-05.md
 !/docs/work-logs/2026-05-06.md

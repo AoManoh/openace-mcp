@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,10 +22,34 @@ func (fakeSyncer) Sync(ctx context.Context, dir string) (workspace.Result, error
 }
 
 func (fakeSyncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
-	return workspace.Result{Text: "retrieved", CheckpointID: "checkpoint", FileCount: 1}, nil
+	if strings.Contains(dir, "bad") {
+		return workspace.Result{}, errors.New("workspace failed")
+	}
+	return workspace.Result{Text: "retrieved " + dir, CheckpointID: "checkpoint", FileCount: 1}, nil
+}
+
+type fakeWorkspaceSyncer struct {
+	fakeSyncer
+}
+
+func (fakeWorkspaceSyncer) ListWorkspaceStatuses(ctx context.Context) ([]workspace.WorkspaceStatus, error) {
+	return []workspace.WorkspaceStatus{{
+		DirectoryPath: "/tmp/project",
+		CheckpointID:  "checkpoint",
+		FileCount:     3,
+	}}, nil
+}
+
+func (fakeWorkspaceSyncer) WorkspaceStatus(ctx context.Context, dir string) (workspace.WorkspaceStatus, error) {
+	return workspace.WorkspaceStatus{
+		DirectoryPath: dir,
+		CheckpointID:  "checkpoint",
+		FileCount:     3,
+	}, nil
 }
 
 func TestServerTaskLifecycle(t *testing.T) {
+	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "")
 	server := httptest.NewServer(NewServer(fakeSyncer{}).routes())
 	defer server.Close()
@@ -40,12 +67,13 @@ func TestServerTaskLifecycle(t *testing.T) {
 	if completed.Result == nil {
 		t.Fatal("completed task should include result")
 	}
-	if completed.Result.Text != "retrieved" {
+	if !strings.Contains(completed.Result.Text, "retrieved") {
 		t.Fatalf("unexpected task result: %+v", completed.Result)
 	}
 }
 
 func TestServerListsTasks(t *testing.T) {
+	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "")
 	server := httptest.NewServer(NewServer(fakeSyncer{}).routes())
 	defer server.Close()
@@ -79,6 +107,7 @@ func TestServerListsTasks(t *testing.T) {
 }
 
 func TestServerOptionalBearerAuth(t *testing.T) {
+	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "local-test-token")
 	server := httptest.NewServer(NewServer(fakeSyncer{}).routes())
 	defer server.Close()
@@ -128,6 +157,105 @@ func TestValidateListenAddrCanAllowRemoteExplicitly(t *testing.T) {
 	}
 }
 
+func TestServerAllowsConcurrentSyncRequests(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	syncer := newConcurrentSyncer()
+	server := httptest.NewServer(NewServer(syncer).routes())
+	defer server.Close()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, dir := range []string{"/tmp/workspace-a", "/tmp/workspace-b"} {
+		wg.Add(1)
+		go func(dir string) {
+			defer wg.Done()
+			errs <- postSync(server.URL, dir)
+		}(dir)
+	}
+
+	syncer.waitForOverlap(t)
+	syncer.release()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestServerWorkspaceStatus(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	server := httptest.NewServer(NewServer(fakeWorkspaceSyncer{}).routes())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/v1/workspaces")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected list status: %s", resp.Status)
+	}
+	var list struct {
+		Workspaces []workspace.WorkspaceStatus `json:"workspaces"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Workspaces) != 1 || list.Workspaces[0].CheckpointID != "checkpoint" {
+		t.Fatalf("unexpected workspace list: %+v", list)
+	}
+
+	payload, err := json.Marshal(workspaceStatusRequest{DirectoryPath: "/tmp/project"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err = http.Post(server.URL+"/v1/workspace/status", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status response: %s", resp.Status)
+	}
+	var status workspace.WorkspaceStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status.DirectoryPath != "/tmp/project" || status.FileCount != 3 {
+		t.Fatalf("unexpected workspace status: %+v", status)
+	}
+}
+
+func TestServerCompletesMultiRetrieveTask(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	server := httptest.NewServer(NewServer(fakeSyncer{}).routes())
+	defer server.Close()
+
+	task := postTask(t, server.URL, TaskRequest{
+		Kind:               TaskKindMultiRetrieve,
+		DirectoryPaths:     []string{"/tmp/one", "/tmp/bad"},
+		InformationRequest: "find shared code",
+	})
+	completed := pollHTTPTask(t, server.URL, task.ID, TaskStateCompleted)
+	if completed.Result == nil {
+		t.Fatal("completed multi retrieve task should include result")
+	}
+	if !strings.Contains(completed.Result.Text, "/tmp/one") || !strings.Contains(completed.Result.Text, "retrieved /tmp/one") {
+		t.Fatalf("result should include successful workspace: %+v", completed.Result)
+	}
+	if !strings.Contains(completed.Result.Text, "/tmp/bad") || !strings.Contains(completed.Result.Text, "workspace failed") {
+		t.Fatalf("result should include failed workspace error: %+v", completed.Result)
+	}
+	if len(completed.DirectoryPaths) != 2 {
+		t.Fatalf("task should retain directory paths: %+v", completed)
+	}
+}
+
 func postTask(t *testing.T, baseURL string, req TaskRequest) TaskSnapshot {
 	t.Helper()
 	payload, err := json.Marshal(req)
@@ -170,4 +298,85 @@ func pollHTTPTask(t *testing.T, baseURL string, id string, want TaskState) TaskS
 	}
 	t.Fatalf("task %s did not reach %s", id, want)
 	return TaskSnapshot{}
+}
+
+func postSync(baseURL string, dir string) error {
+	payload, err := json.Marshal(syncRequest{DirectoryPath: dir})
+	if err != nil {
+		return err
+	}
+	resp, err := http.Post(baseURL+"/v1/sync", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return errors.New(resp.Status)
+	}
+	return nil
+}
+
+type concurrentSyncer struct {
+	mu          sync.Mutex
+	releaseOnce sync.Once
+	releaseCh   chan struct{}
+	overlapCh   chan struct{}
+	active      int
+	maxActive   int
+}
+
+func newConcurrentSyncer() *concurrentSyncer {
+	return &concurrentSyncer{
+		releaseCh: make(chan struct{}),
+		overlapCh: make(chan struct{}),
+	}
+}
+
+func (s *concurrentSyncer) Sync(ctx context.Context, dir string) (workspace.Result, error) {
+	s.mu.Lock()
+	s.active++
+	if s.active > s.maxActive {
+		s.maxActive = s.active
+	}
+	if s.active >= 2 {
+		select {
+		case <-s.overlapCh:
+		default:
+			close(s.overlapCh)
+		}
+	}
+	s.mu.Unlock()
+
+	select {
+	case <-s.releaseCh:
+	case <-ctx.Done():
+		s.leave()
+		return workspace.Result{}, ctx.Err()
+	}
+
+	s.leave()
+	return workspace.Result{CheckpointID: "checkpoint", FileCount: 1}, nil
+}
+
+func (s *concurrentSyncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
+	return s.Sync(ctx, dir)
+}
+
+func (s *concurrentSyncer) waitForOverlap(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.overlapCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sync requests did not overlap")
+	}
+}
+
+func (s *concurrentSyncer) release() {
+	s.releaseOnce.Do(func() { close(s.releaseCh) })
+}
+
+func (s *concurrentSyncer) leave() {
+	s.mu.Lock()
+	s.active--
+	s.mu.Unlock()
 }

@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/AoManoh/openace-mcp/internal/pathutil"
 )
 
 type Session struct {
@@ -114,19 +116,5 @@ func firstEnv(keys ...string) string {
 }
 
 func expandPath(path string) (string, error) {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return "", errors.New("empty path")
-	}
-	if path == "~" {
-		return os.UserHomeDir()
-	}
-	if strings.HasPrefix(path, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		return filepath.Join(home, path[2:]), nil
-	}
-	return path, nil
+	return pathutil.ExpandUser(path)
 }

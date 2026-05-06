@@ -48,6 +48,20 @@ func (c *Client) Retrieve(ctx context.Context, dir string, query string, maxOutp
 	return result, err
 }
 
+func (c *Client) ListWorkspaceStatuses(ctx context.Context) ([]workspace.WorkspaceStatus, error) {
+	var result struct {
+		Workspaces []workspace.WorkspaceStatus `json:"workspaces"`
+	}
+	err := c.get(ctx, "/v1/workspaces", &result)
+	return result.Workspaces, err
+}
+
+func (c *Client) WorkspaceStatus(ctx context.Context, dir string) (workspace.WorkspaceStatus, error) {
+	var result workspace.WorkspaceStatus
+	err := c.post(ctx, "/v1/workspace/status", workspaceStatusRequest{DirectoryPath: dir}, &result)
+	return result, err
+}
+
 func (c *Client) StartTask(ctx context.Context, req TaskRequest) (TaskSnapshot, error) {
 	var result TaskSnapshot
 	err := c.post(ctx, "/v1/tasks", req, &result)

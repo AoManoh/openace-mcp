@@ -8,10 +8,13 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/AoManoh/openace-mcp/internal/daemon"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
+
+const maxMultiWorkspacePaths = daemon.MaxMultiWorkspacePaths
 
 type Syncer interface {
 	Retrieve(context.Context, string, string, int) (workspace.Result, error)
@@ -25,9 +28,15 @@ type Tasker interface {
 	TaskStatus(context.Context, string) (daemon.TaskSnapshot, error)
 }
 
+type WorkspaceInspector interface {
+	ListWorkspaceStatuses(context.Context) ([]workspace.WorkspaceStatus, error)
+	WorkspaceStatus(context.Context, string) (workspace.WorkspaceStatus, error)
+}
+
 type Server struct {
-	syncer Syncer
-	tasker Tasker
+	syncer    Syncer
+	tasker    Tasker
+	inspector WorkspaceInspector
 }
 
 type rpcRequest struct {
@@ -60,6 +69,12 @@ type retrievalArgs struct {
 	MaxOutputLength    int    `json:"max_output_length,omitempty"`
 }
 
+type multiRetrievalArgs struct {
+	InformationRequest string   `json:"information_request"`
+	DirectoryPaths     []string `json:"directory_paths"`
+	MaxOutputLength    int      `json:"max_output_length,omitempty"`
+}
+
 type syncArgs struct {
 	DirectoryPath string `json:"directory_path"`
 }
@@ -76,6 +91,9 @@ func NewServer(syncer Syncer) *Server {
 	server := &Server{syncer: syncer}
 	if tasker, ok := syncer.(Tasker); ok {
 		server.tasker = tasker
+	}
+	if inspector, ok := syncer.(WorkspaceInspector); ok && server.tasker != nil {
+		server.inspector = inspector
 	}
 	return server
 }
@@ -124,9 +142,12 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
 			},
 		})
 	case "tools/list":
-		tools := []any{retrievalTool(), syncTool()}
+		tools := []any{retrievalTool(), multiRetrievalTool(), syncTool()}
 		if s.tasker != nil {
-			tools = append(tools, startRetrievalTool(), startSyncTool(), taskStatusTool(), listTasksTool(), cancelTaskTool())
+			tools = append(tools, startRetrievalTool(), startMultiRetrievalTool(), startSyncTool(), taskStatusTool(), listTasksTool(), cancelTaskTool())
+		}
+		if s.inspector != nil {
+			tools = append(tools, listWorkspacesTool(), workspaceStatusTool())
 		}
 		return ok(req.ID, map[string]any{"tools": tools})
 	case "tools/call":
@@ -168,6 +189,20 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 			text = "No relevant code sections were found."
 		}
 		return ok(req.ID, toolResult(text+"\n\n"+result.Summary(), false))
+	case "multi_codebase_retrieval", "multi-codebase-retrieval":
+		var args multiRetrievalArgs
+		if err := json.Unmarshal(params.Arguments, &args); err != nil {
+			return fail(req.ID, -32602, err.Error())
+		}
+		if args.InformationRequest == "" {
+			return toolError(req.ID, "information_request is required")
+		}
+		paths, err := normalizeDirectoryPaths(args.DirectoryPaths)
+		if err != nil {
+			return toolError(req.ID, err.Error())
+		}
+		results := s.retrieveMultiple(ctx, paths, args.InformationRequest, args.MaxOutputLength)
+		return ok(req.ID, toolResult(formatMultiRetrievalResults(results), false))
 	case "sync_workspace", "sync-workspace":
 		var args syncArgs
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
@@ -198,6 +233,31 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		task, err := s.tasker.StartTask(ctx, daemon.TaskRequest{
 			Kind:               daemon.TaskKindRetrieve,
 			DirectoryPath:      args.DirectoryPath,
+			InformationRequest: args.InformationRequest,
+			MaxOutputLength:    args.MaxOutputLength,
+		})
+		if err != nil {
+			return toolError(req.ID, err.Error())
+		}
+		return ok(req.ID, toolResult(jsonText(task), false))
+	case "start_multi_codebase_retrieval", "start-multi-codebase-retrieval":
+		if s.tasker == nil {
+			return toolError(req.ID, "task tools require OPENACE_DAEMON_ADDR")
+		}
+		var args multiRetrievalArgs
+		if err := json.Unmarshal(params.Arguments, &args); err != nil {
+			return fail(req.ID, -32602, err.Error())
+		}
+		if args.InformationRequest == "" {
+			return toolError(req.ID, "information_request is required")
+		}
+		paths, err := normalizeDirectoryPaths(args.DirectoryPaths)
+		if err != nil {
+			return toolError(req.ID, err.Error())
+		}
+		task, err := s.tasker.StartTask(ctx, daemon.TaskRequest{
+			Kind:               daemon.TaskKindMultiRetrieve,
+			DirectoryPaths:     paths,
 			InformationRequest: args.InformationRequest,
 			MaxOutputLength:    args.MaxOutputLength,
 		})
@@ -271,9 +331,106 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 			return toolError(req.ID, err.Error())
 		}
 		return ok(req.ID, toolResult(jsonText(task), false))
+	case "list_workspaces", "list-workspaces":
+		if s.inspector == nil {
+			return toolError(req.ID, "workspace status tools require OPENACE_DAEMON_ADDR")
+		}
+		statuses, err := s.inspector.ListWorkspaceStatuses(ctx)
+		if err != nil {
+			return toolError(req.ID, err.Error())
+		}
+		return ok(req.ID, toolResult(jsonText(map[string]any{"workspaces": statuses}), false))
+	case "workspace_status", "workspace-status":
+		if s.inspector == nil {
+			return toolError(req.ID, "workspace status tools require OPENACE_DAEMON_ADDR")
+		}
+		var args syncArgs
+		if err := json.Unmarshal(params.Arguments, &args); err != nil {
+			return fail(req.ID, -32602, err.Error())
+		}
+		if args.DirectoryPath == "" {
+			return toolError(req.ID, "directory_path is required")
+		}
+		status, err := s.inspector.WorkspaceStatus(ctx, args.DirectoryPath)
+		if err != nil {
+			return toolError(req.ID, err.Error())
+		}
+		return ok(req.ID, toolResult(jsonText(status), false))
 	default:
 		return toolError(req.ID, "unknown tool: "+params.Name)
 	}
+}
+
+type multiRetrievalResult struct {
+	DirectoryPath string
+	Text          string
+	Summary       string
+	Error         string
+}
+
+func normalizeDirectoryPaths(paths []string) ([]string, error) {
+	normalized := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		normalized = append(normalized, path)
+	}
+	if len(normalized) == 0 {
+		return nil, fmt.Errorf("directory_paths is required")
+	}
+	if len(normalized) > maxMultiWorkspacePaths {
+		return nil, fmt.Errorf("directory_paths supports at most %d workspaces", maxMultiWorkspacePaths)
+	}
+	return normalized, nil
+}
+
+func (s *Server) retrieveMultiple(ctx context.Context, paths []string, query string, maxOutputLen int) []multiRetrievalResult {
+	results := make([]multiRetrievalResult, len(paths))
+	var wg sync.WaitGroup
+	for i, path := range paths {
+		i, path := i, path
+		results[i].DirectoryPath = path
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := s.syncer.Retrieve(ctx, path, query, maxOutputLen)
+			if err != nil {
+				results[i].Error = err.Error()
+				return
+			}
+			text := strings.TrimSpace(result.Text)
+			if text == "" {
+				text = "No relevant code sections were found."
+			}
+			results[i].Text = text
+			results[i].Summary = result.Summary()
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+func formatMultiRetrievalResults(results []multiRetrievalResult) string {
+	var out strings.Builder
+	out.WriteString("Cross-workspace retrieval results")
+	for _, result := range results {
+		out.WriteString("\n\n## ")
+		out.WriteString(result.DirectoryPath)
+		out.WriteString("\n")
+		if result.Error != "" {
+			out.WriteString("ERROR: ")
+			out.WriteString(result.Error)
+			continue
+		}
+		out.WriteString(result.Text)
+		if result.Summary != "" {
+			out.WriteString("\n\n")
+			out.WriteString(result.Summary)
+		}
+	}
+	return out.String()
 }
 
 func retrievalTool() map[string]any {
@@ -288,6 +445,25 @@ func retrievalTool() map[string]any {
 				"max_output_length":   map[string]any{"type": "integer"},
 			},
 			"required": []string{"information_request", "directory_path"},
+		},
+	}
+}
+
+func multiRetrievalTool() map[string]any {
+	return map[string]any{
+		"name":        "multi_codebase_retrieval",
+		"description": "Query multiple explicit workspaces independently through ACE and return per-workspace results.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"information_request": map[string]any{"type": "string"},
+				"directory_paths": map[string]any{
+					"type":  "array",
+					"items": map[string]any{"type": "string"},
+				},
+				"max_output_length": map[string]any{"type": "integer"},
+			},
+			"required": []string{"information_request", "directory_paths"},
 		},
 	}
 }
@@ -318,6 +494,25 @@ func startRetrievalTool() map[string]any {
 				"max_output_length":   map[string]any{"type": "integer"},
 			},
 			"required": []string{"information_request", "directory_path"},
+		},
+	}
+}
+
+func startMultiRetrievalTool() map[string]any {
+	return map[string]any{
+		"name":        "start_multi_codebase_retrieval",
+		"description": "Submit an asynchronous retrieval task for multiple explicit workspaces to the local openACE daemon.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"information_request": map[string]any{"type": "string"},
+				"directory_paths": map[string]any{
+					"type":  "array",
+					"items": map[string]any{"type": "string"},
+				},
+				"max_output_length": map[string]any{"type": "integer"},
+			},
+			"required": []string{"information_request", "directory_paths"},
 		},
 	}
 }
@@ -373,6 +568,31 @@ func cancelTaskTool() map[string]any {
 				"task_id": map[string]any{"type": "string"},
 			},
 			"required": []string{"task_id"},
+		},
+	}
+}
+
+func listWorkspacesTool() map[string]any {
+	return map[string]any{
+		"name":        "list_workspaces",
+		"description": "List workspace states currently known by the local openACE daemon.",
+		"inputSchema": map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+		},
+	}
+}
+
+func workspaceStatusTool() map[string]any {
+	return map[string]any{
+		"name":        "workspace_status",
+		"description": "Get checkpoint, file count, in-flight state, and last error for a workspace known by the local openACE daemon.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"directory_path": map[string]any{"type": "string"},
+			},
+			"required": []string{"directory_path"},
 		},
 	}
 }

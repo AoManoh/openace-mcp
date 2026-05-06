@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/ace"
 )
@@ -287,6 +289,243 @@ func TestFindMissingBatchedDefaultBatchSize(t *testing.T) {
 	}
 }
 
+func TestSyncerSingleflightSharesConcurrentWorkspaceSync(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client := newBlockingSyncClient()
+	syncer := NewSyncer(client)
+
+	const workers = 5
+	var wg sync.WaitGroup
+	results := make([]Result, workers)
+	errs := make([]error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = syncer.Sync(context.Background(), root)
+		}(i)
+	}
+
+	client.waitForFindMissing(t)
+	client.release()
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("worker %d returned error: %v", i, err)
+		}
+		if results[i].CheckpointID != "checkpoint-1" {
+			t.Fatalf("worker %d got checkpoint %q", i, results[i].CheckpointID)
+		}
+	}
+	if got := client.findMissingCallCount(); got != 1 {
+		t.Fatalf("expected one shared find-missing call, got %d", got)
+	}
+	if got := client.batchUploadCallCount(); got != 1 {
+		t.Fatalf("expected one shared batch-upload call, got %d", got)
+	}
+	if got := client.checkpointCallCount(); got != 1 {
+		t.Fatalf("expected one shared checkpoint call, got %d", got)
+	}
+}
+
+func TestSyncerSingleflightCallerCancelDoesNotCancelOtherWaiters(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client := newBlockingSyncClient()
+	syncer := NewSyncer(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := syncer.Sync(ctx, root)
+		firstErr <- err
+	}()
+	client.waitForFindMissing(t)
+
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondResult := make(chan Result, 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		result, err := syncer.Sync(context.Background(), root)
+		secondResult <- result
+		secondErr <- err
+	}()
+	waitForInflightWaiters(t, syncer, absRoot, 2)
+
+	cancel()
+	if err := waitForError(t, firstErr); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first waiter should see context.Canceled, got %v", err)
+	}
+
+	client.release()
+	if err := waitForError(t, secondErr); err != nil {
+		t.Fatalf("second waiter should complete shared sync: %v", err)
+	}
+	if result := waitForResult(t, secondResult); result.CheckpointID != "checkpoint-1" {
+		t.Fatalf("unexpected second result: %+v", result)
+	}
+	if got := client.findMissingCallCount(); got != 1 {
+		t.Fatalf("expected one find-missing call, got %d", got)
+	}
+}
+
+func TestSyncerSingleflightCancelsSharedSyncWhenAllWaitersCancel(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client := newBlockingSyncClient()
+	syncer := NewSyncer(client)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := syncer.Sync(ctx, root)
+		errCh <- err
+	}()
+	client.waitForFindMissing(t)
+
+	cancel()
+	if err := waitForError(t, errCh); !errors.Is(err, context.Canceled) {
+		t.Fatalf("caller should see context.Canceled, got %v", err)
+	}
+	client.waitForSharedCancel(t)
+}
+
+func TestSyncerWorkspaceStatusTracksInflightAndCompletion(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client := newBlockingSyncClient()
+	syncer := NewSyncer(client)
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := syncer.Sync(context.Background(), root)
+		errCh <- err
+	}()
+	client.waitForFindMissing(t)
+
+	status, err := syncer.WorkspaceStatus(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.InFlight {
+		t.Fatalf("workspace should be in flight: %+v", status)
+	}
+	if status.LastStartedAt == nil {
+		t.Fatalf("workspace should include last_started_at: %+v", status)
+	}
+
+	client.release()
+	if err := waitForError(t, errCh); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err = syncer.WorkspaceStatus(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.InFlight {
+		t.Fatalf("workspace should not be in flight after sync: %+v", status)
+	}
+	if status.CheckpointID != "checkpoint-1" || status.FileCount != 1 {
+		t.Fatalf("unexpected completed status: %+v", status)
+	}
+	if status.LastError != "" {
+		t.Fatalf("successful sync should clear last error: %+v", status)
+	}
+	if status.UpdatedAt == nil || status.LastFinishedAt == nil {
+		t.Fatalf("completed status should include timestamps: %+v", status)
+	}
+}
+
+func TestSyncerWorkspaceStatusLoadsDiskState(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statePath, err := stateFile(absRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := time.Now().UTC()
+	if err := saveState(statePath, state{
+		CheckpointID: "checkpoint-disk",
+		BlobNames: map[string]string{
+			"main.go": "blob-1",
+		},
+		UpdatedAt: updated,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := NewSyncer(nil).WorkspaceStatus(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.DirectoryPath != absRoot {
+		t.Fatalf("unexpected directory path: %+v", status)
+	}
+	if status.CheckpointID != "checkpoint-disk" || status.FileCount != 1 {
+		t.Fatalf("unexpected disk status: %+v", status)
+	}
+	if status.UpdatedAt == nil || !status.UpdatedAt.Equal(updated) {
+		t.Fatalf("unexpected updated_at: %+v", status)
+	}
+}
+
+func TestSyncerListsWorkspaceStatuses(t *testing.T) {
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	for _, root := range []string{rootB, rootA} {
+		if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	syncer := NewSyncer(&recordingClient{})
+	if _, err := syncer.Sync(context.Background(), rootB); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := syncer.Sync(context.Background(), rootA); err != nil {
+		t.Fatal(err)
+	}
+
+	statuses, err := syncer.ListWorkspaceStatuses(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("expected 2 statuses, got %d: %+v", len(statuses), statuses)
+	}
+	if statuses[0].DirectoryPath > statuses[1].DirectoryPath {
+		t.Fatalf("statuses should be sorted by directory path: %+v", statuses)
+	}
+}
+
 type recordingClient struct {
 	batches            [][]ace.BlobUpload
 	findMissingBatches [][]string
@@ -321,4 +560,144 @@ func (c *recordingClient) CheckpointBlobs(context.Context, string, []string, []s
 
 func (c *recordingClient) CodebaseRetrieval(context.Context, string, ace.RetrievalOptions) (string, error) {
 	return "", nil
+}
+
+type blockingSyncClient struct {
+	mu                 sync.Mutex
+	startOnce          sync.Once
+	cancelOnce         sync.Once
+	releaseOnce        sync.Once
+	findMissingStarted chan struct{}
+	findMissingCancel  chan struct{}
+	releaseFindMissing chan struct{}
+	findMissingCalls   int
+	batchUploadCalls   int
+	checkpointCalls    int
+}
+
+func newBlockingSyncClient() *blockingSyncClient {
+	return &blockingSyncClient{
+		findMissingStarted: make(chan struct{}),
+		findMissingCancel:  make(chan struct{}),
+		releaseFindMissing: make(chan struct{}),
+	}
+}
+
+func (c *blockingSyncClient) FindMissing(ctx context.Context, names []string) ([]string, []string, error) {
+	c.mu.Lock()
+	c.findMissingCalls++
+	c.startOnce.Do(func() { close(c.findMissingStarted) })
+	c.mu.Unlock()
+
+	select {
+	case <-c.releaseFindMissing:
+	case <-ctx.Done():
+		c.cancelOnce.Do(func() { close(c.findMissingCancel) })
+		return nil, nil, ctx.Err()
+	}
+	return append([]string(nil), names...), nil, nil
+}
+
+func (c *blockingSyncClient) BatchUpload(ctx context.Context, uploads []ace.BlobUpload) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.batchUploadCalls++
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *blockingSyncClient) CheckpointBlobs(ctx context.Context, previous string, added []string, deleted []string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.checkpointCalls++
+	return "checkpoint-1", nil
+}
+
+func (c *blockingSyncClient) CodebaseRetrieval(context.Context, string, ace.RetrievalOptions) (string, error) {
+	return "retrieved", nil
+}
+
+func (c *blockingSyncClient) waitForFindMissing(t *testing.T) {
+	t.Helper()
+	select {
+	case <-c.findMissingStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("find-missing did not start")
+	}
+}
+
+func (c *blockingSyncClient) waitForSharedCancel(t *testing.T) {
+	t.Helper()
+	select {
+	case <-c.findMissingCancel:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shared sync was not cancelled")
+	}
+}
+
+func (c *blockingSyncClient) release() {
+	c.releaseOnce.Do(func() { close(c.releaseFindMissing) })
+}
+
+func (c *blockingSyncClient) findMissingCallCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.findMissingCalls
+}
+
+func (c *blockingSyncClient) batchUploadCallCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.batchUploadCalls
+}
+
+func (c *blockingSyncClient) checkpointCallCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.checkpointCalls
+}
+
+func waitForInflightWaiters(t *testing.T, syncer *Syncer, root string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		syncer.mu.Lock()
+		got := 0
+		if call, ok := syncer.inflight[root]; ok {
+			got = call.waiters
+		}
+		syncer.mu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("inflight waiters did not reach %d", want)
+}
+
+func waitForError(t *testing.T, ch <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error")
+		return nil
+	}
+}
+
+func waitForResult(t *testing.T, ch <-chan Result) Result {
+	t.Helper()
+	select {
+	case result := <-ch:
+		return result
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for result")
+		return Result{}
+	}
 }

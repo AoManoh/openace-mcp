@@ -23,14 +23,22 @@ type Syncer interface {
 	Sync(context.Context, string) (workspace.Result, error)
 }
 
+type WorkspaceInspector interface {
+	ListWorkspaceStatuses(context.Context) ([]workspace.WorkspaceStatus, error)
+	WorkspaceStatus(context.Context, string) (workspace.WorkspaceStatus, error)
+}
+
 type Server struct {
 	syncer    Syncer
-	mu        sync.Mutex
 	tasks     *TaskStore
 	authToken string
 }
 
 type syncRequest struct {
+	DirectoryPath string `json:"directory_path"`
+}
+
+type workspaceStatusRequest struct {
 	DirectoryPath string `json:"directory_path"`
 }
 
@@ -115,6 +123,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/readyz", s.health)
 	mux.HandleFunc("/v1/sync", s.sync)
 	mux.HandleFunc("/v1/retrieve", s.retrieve)
+	mux.HandleFunc("/v1/workspaces", s.workspaces)
+	mux.HandleFunc("/v1/workspace/status", s.workspaceStatus)
 	mux.HandleFunc("/v1/tasks", s.tasksCollection)
 	mux.HandleFunc("/v1/tasks/", s.taskItem)
 	if s.authToken == "" {
@@ -186,6 +196,56 @@ func (s *Server) retrieve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) workspaces(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	inspector, ok := s.workspaceInspector()
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "workspace status is not supported")
+		return
+	}
+	statuses, err := inspector.ListWorkspaceStatuses(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"workspaces": statuses})
+}
+
+func (s *Server) workspaceStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	inspector, ok := s.workspaceInspector()
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "workspace status is not supported")
+		return
+	}
+	var req workspaceStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(req.DirectoryPath) == "" {
+		writeError(w, http.StatusBadRequest, "directory_path is required")
+		return
+	}
+	status, err := inspector.WorkspaceStatus(r.Context(), req.DirectoryPath)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) workspaceInspector() (WorkspaceInspector, bool) {
+	inspector, ok := s.syncer.(WorkspaceInspector)
+	return inspector, ok
 }
 
 func (s *Server) tasksCollection(w http.ResponseWriter, r *http.Request) {
@@ -269,21 +329,75 @@ func (s *Server) runTask(ctx context.Context, req TaskRequest) (workspace.Result
 		return s.runSync(ctx, req.DirectoryPath)
 	case TaskKindRetrieve:
 		return s.runRetrieve(ctx, req.DirectoryPath, req.InformationRequest, req.MaxOutputLength)
+	case TaskKindMultiRetrieve:
+		return s.runMultiRetrieve(ctx, req.DirectoryPaths, req.InformationRequest, req.MaxOutputLength)
 	default:
 		return workspace.Result{}, fmt.Errorf("unknown task kind: %s", req.Kind)
 	}
 }
 
 func (s *Server) runSync(ctx context.Context, dir string) (workspace.Result, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.syncer.Sync(ctx, dir)
 }
 
 func (s *Server) runRetrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.syncer.Retrieve(ctx, dir, query, maxOutputLen)
+}
+
+type multiRetrieveResult struct {
+	directoryPath string
+	result        workspace.Result
+	err           error
+}
+
+func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, query string, maxOutputLen int) (workspace.Result, error) {
+	results := make([]multiRetrieveResult, len(dirs))
+	var wg sync.WaitGroup
+	for i, dir := range dirs {
+		i, dir := i, dir
+		results[i].directoryPath = dir
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := s.syncer.Retrieve(ctx, dir, query, maxOutputLen)
+			results[i].result = result
+			results[i].err = err
+		}()
+	}
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return workspace.Result{}, err
+	}
+	return aggregateMultiRetrieveResults(results), nil
+}
+
+func aggregateMultiRetrieveResults(results []multiRetrieveResult) workspace.Result {
+	var out strings.Builder
+	out.WriteString("Cross-workspace retrieval results")
+	aggregate := workspace.Result{Text: ""}
+	for _, item := range results {
+		out.WriteString("\n\n## ")
+		out.WriteString(item.directoryPath)
+		out.WriteString("\n")
+		if item.err != nil {
+			out.WriteString("ERROR: ")
+			out.WriteString(item.err.Error())
+			continue
+		}
+		text := strings.TrimSpace(item.result.Text)
+		if text == "" {
+			text = "No relevant code sections were found."
+		}
+		out.WriteString(text)
+		out.WriteString("\n\n")
+		out.WriteString(item.result.Summary())
+		aggregate.FileCount += item.result.FileCount
+		aggregate.Uploaded += item.result.Uploaded
+		aggregate.Added += item.result.Added
+		aggregate.Deleted += item.result.Deleted
+	}
+	aggregate.Text = out.String()
+	return aggregate
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

@@ -13,10 +13,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/AoManoh/openace-mcp/internal/ace"
+	"github.com/AoManoh/openace-mcp/internal/pathutil"
 )
 
 const defaultUploadBatchBytes = 1 << 20
@@ -31,7 +33,19 @@ type ACEClient interface {
 }
 
 type Syncer struct {
-	client ACEClient
+	client   ACEClient
+	mu       sync.Mutex
+	inflight map[string]*syncCall
+	statuses map[string]WorkspaceStatus
+}
+
+type syncCall struct {
+	done      chan struct{}
+	cancel    context.CancelFunc
+	result    Result
+	err       error
+	waiters   int
+	cancelled bool
 }
 
 type Result struct {
@@ -41,6 +55,17 @@ type Result struct {
 	Uploaded     int
 	Added        int
 	Deleted      int
+}
+
+type WorkspaceStatus struct {
+	DirectoryPath  string     `json:"directory_path"`
+	CheckpointID   string     `json:"checkpoint_id,omitempty"`
+	FileCount      int        `json:"file_count"`
+	InFlight       bool       `json:"in_flight"`
+	LastError      string     `json:"last_error,omitempty"`
+	LastStartedAt  *time.Time `json:"last_started_at,omitempty"`
+	LastFinishedAt *time.Time `json:"last_finished_at,omitempty"`
+	UpdatedAt      *time.Time `json:"updated_at,omitempty"`
 }
 
 type state struct {
@@ -56,7 +81,11 @@ type fileBlob struct {
 }
 
 func NewSyncer(client ACEClient) *Syncer {
-	return &Syncer{client: client}
+	return &Syncer{
+		client:   client,
+		inflight: make(map[string]*syncCall),
+		statuses: make(map[string]WorkspaceStatus),
+	}
 }
 
 func (s *Syncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (Result, error) {
@@ -80,6 +109,196 @@ func (s *Syncer) Sync(ctx context.Context, dir string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	return s.syncSingleflight(ctx, root)
+}
+
+func (s *Syncer) WorkspaceStatus(ctx context.Context, dir string) (WorkspaceStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return WorkspaceStatus{}, err
+	}
+	root, err := filepath.Abs(dir)
+	if err != nil {
+		return WorkspaceStatus{}, err
+	}
+
+	s.mu.Lock()
+	if status, ok := s.statuses[root]; ok {
+		s.mu.Unlock()
+		return cloneWorkspaceStatus(status), nil
+	}
+	s.mu.Unlock()
+
+	st, _, err := loadState(root)
+	if err != nil {
+		return WorkspaceStatus{}, err
+	}
+	return workspaceStatusFromState(root, st), nil
+}
+
+func (s *Syncer) ListWorkspaceStatuses(ctx context.Context) ([]WorkspaceStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	statuses := make([]WorkspaceStatus, 0, len(s.statuses))
+	for _, status := range s.statuses {
+		statuses = append(statuses, cloneWorkspaceStatus(status))
+	}
+	s.mu.Unlock()
+	sort.Slice(statuses, func(i, j int) bool {
+		return statuses[i].DirectoryPath < statuses[j].DirectoryPath
+	})
+	return statuses, nil
+}
+
+func (s *Syncer) syncSingleflight(ctx context.Context, root string) (Result, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+
+		s.mu.Lock()
+		if s.inflight == nil {
+			s.inflight = make(map[string]*syncCall)
+		}
+		if call, ok := s.inflight[root]; ok {
+			if call.cancelled {
+				done := call.done
+				s.mu.Unlock()
+				select {
+				case <-done:
+					continue
+				case <-ctx.Done():
+					return Result{}, ctx.Err()
+				}
+			}
+			call.waiters++
+			s.mu.Unlock()
+			return s.waitSyncCall(ctx, root, call)
+		}
+
+		runCtx, cancel := context.WithCancel(context.Background())
+		call := &syncCall{
+			done:    make(chan struct{}),
+			cancel:  cancel,
+			waiters: 1,
+		}
+		s.inflight[root] = call
+		s.markSyncStartedLocked(root)
+		s.mu.Unlock()
+
+		go s.runSyncCall(runCtx, root, call)
+		return s.waitSyncCall(ctx, root, call)
+	}
+}
+
+func (s *Syncer) runSyncCall(ctx context.Context, root string, call *syncCall) {
+	result, err := s.syncRoot(ctx, root)
+
+	s.mu.Lock()
+	call.result = result
+	call.err = err
+	s.markSyncFinishedLocked(root, result, err)
+	if current, ok := s.inflight[root]; ok && current == call {
+		delete(s.inflight, root)
+	}
+	close(call.done)
+	s.mu.Unlock()
+}
+
+func (s *Syncer) waitSyncCall(ctx context.Context, root string, call *syncCall) (Result, error) {
+	select {
+	case <-call.done:
+		return call.result, call.err
+	case <-ctx.Done():
+		select {
+		case <-call.done:
+			return call.result, call.err
+		default:
+		}
+		s.releaseSyncCall(root, call)
+		return Result{}, ctx.Err()
+	}
+}
+
+func (s *Syncer) releaseSyncCall(root string, call *syncCall) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.inflight[root]
+	if !ok || current != call {
+		return
+	}
+	if call.waiters > 0 {
+		call.waiters--
+	}
+	if call.waiters == 0 {
+		call.cancelled = true
+		call.cancel()
+	}
+}
+
+func (s *Syncer) markSyncStartedLocked(root string) {
+	if s.statuses == nil {
+		s.statuses = make(map[string]WorkspaceStatus)
+	}
+	now := time.Now().UTC()
+	status := s.statuses[root]
+	status.DirectoryPath = root
+	status.InFlight = true
+	status.LastStartedAt = &now
+	s.statuses[root] = status
+}
+
+func (s *Syncer) markSyncFinishedLocked(root string, result Result, err error) {
+	if s.statuses == nil {
+		s.statuses = make(map[string]WorkspaceStatus)
+	}
+	now := time.Now().UTC()
+	status := s.statuses[root]
+	status.DirectoryPath = root
+	status.InFlight = false
+	status.LastFinishedAt = &now
+	if err != nil {
+		status.LastError = err.Error()
+		s.statuses[root] = status
+		return
+	}
+	status.CheckpointID = result.CheckpointID
+	status.FileCount = result.FileCount
+	status.LastError = ""
+	status.UpdatedAt = &now
+	s.statuses[root] = status
+}
+
+func workspaceStatusFromState(root string, st state) WorkspaceStatus {
+	status := WorkspaceStatus{
+		DirectoryPath: root,
+		CheckpointID:  st.CheckpointID,
+		FileCount:     len(st.BlobNames),
+	}
+	if !st.UpdatedAt.IsZero() {
+		updated := st.UpdatedAt.UTC()
+		status.UpdatedAt = &updated
+	}
+	return status
+}
+
+func cloneWorkspaceStatus(status WorkspaceStatus) WorkspaceStatus {
+	status.LastStartedAt = cloneTime(status.LastStartedAt)
+	status.LastFinishedAt = cloneTime(status.LastFinishedAt)
+	status.UpdatedAt = cloneTime(status.UpdatedAt)
+	return status
+}
+
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copied := value.UTC()
+	return &copied
+}
+
+func (s *Syncer) syncRoot(ctx context.Context, root string) (Result, error) {
 	files, err := scan(ctx, root)
 	if err != nil {
 		return Result{}, err
@@ -149,7 +368,7 @@ func (s *Syncer) Sync(ctx context.Context, dir string) (Result, error) {
 		st.CheckpointID = checkpointID
 	}
 	st.BlobNames = current
-	st.UpdatedAt = time.Now()
+	st.UpdatedAt = time.Now().UTC()
 	if err := saveState(statePath, st); err != nil {
 		return Result{}, err
 	}
@@ -603,14 +822,11 @@ func cacheNamespace() string {
 
 func cacheRoot() (string, error) {
 	if dir := strings.TrimSpace(os.Getenv("OPENACE_CACHE_DIR")); dir != "" {
-		if strings.HasPrefix(dir, "~/") {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return "", err
-			}
-			dir = filepath.Join(home, strings.TrimPrefix(dir, "~/"))
+		expanded, err := pathutil.ExpandUser(dir)
+		if err != nil {
+			return "", err
 		}
-		return filepath.Abs(dir)
+		return filepath.Abs(expanded)
 	}
 	cache, err := os.UserCacheDir()
 	if err != nil {

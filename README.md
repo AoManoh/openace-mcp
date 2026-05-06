@@ -8,7 +8,9 @@
 
 - Go MCP stdio 主流程已跑通。
 - daemon + MCP shim 已跑通，适合大仓库和多 AI 会话共享状态。
-- 已在约 5GB 大仓库上完成 5 并发冷/热缓存压力测试。
+- daemon 异步任务使用可配置 worker pool，默认 4 个 worker。
+- daemon 任务快照已支持本地持久化，重启后仍可通过 `list_tasks` / `task_status` 找回最近任务。
+- 已在大仓库场景完成 5 并发冷/热缓存压力测试。
 - 默认扫描会跳过 `.gitignore` / `.ignore` 命中内容，并排除 `.env*`、session、credentials、私钥、证书等敏感文件。
 
 ## 你需要准备
@@ -50,7 +52,6 @@
     "GOSUMDB": "sum.golang.google.cn",
     "AUGMENT_TOKEN": "your-augment-token",
     "AUGMENT_TENANT": "https://<your-tenant>.api.augmentcode.com/",
-    "OPENACE_CACHE_DIR": "$HOME/.cache/openace-mcp",
     "OPENACE_CACHE_NAMESPACE": "default"
   }
 }
@@ -73,13 +74,14 @@
         "GOSUMDB": "sum.golang.google.cn",
         "AUGMENT_TOKEN": "your-augment-token",
         "AUGMENT_TENANT": "https://<your-tenant>.api.augmentcode.com/",
-        "OPENACE_CACHE_DIR": "$HOME/.cache/openace-mcp",
         "OPENACE_CACHE_NAMESPACE": "default"
       }
     }
   }
 }
 ```
+
+> **注意**：AI IDE 启动 MCP 子进程时不会经过 shell，`$HOME`、`%USERPROFILE%` 这类占位符**不会自动展开**。openACE 已在内部兼容这些写法，但仍建议在 IDE 配置里写**绝对路径**或直接省略 `OPENACE_CACHE_DIR`（默认走 `os.UserCacheDir()`，Windows 自动落到 `%LocalAppData%\openace-mcp`，macOS 落到 `~/Library/Caches/openace-mcp`，Linux 落到 `~/.cache/openace-mcp`）。
 
 Windows 下如果 IDE 找不到 `go`，把 `command` 改成你的 `go.exe` 绝对路径。
 
@@ -144,25 +146,32 @@ GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/
 }
 ```
 
-如果 AI IDE 找不到命令，把 `command` 改成绝对路径，例如 `$HOME/go/bin/openace-mcp`。
+如果 AI IDE 找不到命令，把 `command` 改成绝对路径。例如 Linux/macOS 用 `/home/you/go/bin/openace-mcp`，Windows 用 `C:\Users\you\go\bin\openace-mcp.exe`。AI IDE 不会自动展开 `$HOME` 或 `%USERPROFILE%`。
 
 ## MCP 工具
 
 | 工具 | 用途 |
 |------|------|
 | `codebase_retrieval` | 同步扫描 workspace，然后调用 ACE 检索代码 |
+| `multi_codebase_retrieval` | 显式传入多个 workspace，分别检索并按 workspace 分段返回结果 |
 | `sync_workspace` | 只同步 workspace，不做检索 |
 | `start_codebase_retrieval` | daemon 模式下提交异步检索任务，适合大仓库 |
+| `start_multi_codebase_retrieval` | daemon 模式下提交异步跨仓检索任务 |
 | `start_sync_workspace` | daemon 模式下提交异步同步任务 |
 | `task_status` | 查询任务状态和结果 |
 | `list_tasks` | 找回最近任务，列表不返回完整检索正文 |
 | `cancel_task` | 取消 queued / running 任务 |
+| `list_workspaces` | daemon 模式下列出已见 workspace 状态 |
+| `workspace_status` | daemon 模式下查询指定 workspace 的 checkpoint、文件数、同步中状态和最近错误 |
 
 建议：
 
 - 小仓库先用 `codebase_retrieval`。
+- 跨仓问题用 `multi_codebase_retrieval`，显式传入 `directory_paths`；大仓库跨仓场景优先用 `start_multi_codebase_retrieval`。
 - 大仓库优先用 `start_codebase_retrieval`，再用 `task_status` 查询。
+- daemon 重启后可继续用 `list_tasks` 找回最近 completed / failed / cancelled 任务；重启前仍在 queued / running 的任务会标记为 failed，并附带 `abandoned after daemon restart`。
 - 忘记 task id 时用 `list_tasks`。
+- 多项目或压测排查时用 `list_workspaces` 和 `workspace_status` 观察 daemon 状态。
 
 ## 环境变量
 
@@ -172,11 +181,13 @@ GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/
 | `AUGMENT_TENANT` | 上游 ACE tenant/base URL |
 | `AUGMENT_SESSION_AUTH` | 完整 session JSON，优先级最高 |
 | `OPENACE_SESSION_FILE` | 显式 session 文件路径 |
-| `OPENACE_CACHE_DIR` | workspace checkpoint/cache 目录 |
+| `OPENACE_CACHE_DIR` | workspace checkpoint/cache 目录，省略时走 `os.UserCacheDir()`；支持 `~/`、`$HOME`、`${HOME}`、`%USERPROFILE%` 占位符，但仍推荐绝对路径 |
 | `OPENACE_CACHE_NAMESPACE` | cache 命名空间，用于隔离账号、tenant 或测试批次 |
 | `OPENACE_DAEMON_ADDR` | MCP shim 连接 daemon 的地址 |
 | `OPENACE_DAEMON_LISTEN_ADDR` | daemon 监听地址，默认 `127.0.0.1:8765` |
 | `OPENACE_DAEMON_TOKEN` | 可选本地 bearer token |
+| `OPENACE_TASK_WORKERS` | daemon 异步任务 worker 数，默认 `4`，最大 `32` |
+| `OPENACE_TASK_STORE_DIR` | daemon 任务快照目录；默认位于 `OPENACE_CACHE_DIR/tasks/<namespace>` 或用户 cache 目录 |
 | `OPENACE_ALLOW_REMOTE_DAEMON` | 显式允许监听非 loopback 地址 |
 | `OPENACE_UPLOAD_BATCH_BYTES` | batch-upload 估算上限，默认 `1048576` |
 | `OPENACE_FIND_MISSING_BATCH_SIZE` | find-missing 分批 blob 数，默认 `1000` |
@@ -199,7 +210,7 @@ set +a
 
 ## 压力测试基线
 
-匿名化验证对象：约 5GB 私有大仓库。
+匿名化验证对象：大仓库。
 
 - 原始仓库包含数千个文件。
 - openACE 过滤后参与索引约 2500 个文本文件。
