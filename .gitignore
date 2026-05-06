@@ -24,12 +24,10 @@ pnpm-debug.log*
 # Reusable public automation should live under the owning skill directory.
 /scripts/
 /skills/
+/AGENTS.md
 
 # Private governance outputs.
-# Keep docs/ only as a public skeleton. Local reports, work logs, requirements,
-# references, debug notes and review artifacts stay private by default.
-# Only add a precise ! exception when a document must be public-read.
-/docs/**
-!/docs/
-!/docs/**/
-!/docs/**/.gitkeep
+# Local reports, work logs, requirements, references, debug notes and review
+# artifacts stay private by default. Only add a precise ! exception when a
+# document must be public-read and the user explicitly approves it.
+/docs/
