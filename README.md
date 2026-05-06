@@ -1,199 +1,220 @@
 # openACE MCP
 
-`openACE` 是 **Open Adapter for Context Engine**。
+`openACE` 是 **Open Adapter for Context Engine**，用于把用户自己的 Augment / ACE codebase retrieval 能力接入 AI IDE 的 MCP 工具面。
 
-本仓库计划提供一个稳定的 MCP adapter 和本地索引编排层，首期主线是复用/提取 Augment Code 插件已稳定调用 ACE 的过程，并把它 MCP 化、daemon 化。
+它不是离线语义检索引擎，也不提供自研 embedding / ranking。openACE 做的是本地工程侧编排：扫描 workspace、过滤文件、计算 blob、同步 checkpoint/cache、调用上游 ACE、提供 MCP 工具、管理 daemon 生命周期和任务队列。
 
-这是在 `aug2api` 讨论过程中产生的新独立项目需求，不是 `aug2api` 子模块、拆分项目或代码迁移目标。首期路线涉及复用插件 ACE 调用过程，但仓库可见性不阻塞当前推进，先跑通 MCP 主流程。
+## 当前状态
 
-当前阶段：最小 Go MCP 主流程、daemon + shim、异步任务 API、任务诊断和大仓库压力测试已跑通。MCP stdio 可以完成初始化、工具列表、workspace 扫描、blob/checkpoint 同步，并通过 `codebase_retrieval` 返回 ACE 检索结果。大仓库建议默认使用 daemon 异步工具，避免 MCP 客户端同步等待超时。
+- Go MCP stdio 主流程已跑通。
+- daemon + MCP shim 已跑通，适合大仓库和多 AI 会话共享状态。
+- 已在约 5GB 大仓库上完成 5 并发冷/热缓存压力测试。
+- 默认扫描会跳过 `.gitignore` / `.ignore` 命中内容，并排除 `.env*`、session、credentials、私钥、证书等敏感文件。
 
-## 边界
+## 你需要准备
 
-- `openACE` 负责本地扫描、blob/checkpoint 缓存、增量同步、daemon 生命周期、MCP 工具、有界并发、取消和诊断。
-- 上游 Context Engine 账号负责语义索引、embedding、ranking、格式化检索、quota 和 tenant 授权。
-- 用户必须提供自己的上游凭据，例如 `AUGMENT_SESSION_AUTH`、`AUGMENT_TOKEN + AUGMENT_TENANT` 或显式 session 文件。
-- 默认实现路径是复用/提取 Augment Code 插件已稳定调用 ACE 的过程，不是重新实现或包装 `auggie --mcp`。
-- `auggie --mcp` 只作为对照样本和 fallback adapter 参考。已观察到的 blob/checkpoint/upload 链路需要以插件主流程验证为准。
-- 当前 MCP 主流程已经跑通并完成大仓库并发压力验收，后续优化不阻塞当前使用。
+- Go `>= 1.23`
+- 可用的 Augment / ACE 账号凭据
+- 一个支持 MCP JSON 配置的 AI IDE
 
-## 当前入口
+认证方式任选一种：
 
-恢复上下文时先读取：
+- `AUGMENT_TOKEN` + `AUGMENT_TENANT`
+- `AUGMENT_SESSION_AUTH`
+- `OPENACE_SESSION_FILE`
+- 已登录插件留下的 `~/.augment/session.json`
 
-1. `AGENTS.md`
-2. `docs/requirements/2026-05-05-project-kickoff.md`
-3. `docs/references/2026-05-05-openace-context-engine.md`
+## 推荐模式
 
-文档记录不阻塞编码；当前以真实运行结果推进下一阶段。
+| 模式 | 适合场景 | 说明 |
+|------|----------|------|
+| 直连 MCP | 小仓库、第一次 smoke test | AI IDE 每次启动 MCP 时直接扫描和检索 |
+| daemon + shim | 大仓库、多 AI 会话、长期使用 | 推荐。daemon 常驻，AI IDE 只启动轻量 shim |
 
-## 安装
+大仓库建议优先用 daemon + shim，并调用 `start_codebase_retrieval` 异步检索。
 
-本地开发验证：
+## AI IDE 配置：直连 MCP
+
+这是最简单的通用 MCP JSON 片段。多数 AI IDE 需要把下面对象放到自己的 `mcpServers` 里。
+
+```json
+"openace-mcp": {
+  "args": [
+    "run",
+    "github.com/AoManoh/openace-mcp/cmd/openace-mcp@main"
+  ],
+  "command": "go",
+  "disabled": false,
+  "env": {
+    "GOPROXY": "https://goproxy.cn,direct",
+    "GOSUMDB": "sum.golang.google.cn",
+    "AUGMENT_TOKEN": "your-augment-token",
+    "AUGMENT_TENANT": "https://<your-tenant>.api.augmentcode.com/",
+    "OPENACE_CACHE_DIR": "$HOME/.cache/openace-mcp",
+    "OPENACE_CACHE_NAMESPACE": "default"
+  }
+}
+```
+
+如果你的 IDE 要求完整配置：
+
+```json
+{
+  "mcpServers": {
+    "openace-mcp": {
+      "args": [
+        "run",
+        "github.com/AoManoh/openace-mcp/cmd/openace-mcp@main"
+      ],
+      "command": "go",
+      "disabled": false,
+      "env": {
+        "GOPROXY": "https://goproxy.cn,direct",
+        "GOSUMDB": "sum.golang.google.cn",
+        "AUGMENT_TOKEN": "your-augment-token",
+        "AUGMENT_TENANT": "https://<your-tenant>.api.augmentcode.com/",
+        "OPENACE_CACHE_DIR": "$HOME/.cache/openace-mcp",
+        "OPENACE_CACHE_NAMESPACE": "default"
+      }
+    }
+  }
+}
+```
+
+Windows 下如果 IDE 找不到 `go`，把 `command` 改成你的 `go.exe` 绝对路径。
+
+## AI IDE 配置：daemon + shim
+
+第一步，先在终端启动 daemon。上游 ACE 凭据放在 daemon 进程里，不要只放在 AI IDE 的 MCP shim 里。
+
+```bash
+export GOPROXY=https://goproxy.cn,direct
+export GOSUMDB=sum.golang.google.cn
+export AUGMENT_TOKEN="your-augment-token"
+export AUGMENT_TENANT="https://<your-tenant>.api.augmentcode.com/"
+export OPENACE_CACHE_DIR="$HOME/.cache/openace-mcp"
+export OPENACE_CACHE_NAMESPACE="default"
+export OPENACE_DAEMON_LISTEN_ADDR="127.0.0.1:8765"
+export OPENACE_DAEMON_TOKEN="change-me-local-token"
+
+go run github.com/AoManoh/openace-mcp/cmd/openace-daemon@main
+```
+
+第二步，在 AI IDE 里配置 shim：
+
+```json
+"openace-mcp": {
+  "args": [
+    "run",
+    "github.com/AoManoh/openace-mcp/cmd/openace-mcp@main"
+  ],
+  "command": "go",
+  "disabled": false,
+  "env": {
+    "GOPROXY": "https://goproxy.cn,direct",
+    "GOSUMDB": "sum.golang.google.cn",
+    "OPENACE_DAEMON_ADDR": "127.0.0.1:8765",
+    "OPENACE_DAEMON_TOKEN": "change-me-local-token"
+  }
+}
+```
+
+如果不设置 `OPENACE_DAEMON_TOKEN`，daemon 和 shim 两边都删掉这个变量即可。默认 daemon 只允许监听 loopback 地址；不要把它直接暴露到公网。
+
+## 本地安装方式
+
+如果不想让 AI IDE 每次 `go run` 在线拉取，可以先安装二进制：
+
+```bash
+GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/openace-mcp@main
+GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/openace-daemon@main
+```
+
+然后把 MCP 配置改成：
+
+```json
+"openace-mcp": {
+  "command": "openace-mcp",
+  "args": [],
+  "disabled": false,
+  "env": {
+    "OPENACE_DAEMON_ADDR": "127.0.0.1:8765",
+    "OPENACE_DAEMON_TOKEN": "change-me-local-token"
+  }
+}
+```
+
+如果 AI IDE 找不到命令，把 `command` 改成绝对路径，例如 `$HOME/go/bin/openace-mcp`。
+
+## MCP 工具
+
+| 工具 | 用途 |
+|------|------|
+| `codebase_retrieval` | 同步扫描 workspace，然后调用 ACE 检索代码 |
+| `sync_workspace` | 只同步 workspace，不做检索 |
+| `start_codebase_retrieval` | daemon 模式下提交异步检索任务，适合大仓库 |
+| `start_sync_workspace` | daemon 模式下提交异步同步任务 |
+| `task_status` | 查询任务状态和结果 |
+| `list_tasks` | 找回最近任务，列表不返回完整检索正文 |
+| `cancel_task` | 取消 queued / running 任务 |
+
+建议：
+
+- 小仓库先用 `codebase_retrieval`。
+- 大仓库优先用 `start_codebase_retrieval`，再用 `task_status` 查询。
+- 忘记 task id 时用 `list_tasks`。
+
+## 环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `AUGMENT_TOKEN` | 上游 ACE access token |
+| `AUGMENT_TENANT` | 上游 ACE tenant/base URL |
+| `AUGMENT_SESSION_AUTH` | 完整 session JSON，优先级最高 |
+| `OPENACE_SESSION_FILE` | 显式 session 文件路径 |
+| `OPENACE_CACHE_DIR` | workspace checkpoint/cache 目录 |
+| `OPENACE_CACHE_NAMESPACE` | cache 命名空间，用于隔离账号、tenant 或测试批次 |
+| `OPENACE_DAEMON_ADDR` | MCP shim 连接 daemon 的地址 |
+| `OPENACE_DAEMON_LISTEN_ADDR` | daemon 监听地址，默认 `127.0.0.1:8765` |
+| `OPENACE_DAEMON_TOKEN` | 可选本地 bearer token |
+| `OPENACE_ALLOW_REMOTE_DAEMON` | 显式允许监听非 loopback 地址 |
+| `OPENACE_UPLOAD_BATCH_BYTES` | batch-upload 估算上限，默认 `1048576` |
+| `OPENACE_FIND_MISSING_BATCH_SIZE` | find-missing 分批 blob 数，默认 `1000` |
+| `OPENACE_MAX_FILE_BYTES` | 单文件索引上限，默认 `1048576` |
+
+`.env` 不会被 openACE 自动加载。如果你使用 `.env`，需要在启动 daemon 或 MCP 前手动加载：
+
+```bash
+set -a
+source .env
+set +a
+```
+
+## 安全与边界
+
+- openACE 不绕过 Augment / ACE 的认证、quota、tenant 或 rate limit。
+- 检索质量取决于你的上游 ACE 账号和服务状态。
+- 默认只索引 UTF-8 文本文件，并跳过常见敏感文件。
+- daemon 默认只允许 loopback 监听；远程暴露前必须自行加网络访问控制。
+
+## 压力测试基线
+
+匿名化验证对象：约 5GB 私有大仓库。
+
+- 原始仓库包含数千个文件。
+- openACE 过滤后参与索引约 2500 个文本文件。
+- 冷缓存 5 并发宽泛检索全部 completed：55.1 秒，daemon RSS 高峰约 20.9MB。
+- 暖缓存 daemon 重启后 5 并发全部 completed：30.0 秒，全部 `uploaded=0 added=0 deleted=0`，daemon RSS 高峰约 20.8MB。
+
+## 本地开发
 
 ```bash
 go test ./...
-go test -race ./internal/daemon ./internal/mcp
+go test -race ./internal/daemon ./internal/mcp ./internal/workspace
 go vet ./...
 go build ./cmd/openace-mcp ./cmd/openace-daemon
 ```
 
-在线安装可使用 Go module；网络较慢时加 GOPROXY 镜像：
+## License
 
-```bash
-GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/openace-mcp@latest
-GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/openace-daemon@latest
-```
-
-## MCP 配置示例
-
-直接 stdio 模式适合小仓库或 smoke test：
-
-```json
-{
-  "mcpServers": {
-    "openace": {
-      "command": "go",
-      "args": ["run", "/home/oh/projects/openace-mcp/cmd/openace-mcp"]
-    }
-  }
-}
-```
-
-## AI IDE 快速测试
-
-推荐用 daemon + MCP shim 测试，尤其是大仓库。`.env` 不会被程序自动加载；如果使用 `.env`，需要先在启动 daemon 的 shell 中执行 `set -a && source .env && set +a`。
-
-1. 安装二进制：
-
-```bash
-GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/openace-mcp@latest
-GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/openace-daemon@latest
-```
-
-2. 启动 daemon：
-
-```bash
-export AUGMENT_TOKEN="..."
-export AUGMENT_TENANT="..."
-export OPENACE_CACHE_DIR="$HOME/.cache/openace-mcp"
-export OPENACE_CACHE_NAMESPACE="default"
-export OPENACE_DAEMON_LISTEN_ADDR=127.0.0.1:8765
-export OPENACE_DAEMON_TOKEN="$(openssl rand -hex 16)"
-openace-daemon
-```
-
-如果不用 `OPENACE_DAEMON_TOKEN`，可以省略该变量；如果启用 token，AI IDE 的 MCP 配置里也必须设置同一个值。
-
-3. 在 AI IDE 中配置 MCP shim：
-
-```json
-{
-  "mcpServers": {
-    "openace": {
-      "command": "openace-mcp",
-      "env": {
-        "OPENACE_DAEMON_ADDR": "127.0.0.1:8765",
-        "OPENACE_DAEMON_TOKEN": "填入 daemon 启动时的同一个 token"
-      }
-    }
-  }
-}
-```
-
-如果 `go install` 后 AI IDE 找不到 `openace-mcp`，把 `command` 改成绝对路径，例如 `$HOME/go/bin/openace-mcp`。
-
-4. 测试建议：
-
-- 小仓库可直接调用 `codebase_retrieval`。
-- 大仓库优先调用 `start_codebase_retrieval`，再用 `task_status` 查询结果。
-- 忘记 task id 时调用 `list_tasks` 找回最近任务。
-
-## Daemon 模式
-
-启动常驻 daemon。上游 ACE 凭据必须给 `openace-daemon` 进程，而不是只给 MCP shim：
-
-```bash
-export AUGMENT_TOKEN="..."
-export AUGMENT_TENANT="..."
-export OPENACE_DAEMON_LISTEN_ADDR=127.0.0.1:8765
-go run ./cmd/openace-daemon
-```
-
-让 MCP shim 代理到 daemon：
-
-```json
-{
-  "mcpServers": {
-    "openace": {
-      "command": "go",
-      "args": ["run", "/home/oh/projects/openace-mcp/cmd/openace-mcp"],
-      "env": {
-        "OPENACE_DAEMON_ADDR": "127.0.0.1:8765"
-      }
-    }
-  }
-}
-```
-
-如果需要给本机 daemon 加一层本地 bearer token，daemon 和 shim 同时设置同一个 `OPENACE_DAEMON_TOKEN`。
-
-默认只允许 daemon 监听 loopback 地址，例如 `127.0.0.1:8765` 或 `localhost:8765`。如需绑定 `0.0.0.0`，必须显式设置 `OPENACE_ALLOW_REMOTE_DAEMON=1`，并自行配置网络访问控制；这不是默认推荐形态。
-
-当前 daemon 暴露：
-
-- `GET /healthz`
-- `GET /readyz`
-- `POST /v1/sync`
-- `POST /v1/retrieve`
-- `POST /v1/tasks`
-- `GET /v1/tasks`
-- `GET /v1/tasks/{id}`
-- `POST /v1/tasks/{id}/cancel`
-
-可选认证方式：
-
-- 默认读取 `~/.augment/session.json`。
-- 或设置 `OPENACE_SESSION_FILE` 指向本地 session 文件。
-- 或设置 `AUGMENT_TOKEN` 与 `AUGMENT_TENANT`。
-
-可选缓存设置：
-
-- `OPENACE_CACHE_DIR`：指定 workspace checkpoint/cache 目录。建议不同账号、tenant 或验证批次使用独立缓存目录，避免复用旧 checkpoint 影响验证结论。
-- `OPENACE_CACHE_NAMESPACE`：在同一个 cache 目录下按账号、tenant 或压测批次隔离 workspace state，默认 `default`。
-
-大仓库调参：
-
-- `OPENACE_UPLOAD_BATCH_BYTES`：单次 batch-upload 估算上限，默认 `1048576`。
-- `OPENACE_FIND_MISSING_BATCH_SIZE`：单次 find-missing blob 数量，默认 `1000`。
-- `OPENACE_MAX_FILE_BYTES`：单文件索引上限，默认 `1048576`。
-
-扫描安全：
-
-- 默认跳过 `.gitignore` / `.ignore` 命中的文件和目录。
-- 默认跳过 `.env*`、`.npmrc`、`.netrc`、`session.json`、`credentials.json`、私钥和证书类文件。
-- 只索引非空、未超过上限、非二进制且 UTF-8 合法的文本文件。
-
-当前工具：
-
-- `codebase_retrieval`: 扫描并同步 workspace 后，调用 ACE 检索代码。
-- `sync_workspace`: 只执行扫描、缺失 blob 上传和 checkpoint。
-- `start_codebase_retrieval`: daemon 模式下提交异步代码检索任务。
-- `start_sync_workspace`: daemon 模式下提交异步 workspace 同步任务。
-- `task_status`: daemon 模式下查询任务状态和结果。
-- `list_tasks`: daemon 模式下列出最近任务，列表不返回完整检索文本，避免诊断接口放大内存和输出。
-- `cancel_task`: daemon 模式下取消 queued/running 任务。
-
-## 压力测试基线
-
-已用 `/home/oh/projects/mailing` 做真实 ACE 压力验证：
-
-- 仓库体量约 5.0GB，`rg --files` 可见 5937 个文件，openACE 当前过滤后参与索引 2557 个文本文件。
-- 冷缓存 5 并发 MCP shim 宽泛检索全部 completed，耗时 55.1 秒，daemon RSS 高峰约 20.9MB。
-- 暖缓存 daemon 重启后 5 并发全部 completed，耗时 30.0 秒，全部 `uploaded=0 added=0 deleted=0`，daemon RSS 高峰约 20.8MB。
-- daemon 压测期间保持存活；扫描与上传支持取消，任务列表可通过 `list_tasks` 找回。
-- 当前并发模型是并发提交任务、daemon 串行执行同步/检索；这是稳定性优先的 MVP，不是最终并行吞吐模型。
-
-## 许可证
-
-本项目采用 MIT License。Copyright (c) 2026 aomanoh.
+MIT License. Copyright (c) 2026 aomanoh.
