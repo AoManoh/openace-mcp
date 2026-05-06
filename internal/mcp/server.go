@@ -218,7 +218,7 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		return ok(req.ID, toolResult("Workspace synced.\n"+result.Summary(), false))
 	case "start_codebase_retrieval", "start-codebase-retrieval":
 		if s.tasker == nil {
-			return toolError(req.ID, "task tools require OPENACE_DAEMON_ADDR")
+			return toolError(req.ID, "task tools require daemon mode")
 		}
 		var args retrievalArgs
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
@@ -242,7 +242,7 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		return ok(req.ID, toolResult(jsonText(task), false))
 	case "start_multi_codebase_retrieval", "start-multi-codebase-retrieval":
 		if s.tasker == nil {
-			return toolError(req.ID, "task tools require OPENACE_DAEMON_ADDR")
+			return toolError(req.ID, "task tools require daemon mode")
 		}
 		var args multiRetrievalArgs
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
@@ -267,7 +267,7 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		return ok(req.ID, toolResult(jsonText(task), false))
 	case "start_sync_workspace", "start-sync-workspace":
 		if s.tasker == nil {
-			return toolError(req.ID, "task tools require OPENACE_DAEMON_ADDR")
+			return toolError(req.ID, "task tools require daemon mode")
 		}
 		var args syncArgs
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
@@ -286,7 +286,7 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		return ok(req.ID, toolResult(jsonText(task), false))
 	case "task_status", "task-status":
 		if s.tasker == nil {
-			return toolError(req.ID, "task tools require OPENACE_DAEMON_ADDR")
+			return toolError(req.ID, "task tools require daemon mode")
 		}
 		var args taskIDArgs
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
@@ -302,7 +302,7 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		return ok(req.ID, toolResult(jsonText(task), false))
 	case "list_tasks", "list-tasks":
 		if s.tasker == nil {
-			return toolError(req.ID, "task tools require OPENACE_DAEMON_ADDR")
+			return toolError(req.ID, "task tools require daemon mode")
 		}
 		var args listTasksArgs
 		if len(params.Arguments) > 0 {
@@ -317,7 +317,7 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		return ok(req.ID, toolResult(jsonText(map[string]any{"tasks": tasks}), false))
 	case "cancel_task", "cancel-task":
 		if s.tasker == nil {
-			return toolError(req.ID, "task tools require OPENACE_DAEMON_ADDR")
+			return toolError(req.ID, "task tools require daemon mode")
 		}
 		var args taskIDArgs
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
@@ -333,7 +333,7 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		return ok(req.ID, toolResult(jsonText(task), false))
 	case "list_workspaces", "list-workspaces":
 		if s.inspector == nil {
-			return toolError(req.ID, "workspace status tools require OPENACE_DAEMON_ADDR")
+			return toolError(req.ID, "workspace status tools require daemon mode")
 		}
 		statuses, err := s.inspector.ListWorkspaceStatuses(ctx)
 		if err != nil {
@@ -342,7 +342,7 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		return ok(req.ID, toolResult(jsonText(map[string]any{"workspaces": statuses}), false))
 	case "workspace_status", "workspace-status":
 		if s.inspector == nil {
-			return toolError(req.ID, "workspace status tools require OPENACE_DAEMON_ADDR")
+			return toolError(req.ID, "workspace status tools require daemon mode")
 		}
 		var args syncArgs
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {

@@ -7,7 +7,7 @@
 ## 当前状态
 
 - Go MCP stdio 主流程已跑通。
-- daemon + MCP shim 已跑通，适合大仓库和多 AI 会话共享状态。
+- 默认 `OPENACE_MODE=auto`，AI IDE 只需要配置一个 MCP server；`openace-mcp` 会自动复用或启动本机 daemon。
 - daemon 异步任务使用可配置 worker pool，默认 4 个 worker。
 - daemon 任务快照已支持本地持久化，重启后仍可通过 `list_tasks` / `task_status` 找回最近任务。
 - 已在大仓库场景完成 5 并发冷/热缓存压力测试。
@@ -30,14 +30,17 @@
 
 | 模式 | 适合场景 | 说明 |
 |------|----------|------|
-| 直连 MCP | 小仓库、第一次 smoke test | AI IDE 每次启动 MCP 时直接扫描和检索 |
-| daemon + shim | 大仓库、多 AI 会话、长期使用 | 推荐。daemon 常驻，AI IDE 只启动轻量 shim |
+| `auto` | 日常默认、大仓库、多 AI 会话 | 推荐。一个 MCP 配置，自动复用或启动本机 daemon |
+| `direct` | 小仓库、第一次 smoke test、排障 fallback | 不启动 daemon，每个 MCP 进程自己扫描和检索 |
+| `manual-daemon` | 高级运维、固定服务、远程/团队部署 | 需要用户自己管理 daemon 生命周期 |
 
-大仓库建议优先用 daemon + shim，并调用 `start_codebase_retrieval` 异步检索。
+`direct` 不等于 Augment Code 插件原生体验。它只是在同步完成后调用同源 ACE retrieval，适合验证链路是否可用；它没有插件的 IDE 预热、watcher 和会话集成，也不能解决 subagent 链式进程膨胀。
 
-## AI IDE 配置：直连 MCP
+`auto` / daemon 模式也不是“复刻插件 UI”。它提供的是面向 AI Agent 的 openACE 原生 MCP 体验：复用用户 ACE 能力，同时增加本地状态共享、任务管理、资源收敛和可观测性。
 
-这是最简单的通用 MCP JSON 片段。多数 AI IDE 需要把下面对象放到自己的 `mcpServers` 里。
+## AI IDE 配置：默认 auto 模式
+
+多数 AI IDE 需要把下面对象放到自己的 `mcpServers` 里。日常只需要这一段配置，不需要手动启动 `openace-daemon`。
 
 ```json
 "openace-mcp": {
@@ -52,6 +55,7 @@
     "GOSUMDB": "sum.golang.google.cn",
     "AUGMENT_TOKEN": "your-augment-token",
     "AUGMENT_TENANT": "https://<your-tenant>.api.augmentcode.com/",
+    "OPENACE_MODE": "auto",
     "OPENACE_CACHE_NAMESPACE": "default"
   }
 }
@@ -74,6 +78,7 @@
         "GOSUMDB": "sum.golang.google.cn",
         "AUGMENT_TOKEN": "your-augment-token",
         "AUGMENT_TENANT": "https://<your-tenant>.api.augmentcode.com/",
+        "OPENACE_MODE": "auto",
         "OPENACE_CACHE_NAMESPACE": "default"
       }
     }
@@ -85,43 +90,7 @@
 
 Windows 下如果 IDE 找不到 `go`，把 `command` 改成你的 `go.exe` 绝对路径。
 
-## AI IDE 配置：daemon + shim
-
-第一步，先在终端启动 daemon。上游 ACE 凭据放在 daemon 进程里，不要只放在 AI IDE 的 MCP shim 里。
-
-```bash
-export GOPROXY=https://goproxy.cn,direct
-export GOSUMDB=sum.golang.google.cn
-export AUGMENT_TOKEN="your-augment-token"
-export AUGMENT_TENANT="https://<your-tenant>.api.augmentcode.com/"
-export OPENACE_CACHE_DIR="$HOME/.cache/openace-mcp"
-export OPENACE_CACHE_NAMESPACE="default"
-export OPENACE_DAEMON_LISTEN_ADDR="127.0.0.1:8765"
-export OPENACE_DAEMON_TOKEN="change-me-local-token"
-
-go run github.com/AoManoh/openace-mcp/cmd/openace-daemon@main
-```
-
-第二步，在 AI IDE 里配置 shim：
-
-```json
-"openace-mcp": {
-  "args": [
-    "run",
-    "github.com/AoManoh/openace-mcp/cmd/openace-mcp@main"
-  ],
-  "command": "go",
-  "disabled": false,
-  "env": {
-    "GOPROXY": "https://goproxy.cn,direct",
-    "GOSUMDB": "sum.golang.google.cn",
-    "OPENACE_DAEMON_ADDR": "127.0.0.1:8765",
-    "OPENACE_DAEMON_TOKEN": "change-me-local-token"
-  }
-}
-```
-
-如果不设置 `OPENACE_DAEMON_TOKEN`，daemon 和 shim 两边都删掉这个变量即可。默认 daemon 只允许监听 loopback 地址；不要把它直接暴露到公网。
+auto 模式会先连接 `OPENACE_DAEMON_ADDR`，其次使用 `OPENACE_DAEMON_LISTEN_ADDR`，默认是 `127.0.0.1:8765`；如果没有现成 daemon，就自动启动当前 `openace-mcp` 二进制的内部 daemon 子进程。daemon 默认只允许 loopback 监听，不要把它直接暴露到公网。
 
 ## 本地安装方式
 
@@ -129,7 +98,6 @@ go run github.com/AoManoh/openace-mcp/cmd/openace-daemon@main
 
 ```bash
 GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/openace-mcp@main
-GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/openace-daemon@main
 ```
 
 然后把 MCP 配置改成：
@@ -140,13 +108,44 @@ GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/
   "args": [],
   "disabled": false,
   "env": {
-    "OPENACE_DAEMON_ADDR": "127.0.0.1:8765",
-    "OPENACE_DAEMON_TOKEN": "change-me-local-token"
+    "AUGMENT_TOKEN": "your-augment-token",
+    "AUGMENT_TENANT": "https://<your-tenant>.api.augmentcode.com/",
+    "OPENACE_MODE": "auto"
   }
 }
 ```
 
 如果 AI IDE 找不到命令，把 `command` 改成绝对路径。例如 Linux/macOS 用 `/home/you/go/bin/openace-mcp`，Windows 用 `C:\Users\you\go\bin\openace-mcp.exe`。AI IDE 不会自动展开 `$HOME` 或 `%USERPROFILE%`。
+
+## 高级模式
+
+### direct
+
+只想做 smoke test 或排查 daemon 问题时，可以设置：
+
+```json
+"OPENACE_MODE": "direct"
+```
+
+此时只会暴露同步工具，不会暴露 `start_*`、`task_status`、`list_tasks`、`list_workspaces` 等 daemon 工具。
+
+### manual-daemon
+
+如果你要自己用 systemd、终端、远程机器或固定端口管理 daemon，可以先启动：
+
+```bash
+export AUGMENT_TOKEN="your-augment-token"
+export AUGMENT_TENANT="https://<your-tenant>.api.augmentcode.com/"
+export OPENACE_DAEMON_LISTEN_ADDR="127.0.0.1:8765"
+openace-mcp daemon
+```
+
+然后在 MCP 配置里设置：
+
+```json
+"OPENACE_MODE": "manual-daemon",
+"OPENACE_DAEMON_ADDR": "127.0.0.1:8765"
+```
 
 ## MCP 工具
 
@@ -181,11 +180,13 @@ GOPROXY=https://goproxy.cn,direct go install github.com/AoManoh/openace-mcp/cmd/
 | `AUGMENT_TENANT` | 上游 ACE tenant/base URL |
 | `AUGMENT_SESSION_AUTH` | 完整 session JSON，优先级最高 |
 | `OPENACE_SESSION_FILE` | 显式 session 文件路径 |
+| `OPENACE_MODE` | `auto` / `direct` / `manual-daemon`，默认 `auto` |
 | `OPENACE_CACHE_DIR` | workspace checkpoint/cache 目录，省略时走 `os.UserCacheDir()`；支持 `~/`、`$HOME`、`${HOME}`、`%USERPROFILE%` 占位符，但仍推荐绝对路径 |
 | `OPENACE_CACHE_NAMESPACE` | cache 命名空间，用于隔离账号、tenant 或测试批次 |
 | `OPENACE_DAEMON_ADDR` | MCP shim 连接 daemon 的地址 |
 | `OPENACE_DAEMON_LISTEN_ADDR` | daemon 监听地址，默认 `127.0.0.1:8765` |
 | `OPENACE_DAEMON_TOKEN` | 可选本地 bearer token |
+| `OPENACE_DAEMON_START_TIMEOUT` | auto 模式等待托管 daemon ready 的时间，默认 `10s` |
 | `OPENACE_TASK_WORKERS` | daemon 异步任务 worker 数，默认 `4`，最大 `32` |
 | `OPENACE_TASK_STORE_DIR` | daemon 任务快照目录；默认位于 `OPENACE_CACHE_DIR/tasks/<namespace>` 或用户 cache 目录 |
 | `OPENACE_ALLOW_REMOTE_DAEMON` | 显式允许监听非 loopback 地址 |

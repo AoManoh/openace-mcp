@@ -32,6 +32,20 @@ func NewClient(addr string) *Client {
 	}
 }
 
+func (c *Client) Health(ctx context.Context) error {
+	var result struct {
+		Status  string `json:"status"`
+		Service string `json:"service"`
+	}
+	if err := c.get(ctx, "/healthz", &result); err != nil {
+		return err
+	}
+	if result.Status != "ok" || result.Service != "openace-daemon" {
+		return fmt.Errorf("daemon /healthz returned unexpected service %q with status %q", result.Service, result.Status)
+	}
+	return nil
+}
+
 func (c *Client) Sync(ctx context.Context, dir string) (workspace.Result, error) {
 	var result workspace.Result
 	err := c.post(ctx, "/v1/sync", syncRequest{DirectoryPath: dir}, &result)
