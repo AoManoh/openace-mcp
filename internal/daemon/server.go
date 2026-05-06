@@ -400,7 +400,7 @@ func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, query stri
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := s.syncer.Retrieve(ctx, dir, query, maxOutputLen)
+			result, err := s.runRetrieve(ctx, dir, query, maxOutputLen)
 			results[i].result = result
 			results[i].err = err
 		}()

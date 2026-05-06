@@ -285,6 +285,41 @@ func TestServerWorkspaceStatusIncludesWatchDiagnosticsForSeenWorkspace(t *testin
 	}
 }
 
+func TestServerMultiRetrieveRegistersWatchDiagnostics(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_WATCH_MODE", "seen")
+	t.Setenv("OPENACE_WATCH_DEBOUNCE", "1h")
+	server := newDaemonHTTPTestServer(t, fakeWatchWorkspaceSyncer{})
+
+	task := postTask(t, server.URL, TaskRequest{
+		Kind:               TaskKindMultiRetrieve,
+		DirectoryPaths:     []string{"/tmp/project", "/tmp/other"},
+		InformationRequest: "find shared code",
+	})
+	pollHTTPTask(t, server.URL, task.ID, TaskStateCompleted)
+
+	payload, err := json.Marshal(workspaceStatusRequest{DirectoryPath: "/tmp/project"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(server.URL+"/v1/workspace/status", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status response: %s", resp.Status)
+	}
+	var status workspace.WorkspaceStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatal(err)
+	}
+	if !status.WatchEnabled || !status.WatchScheduled {
+		t.Fatalf("multi retrieve should register workspace with watcher: %+v", status)
+	}
+}
+
 func TestServerCompletesMultiRetrieveTask(t *testing.T) {
 	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "")
