@@ -53,7 +53,7 @@ func NewServer(syncer Syncer) *Server {
 		syncer:    syncer,
 		authToken: strings.TrimSpace(os.Getenv("OPENACE_DAEMON_TOKEN")),
 	}
-	server.tasks = NewTaskStore(server.runTask, defaultTaskQueueSize)
+	server.tasks = NewTaskStore(server.runTask, 0)
 	return server
 }
 
@@ -64,6 +64,11 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 	if err := validateListenAddr(addr); err != nil {
 		return err
 	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = s.Shutdown(shutdownCtx)
+	}()
 	httpServer := &http.Server{
 		Addr:              addr,
 		Handler:           s.routes(),
@@ -89,6 +94,13 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		}
 		return err
 	}
+}
+
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s.tasks == nil {
+		return nil
+	}
+	return s.tasks.Shutdown(ctx)
 }
 
 func validateListenAddr(addr string) error {
@@ -270,6 +282,10 @@ func (s *Server) tasksCollection(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusTooManyRequests, err.Error())
 			return
 		}
+		if errors.Is(err, ErrTaskStoreClosed) {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -368,13 +384,18 @@ func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, query stri
 	if err := ctx.Err(); err != nil {
 		return workspace.Result{}, err
 	}
-	return aggregateMultiRetrieveResults(results), nil
+	result, successCount := aggregateMultiRetrieveResults(results)
+	if successCount == 0 {
+		return workspace.Result{}, fmt.Errorf("all workspace retrievals failed\n\n%s", strings.TrimSpace(result.Text))
+	}
+	return result, nil
 }
 
-func aggregateMultiRetrieveResults(results []multiRetrieveResult) workspace.Result {
+func aggregateMultiRetrieveResults(results []multiRetrieveResult) (workspace.Result, int) {
 	var out strings.Builder
 	out.WriteString("Cross-workspace retrieval results")
 	aggregate := workspace.Result{Text: ""}
+	successCount := 0
 	for _, item := range results {
 		out.WriteString("\n\n## ")
 		out.WriteString(item.directoryPath)
@@ -388,6 +409,7 @@ func aggregateMultiRetrieveResults(results []multiRetrieveResult) workspace.Resu
 		if text == "" {
 			text = "No relevant code sections were found."
 		}
+		successCount++
 		out.WriteString(text)
 		out.WriteString("\n\n")
 		out.WriteString(item.result.Summary())
@@ -397,7 +419,7 @@ func aggregateMultiRetrieveResults(results []multiRetrieveResult) workspace.Resu
 		aggregate.Deleted += item.result.Deleted
 	}
 	aggregate.Text = out.String()
-	return aggregate
+	return aggregate, successCount
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

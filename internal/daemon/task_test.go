@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -22,6 +23,7 @@ func TestTaskStoreCompletesRetrieveTask(t *testing.T) {
 		}
 		return workspace.Result{Text: "result", FileCount: 3}, nil
 	}, 2)
+	cleanupTaskStore(t, store)
 
 	task, err := store.Submit(TaskRequest{
 		Kind:               "retrieve",
@@ -52,6 +54,7 @@ func TestTaskStoreCompletesMultiRetrieveTask(t *testing.T) {
 		}
 		return workspace.Result{Text: "multi result", FileCount: 5}, nil
 	}, 2)
+	cleanupTaskStore(t, store)
 
 	task, err := store.Submit(TaskRequest{
 		Kind:               "multi_codebase_retrieval",
@@ -79,6 +82,7 @@ func TestTaskStoreRejectsTooManyMultiRetrievePaths(t *testing.T) {
 	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
 		return workspace.Result{}, nil
 	}, 2)
+	cleanupTaskStore(t, store)
 	paths := make([]string, MaxMultiWorkspacePaths+1)
 	for i := range paths {
 		paths[i] = "/tmp/workspace"
@@ -100,6 +104,7 @@ func TestTaskStoreCancelsRunningTask(t *testing.T) {
 		<-ctx.Done()
 		return workspace.Result{}, ctx.Err()
 	}, 1)
+	cleanupTaskStore(t, store)
 
 	task, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/workspace"})
 	if err != nil {
@@ -125,6 +130,7 @@ func TestTaskStoreListsNewestTasksFirst(t *testing.T) {
 	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
 		return workspace.Result{}, nil
 	}, 4)
+	cleanupTaskStore(t, store)
 
 	first, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/one"})
 	if err != nil {
@@ -153,6 +159,7 @@ func TestTaskStoreListOmitsResultText(t *testing.T) {
 	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
 		return workspace.Result{Text: "large retrieval text", FileCount: 1}, nil
 	}, 2)
+	cleanupTaskStore(t, store)
 
 	task, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/workspace"})
 	if err != nil {
@@ -211,6 +218,7 @@ func TestTaskStoreRunsTasksConcurrently(t *testing.T) {
 		mu.Unlock()
 		return workspace.Result{FileCount: 1}, nil
 	}, 4, 2)
+	cleanupTaskStore(t, store)
 
 	first, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/one"})
 	if err != nil {
@@ -241,6 +249,85 @@ func TestTaskStoreRunsTasksConcurrently(t *testing.T) {
 	}
 }
 
+func TestTaskStoreShutdownCancelsRunningTasksAndRejectsSubmit(t *testing.T) {
+	useTempTaskStore(t)
+	started := make(chan struct{})
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+		close(started)
+		<-ctx.Done()
+		return workspace.Result{}, ctx.Err()
+	}, 1)
+
+	task, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/workspace"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("task did not start")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := store.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := store.Get(task.ID)
+	if !ok {
+		t.Fatal("task should still be retained after shutdown")
+	}
+	if got.State != TaskStateCancelled || got.Error != "shutdown" {
+		t.Fatalf("running task should be cancelled by shutdown: %+v", got)
+	}
+	if _, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/other"}); !errors.Is(err, ErrTaskStoreClosed) {
+		t.Fatalf("submit after shutdown error = %v, want %v", err, ErrTaskStoreClosed)
+	}
+}
+
+func TestTaskStorePersistsShutdownCancelledTasksBeyondHistoryLimit(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_TASK_HISTORY_LIMIT", "1")
+	started := make(chan struct{}, 2)
+	store := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		return workspace.Result{}, ctx.Err()
+	}, 2, 2)
+
+	first, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("tasks did not start")
+		}
+	}
+
+	shutdownTaskStore(t, store)
+	recovered := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+		t.Fatal("shutdown-cancelled task should not run")
+		return workspace.Result{}, nil
+	}, 2, 1)
+	cleanupTaskStore(t, recovered)
+	for _, id := range []string{first.ID, second.ID} {
+		got, ok := recovered.Get(id)
+		if !ok {
+			t.Fatalf("task %s was dropped from persisted manifest", id)
+		}
+		if got.State != TaskStateCancelled || got.Error != "shutdown" {
+			t.Fatalf("unexpected recovered task %s: %+v", id, got)
+		}
+	}
+}
+
 func TestTaskWorkerCountEnvironment(t *testing.T) {
 	useTempTaskStore(t)
 	t.Setenv("OPENACE_TASK_WORKERS", "7")
@@ -261,11 +348,60 @@ func TestTaskWorkerCountEnvironment(t *testing.T) {
 	}
 }
 
+func TestTaskQueueSizeEnvironment(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_TASK_QUEUE_SIZE", "")
+	if got := taskQueueSize(); got != defaultTaskQueueSize {
+		t.Fatalf("default queue size = %d", got)
+	}
+	t.Setenv("OPENACE_TASK_QUEUE_SIZE", "512")
+	if got := taskQueueSize(); got != 512 {
+		t.Fatalf("custom queue size = %d", got)
+	}
+	t.Setenv("OPENACE_TASK_QUEUE_SIZE", "0")
+	if got := taskQueueSize(); got != defaultTaskQueueSize {
+		t.Fatalf("zero queue size should use default, got %d", got)
+	}
+	t.Setenv("OPENACE_TASK_QUEUE_SIZE", "100000")
+	if got := taskQueueSize(); got != maxTaskQueueSize {
+		t.Fatalf("queue size should be capped, got %d", got)
+	}
+	t.Setenv("OPENACE_TASK_QUEUE_SIZE", "not-a-number")
+	if got := taskQueueSize(); got != defaultTaskQueueSize {
+		t.Fatalf("invalid queue size should use default, got %d", got)
+	}
+}
+
+func TestTaskHistoryLimitEnvironment(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_TASK_HISTORY_LIMIT", "")
+	if got := taskHistoryLimit(); got != defaultTaskHistoryLimit {
+		t.Fatalf("default history limit = %d", got)
+	}
+	t.Setenv("OPENACE_TASK_HISTORY_LIMIT", "2048")
+	if got := taskHistoryLimit(); got != 2048 {
+		t.Fatalf("custom history limit = %d", got)
+	}
+	t.Setenv("OPENACE_TASK_HISTORY_LIMIT", "0")
+	if got := taskHistoryLimit(); got != defaultTaskHistoryLimit {
+		t.Fatalf("zero history limit should use default, got %d", got)
+	}
+	t.Setenv("OPENACE_TASK_HISTORY_LIMIT", "100000")
+	if got := taskHistoryLimit(); got != maxTaskHistoryLimit {
+		t.Fatalf("history limit should be capped, got %d", got)
+	}
+	t.Setenv("OPENACE_TASK_HISTORY_LIMIT", "not-a-number")
+	if got := taskHistoryLimit(); got != defaultTaskHistoryLimit {
+		t.Fatalf("invalid history limit should use default, got %d", got)
+	}
+}
+
 func TestTaskStorePersistsCompletedTasks(t *testing.T) {
 	dir := useTempTaskStore(t)
 	store := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
 		return workspace.Result{Text: "persisted result", FileCount: 9}, nil
 	}, 2, 1)
+	cleanupTaskStore(t, store)
 
 	task, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/workspace"})
 	if err != nil {
@@ -275,6 +411,7 @@ func TestTaskStorePersistsCompletedTasks(t *testing.T) {
 	if completed.Result == nil {
 		t.Fatal("completed task should include result")
 	}
+	shutdownTaskStore(t, store)
 
 	if _, err := os.Stat(filepath.Join(dir, "tasks.json")); err != nil {
 		t.Fatal(err)
@@ -284,6 +421,7 @@ func TestTaskStorePersistsCompletedTasks(t *testing.T) {
 		t.Fatal("recovered terminal task should not run")
 		return workspace.Result{}, nil
 	}, 2, 1)
+	cleanupTaskStore(t, recovered)
 	got, ok := recovered.Get(task.ID)
 	if !ok {
 		t.Fatalf("recovered task %s not found", task.ID)
@@ -316,6 +454,7 @@ func TestTaskStoreMarksRunningTaskAbandonedOnRestart(t *testing.T) {
 		t.Fatal("abandoned task should not run")
 		return workspace.Result{}, nil
 	}, 2, 1)
+	cleanupTaskStore(t, recovered)
 	got, ok := recovered.Get(task.ID)
 	if !ok {
 		t.Fatalf("recovered task %s not found", task.ID)
@@ -332,6 +471,28 @@ func useTempTaskStore(t *testing.T) string {
 	t.Setenv("OPENACE_CACHE_DIR", "")
 	t.Setenv("OPENACE_CACHE_NAMESPACE", "test")
 	return dir
+}
+
+func cleanupTaskStore(t *testing.T, store *TaskStore) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := shutdownTaskStoreErr(store); err != nil {
+			t.Errorf("shutdown task store: %v", err)
+		}
+	})
+}
+
+func shutdownTaskStore(t *testing.T, store *TaskStore) {
+	t.Helper()
+	if err := shutdownTaskStoreErr(store); err != nil {
+		t.Fatalf("shutdown task store: %v", err)
+	}
+}
+
+func shutdownTaskStoreErr(store *TaskStore) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return store.Shutdown(ctx)
 }
 
 func waitForTaskState(t *testing.T, store *TaskStore, id string, want TaskState) TaskSnapshot {

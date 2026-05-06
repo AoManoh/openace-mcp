@@ -19,8 +19,10 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
-const defaultTaskQueueSize = 16
-const defaultTaskHistoryLimit = 128
+const defaultTaskQueueSize = 256
+const maxTaskQueueSize = 4096
+const defaultTaskHistoryLimit = 1024
+const maxTaskHistoryLimit = 8192
 const defaultTaskWorkerCount = 4
 const maxTaskWorkerCount = 32
 const MaxMultiWorkspacePaths = 8
@@ -69,12 +71,18 @@ type TaskSnapshot struct {
 type TaskRunner func(context.Context, TaskRequest) (workspace.Result, error)
 
 type TaskStore struct {
-	mu          sync.Mutex
-	runner      TaskRunner
-	queue       chan string
-	tasks       map[string]*taskRecord
-	workerCount int
-	storeDir    string
+	mu              sync.Mutex
+	runner          TaskRunner
+	queue           chan string
+	tasks           map[string]*taskRecord
+	workerCount     int
+	storeDir        string
+	closed          bool
+	workers         sync.WaitGroup
+	persistCh       chan struct{}
+	persistStop     chan struct{}
+	persistStopOnce sync.Once
+	persistWorkers  sync.WaitGroup
 }
 
 type taskRecord struct {
@@ -84,14 +92,18 @@ type taskRecord struct {
 }
 
 var ErrTaskQueueFull = errors.New("task queue is full")
+var ErrTaskStoreClosed = errors.New("task store is shut down")
 
 func NewTaskStore(runner TaskRunner, queueSize int) *TaskStore {
+	if queueSize <= 0 {
+		queueSize = taskQueueSize()
+	}
 	return NewTaskStoreWithWorkers(runner, queueSize, taskWorkerCount())
 }
 
 func NewTaskStoreWithWorkers(runner TaskRunner, queueSize int, workerCount int) *TaskStore {
 	if queueSize <= 0 {
-		queueSize = defaultTaskQueueSize
+		queueSize = taskQueueSize()
 	}
 	workerCount = normalizeTaskWorkerCount(workerCount)
 	store := &TaskStore{
@@ -102,7 +114,9 @@ func NewTaskStoreWithWorkers(runner TaskRunner, queueSize int, workerCount int) 
 		storeDir:    taskStoreDir(),
 	}
 	store.loadPersisted()
+	store.startPersister()
 	for i := 0; i < workerCount; i++ {
+		store.workers.Add(1)
 		go store.worker()
 	}
 	return store
@@ -120,6 +134,21 @@ func taskWorkerCount() int {
 	return normalizeTaskWorkerCount(parsed)
 }
 
+func taskQueueSize() int {
+	value := strings.TrimSpace(os.Getenv("OPENACE_TASK_QUEUE_SIZE"))
+	if value == "" {
+		return defaultTaskQueueSize
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return defaultTaskQueueSize
+	}
+	if parsed > maxTaskQueueSize {
+		return maxTaskQueueSize
+	}
+	return parsed
+}
+
 func normalizeTaskWorkerCount(value int) int {
 	if value <= 0 {
 		return defaultTaskWorkerCount
@@ -128,6 +157,21 @@ func normalizeTaskWorkerCount(value int) int {
 		return maxTaskWorkerCount
 	}
 	return value
+}
+
+func taskHistoryLimit() int {
+	value := strings.TrimSpace(os.Getenv("OPENACE_TASK_HISTORY_LIMIT"))
+	if value == "" {
+		return defaultTaskHistoryLimit
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return defaultTaskHistoryLimit
+	}
+	if parsed > maxTaskHistoryLimit {
+		return maxTaskHistoryLimit
+	}
+	return parsed
 }
 
 func (s *TaskStore) WorkerCount() int {
@@ -158,17 +202,19 @@ func (s *TaskStore) Submit(req TaskRequest) (TaskSnapshot, error) {
 	}
 
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return TaskSnapshot{}, ErrTaskStoreClosed
+	}
 	s.tasks[id] = record
-	s.pruneLocked(defaultTaskHistoryLimit)
+	s.pruneLocked(taskHistoryLimit())
 	s.persistLocked()
 	snapshot := cloneTask(record.snapshot)
-	s.mu.Unlock()
-
 	select {
 	case s.queue <- id:
+		s.mu.Unlock()
 		return snapshot, nil
 	default:
-		s.mu.Lock()
 		delete(s.tasks, id)
 		s.persistLocked()
 		s.mu.Unlock()
@@ -212,7 +258,7 @@ func (s *TaskStore) pruneLocked(max int) {
 	}
 	var terminals []terminalTask
 	for id, record := range s.tasks {
-		if isTerminal(record.snapshot.State) {
+		if isPrunableTask(record.snapshot) {
 			terminals = append(terminals, terminalTask{id: id, submittedAt: record.snapshot.SubmittedAt})
 		}
 	}
@@ -248,6 +294,7 @@ func (s *TaskStore) Cancel(id string) (TaskSnapshot, bool) {
 }
 
 func (s *TaskStore) worker() {
+	defer s.workers.Done()
 	for id := range s.queue {
 		record, ctx, ok := s.start(id)
 		if !ok {
@@ -255,6 +302,45 @@ func (s *TaskStore) worker() {
 		}
 		result, err := s.runner(ctx, record.request)
 		s.finish(id, result, err)
+	}
+}
+
+func (s *TaskStore) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	if !s.closed {
+		s.closed = true
+		close(s.queue)
+		now := time.Now().UTC()
+		for _, record := range s.tasks {
+			if isTerminal(record.snapshot.State) {
+				continue
+			}
+			if record.cancel != nil {
+				record.cancel()
+				record.cancel = nil
+			}
+			record.snapshot.State = TaskStateCancelled
+			record.snapshot.CompletedAt = &now
+			record.snapshot.Error = "shutdown"
+		}
+		s.persistNowLocked()
+	}
+	s.mu.Unlock()
+
+	if err := s.stopPersister(ctx); err != nil {
+		return err
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -301,6 +387,68 @@ func (s *TaskStore) finish(id string, result workspace.Result, err error) {
 	s.persistLocked()
 }
 
+func (s *TaskStore) startPersister() {
+	if s.storeDir == "" {
+		return
+	}
+	s.persistCh = make(chan struct{}, 1)
+	s.persistStop = make(chan struct{})
+	s.persistWorkers.Add(1)
+	go s.persistWorker()
+}
+
+func (s *TaskStore) stopPersister(ctx context.Context) error {
+	if s.persistStop == nil {
+		return nil
+	}
+	s.persistStopOnce.Do(func() {
+		close(s.persistStop)
+	})
+	done := make(chan struct{})
+	go func() {
+		s.persistWorkers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *TaskStore) persistWorker() {
+	defer s.persistWorkers.Done()
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	pending := false
+	for {
+		select {
+		case <-s.persistCh:
+			if !pending {
+				pending = true
+				timer.Reset(25 * time.Millisecond)
+			}
+		case <-timer.C:
+			s.persistNow()
+			pending = false
+		case <-s.persistStop:
+			if pending {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			}
+			s.persistNow()
+			return
+		}
+	}
+}
+
 type taskManifest struct {
 	Tasks []TaskSnapshot `json:"tasks"`
 }
@@ -335,7 +483,7 @@ func (s *TaskStore) loadPersisted() {
 			snapshot: snapshot,
 		}
 	}
-	s.pruneLocked(defaultTaskHistoryLimit)
+	s.pruneLocked(taskHistoryLimit())
 	s.persistLocked()
 }
 
@@ -343,19 +491,67 @@ func (s *TaskStore) persistLocked() {
 	if s.storeDir == "" {
 		return
 	}
-	tasks := make([]TaskSnapshot, 0, len(s.tasks))
-	for _, record := range s.tasks {
-		tasks = append(tasks, cloneTask(record.snapshot))
+	if s.persistCh != nil {
+		select {
+		case s.persistCh <- struct{}{}:
+		default:
+		}
+		return
 	}
+	s.persistNowLocked()
+}
+
+func (s *TaskStore) persistNow() {
+	if s.storeDir == "" {
+		return
+	}
+	s.mu.Lock()
+	manifest := s.manifestLocked()
+	s.mu.Unlock()
+	_ = saveTaskManifest(s.storeDir, manifest)
+}
+
+func (s *TaskStore) persistNowLocked() {
+	if s.storeDir == "" {
+		return
+	}
+	_ = saveTaskManifest(s.storeDir, s.manifestLocked())
+}
+
+func (s *TaskStore) manifestLocked() taskManifest {
+	protected := make([]TaskSnapshot, 0, len(s.tasks))
+	prunable := make([]TaskSnapshot, 0, len(s.tasks))
+	for _, record := range s.tasks {
+		snapshot := cloneTask(record.snapshot)
+		if isPrunableTask(snapshot) {
+			prunable = append(prunable, snapshot)
+			continue
+		}
+		protected = append(protected, snapshot)
+	}
+	sort.Slice(prunable, func(i, j int) bool {
+		return prunable[i].SubmittedAt.After(prunable[j].SubmittedAt)
+	})
+	limit := taskHistoryLimit()
+	if remaining := limit - len(protected); remaining < len(prunable) {
+		if remaining <= 0 {
+			prunable = nil
+		} else {
+			prunable = prunable[:remaining]
+		}
+	}
+	tasks := append(protected, prunable...)
 	sort.Slice(tasks, func(i, j int) bool {
 		return tasks[i].SubmittedAt.After(tasks[j].SubmittedAt)
 	})
-	if len(tasks) > defaultTaskHistoryLimit {
-		tasks = tasks[:defaultTaskHistoryLimit]
+	return taskManifest{Tasks: tasks}
+}
+
+func isPrunableTask(snapshot TaskSnapshot) bool {
+	if !isTerminal(snapshot.State) {
+		return false
 	}
-	if err := saveTaskManifest(s.storeDir, taskManifest{Tasks: tasks}); err != nil {
-		return
-	}
+	return snapshot.Error != "shutdown" && snapshot.Error != "abandoned after daemon restart"
 }
 
 func saveTaskManifest(dir string, manifest taskManifest) error {

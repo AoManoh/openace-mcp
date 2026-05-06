@@ -51,8 +51,7 @@ func (fakeWorkspaceSyncer) WorkspaceStatus(ctx context.Context, dir string) (wor
 func TestServerTaskLifecycle(t *testing.T) {
 	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "")
-	server := httptest.NewServer(NewServer(fakeSyncer{}).routes())
-	defer server.Close()
+	server := newDaemonHTTPTestServer(t, fakeSyncer{})
 
 	task := postTask(t, server.URL, TaskRequest{
 		Kind:               TaskKindRetrieve,
@@ -75,8 +74,7 @@ func TestServerTaskLifecycle(t *testing.T) {
 func TestServerListsTasks(t *testing.T) {
 	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "")
-	server := httptest.NewServer(NewServer(fakeSyncer{}).routes())
-	defer server.Close()
+	server := newDaemonHTTPTestServer(t, fakeSyncer{})
 
 	first := postTask(t, server.URL, TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/one"})
 	second := postTask(t, server.URL, TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/two"})
@@ -109,8 +107,7 @@ func TestServerListsTasks(t *testing.T) {
 func TestServerOptionalBearerAuth(t *testing.T) {
 	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "local-test-token")
-	server := httptest.NewServer(NewServer(fakeSyncer{}).routes())
-	defer server.Close()
+	server := newDaemonHTTPTestServer(t, fakeSyncer{})
 
 	resp, err := http.Get(server.URL + "/healthz")
 	if err != nil {
@@ -161,8 +158,7 @@ func TestServerAllowsConcurrentSyncRequests(t *testing.T) {
 	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "")
 	syncer := newConcurrentSyncer()
-	server := httptest.NewServer(NewServer(syncer).routes())
-	defer server.Close()
+	server := newDaemonHTTPTestServer(t, syncer)
 
 	var wg sync.WaitGroup
 	errs := make(chan error, 2)
@@ -188,8 +184,7 @@ func TestServerAllowsConcurrentSyncRequests(t *testing.T) {
 func TestServerWorkspaceStatus(t *testing.T) {
 	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "")
-	server := httptest.NewServer(NewServer(fakeWorkspaceSyncer{}).routes())
-	defer server.Close()
+	server := newDaemonHTTPTestServer(t, fakeWorkspaceSyncer{})
 
 	resp, err := http.Get(server.URL + "/v1/workspaces")
 	if err != nil {
@@ -233,8 +228,7 @@ func TestServerWorkspaceStatus(t *testing.T) {
 func TestServerCompletesMultiRetrieveTask(t *testing.T) {
 	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "")
-	server := httptest.NewServer(NewServer(fakeSyncer{}).routes())
-	defer server.Close()
+	server := newDaemonHTTPTestServer(t, fakeSyncer{})
 
 	task := postTask(t, server.URL, TaskRequest{
 		Kind:               TaskKindMultiRetrieve,
@@ -254,6 +248,40 @@ func TestServerCompletesMultiRetrieveTask(t *testing.T) {
 	if len(completed.DirectoryPaths) != 2 {
 		t.Fatalf("task should retain directory paths: %+v", completed)
 	}
+}
+
+func TestServerFailsMultiRetrieveTaskWhenAllWorkspacesFail(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	server := newDaemonHTTPTestServer(t, fakeSyncer{})
+
+	task := postTask(t, server.URL, TaskRequest{
+		Kind:               TaskKindMultiRetrieve,
+		DirectoryPaths:     []string{"/tmp/bad-one", "/tmp/bad-two"},
+		InformationRequest: "find shared code",
+	})
+	failed := pollHTTPTask(t, server.URL, task.ID, TaskStateFailed)
+	if !strings.Contains(failed.Error, "all workspace retrievals failed") {
+		t.Fatalf("all-failed multi retrieve should fail task: %+v", failed)
+	}
+	if !strings.Contains(failed.Error, "/tmp/bad-one") || !strings.Contains(failed.Error, "/tmp/bad-two") {
+		t.Fatalf("failure should retain workspace diagnostics: %+v", failed)
+	}
+}
+
+func newDaemonHTTPTestServer(t *testing.T, syncer Syncer) *httptest.Server {
+	t.Helper()
+	openace := NewServer(syncer)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := openace.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown daemon server: %v", err)
+		}
+	})
+	server := httptest.NewServer(openace.routes())
+	t.Cleanup(server.Close)
+	return server
 }
 
 func postTask(t *testing.T, baseURL string, req TaskRequest) TaskSnapshot {
