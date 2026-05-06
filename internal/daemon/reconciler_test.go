@@ -37,6 +37,9 @@ func TestWorkspaceReconcilerSyncsChangedSeenWorkspace(t *testing.T) {
 	if !status.WatchEnabled {
 		t.Fatalf("unexpected watch status after successful background sync: %+v", status)
 	}
+	if !status.WatchScheduled || status.WatchRunning {
+		t.Fatalf("successful background sync should be scheduled but not running: %+v", status)
+	}
 	if status.LastWatchAt == nil || status.LastBackgroundSyncAt == nil {
 		t.Fatalf("watch status should expose timestamps: %+v", status)
 	}
@@ -77,7 +80,7 @@ func TestWorkspaceReconcilerBacksOffAfterProbeError(t *testing.T) {
 
 	status := workspace.WorkspaceStatus{DirectoryPath: "/tmp/project"}
 	reconciler.Decorate(&status)
-	if !status.WatchEnabled || !status.WatchPending {
+	if !status.WatchEnabled || !status.WatchScheduled {
 		t.Fatalf("failed probe should leave watch pending: %+v", status)
 	}
 	if !strings.Contains(status.WatchError, "probe failed") {

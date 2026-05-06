@@ -90,7 +90,8 @@ type WorkspaceStatus struct {
 	LastAdded            int        `json:"last_added,omitempty"`
 	LastDeleted          int        `json:"last_deleted,omitempty"`
 	WatchEnabled         bool       `json:"watch_enabled,omitempty"`
-	WatchPending         bool       `json:"watch_pending,omitempty"`
+	WatchScheduled       bool       `json:"watch_scheduled,omitempty"`
+	WatchRunning         bool       `json:"watch_running,omitempty"`
 	LastError            string     `json:"last_error,omitempty"`
 	WatchError           string     `json:"watch_error,omitempty"`
 	LastStartedAt        *time.Time `json:"last_started_at,omitempty"`

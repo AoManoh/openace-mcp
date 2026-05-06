@@ -280,7 +280,7 @@ func TestServerWorkspaceStatusIncludesWatchDiagnosticsForSeenWorkspace(t *testin
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
 		t.Fatal(err)
 	}
-	if !status.WatchEnabled || !status.WatchPending || status.NextWatchAt == nil {
+	if !status.WatchEnabled || !status.WatchScheduled || status.WatchRunning || status.NextWatchAt == nil {
 		t.Fatalf("workspace status should include watch diagnostics: %+v", status)
 	}
 }

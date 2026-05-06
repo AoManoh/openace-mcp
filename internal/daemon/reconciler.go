@@ -140,7 +140,8 @@ func (r *workspaceReconciler) Decorate(status *workspace.WorkspaceStatus) {
 		return
 	}
 	status.WatchEnabled = true
-	status.WatchPending = state.pending || state.running
+	status.WatchScheduled = state.pending && state.nextWatchAt != nil
+	status.WatchRunning = state.running
 	status.WatchError = state.lastError
 	status.LastWatchAt = cloneDaemonTime(state.lastWatchAt)
 	status.NextWatchAt = cloneDaemonTime(state.nextWatchAt)
