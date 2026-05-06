@@ -7,14 +7,17 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/daemon"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
 const maxMultiWorkspacePaths = daemon.MaxMultiWorkspacePaths
+const defaultToolTimeout = 110 * time.Second
 
 type Syncer interface {
 	Retrieve(context.Context, string, string, int) (workspace.Result, error)
@@ -163,6 +166,24 @@ func (s *Server) handleNotification(req rpcRequest) {
 	}
 }
 
+func toolTimeoutContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, toolTimeout())
+}
+
+func toolTimeout() time.Duration {
+	value := strings.TrimSpace(os.Getenv("OPENACE_TOOL_TIMEOUT"))
+	if value == "" {
+		return defaultToolTimeout
+	}
+	if parsed, err := time.ParseDuration(value); err == nil && parsed > 0 {
+		return parsed
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return defaultToolTimeout
+}
+
 func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 	var params toolCallParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -180,7 +201,9 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		if args.DirectoryPath == "" {
 			return toolError(req.ID, "directory_path is required")
 		}
-		result, err := s.syncer.Retrieve(ctx, args.DirectoryPath, args.InformationRequest, args.MaxOutputLength)
+		toolCtx, cancel := toolTimeoutContext(ctx)
+		defer cancel()
+		result, err := s.syncer.Retrieve(toolCtx, args.DirectoryPath, args.InformationRequest, args.MaxOutputLength)
 		if err != nil {
 			return toolError(req.ID, err.Error())
 		}
@@ -201,8 +224,17 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		if err != nil {
 			return toolError(req.ID, err.Error())
 		}
-		results := s.retrieveMultiple(ctx, paths, args.InformationRequest, args.MaxOutputLength)
-		return ok(req.ID, toolResult(formatMultiRetrievalResults(results), false))
+		toolCtx, cancel := toolTimeoutContext(ctx)
+		defer cancel()
+		results := s.retrieveMultiple(toolCtx, paths, args.InformationRequest, args.MaxOutputLength)
+		text := formatMultiRetrievalResults(results)
+		if err := toolCtx.Err(); err != nil {
+			return toolError(req.ID, text)
+		}
+		if allMultiRetrievalsFailed(results) {
+			return toolError(req.ID, text)
+		}
+		return ok(req.ID, toolResult(text, false))
 	case "sync_workspace", "sync-workspace":
 		var args syncArgs
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
@@ -211,7 +243,9 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		if args.DirectoryPath == "" {
 			return toolError(req.ID, "directory_path is required")
 		}
-		result, err := s.syncer.Sync(ctx, args.DirectoryPath)
+		toolCtx, cancel := toolTimeoutContext(ctx)
+		defer cancel()
+		result, err := s.syncer.Sync(toolCtx, args.DirectoryPath)
 		if err != nil {
 			return toolError(req.ID, err.Error())
 		}
@@ -431,6 +465,18 @@ func formatMultiRetrievalResults(results []multiRetrievalResult) string {
 		}
 	}
 	return out.String()
+}
+
+func allMultiRetrievalsFailed(results []multiRetrievalResult) bool {
+	if len(results) == 0 {
+		return false
+	}
+	for _, result := range results {
+		if result.Error == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func retrievalTool() map[string]any {

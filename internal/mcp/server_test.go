@@ -38,6 +38,32 @@ func (fakeMultiSyncer) Sync(ctx context.Context, dir string) (workspace.Result, 
 	return workspace.Result{CheckpointID: "checkpoint-" + dir, FileCount: 2}, nil
 }
 
+type blockingToolSyncer struct{}
+
+func (blockingToolSyncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
+	<-ctx.Done()
+	return workspace.Result{}, ctx.Err()
+}
+
+func (blockingToolSyncer) Sync(ctx context.Context, dir string) (workspace.Result, error) {
+	<-ctx.Done()
+	return workspace.Result{}, ctx.Err()
+}
+
+type timeoutMultiSyncer struct{}
+
+func (timeoutMultiSyncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
+	if strings.Contains(dir, "slow") {
+		<-ctx.Done()
+		return workspace.Result{}, ctx.Err()
+	}
+	return workspace.Result{Text: "retrieved from " + dir, CheckpointID: "checkpoint-" + dir, FileCount: 2}, nil
+}
+
+func (timeoutMultiSyncer) Sync(ctx context.Context, dir string) (workspace.Result, error) {
+	return workspace.Result{CheckpointID: "checkpoint-" + dir, FileCount: 2}, nil
+}
+
 func (fakeTasker) StartTask(ctx context.Context, req daemon.TaskRequest) (daemon.TaskSnapshot, error) {
 	return daemon.TaskSnapshot{ID: "task-1", Kind: req.Kind, State: daemon.TaskStateQueued, DirectoryPath: req.DirectoryPath, DirectoryPaths: append([]string(nil), req.DirectoryPaths...)}, nil
 }
@@ -170,6 +196,35 @@ func TestMultiCodebaseRetrievalKeepsPartialResults(t *testing.T) {
 	}
 	if strings.Contains(out, `"isError":true`) {
 		t.Fatalf("partial failures should not fail whole tool: %s", out)
+	}
+}
+
+func TestMultiCodebaseRetrievalReportsAllFailuresAsToolError(t *testing.T) {
+	out := runMCP(t, NewServer(fakeMultiSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"multi_codebase_retrieval","arguments":{"directory_paths":["/tmp/bad-one","/tmp/bad-two"],"information_request":"find shared auth code"}}}`)
+	if !strings.Contains(out, "/tmp/bad-one") || !strings.Contains(out, "/tmp/bad-two") {
+		t.Fatalf("multi retrieval should include every failed workspace: %s", out)
+	}
+	if !strings.Contains(out, "workspace failed") || !strings.Contains(out, `"isError":true`) {
+		t.Fatalf("all failures should return tool error: %s", out)
+	}
+}
+
+func TestCodebaseRetrievalToolAppliesTimeout(t *testing.T) {
+	t.Setenv("OPENACE_TOOL_TIMEOUT", "10ms")
+	out := runMCP(t, NewServer(blockingToolSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"/tmp/workspace","information_request":"find code"}}}`)
+	if !strings.Contains(out, "context deadline exceeded") || !strings.Contains(out, `"isError":true`) {
+		t.Fatalf("timeout should return tool error: %s", out)
+	}
+}
+
+func TestMultiCodebaseRetrievalTimeoutReportsToolErrorEvenWithPartialResults(t *testing.T) {
+	t.Setenv("OPENACE_TOOL_TIMEOUT", "10ms")
+	out := runMCP(t, NewServer(timeoutMultiSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"multi_codebase_retrieval","arguments":{"directory_paths":["/tmp/fast","/tmp/slow"],"information_request":"find shared code"}}}`)
+	if !strings.Contains(out, "retrieved from /tmp/fast") {
+		t.Fatalf("timeout response should keep partial result: %s", out)
+	}
+	if !strings.Contains(out, "context deadline exceeded") || !strings.Contains(out, `"isError":true`) {
+		t.Fatalf("timeout should return tool error: %s", out)
 	}
 }
 
