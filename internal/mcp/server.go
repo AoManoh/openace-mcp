@@ -207,11 +207,8 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
 			return fail(req.ID, -32602, err.Error())
 		}
-		if args.InformationRequest == "" {
-			return toolError(req.ID, "information_request is required")
-		}
-		if args.DirectoryPath == "" {
-			return toolError(req.ID, "directory_path is required")
+		if err := normalizeRetrievalArgs(&args); err != nil {
+			return toolError(req.ID, err.Error())
 		}
 		toolCtx, cancel := toolTimeoutContext(ctx)
 		defer cancel()
@@ -229,8 +226,13 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
 			return fail(req.ID, -32602, err.Error())
 		}
+		args.InformationRequest = strings.TrimSpace(args.InformationRequest)
+		args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
 		if args.InformationRequest == "" {
 			return toolError(req.ID, "information_request is required")
+		}
+		if err := validateMaxOutputLength(args.MaxOutputLength); err != nil {
+			return toolError(req.ID, err.Error())
 		}
 		paths, err := normalizeDirectoryPaths(args.DirectoryPaths)
 		if err != nil {
@@ -252,6 +254,8 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
 			return fail(req.ID, -32602, err.Error())
 		}
+		args.DirectoryPath = strings.TrimSpace(args.DirectoryPath)
+		args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
 		if args.DirectoryPath == "" {
 			return toolError(req.ID, "directory_path is required")
 		}
@@ -270,16 +274,15 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
 			return fail(req.ID, -32602, err.Error())
 		}
-		if args.InformationRequest == "" {
-			return toolError(req.ID, "information_request is required")
+		if err := normalizeRetrievalArgs(&args); err != nil {
+			return toolError(req.ID, err.Error())
 		}
-		if args.DirectoryPath == "" {
-			return toolError(req.ID, "directory_path is required")
-		}
-		task, err := s.tasker.StartTask(ctx, daemon.TaskRequest{
+		toolCtx, cancel := toolTimeoutContext(ctx)
+		defer cancel()
+		task, err := s.tasker.StartTask(toolCtx, daemon.TaskRequest{
 			Kind:               daemon.TaskKindRetrieve,
 			DirectoryPath:      args.DirectoryPath,
-			ProviderProfileID:  strings.TrimSpace(args.ProviderProfileID),
+			ProviderProfileID:  args.ProviderProfileID,
 			InformationRequest: args.InformationRequest,
 			MaxOutputLength:    args.MaxOutputLength,
 		})
@@ -295,17 +298,24 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
 			return fail(req.ID, -32602, err.Error())
 		}
+		args.InformationRequest = strings.TrimSpace(args.InformationRequest)
+		args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
 		if args.InformationRequest == "" {
 			return toolError(req.ID, "information_request is required")
+		}
+		if err := validateMaxOutputLength(args.MaxOutputLength); err != nil {
+			return toolError(req.ID, err.Error())
 		}
 		paths, err := normalizeDirectoryPaths(args.DirectoryPaths)
 		if err != nil {
 			return toolError(req.ID, err.Error())
 		}
-		task, err := s.tasker.StartTask(ctx, daemon.TaskRequest{
+		toolCtx, cancel := toolTimeoutContext(ctx)
+		defer cancel()
+		task, err := s.tasker.StartTask(toolCtx, daemon.TaskRequest{
 			Kind:               daemon.TaskKindMultiRetrieve,
 			DirectoryPaths:     paths,
-			ProviderProfileID:  strings.TrimSpace(args.ProviderProfileID),
+			ProviderProfileID:  args.ProviderProfileID,
 			InformationRequest: args.InformationRequest,
 			MaxOutputLength:    args.MaxOutputLength,
 		})
@@ -321,13 +331,17 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
 			return fail(req.ID, -32602, err.Error())
 		}
+		args.DirectoryPath = strings.TrimSpace(args.DirectoryPath)
+		args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
 		if args.DirectoryPath == "" {
 			return toolError(req.ID, "directory_path is required")
 		}
-		task, err := s.tasker.StartTask(ctx, daemon.TaskRequest{
+		toolCtx, cancel := toolTimeoutContext(ctx)
+		defer cancel()
+		task, err := s.tasker.StartTask(toolCtx, daemon.TaskRequest{
 			Kind:              daemon.TaskKindSync,
 			DirectoryPath:     args.DirectoryPath,
-			ProviderProfileID: strings.TrimSpace(args.ProviderProfileID),
+			ProviderProfileID: args.ProviderProfileID,
 		})
 		if err != nil {
 			return toolError(req.ID, err.Error())
@@ -341,10 +355,13 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
 			return fail(req.ID, -32602, err.Error())
 		}
+		args.TaskID = strings.TrimSpace(args.TaskID)
 		if args.TaskID == "" {
 			return toolError(req.ID, "task_id is required")
 		}
-		task, err := s.tasker.TaskStatus(ctx, args.TaskID)
+		toolCtx, cancel := toolTimeoutContext(ctx)
+		defer cancel()
+		task, err := s.tasker.TaskStatus(toolCtx, args.TaskID)
 		if err != nil {
 			return toolError(req.ID, err.Error())
 		}
@@ -359,7 +376,9 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 				return fail(req.ID, -32602, err.Error())
 			}
 		}
-		tasks, err := s.tasker.ListTasks(ctx, args.Limit)
+		toolCtx, cancel := toolTimeoutContext(ctx)
+		defer cancel()
+		tasks, err := s.tasker.ListTasks(toolCtx, args.Limit)
 		if err != nil {
 			return toolError(req.ID, err.Error())
 		}
@@ -372,10 +391,13 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
 			return fail(req.ID, -32602, err.Error())
 		}
+		args.TaskID = strings.TrimSpace(args.TaskID)
 		if args.TaskID == "" {
 			return toolError(req.ID, "task_id is required")
 		}
-		task, err := s.tasker.CancelTask(ctx, args.TaskID)
+		toolCtx, cancel := toolTimeoutContext(ctx)
+		defer cancel()
+		task, err := s.tasker.CancelTask(toolCtx, args.TaskID)
 		if err != nil {
 			return toolError(req.ID, err.Error())
 		}
@@ -384,7 +406,9 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		if s.inspector == nil {
 			return toolError(req.ID, "workspace status tools require daemon mode")
 		}
-		statuses, err := s.inspector.ListWorkspaceStatuses(ctx)
+		toolCtx, cancel := toolTimeoutContext(ctx)
+		defer cancel()
+		statuses, err := s.inspector.ListWorkspaceStatuses(toolCtx)
 		if err != nil {
 			return toolError(req.ID, err.Error())
 		}
@@ -397,10 +421,14 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
 			return fail(req.ID, -32602, err.Error())
 		}
+		args.DirectoryPath = strings.TrimSpace(args.DirectoryPath)
+		args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
 		if args.DirectoryPath == "" {
 			return toolError(req.ID, "directory_path is required")
 		}
-		status, err := s.workspaceStatus(ctx, args.DirectoryPath, args.ProviderProfileID)
+		toolCtx, cancel := toolTimeoutContext(ctx)
+		defer cancel()
+		status, err := s.workspaceStatus(toolCtx, args.DirectoryPath, args.ProviderProfileID)
 		if err != nil {
 			return toolError(req.ID, err.Error())
 		}
@@ -451,6 +479,29 @@ func (s *Server) workspaceStatus(ctx context.Context, dir string, providerProfil
 		return workspace.WorkspaceStatus{}, fmt.Errorf("provider_profile_id is not supported by this openACE mode")
 	}
 	return providerInspector.WorkspaceStatusWithProvider(ctx, dir, providerProfileID)
+}
+
+func normalizeRetrievalArgs(args *retrievalArgs) error {
+	args.InformationRequest = strings.TrimSpace(args.InformationRequest)
+	args.DirectoryPath = strings.TrimSpace(args.DirectoryPath)
+	args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
+	if args.InformationRequest == "" {
+		return fmt.Errorf("information_request is required")
+	}
+	if args.DirectoryPath == "" {
+		return fmt.Errorf("directory_path is required")
+	}
+	return validateMaxOutputLength(args.MaxOutputLength)
+}
+
+func validateMaxOutputLength(value int) error {
+	if value < 0 {
+		return fmt.Errorf("max_output_length must be non-negative")
+	}
+	if value > daemon.MaxOutputLengthLimit {
+		return fmt.Errorf("max_output_length must be <= %d", daemon.MaxOutputLengthLimit)
+	}
+	return nil
 }
 
 func normalizeDirectoryPaths(paths []string) ([]string, error) {

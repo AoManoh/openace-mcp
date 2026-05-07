@@ -84,18 +84,22 @@ type HealthSnapshot struct {
 
 func (c *Client) FindMissing(ctx context.Context, blobNames []string) ([]string, []string, error) {
 	var resp struct {
-		UnknownMemoryNames []string `json:"unknown_memory_names"`
-		UnknownBlobNames   []string `json:"unknownBlobNames"`
-		NonindexedNames    []string `json:"nonindexed_blob_names"`
-		NonindexedBlobs    []string `json:"nonindexedBlobNames"`
+		UnknownMemoryNames *[]string `json:"unknown_memory_names"`
+		UnknownBlobNames   *[]string `json:"unknownBlobNames"`
+		UnknownBlobSnake   *[]string `json:"unknown_blob_names"`
+		NonindexedNames    *[]string `json:"nonindexed_blob_names"`
+		NonindexedBlobs    *[]string `json:"nonindexedBlobNames"`
 	}
 	if err := c.post(ctx, "find-missing", map[string]any{
 		"mem_object_names": blobNames,
 	}, &resp); err != nil {
 		return nil, nil, err
 	}
-	unknown := append(resp.UnknownMemoryNames, resp.UnknownBlobNames...)
-	nonindexed := append(resp.NonindexedNames, resp.NonindexedBlobs...)
+	if resp.UnknownMemoryNames == nil && resp.UnknownBlobNames == nil && resp.UnknownBlobSnake == nil && resp.NonindexedNames == nil && resp.NonindexedBlobs == nil {
+		return nil, nil, errors.New("find-missing response missing blob name fields")
+	}
+	unknown := appendOptionalStrings(nil, resp.UnknownMemoryNames, resp.UnknownBlobNames, resp.UnknownBlobSnake)
+	nonindexed := appendOptionalStrings(nil, resp.NonindexedNames, resp.NonindexedBlobs)
 	return unique(unknown), unique(nonindexed), nil
 }
 
@@ -114,24 +118,27 @@ func (c *Client) BatchUpload(ctx context.Context, blobs []BlobUpload) error {
 
 func (c *Client) CheckpointBlobs(ctx context.Context, checkpointID string, added []string, deleted []string) (string, error) {
 	var resp struct {
-		NewCheckpointID string `json:"new_checkpoint_id"`
-		NewCheckpoint   string `json:"newCheckpointId"`
+		NewCheckpointID *string `json:"new_checkpoint_id"`
+		NewCheckpoint   *string `json:"newCheckpointId"`
 	}
 	if err := c.post(ctx, "checkpoint-blobs", map[string]any{
 		"blobs": blobsPayload(checkpointID, added, deleted),
 	}, &resp); err != nil {
 		return "", err
 	}
-	if resp.NewCheckpointID != "" {
-		return resp.NewCheckpointID, nil
+	if resp.NewCheckpointID != nil && strings.TrimSpace(*resp.NewCheckpointID) != "" {
+		return *resp.NewCheckpointID, nil
 	}
-	return resp.NewCheckpoint, nil
+	if resp.NewCheckpoint != nil && strings.TrimSpace(*resp.NewCheckpoint) != "" {
+		return *resp.NewCheckpoint, nil
+	}
+	return "", errors.New("checkpoint-blobs response missing new checkpoint id")
 }
 
 func (c *Client) CodebaseRetrieval(ctx context.Context, informationRequest string, opts RetrievalOptions) (string, error) {
 	var resp struct {
-		FormattedRetrieval string `json:"formatted_retrieval"`
-		FormattedCamel     string `json:"formattedRetrieval"`
+		FormattedRetrieval *string `json:"formatted_retrieval"`
+		FormattedCamel     *string `json:"formattedRetrieval"`
 	}
 	if err := c.post(ctx, "agents/codebase-retrieval", map[string]any{
 		"information_request":           informationRequest,
@@ -144,10 +151,13 @@ func (c *Client) CodebaseRetrieval(ctx context.Context, informationRequest strin
 	}, &resp); err != nil {
 		return "", err
 	}
-	if resp.FormattedRetrieval != "" {
-		return resp.FormattedRetrieval, nil
+	if resp.FormattedRetrieval != nil {
+		return *resp.FormattedRetrieval, nil
 	}
-	return resp.FormattedCamel, nil
+	if resp.FormattedCamel != nil {
+		return *resp.FormattedCamel, nil
+	}
+	return "", errors.New("agents/codebase-retrieval response missing formatted retrieval")
 }
 
 func (c *Client) post(ctx context.Context, endpoint string, body any, out any) error {
@@ -406,6 +416,16 @@ func randomID() string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b[:])
+}
+
+func appendOptionalStrings(dst []string, values ...*[]string) []string {
+	for _, value := range values {
+		if value == nil {
+			continue
+		}
+		dst = append(dst, (*value)...)
+	}
+	return dst
 }
 
 func unique(values []string) []string {

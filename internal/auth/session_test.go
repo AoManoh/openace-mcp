@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -71,5 +72,16 @@ func TestParseProfilesRejectsDuplicateIDs(t *testing.T) {
 ]`), "test")
 	if err == nil {
 		t.Fatal("duplicate profile IDs should be rejected")
+	}
+}
+
+func TestParseProfilesRejectsStatePathAmbiguousIDs(t *testing.T) {
+	for _, id := range []string{"alpha-", ".alpha", "alpha.", "-alpha"} {
+		_, err := parseProfilesJSON([]byte(`[
+  {"id":`+strconv.Quote(id)+`,"accessToken":"token-a","tenantURL":"https://a.example.test/"}
+]`), "test")
+		if err == nil {
+			t.Fatalf("profile id %q should be rejected", id)
+		}
 	}
 }

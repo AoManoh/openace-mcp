@@ -27,6 +27,7 @@ func NewRegistry(profiles []auth.Profile) (*Registry, error) {
 		clients:  make(map[string]*ace.Client, len(profiles)),
 		profiles: append([]auth.Profile(nil), profiles...),
 	}
+	foldedIDs := make(map[string]string, len(profiles))
 	for _, profile := range profiles {
 		id := strings.TrimSpace(profile.ID)
 		if id == "" {
@@ -35,6 +36,11 @@ func NewRegistry(profiles []auth.Profile) (*Registry, error) {
 		if _, ok := registry.clients[id]; ok {
 			return nil, fmt.Errorf("duplicate provider profile id %q", id)
 		}
+		foldedID := strings.ToLower(id)
+		if existing, ok := foldedIDs[foldedID]; ok {
+			return nil, fmt.Errorf("provider profile id %q collides with %q on case-insensitive filesystems", id, existing)
+		}
+		foldedIDs[foldedID] = id
 		session := profile.Session
 		registry.clients[id] = ace.NewClient(staticSessionLoader{session: session})
 		if profile.Default {

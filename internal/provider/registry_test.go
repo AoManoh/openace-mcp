@@ -56,3 +56,13 @@ func TestRegistryRejectsDuplicateProfiles(t *testing.T) {
 		t.Fatal("duplicate provider profile IDs should be rejected")
 	}
 }
+
+func TestRegistryRejectsCaseInsensitiveProfileCollisions(t *testing.T) {
+	_, err := NewRegistry([]auth.Profile{
+		{ID: "Alpha", Session: auth.Session{AccessToken: "token-a", TenantURL: "https://a.example.test/"}},
+		{ID: "alpha", Session: auth.Session{AccessToken: "token-b", TenantURL: "https://b.example.test/"}},
+	})
+	if err == nil {
+		t.Fatal("case-insensitive provider profile collisions should be rejected")
+	}
+}

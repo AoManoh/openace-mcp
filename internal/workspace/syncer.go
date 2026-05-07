@@ -279,6 +279,11 @@ func (s *Syncer) WorkspaceStatusWithProvider(ctx context.Context, dir string, pr
 		return WorkspaceStatus{}, err
 	}
 	key := s.stateKey(root, providerProfileID)
+	if strings.TrimSpace(providerProfileID) != "" {
+		if _, err := s.clientForProvider(key.providerProfileID); err != nil {
+			return WorkspaceStatus{}, err
+		}
+	}
 
 	s.mu.Lock()
 	if status, ok := s.statuses[key.mapKey()]; ok {
@@ -327,6 +332,11 @@ func (s *Syncer) WorkspaceChangedWithProvider(ctx context.Context, dir string, p
 		return false, err
 	}
 	key := s.stateKey(root, providerProfileID)
+	if strings.TrimSpace(providerProfileID) != "" {
+		if _, err := s.clientForProvider(key.providerProfileID); err != nil {
+			return false, err
+		}
+	}
 	assets, err := FileAssetSource{}.Load(ctx, root)
 	if err != nil {
 		return false, err
@@ -1282,15 +1292,19 @@ func stateFileForProvider(root string, providerProfileID string) (string, error)
 }
 
 func safeProviderProfileID(providerProfileID string) string {
+	raw := strings.TrimSpace(providerProfileID)
 	providerProfileID = strings.Map(func(r rune) rune {
 		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' {
 			return r
 		}
 		return '-'
-	}, strings.TrimSpace(providerProfileID))
-	providerProfileID = strings.Trim(providerProfileID, ".-")
-	if providerProfileID == "" {
+	}, raw)
+	if providerProfileID == "" || providerProfileID == "." || providerProfileID == ".." {
 		return "default"
+	}
+	if providerProfileID != raw {
+		sum := sha256.Sum256([]byte(raw))
+		providerProfileID += "-" + hex.EncodeToString(sum[:8])
 	}
 	return providerProfileID
 }

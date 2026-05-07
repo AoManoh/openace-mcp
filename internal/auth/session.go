@@ -279,6 +279,9 @@ func validateProfileID(id string) (string, error) {
 		}
 		return "", fmt.Errorf("invalid profile id %q", id)
 	}
+	if strings.Trim(id, ".-") != id {
+		return "", fmt.Errorf("invalid profile id %q: must not start or end with '.' or '-'", id)
+	}
 	return id, nil
 }
 

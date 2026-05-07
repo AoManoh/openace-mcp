@@ -62,9 +62,13 @@ func TestStateFileUsesSeparateProviderProfilePath(t *testing.T) {
 	if defaultPath == providerPath {
 		t.Fatalf("provider state path should differ from default path: %s", defaultPath)
 	}
-	wantProviderPrefix := filepath.Join(cacheDir, "workspaces", "default", "profiles", "standby-B") + string(os.PathSeparator)
-	if !strings.HasPrefix(providerPath, wantProviderPrefix) {
-		t.Fatalf("provider state file %q does not use provider prefix %q", providerPath, wantProviderPrefix)
+	plainAliasPrefix := filepath.Join(cacheDir, "workspaces", "default", "profiles", "standby-B") + string(os.PathSeparator)
+	if strings.HasPrefix(providerPath, plainAliasPrefix) {
+		t.Fatalf("unsafe provider id should not alias sanitized legal id path: %q", providerPath)
+	}
+	profileDir := filepath.Base(filepath.Dir(providerPath))
+	if !strings.HasPrefix(profileDir, "standby-B-") {
+		t.Fatalf("provider state file %q does not use a collision-resistant provider directory", providerPath)
 	}
 }
 
@@ -725,6 +729,30 @@ func TestSyncerProviderProfilesUseIndependentCheckpointState(t *testing.T) {
 	}
 	if standbyStatus.ProviderProfileID != "standby" || standbyStatus.CheckpointID != "checkpoint-standby" {
 		t.Fatalf("unexpected standby status: %+v", standbyStatus)
+	}
+}
+
+func TestSyncerRejectsUnknownProviderForStatusAndChanged(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	syncer := NewSyncerWithRouter(testProviderRouter{
+		defaultID: "primary",
+		clients: map[string]*providerRecordingClient{
+			"primary":   {checkpoint: "checkpoint-primary"},
+			"standby-B": {checkpoint: "checkpoint-standby"},
+		},
+	})
+	if _, err := syncer.SyncWithProvider(context.Background(), root, "standby-B"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := syncer.WorkspaceStatusWithProvider(context.Background(), root, "standby/B"); err == nil {
+		t.Fatal("workspace status should reject unknown provider instead of reading an aliased state path")
+	}
+	if _, err := syncer.WorkspaceChangedWithProvider(context.Background(), root, "standby/B"); err == nil {
+		t.Fatal("workspace changed should reject unknown provider instead of reading an aliased state path")
 	}
 }
 

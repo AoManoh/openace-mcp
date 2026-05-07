@@ -119,6 +119,22 @@ func TestCheckpointBlobsRequestBodyUsesArrays(t *testing.T) {
 	}
 }
 
+func TestCheckpointBlobsRejectsMissingCheckpointID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(staticSessionLoader{session: auth.Session{
+		AccessToken: "token",
+		TenantURL:   server.URL,
+	}})
+	_, err := client.CheckpointBlobs(context.Background(), "", []string{"blob-a"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "missing new checkpoint id") {
+		t.Fatalf("CheckpointBlobs error = %v, want missing checkpoint id", err)
+	}
+}
+
 func TestCodebaseRetrievalRequestBodyUsesArrayBlobs(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/agents/codebase-retrieval" {
@@ -152,6 +168,60 @@ func TestCodebaseRetrievalRequestBodyUsesArrayBlobs(t *testing.T) {
 	}
 	if text != "ok" {
 		t.Fatalf("retrieval = %q", text)
+	}
+}
+
+func TestCodebaseRetrievalRejectsMissingFormattedRetrieval(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(staticSessionLoader{session: auth.Session{
+		AccessToken: "token",
+		TenantURL:   server.URL,
+	}})
+	_, err := client.CodebaseRetrieval(context.Background(), "find code", RetrievalOptions{})
+	if err == nil || !strings.Contains(err.Error(), "missing formatted retrieval") {
+		t.Fatalf("CodebaseRetrieval error = %v, want missing formatted retrieval", err)
+	}
+}
+
+func TestFindMissingAcceptsSnakeCaseUnknownBlobNames(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"unknown_blob_names":["b","a","a"],"nonindexed_blob_names":["c"]}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(staticSessionLoader{session: auth.Session{
+		AccessToken: "token",
+		TenantURL:   server.URL,
+	}})
+	unknown, nonindexed, err := client.FindMissing(context.Background(), []string{"a", "b", "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(unknown, []string{"b", "a"}) {
+		t.Fatalf("unknown = %#v", unknown)
+	}
+	if !reflect.DeepEqual(nonindexed, []string{"c"}) {
+		t.Fatalf("nonindexed = %#v", nonindexed)
+	}
+}
+
+func TestFindMissingRejectsMissingBlobNameFields(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(staticSessionLoader{session: auth.Session{
+		AccessToken: "token",
+		TenantURL:   server.URL,
+	}})
+	_, _, err := client.FindMissing(context.Background(), []string{"a"})
+	if err == nil || !strings.Contains(err.Error(), "missing blob name fields") {
+		t.Fatalf("FindMissing error = %v, want missing blob name fields", err)
 	}
 }
 

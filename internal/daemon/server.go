@@ -222,7 +222,12 @@ func (s *Server) retrieve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "information_request is required")
 		return
 	}
-	result, err := s.runRetrieve(r.Context(), req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength)
+	maxOutputLength, err := normalizeMaxOutputLength(req.MaxOutputLength)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	result, err := s.runRetrieve(r.Context(), req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, maxOutputLength)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return

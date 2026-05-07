@@ -27,6 +27,7 @@ const maxTaskHistoryLimit = 8192
 const defaultTaskWorkerCount = 4
 const maxTaskWorkerCount = 32
 const MaxMultiWorkspacePaths = 8
+const MaxOutputLengthLimit = 1_000_000
 
 type TaskKind string
 
@@ -212,36 +213,26 @@ func (s *TaskStore) Submit(req TaskRequest) (TaskSnapshot, error) {
 		return TaskSnapshot{}, ErrTaskStoreClosed
 	}
 	s.tasks[id] = record
-	select {
-	case s.queue <- id:
-		record.acceptedSidecar = s.storeDir != ""
-		accepted := cloneTask(record.snapshot)
-		s.mu.Unlock()
-
-		if err := saveAcceptedTaskSnapshot(s.storeDir, accepted); err != nil {
-			s.mu.Lock()
-			if current := s.tasks[id]; current != nil {
-				current.acceptedSidecar = false
-				if current.snapshot.State == TaskStateQueued {
-					delete(s.tasks, id)
-				} else {
-					s.persistLocked()
-				}
-			}
+	if s.storeDir != "" {
+		record.acceptedSidecar = true
+		if err := saveAcceptedTaskSnapshot(s.storeDir, record.snapshot); err != nil {
+			delete(s.tasks, id)
 			s.mu.Unlock()
 			return TaskSnapshot{}, err
 		}
-
-		s.mu.Lock()
-		if current := s.tasks[id]; current != nil {
-			current.acceptedSidecar = s.storeDir != ""
-		}
+	}
+	select {
+	case s.queue <- id:
 		s.pruneLocked(taskHistoryLimit())
 		s.persistLocked()
+		snapshot := cloneTask(record.snapshot)
 		s.mu.Unlock()
-		return accepted, nil
+		return snapshot, nil
 	default:
 		delete(s.tasks, id)
+		if record.acceptedSidecar {
+			_ = removeAcceptedTaskSnapshot(s.storeDir, id)
+		}
 		s.mu.Unlock()
 		return TaskSnapshot{}, ErrTaskQueueFull
 	}
@@ -283,7 +274,7 @@ func (s *TaskStore) pruneLocked(max int) {
 	}
 	var terminals []terminalTask
 	for id, record := range s.tasks {
-		if isPrunableTask(record.snapshot) {
+		if isPrunableTask(record.snapshot) && !record.acceptedSidecar {
 			terminals = append(terminals, terminalTask{id: id, submittedAt: record.snapshot.SubmittedAt})
 		}
 	}
@@ -314,6 +305,7 @@ func (s *TaskStore) Cancel(id string) (TaskSnapshot, bool) {
 	record.snapshot.State = TaskStateCancelled
 	record.snapshot.CompletedAt = &now
 	record.snapshot.Error = "cancelled"
+	s.saveAcceptedSidecarLocked(record)
 	s.persistLocked()
 	return cloneTask(record.snapshot), true
 }
@@ -399,17 +391,29 @@ func (s *TaskStore) finish(id string, result workspace.Result, err error) {
 		if errors.Is(err, context.Canceled) {
 			record.snapshot.State = TaskStateCancelled
 			record.snapshot.Error = "cancelled"
+			s.saveAcceptedSidecarLocked(record)
 			s.persistLocked()
 			return
 		}
 		record.snapshot.State = TaskStateFailed
 		record.snapshot.Error = err.Error()
+		s.saveAcceptedSidecarLocked(record)
 		s.persistLocked()
 		return
 	}
 	record.snapshot.State = TaskStateCompleted
 	record.snapshot.Result = &result
+	s.saveAcceptedSidecarLocked(record)
 	s.persistLocked()
+}
+
+func (s *TaskStore) saveAcceptedSidecarLocked(record *taskRecord) {
+	if s.storeDir == "" || record == nil {
+		return
+	}
+	if err := saveAcceptedTaskSnapshot(s.storeDir, record.snapshot); err == nil {
+		record.acceptedSidecar = true
+	}
 }
 
 func (s *TaskStore) startPersister() {
@@ -496,9 +500,6 @@ func (s *TaskStore) loadPersisted() {
 		}
 	}
 	for _, snapshot := range loadAcceptedTaskSnapshots(s.storeDir) {
-		if _, exists := s.tasks[snapshot.ID]; exists {
-			continue
-		}
 		s.addRecoveredTaskLocked(snapshot, now, true)
 	}
 	s.pruneLocked(taskHistoryLimit())
@@ -515,11 +516,38 @@ func (s *TaskStore) addRecoveredTaskLocked(snapshot TaskSnapshot, now time.Time,
 		snapshot.Error = "abandoned after daemon restart"
 		snapshot.CompletedAt = &now
 	}
+	if existing := s.tasks[snapshot.ID]; existing != nil {
+		if shouldReplaceRecoveredTask(existing.snapshot, snapshot) {
+			existing.snapshot = snapshot
+			existing.request = requestFromSnapshot(snapshot)
+		}
+		existing.acceptedSidecar = existing.acceptedSidecar || acceptedSidecar
+		return
+	}
 	s.tasks[snapshot.ID] = &taskRecord{
 		request:         requestFromSnapshot(snapshot),
 		snapshot:        snapshot,
 		acceptedSidecar: acceptedSidecar,
 	}
+}
+
+func shouldReplaceRecoveredTask(current TaskSnapshot, next TaskSnapshot) bool {
+	currentAbandoned := isAbandonedTask(current)
+	nextAbandoned := isAbandonedTask(next)
+	if currentAbandoned != nextAbandoned {
+		return currentAbandoned && !nextAbandoned
+	}
+	if current.CompletedAt == nil {
+		return next.CompletedAt != nil
+	}
+	if next.CompletedAt == nil {
+		return false
+	}
+	return next.CompletedAt.After(*current.CompletedAt)
+}
+
+func isAbandonedTask(snapshot TaskSnapshot) bool {
+	return snapshot.State == TaskStateFailed && snapshot.Error == "abandoned after daemon restart"
 }
 
 func (s *TaskStore) persistLocked() {
@@ -541,12 +569,8 @@ func (s *TaskStore) persistNow() {
 		return
 	}
 	s.mu.Lock()
-	manifest := s.manifestLocked()
-	sidecarIDs := s.acceptedSidecarIDsLocked(manifest)
-	s.mu.Unlock()
-	if err := saveTaskManifest(s.storeDir, manifest); err == nil {
-		s.clearAcceptedSidecars(sidecarIDs)
-	}
+	defer s.mu.Unlock()
+	s.persistNowLocked()
 }
 
 func (s *TaskStore) persistNowLocked() {
@@ -604,22 +628,6 @@ func (s *TaskStore) acceptedSidecarIDsLocked(manifest taskManifest) []string {
 		ids = append(ids, snapshot.ID)
 	}
 	return ids
-}
-
-func (s *TaskStore) clearAcceptedSidecars(ids []string) {
-	if len(ids) == 0 || s.storeDir == "" {
-		return
-	}
-	for _, id := range ids {
-		_ = removeAcceptedTaskSnapshot(s.storeDir, id)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, id := range ids {
-		if record := s.tasks[id]; record != nil {
-			record.acceptedSidecar = false
-		}
-	}
 }
 
 func isPrunableTask(snapshot TaskSnapshot) bool {
@@ -832,6 +840,11 @@ func normalizeTaskRequest(req TaskRequest) (TaskRequest, error) {
 		if req.InformationRequest == "" {
 			return TaskRequest{}, errors.New("information_request is required")
 		}
+		maxOutputLength, err := normalizeMaxOutputLength(req.MaxOutputLength)
+		if err != nil {
+			return TaskRequest{}, err
+		}
+		req.MaxOutputLength = maxOutputLength
 		return req, nil
 	}
 	if req.DirectoryPath == "" {
@@ -840,7 +853,22 @@ func normalizeTaskRequest(req TaskRequest) (TaskRequest, error) {
 	if req.Kind == TaskKindRetrieve && req.InformationRequest == "" {
 		return TaskRequest{}, errors.New("information_request is required")
 	}
+	maxOutputLength, err := normalizeMaxOutputLength(req.MaxOutputLength)
+	if err != nil {
+		return TaskRequest{}, err
+	}
+	req.MaxOutputLength = maxOutputLength
 	return req, nil
+}
+
+func normalizeMaxOutputLength(value int) (int, error) {
+	if value < 0 {
+		return 0, errors.New("max_output_length must be non-negative")
+	}
+	if value > MaxOutputLengthLimit {
+		return 0, fmt.Errorf("max_output_length must be <= %d", MaxOutputLengthLimit)
+	}
+	return value, nil
 }
 
 func normalizeTaskDirectoryPaths(paths []string) ([]string, error) {

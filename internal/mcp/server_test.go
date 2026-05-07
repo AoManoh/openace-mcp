@@ -25,6 +25,10 @@ type fakeTasker struct {
 	fakeSyncer
 }
 
+type blockingDiagnosticTasker struct {
+	fakeSyncer
+}
+
 type fakeMultiSyncer struct{}
 
 func (fakeMultiSyncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
@@ -78,6 +82,26 @@ func (fakeTasker) TaskStatus(ctx context.Context, id string) (daemon.TaskSnapsho
 
 func (fakeTasker) CancelTask(ctx context.Context, id string) (daemon.TaskSnapshot, error) {
 	return daemon.TaskSnapshot{ID: id, State: daemon.TaskStateCancelled}, nil
+}
+
+func (blockingDiagnosticTasker) StartTask(ctx context.Context, req daemon.TaskRequest) (daemon.TaskSnapshot, error) {
+	<-ctx.Done()
+	return daemon.TaskSnapshot{}, ctx.Err()
+}
+
+func (blockingDiagnosticTasker) ListTasks(ctx context.Context, limit int) ([]daemon.TaskSnapshot, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (blockingDiagnosticTasker) TaskStatus(ctx context.Context, id string) (daemon.TaskSnapshot, error) {
+	<-ctx.Done()
+	return daemon.TaskSnapshot{}, ctx.Err()
+}
+
+func (blockingDiagnosticTasker) CancelTask(ctx context.Context, id string) (daemon.TaskSnapshot, error) {
+	<-ctx.Done()
+	return daemon.TaskSnapshot{}, ctx.Err()
 }
 
 func (fakeTasker) ListWorkspaceStatuses(ctx context.Context) ([]workspace.WorkspaceStatus, error) {
@@ -183,6 +207,36 @@ func TestStartRetrievalTaskTool(t *testing.T) {
 	}
 	if !strings.Contains(out, "queued") {
 		t.Fatalf("task response should include task state: %s", out)
+	}
+}
+
+func TestTaskStatusToolAppliesTimeout(t *testing.T) {
+	t.Setenv("OPENACE_TOOL_TIMEOUT", "10ms")
+	out := runMCP(t, NewServer(blockingDiagnosticTasker{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"task_status","arguments":{"task_id":"task-1"}}}`)
+	if !strings.Contains(out, "context deadline exceeded") || !strings.Contains(out, `"isError":true`) {
+		t.Fatalf("task status timeout should return tool error: %s", out)
+	}
+}
+
+func TestCodebaseRetrievalRejectsWhitespaceArguments(t *testing.T) {
+	out := runMCP(t, NewServer(fakeSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"   ","information_request":"find code"}}}`)
+	if !strings.Contains(out, "directory_path is required") || !strings.Contains(out, `"isError":true`) {
+		t.Fatalf("blank directory path should be rejected: %s", out)
+	}
+	out = runMCP(t, NewServer(fakeSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"/tmp/workspace","information_request":"   "}}}`)
+	if !strings.Contains(out, "information_request is required") || !strings.Contains(out, `"isError":true`) {
+		t.Fatalf("blank information request should be rejected: %s", out)
+	}
+}
+
+func TestRetrievalToolsValidateMaxOutputLength(t *testing.T) {
+	out := runMCP(t, NewServer(fakeTasker{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"start_codebase_retrieval","arguments":{"directory_path":"/tmp/workspace","information_request":"find code","max_output_length":-1}}}`)
+	if !strings.Contains(out, "max_output_length must be non-negative") || !strings.Contains(out, `"isError":true`) {
+		t.Fatalf("negative max output should be rejected: %s", out)
+	}
+	out = runMCP(t, NewServer(fakeSyncer{}), `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"/tmp/workspace","information_request":"find code","max_output_length":1000001}}}`)
+	if !strings.Contains(out, "max_output_length must be") || !strings.Contains(out, "1000000") || !strings.Contains(out, `"isError":true`) {
+		t.Fatalf("huge max output should be rejected: %s", out)
 	}
 }
 
