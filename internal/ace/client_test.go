@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -59,6 +60,113 @@ func TestBlobsPayloadKeepsCheckpoint(t *testing.T) {
 	}
 	if got := payload["deleted_blobs"]; !reflect.DeepEqual(got, []string{"x", "z"}) {
 		t.Fatalf("deleted_blobs = %#v", got)
+	}
+}
+
+func TestCheckpointBlobsRequestBodyUsesArrays(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/checkpoint-blobs" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		blobs, ok := payload["blobs"].(map[string]any)
+		if !ok {
+			t.Fatalf("blobs payload = %#v", payload["blobs"])
+		}
+		if got, ok := blobs["added_blobs"].([]any); !ok || len(got) != 0 {
+			t.Fatalf("added_blobs should be an empty array, got %#v", blobs["added_blobs"])
+		}
+		if got, ok := blobs["deleted_blobs"].([]any); !ok || len(got) != 0 {
+			t.Fatalf("deleted_blobs should be an empty array, got %#v", blobs["deleted_blobs"])
+		}
+		if _, ok := blobs["checkpoint_id"]; ok {
+			t.Fatalf("checkpoint_id should be omitted when empty: %#v", blobs)
+		}
+		_, _ = w.Write([]byte(`{"new_checkpoint_id":"checkpoint-new"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(staticSessionLoader{session: auth.Session{
+		AccessToken: "token",
+		TenantURL:   server.URL,
+	}})
+	checkpoint, err := client.CheckpointBlobs(context.Background(), "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint != "checkpoint-new" {
+		t.Fatalf("checkpoint = %q", checkpoint)
+	}
+}
+
+func TestCodebaseRetrievalRequestBodyUsesArrayBlobs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/agents/codebase-retrieval" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		blobs, ok := payload["blobs"].(map[string]any)
+		if !ok {
+			t.Fatalf("blobs payload = %#v", payload["blobs"])
+		}
+		if got, ok := blobs["added_blobs"].([]any); !ok || len(got) != 0 {
+			t.Fatalf("added_blobs should be an empty array, got %#v", blobs["added_blobs"])
+		}
+		if got, ok := blobs["deleted_blobs"].([]any); !ok || len(got) != 0 {
+			t.Fatalf("deleted_blobs should be an empty array, got %#v", blobs["deleted_blobs"])
+		}
+		_, _ = w.Write([]byte(`{"formatted_retrieval":"ok"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(staticSessionLoader{session: auth.Session{
+		AccessToken: "token",
+		TenantURL:   server.URL,
+	}})
+	text, err := client.CodebaseRetrieval(context.Background(), "find code", RetrievalOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "ok" {
+		t.Fatalf("retrieval = %q", text)
+	}
+}
+
+func TestCheckpointBlobsHTTP400IncludesSafePayloadShape(t *testing.T) {
+	const blobName = "secret-blob-name-should-not-leak"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Json deserialize error: invalid type: null, expected a sequence at line 1 column 196", http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	client := NewClient(staticSessionLoader{session: auth.Session{
+		AccessToken: "token",
+		TenantURL:   server.URL,
+	}})
+	_, err := client.CheckpointBlobs(context.Background(), "checkpoint-1", []string{blobName}, nil)
+	if err == nil {
+		t.Fatal("CheckpointBlobs should return HTTP 400")
+	}
+	text := err.Error()
+	for _, want := range []string{
+		"checkpoint-blobs returned HTTP 400",
+		"request_shape=",
+		"blobs.added_blobs=array(len=1)",
+		"blobs.deleted_blobs=array(len=0)",
+		"blobs.checkpoint_id=present",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("error %q missing %q", text, want)
+		}
+	}
+	if strings.Contains(text, blobName) {
+		t.Fatalf("payload shape should not include blob names: %s", text)
 	}
 }
 

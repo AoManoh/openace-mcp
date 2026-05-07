@@ -59,11 +59,15 @@ type apiError struct {
 	endpoint           string
 	status             int
 	body               string
+	requestShape       string
 	retryAfterDuration time.Duration
 	receivedAt         time.Time
 }
 
 func (e apiError) Error() string {
+	if e.requestShape != "" {
+		return fmt.Sprintf("%s returned HTTP %d: %s (%s)", e.endpoint, e.status, e.body, e.requestShape)
+	}
 	return fmt.Sprintf("%s returned HTTP %d: %s", e.endpoint, e.status, e.body)
 }
 
@@ -217,6 +221,7 @@ func (c *Client) postOnce(ctx context.Context, session auth.Session, endpoint st
 			endpoint:           endpoint,
 			status:             resp.StatusCode,
 			body:               trimForError(data),
+			requestShape:       requestPayloadShape(endpoint, payload),
 			retryAfterDuration: delay,
 			receivedAt:         time.Now().UTC(),
 		}
@@ -437,6 +442,70 @@ func blobsPayload(checkpointID string, added []string, deleted []string) map[str
 		payload["checkpoint_id"] = checkpointID
 	}
 	return payload
+}
+
+func requestPayloadShape(endpoint string, payload []byte) string {
+	switch endpoint {
+	case "checkpoint-blobs", "agents/codebase-retrieval":
+	default:
+		return ""
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return ""
+	}
+	blobs, ok := root["blobs"]
+	if !ok {
+		return ""
+	}
+	parts := describeBlobsPayloadShape(blobs)
+	if len(parts) == 0 {
+		return ""
+	}
+	return "request_shape=" + strings.Join(parts, " ")
+}
+
+func describeBlobsPayloadShape(raw json.RawMessage) []string {
+	var blobs map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &blobs); err != nil {
+		return []string{"blobs=" + jsonValueShape(raw)}
+	}
+	parts := []string{
+		"blobs.added_blobs=" + jsonValueShape(blobs["added_blobs"]),
+		"blobs.deleted_blobs=" + jsonValueShape(blobs["deleted_blobs"]),
+	}
+	if _, ok := blobs["checkpoint_id"]; ok {
+		parts = append(parts, "blobs.checkpoint_id=present")
+	} else {
+		parts = append(parts, "blobs.checkpoint_id=absent")
+	}
+	return parts
+}
+
+func jsonValueShape(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return "missing"
+	}
+	switch trimmed[0] {
+	case '[':
+		var values []json.RawMessage
+		if err := json.Unmarshal(trimmed, &values); err != nil {
+			return "array(invalid)"
+		}
+		return fmt.Sprintf("array(len=%d)", len(values))
+	case 'n':
+		if bytes.Equal(trimmed, []byte("null")) {
+			return "null"
+		}
+	case '{':
+		return "object"
+	case '"':
+		return "string"
+	case 't', 'f':
+		return "bool"
+	}
+	return "number"
 }
 
 func trimForError(data []byte) string {

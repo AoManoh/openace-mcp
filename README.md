@@ -292,6 +292,12 @@ daemon 模式会记住已经被 `sync_workspace` / `codebase_retrieval` / `multi
 
 `workspace_status` 和 `list_workspaces` 会返回可解释状态字段：`stage` 表示当前同步阶段（`scanning` / `reconciling` / `uploading` / `checkpointing` / `ready` / `failed`），`provider_profile_id` / `provider_state` 表示当前 provider 维度的本地状态，`last_sync_reason` 区分 `manual`、`retrieval` 和 `background`，watch 字段会展示后台检查是否启用、下次检查时间、最近检查时间、最近后台同步时间和探测错误。后台探测失败会按 `OPENACE_WATCH_BACKOFF_MIN` / `OPENACE_WATCH_BACKOFF_MAX` 退避重试。上游 ACE 返回 `429` / `5xx` 时，status 还会通过 `upstream_status`、`upstream_last_status_code`、`upstream_retry_after`、`upstream_backoff_until`、`upstream_last_error`、`upstream_last_failure` 和 `upstream_last_success` 暴露当前 provider 的最近退避与错误摘要；这些字段不是单 workspace 指标，而是帮助多 agent 场景判断是否应暂停真实上游压力的上游信号。
 
+## 排障：checkpoint-blobs 400
+
+如果看到 `checkpoint-blobs returned HTTP 400: Json deserialize error: invalid type: null, expected a sequence`，先确认运行的是固定 commit/tag 或本地二进制，而不是不可复现的浮动 `@main`。当前版本会把 `added_blobs` / `deleted_blobs` 显式编码为数组，即使为空也是 `[]`，不会发送 `null`。
+
+较新的错误信息会附带脱敏请求形态，例如 `request_shape=blobs.added_blobs=array(len=12) blobs.deleted_blobs=array(len=0)`；这里只包含字段类型和数量，不包含 blob 名、文件内容、token 或 tenant。若该形态显示 `null`，请升级到包含该保护的版本；若形态已经是 `array(...)` 但上游仍返回 400，请保留 exact commit、`workspace_status` 的 `stage/last_error_stage/last_error/last_added/last_deleted/last_uploaded`，再排查旧 checkpoint、大量删除/重命名、Windows 路径大小写变化或上游临时兼容问题。
+
 ## 安全与边界
 
 - openACE 不绕过 Augment / ACE 的认证、quota、tenant 或 rate limit。
