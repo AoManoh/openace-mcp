@@ -161,7 +161,7 @@ openace-mcp daemon
 | `list_tasks` | 找回最近任务，列表不返回完整检索正文 |
 | `cancel_task` | 取消 queued / running 任务 |
 | `list_workspaces` | daemon 模式下列出已见 workspace 状态 |
-| `workspace_status` | daemon 模式下查询指定 workspace 的 checkpoint、文件数、同步中状态和最近错误 |
+| `workspace_status` | daemon 模式下查询指定 workspace 的 checkpoint、文件数、同步中状态、最近错误和上游退避摘要 |
 
 建议：
 
@@ -250,7 +250,7 @@ Git ignore 和 openACE index ignore 是两条不同边界：`docs/`、`skills/` 
 
 daemon 模式会记住已经被 `sync_workspace` / `codebase_retrieval` / `multi_codebase_retrieval` 显式访问过的 workspace，并在后台做增量检查。后台检查先在本地重新扫描索引范围并比较 blob 集；只有发现新增、删除或内容变化时，才触发后台 `sync` 进入 ACE 上传与 checkpoint 流程，避免无变化时反复消耗上游 quota。
 
-`workspace_status` 和 `list_workspaces` 会返回可解释状态字段：`stage` 表示当前同步阶段（`scanning` / `reconciling` / `uploading` / `checkpointing` / `ready` / `failed`），`last_sync_reason` 区分 `manual`、`retrieval` 和 `background`，watch 字段会展示后台检查是否启用、下次检查时间、最近检查时间、最近后台同步时间和探测错误。后台探测失败会按 `OPENACE_WATCH_BACKOFF_MIN` / `OPENACE_WATCH_BACKOFF_MAX` 退避重试。
+`workspace_status` 和 `list_workspaces` 会返回可解释状态字段：`stage` 表示当前同步阶段（`scanning` / `reconciling` / `uploading` / `checkpointing` / `ready` / `failed`），`last_sync_reason` 区分 `manual`、`retrieval` 和 `background`，watch 字段会展示后台检查是否启用、下次检查时间、最近检查时间、最近后台同步时间和探测错误。后台探测失败会按 `OPENACE_WATCH_BACKOFF_MIN` / `OPENACE_WATCH_BACKOFF_MAX` 退避重试。上游 ACE 返回 `429` / `5xx` 时，status 还会通过 `upstream_status`、`upstream_last_status_code`、`upstream_retry_after`、`upstream_backoff_until`、`upstream_last_error`、`upstream_last_failure` 和 `upstream_last_success` 暴露当前 daemon / client 共享的最近退避与错误摘要；这些字段不是单 workspace 指标，而是帮助多 agent 场景判断是否应暂停真实上游压力的上游信号。
 
 ## 安全与边界
 

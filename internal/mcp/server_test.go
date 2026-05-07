@@ -82,17 +82,23 @@ func (fakeTasker) CancelTask(ctx context.Context, id string) (daemon.TaskSnapsho
 
 func (fakeTasker) ListWorkspaceStatuses(ctx context.Context) ([]workspace.WorkspaceStatus, error) {
 	return []workspace.WorkspaceStatus{{
-		DirectoryPath: "/tmp/workspace",
-		CheckpointID:  "checkpoint",
-		FileCount:     3,
+		DirectoryPath:          "/tmp/workspace",
+		CheckpointID:           "checkpoint",
+		FileCount:              3,
+		UpstreamStatus:         "backoff",
+		UpstreamLastStatusCode: 429,
+		UpstreamRetryAfter:     "30s",
 	}}, nil
 }
 
 func (fakeTasker) WorkspaceStatus(ctx context.Context, dir string) (workspace.WorkspaceStatus, error) {
 	return workspace.WorkspaceStatus{
-		DirectoryPath: dir,
-		CheckpointID:  "checkpoint",
-		FileCount:     3,
+		DirectoryPath:          dir,
+		CheckpointID:           "checkpoint",
+		FileCount:              3,
+		UpstreamStatus:         "backoff",
+		UpstreamLastStatusCode: 429,
+		UpstreamRetryAfter:     "30s",
 	}, nil
 }
 
@@ -164,6 +170,9 @@ func TestListWorkspacesTool(t *testing.T) {
 	if !strings.Contains(out, "checkpoint") {
 		t.Fatalf("workspace list should include checkpoint: %s", out)
 	}
+	if !strings.Contains(out, "upstream_status") || !strings.Contains(out, "backoff") {
+		t.Fatalf("workspace list should include upstream health: %s", out)
+	}
 }
 
 func TestWorkspaceStatusTool(t *testing.T) {
@@ -173,6 +182,9 @@ func TestWorkspaceStatusTool(t *testing.T) {
 	}
 	if !strings.Contains(out, "file_count") || !strings.Contains(out, "3") {
 		t.Fatalf("workspace status should include file count: %s", out)
+	}
+	if !strings.Contains(out, "upstream_last_status_code") || !strings.Contains(out, "429") {
+		t.Fatalf("workspace status should include upstream health: %s", out)
 	}
 }
 

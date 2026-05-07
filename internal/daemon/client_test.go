@@ -2,9 +2,12 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
 func TestClientHealth(t *testing.T) {
@@ -31,5 +34,49 @@ func TestClientHealthRejectsUnexpectedService(t *testing.T) {
 
 	if err := NewClient(server.URL).Health(context.Background()); err == nil {
 		t.Fatal("health should reject non-openace service")
+	}
+}
+
+func TestClientDecodesWorkspaceUpstreamHealth(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/v1/workspaces":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"workspaces": []workspace.WorkspaceStatus{{
+					DirectoryPath:          "/tmp/project",
+					UpstreamStatus:         "backoff",
+					UpstreamLastStatusCode: 429,
+					UpstreamRetryAfter:     "30s",
+				}},
+			})
+		case "/v1/workspace/status":
+			_ = json.NewEncoder(w).Encode(workspace.WorkspaceStatus{
+				DirectoryPath:          "/tmp/project",
+				UpstreamStatus:         "backoff",
+				UpstreamLastStatusCode: 429,
+				UpstreamRetryAfter:     "30s",
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	statuses, err := client.ListWorkspaceStatuses(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].UpstreamStatus != "backoff" || statuses[0].UpstreamLastStatusCode != 429 {
+		t.Fatalf("workspace list should decode upstream health: %+v", statuses)
+	}
+
+	status, err := client.WorkspaceStatus(context.Background(), "/tmp/project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.UpstreamStatus != "backoff" || status.UpstreamRetryAfter != "30s" {
+		t.Fatalf("workspace status should decode upstream health: %+v", status)
 	}
 }

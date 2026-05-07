@@ -53,6 +53,10 @@ type ACEClient interface {
 	CodebaseRetrieval(context.Context, string, ace.RetrievalOptions) (string, error)
 }
 
+type upstreamHealthReporter interface {
+	HealthSnapshot() ace.HealthSnapshot
+}
+
 type Syncer struct {
 	client   ACEClient
 	mu       sync.Mutex
@@ -79,28 +83,35 @@ type Result struct {
 }
 
 type WorkspaceStatus struct {
-	DirectoryPath        string     `json:"directory_path"`
-	CheckpointID         string     `json:"checkpoint_id,omitempty"`
-	FileCount            int        `json:"file_count"`
-	InFlight             bool       `json:"in_flight"`
-	Stage                IndexStage `json:"stage"`
-	LastSyncReason       SyncReason `json:"last_sync_reason,omitempty"`
-	LastErrorStage       IndexStage `json:"last_error_stage,omitempty"`
-	LastUploaded         int        `json:"last_uploaded,omitempty"`
-	LastAdded            int        `json:"last_added,omitempty"`
-	LastDeleted          int        `json:"last_deleted,omitempty"`
-	WatchEnabled         bool       `json:"watch_enabled,omitempty"`
-	WatchScheduled       bool       `json:"watch_scheduled,omitempty"`
-	WatchRunning         bool       `json:"watch_running,omitempty"`
-	LastError            string     `json:"last_error,omitempty"`
-	WatchError           string     `json:"watch_error,omitempty"`
-	LastStartedAt        *time.Time `json:"last_started_at,omitempty"`
-	LastFinishedAt       *time.Time `json:"last_finished_at,omitempty"`
-	StageStartedAt       *time.Time `json:"stage_started_at,omitempty"`
-	LastWatchAt          *time.Time `json:"last_watch_at,omitempty"`
-	NextWatchAt          *time.Time `json:"next_watch_at,omitempty"`
-	LastBackgroundSyncAt *time.Time `json:"last_background_sync_at,omitempty"`
-	UpdatedAt            *time.Time `json:"updated_at,omitempty"`
+	DirectoryPath          string     `json:"directory_path"`
+	CheckpointID           string     `json:"checkpoint_id,omitempty"`
+	FileCount              int        `json:"file_count"`
+	InFlight               bool       `json:"in_flight"`
+	Stage                  IndexStage `json:"stage"`
+	LastSyncReason         SyncReason `json:"last_sync_reason,omitempty"`
+	LastErrorStage         IndexStage `json:"last_error_stage,omitempty"`
+	LastUploaded           int        `json:"last_uploaded,omitempty"`
+	LastAdded              int        `json:"last_added,omitempty"`
+	LastDeleted            int        `json:"last_deleted,omitempty"`
+	WatchEnabled           bool       `json:"watch_enabled,omitempty"`
+	WatchScheduled         bool       `json:"watch_scheduled,omitempty"`
+	WatchRunning           bool       `json:"watch_running,omitempty"`
+	LastError              string     `json:"last_error,omitempty"`
+	WatchError             string     `json:"watch_error,omitempty"`
+	UpstreamStatus         string     `json:"upstream_status,omitempty"`
+	UpstreamLastStatusCode int        `json:"upstream_last_status_code,omitempty"`
+	UpstreamRetryAfter     string     `json:"upstream_retry_after,omitempty"`
+	UpstreamBackoffUntil   *time.Time `json:"upstream_backoff_until,omitempty"`
+	UpstreamLastError      string     `json:"upstream_last_error,omitempty"`
+	UpstreamLastFailure    *time.Time `json:"upstream_last_failure,omitempty"`
+	UpstreamLastSuccess    *time.Time `json:"upstream_last_success,omitempty"`
+	LastStartedAt          *time.Time `json:"last_started_at,omitempty"`
+	LastFinishedAt         *time.Time `json:"last_finished_at,omitempty"`
+	StageStartedAt         *time.Time `json:"stage_started_at,omitempty"`
+	LastWatchAt            *time.Time `json:"last_watch_at,omitempty"`
+	NextWatchAt            *time.Time `json:"next_watch_at,omitempty"`
+	LastBackgroundSyncAt   *time.Time `json:"last_background_sync_at,omitempty"`
+	UpdatedAt              *time.Time `json:"updated_at,omitempty"`
 }
 
 type state struct {
@@ -169,7 +180,7 @@ func (s *Syncer) WorkspaceStatus(ctx context.Context, dir string) (WorkspaceStat
 	s.mu.Lock()
 	if status, ok := s.statuses[root]; ok {
 		s.mu.Unlock()
-		return cloneWorkspaceStatus(status), nil
+		return s.withUpstreamHealth(cloneWorkspaceStatus(status)), nil
 	}
 	s.mu.Unlock()
 
@@ -177,7 +188,7 @@ func (s *Syncer) WorkspaceStatus(ctx context.Context, dir string) (WorkspaceStat
 	if err != nil {
 		return WorkspaceStatus{}, err
 	}
-	return workspaceStatusFromState(root, st), nil
+	return s.withUpstreamHealth(workspaceStatusFromState(root, st)), nil
 }
 
 func (s *Syncer) ListWorkspaceStatuses(ctx context.Context) ([]WorkspaceStatus, error) {
@@ -187,7 +198,7 @@ func (s *Syncer) ListWorkspaceStatuses(ctx context.Context) ([]WorkspaceStatus, 
 	s.mu.Lock()
 	statuses := make([]WorkspaceStatus, 0, len(s.statuses))
 	for _, status := range s.statuses {
-		statuses = append(statuses, cloneWorkspaceStatus(status))
+		statuses = append(statuses, s.withUpstreamHealth(cloneWorkspaceStatus(status)))
 	}
 	s.mu.Unlock()
 	sort.Slice(statuses, func(i, j int) bool {
@@ -391,7 +402,33 @@ func cloneWorkspaceStatus(status WorkspaceStatus) WorkspaceStatus {
 	status.LastWatchAt = cloneTime(status.LastWatchAt)
 	status.NextWatchAt = cloneTime(status.NextWatchAt)
 	status.LastBackgroundSyncAt = cloneTime(status.LastBackgroundSyncAt)
+	status.UpstreamBackoffUntil = cloneTime(status.UpstreamBackoffUntil)
+	status.UpstreamLastFailure = cloneTime(status.UpstreamLastFailure)
+	status.UpstreamLastSuccess = cloneTime(status.UpstreamLastSuccess)
 	status.UpdatedAt = cloneTime(status.UpdatedAt)
+	return status
+}
+
+func (s *Syncer) withUpstreamHealth(status WorkspaceStatus) WorkspaceStatus {
+	reporter, ok := s.client.(upstreamHealthReporter)
+	if !ok {
+		return status
+	}
+	health := reporter.HealthSnapshot()
+	if health.Status == "" && health.LastStatusCode == 0 && health.LastError == "" && health.BackoffUntil == nil && health.LastFailureAt == nil && health.LastSuccessAt == nil {
+		return status
+	}
+	status.UpstreamStatus = health.Status
+	status.UpstreamLastStatusCode = health.LastStatusCode
+	if health.RetryAfter > 0 {
+		status.UpstreamRetryAfter = health.RetryAfter.String()
+	} else {
+		status.UpstreamRetryAfter = ""
+	}
+	status.UpstreamBackoffUntil = cloneTime(health.BackoffUntil)
+	status.UpstreamLastError = health.LastError
+	status.UpstreamLastFailure = cloneTime(health.LastFailureAt)
+	status.UpstreamLastSuccess = cloneTime(health.LastSuccessAt)
 	return status
 }
 

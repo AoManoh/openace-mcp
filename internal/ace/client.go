@@ -14,7 +14,9 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/auth"
@@ -27,6 +29,8 @@ type SessionLoader interface {
 type Client struct {
 	loader SessionLoader
 	http   *http.Client
+	mu     sync.Mutex
+	health HealthSnapshot
 }
 
 func NewClient(loader SessionLoader) *Client {
@@ -52,13 +56,26 @@ type RetrievalOptions struct {
 }
 
 type apiError struct {
-	endpoint string
-	status   int
-	body     string
+	endpoint           string
+	status             int
+	body               string
+	retryAfterDuration time.Duration
+	receivedAt         time.Time
 }
 
 func (e apiError) Error() string {
 	return fmt.Sprintf("%s returned HTTP %d: %s", e.endpoint, e.status, e.body)
+}
+
+// HealthSnapshot summarizes the latest upstream ACE availability signal.
+type HealthSnapshot struct {
+	Status         string
+	LastStatusCode int
+	LastError      string
+	RetryAfter     time.Duration
+	BackoffUntil   *time.Time
+	LastFailureAt  *time.Time
+	LastSuccessAt  *time.Time
 }
 
 func (c *Client) FindMissing(ctx context.Context, blobNames []string) ([]string, []string, error) {
@@ -142,15 +159,29 @@ func (c *Client) post(ctx context.Context, endpoint string, body any, out any) e
 
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
+		if err := c.waitForBackoff(ctx); err != nil {
+			return err
+		}
 		err := c.postOnce(ctx, session, endpoint, payload, out)
 		if err == nil {
+			c.recordSuccess()
 			return nil
 		}
 		lastErr = err
 		if !retryable(err) || attempt == 2 {
+			delay := time.Duration(0)
+			if retryable(err) {
+				delay = retryDelay(err, attempt)
+			}
+			c.recordFailure(err, delay)
 			return err
 		}
-		if err := sleep(ctx, time.Duration(attempt+1)*500*time.Millisecond); err != nil {
+		delay := retryDelay(err, attempt)
+		c.recordFailure(err, delay)
+		if isRateLimited(err) {
+			return err
+		}
+		if err := sleep(ctx, delay); err != nil {
 			return err
 		}
 	}
@@ -180,7 +211,15 @@ func (c *Client) postOnce(ctx context.Context, session auth.Session, endpoint st
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return apiError{endpoint: endpoint, status: resp.StatusCode, body: trimForError(data)}
+		retryAfter := resp.Header.Get("Retry-After")
+		delay, _ := parseRetryAfter(retryAfter, time.Now().UTC())
+		return apiError{
+			endpoint:           endpoint,
+			status:             resp.StatusCode,
+			body:               trimForError(data),
+			retryAfterDuration: delay,
+			receivedAt:         time.Now().UTC(),
+		}
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
 		return nil
@@ -205,6 +244,144 @@ func retryable(err error) bool {
 	}
 	text := strings.ToLower(err.Error())
 	return strings.Contains(text, "tls handshake timeout") || strings.Contains(text, "temporary")
+}
+
+func retryDelay(err error, attempt int) time.Duration {
+	var api apiError
+	if errors.As(err, &api) && api.retryAfterDuration > 0 {
+		return api.retryAfterDuration
+	}
+	return time.Duration(attempt+1) * 500 * time.Millisecond
+}
+
+func isRateLimited(err error) bool {
+	var api apiError
+	return errors.As(err, &api) && api.status == http.StatusTooManyRequests
+}
+
+func parseRetryAfter(value string, now time.Time) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds <= 0 {
+			return 0, true
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	delay := when.Sub(now)
+	if delay < 0 {
+		return 0, true
+	}
+	return delay, true
+}
+
+func (c *Client) waitForBackoff(ctx context.Context) error {
+	for {
+		c.mu.Lock()
+		until := cloneTime(c.health.BackoffUntil)
+		c.mu.Unlock()
+		if until == nil {
+			return nil
+		}
+		delay := time.Until(*until)
+		if delay <= 0 {
+			return nil
+		}
+		if err := sleep(ctx, delay); err != nil {
+			return err
+		}
+	}
+}
+
+func (c *Client) recordSuccess() {
+	now := time.Now().UTC()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.health.BackoffUntil != nil && now.Before(*c.health.BackoffUntil) {
+		c.health.LastSuccessAt = &now
+		return
+	}
+	c.health.Status = "ok"
+	c.health.LastError = ""
+	c.health.LastStatusCode = 0
+	c.health.RetryAfter = 0
+	c.health.BackoffUntil = nil
+	c.health.LastSuccessAt = &now
+}
+
+func (c *Client) recordFailure(err error, delay time.Duration) {
+	now := time.Now().UTC()
+	snapshot := HealthSnapshot{
+		Status:        "degraded",
+		LastError:     redactSensitive(err.Error()),
+		RetryAfter:    delay,
+		LastFailureAt: &now,
+	}
+	var api apiError
+	if errors.As(err, &api) {
+		snapshot.LastStatusCode = api.status
+		if api.receivedAt.IsZero() {
+			api.receivedAt = now
+		}
+		snapshot.LastFailureAt = cloneTimeValue(api.receivedAt)
+		if api.status == http.StatusTooManyRequests {
+			snapshot.Status = "backoff"
+		}
+	}
+	if delay > 0 {
+		until := now.Add(delay).UTC()
+		snapshot.BackoffUntil = &until
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.health.LastSuccessAt != nil {
+		snapshot.LastSuccessAt = cloneTime(c.health.LastSuccessAt)
+	}
+	if snapshot.BackoffUntil == nil && c.health.BackoffUntil != nil && time.Now().Before(*c.health.BackoffUntil) {
+		snapshot.BackoffUntil = cloneTime(c.health.BackoffUntil)
+		snapshot.RetryAfter = time.Until(*c.health.BackoffUntil)
+		snapshot.Status = "backoff"
+	}
+	c.health = snapshot
+}
+
+func (c *Client) HealthSnapshot() HealthSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	snapshot := c.health
+	if snapshot.BackoffUntil != nil && !time.Now().Before(*snapshot.BackoffUntil) {
+		snapshot.BackoffUntil = nil
+		snapshot.RetryAfter = 0
+		if snapshot.Status == "backoff" {
+			snapshot.Status = "degraded"
+		}
+	}
+	snapshot.BackoffUntil = cloneTime(snapshot.BackoffUntil)
+	snapshot.LastFailureAt = cloneTime(snapshot.LastFailureAt)
+	snapshot.LastSuccessAt = cloneTime(snapshot.LastSuccessAt)
+	return snapshot
+}
+
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copied := value.UTC()
+	return &copied
+}
+
+func cloneTimeValue(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	copied := value.UTC()
+	return &copied
 }
 
 func sleep(ctx context.Context, d time.Duration) error {

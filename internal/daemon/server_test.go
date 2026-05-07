@@ -34,17 +34,25 @@ type fakeWorkspaceSyncer struct {
 
 func (fakeWorkspaceSyncer) ListWorkspaceStatuses(ctx context.Context) ([]workspace.WorkspaceStatus, error) {
 	return []workspace.WorkspaceStatus{{
-		DirectoryPath: "/tmp/project",
-		CheckpointID:  "checkpoint",
-		FileCount:     3,
+		DirectoryPath:          "/tmp/project",
+		CheckpointID:           "checkpoint",
+		FileCount:              3,
+		UpstreamStatus:         "backoff",
+		UpstreamLastStatusCode: 429,
+		UpstreamRetryAfter:     "30s",
+		UpstreamLastError:      "find-missing returned HTTP 429: quota exhausted",
 	}}, nil
 }
 
 func (fakeWorkspaceSyncer) WorkspaceStatus(ctx context.Context, dir string) (workspace.WorkspaceStatus, error) {
 	return workspace.WorkspaceStatus{
-		DirectoryPath: dir,
-		CheckpointID:  "checkpoint",
-		FileCount:     3,
+		DirectoryPath:          dir,
+		CheckpointID:           "checkpoint",
+		FileCount:              3,
+		UpstreamStatus:         "backoff",
+		UpstreamLastStatusCode: 429,
+		UpstreamRetryAfter:     "30s",
+		UpstreamLastError:      "find-missing returned HTTP 429: quota exhausted",
 	}, nil
 }
 
@@ -231,6 +239,9 @@ func TestServerWorkspaceStatus(t *testing.T) {
 	if len(list.Workspaces) != 1 || list.Workspaces[0].CheckpointID != "checkpoint" {
 		t.Fatalf("unexpected workspace list: %+v", list)
 	}
+	if list.Workspaces[0].UpstreamStatus != "backoff" || list.Workspaces[0].UpstreamLastStatusCode != 429 {
+		t.Fatalf("workspace list should include upstream health: %+v", list)
+	}
 
 	payload, err := json.Marshal(workspaceStatusRequest{DirectoryPath: "/tmp/project"})
 	if err != nil {
@@ -250,6 +261,9 @@ func TestServerWorkspaceStatus(t *testing.T) {
 	}
 	if status.DirectoryPath != "/tmp/project" || status.FileCount != 3 {
 		t.Fatalf("unexpected workspace status: %+v", status)
+	}
+	if status.UpstreamStatus != "backoff" || status.UpstreamRetryAfter != "30s" {
+		t.Fatalf("workspace status should include upstream health: %+v", status)
 	}
 }
 

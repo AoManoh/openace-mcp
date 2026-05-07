@@ -2,10 +2,29 @@ package ace
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/AoManoh/openace-mcp/internal/auth"
 )
+
+type staticSessionLoader struct {
+	session auth.Session
+}
+
+func (l staticSessionLoader) Load(ctx context.Context) (auth.Session, error) {
+	if err := ctx.Err(); err != nil {
+		return auth.Session{}, err
+	}
+	return l.session, nil
+}
 
 func TestBlobsPayloadOmitsEmptyCheckpointAndUsesArrays(t *testing.T) {
 	payload := blobsPayload("", []string{"b", "a"}, nil)
@@ -67,5 +86,113 @@ func TestRetryableIncludesTransientGatewayStatuses(t *testing.T) {
 	}
 	if retryable(apiError{endpoint: "agents/codebase-retrieval", status: 400}) {
 		t.Fatal("status 400 should not be retryable")
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC)
+	if got, ok := parseRetryAfter("3", now); !ok || got != 3*time.Second {
+		t.Fatalf("seconds retry-after = %v, %v", got, ok)
+	}
+	when := now.Add(5 * time.Second).Format(http.TimeFormat)
+	if got, ok := parseRetryAfter(when, now); !ok || got != 5*time.Second {
+		t.Fatalf("date retry-after = %v, %v", got, ok)
+	}
+	if got, ok := parseRetryAfter("", now); ok || got != 0 {
+		t.Fatalf("empty retry-after = %v, %v", got, ok)
+	}
+	if got, ok := parseRetryAfter("not-a-date", now); ok || got != 0 {
+		t.Fatalf("invalid retry-after = %v, %v", got, ok)
+	}
+}
+
+func TestClientRateLimitWithRetryAfterDoesNotRetryImmediately(t *testing.T) {
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "quota exhausted", http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	client := NewClient(staticSessionLoader{session: auth.Session{
+		AccessToken: "token",
+		TenantURL:   server.URL,
+	}})
+	_, _, err := client.FindMissing(context.Background(), []string{"blob-a"})
+	if err == nil {
+		t.Fatal("FindMissing should return rate limit error")
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("rate-limited request should not be retried immediately, got %d requests", got)
+	}
+	health := client.HealthSnapshot()
+	if health.Status != "backoff" || health.LastStatusCode != http.StatusTooManyRequests || health.BackoffUntil == nil {
+		t.Fatalf("unexpected health snapshot: %+v", health)
+	}
+}
+
+func TestClientSharedBackoffBlocksFollowupRequest(t *testing.T) {
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&requests, 1) == 1 {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "quota exhausted", http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"unknown_memory_names":[]}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(staticSessionLoader{session: auth.Session{
+		AccessToken: "token",
+		TenantURL:   server.URL,
+	}})
+	_, _, err := client.FindMissing(context.Background(), []string{"blob-a"})
+	if err == nil {
+		t.Fatal("first FindMissing should return rate limit error")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, _, err = client.FindMissing(ctx, []string{"blob-b"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("followup request should wait for shared backoff until context deadline, got %v", err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("followup request should not reach upstream during backoff, got %d requests", got)
+	}
+}
+
+func TestClientSuccessDoesNotClearActiveBackoff(t *testing.T) {
+	client := NewClient(staticSessionLoader{session: auth.Session{AccessToken: "token", TenantURL: "https://tenant.example.invalid"}})
+	client.recordFailure(apiError{
+		endpoint: "find-missing",
+		status:   http.StatusTooManyRequests,
+		body:     "quota exhausted",
+	}, time.Minute)
+	client.recordSuccess()
+
+	health := client.HealthSnapshot()
+	if health.Status != "backoff" || health.BackoffUntil == nil || health.LastSuccessAt == nil {
+		t.Fatalf("active backoff should survive concurrent success: %+v", health)
+	}
+}
+
+func TestClientServerErrorRecordsDegradedHealth(t *testing.T) {
+	client := NewClient(staticSessionLoader{session: auth.Session{AccessToken: "token", TenantURL: "https://tenant.example.invalid"}})
+	client.recordFailure(apiError{
+		endpoint: "find-missing",
+		status:   http.StatusServiceUnavailable,
+		body:     "temporarily unavailable",
+	}, 2*time.Second)
+
+	health := client.HealthSnapshot()
+	if health.Status != "degraded" || health.LastStatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("5xx should record degraded health: %+v", health)
+	}
+	if health.BackoffUntil == nil || health.RetryAfter <= 0 {
+		t.Fatalf("5xx should expose retry timing: %+v", health)
 	}
 }

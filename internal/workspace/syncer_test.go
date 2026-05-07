@@ -679,6 +679,37 @@ func TestSyncerWorkspaceStatusRecordsFailureStage(t *testing.T) {
 	}
 }
 
+func TestSyncerWorkspaceStatusIncludesUpstreamHealth(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	backoffUntil := time.Now().Add(time.Minute).UTC()
+	failureAt := time.Now().UTC()
+	client := &healthReportingClient{
+		health: ace.HealthSnapshot{
+			Status:         "backoff",
+			LastStatusCode: 429,
+			LastError:      "find-missing returned HTTP 429: quota exhausted",
+			RetryAfter:     time.Minute,
+			BackoffUntil:   &backoffUntil,
+			LastFailureAt:  &failureAt,
+		},
+	}
+
+	status, err := NewSyncer(client).WorkspaceStatus(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.UpstreamStatus != "backoff" || status.UpstreamLastStatusCode != 429 {
+		t.Fatalf("status should include upstream health: %+v", status)
+	}
+	if status.UpstreamRetryAfter != "1m0s" || status.UpstreamBackoffUntil == nil || status.UpstreamLastFailure == nil {
+		t.Fatalf("status should include upstream retry timing: %+v", status)
+	}
+	if !strings.Contains(status.UpstreamLastError, "HTTP 429") {
+		t.Fatalf("status should include upstream last error: %+v", status)
+	}
+}
+
 func TestSyncerWorkspaceChangedComparesCurrentScanToState(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
@@ -931,6 +962,15 @@ type recordingClient struct {
 	findMissingBatches [][]string
 	unknownByName      map[string]bool
 	nonindexedByName   map[string]bool
+}
+
+type healthReportingClient struct {
+	recordingClient
+	health ace.HealthSnapshot
+}
+
+func (c *healthReportingClient) HealthSnapshot() ace.HealthSnapshot {
+	return c.health
 }
 
 func (c *recordingClient) FindMissing(ctx context.Context, names []string) ([]string, []string, error) {
