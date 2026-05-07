@@ -49,6 +49,23 @@ func TestBlobsPayloadOmitsEmptyCheckpointAndUsesArrays(t *testing.T) {
 	}
 }
 
+func TestBlobsPayloadUsesArraysForNonNilEmptySlices(t *testing.T) {
+	payload := blobsPayload("cp-1", []string{}, []string{})
+
+	for _, key := range []string{"added_blobs", "deleted_blobs"} {
+		if got, ok := payload[key].([]string); !ok || got == nil || len(got) != 0 {
+			t.Fatalf("%s = %#v, want non-nil empty []string", key, payload[key])
+		}
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(`null`)) {
+		t.Fatalf("empty slices encoded as null: %s", data)
+	}
+}
+
 func TestBlobsPayloadKeepsCheckpoint(t *testing.T) {
 	payload := blobsPayload("cp-1", nil, []string{"z", "x"})
 

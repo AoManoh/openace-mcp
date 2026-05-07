@@ -425,7 +425,7 @@ func unique(values []string) []string {
 }
 
 func jsonStrings(values []string) []string {
-	if values == nil {
+	if len(values) == 0 {
 		return []string{}
 	}
 	result := append([]string(nil), values...)
