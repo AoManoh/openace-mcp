@@ -204,7 +204,7 @@ func (s *Syncer) WorkspaceChanged(ctx context.Context, dir string) (bool, error)
 	if err != nil {
 		return false, err
 	}
-	files, err := scan(ctx, root)
+	assets, err := FileAssetSource{}.Load(ctx, root)
 	if err != nil {
 		return false, err
 	}
@@ -212,7 +212,7 @@ func (s *Syncer) WorkspaceChanged(ctx context.Context, dir string) (bool, error)
 	if err != nil {
 		return false, err
 	}
-	current := blobMap(files)
+	current := assets.blobMap()
 	return !sameBlobMap(st.BlobNames, current), nil
 }
 
@@ -405,7 +405,7 @@ func cloneTime(value *time.Time) *time.Time {
 
 func (s *Syncer) syncRoot(ctx context.Context, root string) (Result, error) {
 	s.markSyncStage(root, IndexStageScanning)
-	files, err := scan(ctx, root)
+	assets, err := FileAssetSource{}.Load(ctx, root)
 	if err != nil {
 		return Result{}, err
 	}
@@ -417,14 +417,9 @@ func (s *Syncer) syncRoot(ctx context.Context, root string) (Result, error) {
 		st.BlobNames = map[string]string{}
 	}
 
-	current := blobMap(files)
-	byName := make(map[string]fileBlob, len(files))
-	allNames := make([]string, 0, len(files))
-	for _, file := range files {
-		byName[file.BlobName] = file
-		allNames = append(allNames, file.BlobName)
-	}
-	sort.Strings(allNames)
+	current := assets.blobMap()
+	byName := assets.byBlobName()
+	allNames := assets.blobNames()
 
 	added, deleted := diff(st.BlobNames, current)
 	if st.CheckpointID == "" {
@@ -443,25 +438,15 @@ func (s *Syncer) syncRoot(ctx context.Context, root string) (Result, error) {
 		s.markSyncStage(root, IndexStageUploading)
 	}
 	for _, name := range toUpload {
-		file, ok := byName[name]
+		asset, ok := byName[name]
 		if !ok {
 			continue
 		}
-		content, ok, err := readIndexableContent(ctx, file.AbsPath, int64(maxFileBytes()))
+		upload, err := asset.upload(ctx)
 		if err != nil {
 			return Result{}, err
 		}
-		if !ok {
-			return Result{}, fmt.Errorf("file is no longer indexable during sync: %s", file.RelPath)
-		}
-		if currentName := blobName(file.RelPath, content); currentName != file.BlobName {
-			return Result{}, fmt.Errorf("file changed during sync: %s", file.RelPath)
-		}
-		uploads = append(uploads, ace.BlobUpload{
-			BlobName: file.BlobName,
-			Path:     file.RelPath,
-			Content:  string(content),
-		})
+		uploads = append(uploads, upload)
 	}
 	if len(uploads) > 0 {
 		if err := batchUpload(ctx, s.client, uploads, uploadBatchBytes()); err != nil {
@@ -485,7 +470,7 @@ func (s *Syncer) syncRoot(ctx context.Context, root string) (Result, error) {
 
 	return Result{
 		CheckpointID: st.CheckpointID,
-		FileCount:    len(files),
+		FileCount:    len(assets),
 		Uploaded:     len(uploads),
 		Added:        len(added),
 		Deleted:      len(deleted),

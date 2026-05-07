@@ -719,6 +719,163 @@ func TestSyncerWorkspaceChangedComparesCurrentScanToState(t *testing.T) {
 	}
 }
 
+func TestSyncerWorkspaceChangedAssetTransitions(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     map[string]string
+		initial map[string]string
+		mutate  func(t *testing.T, root string)
+		want    bool
+	}{
+		{
+			name: "indexed file added",
+			initial: map[string]string{
+				"main.go": "package main\n",
+			},
+			mutate: func(t *testing.T, root string) {
+				writeWorkspaceTestFile(t, root, "new.go", "package new\n")
+			},
+			want: true,
+		},
+		{
+			name: "indexed file deleted",
+			initial: map[string]string{
+				"main.go": "package main\n",
+				"old.go":  "package old\n",
+			},
+			mutate: func(t *testing.T, root string) {
+				if err := os.Remove(filepath.Join(root, "old.go")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: true,
+		},
+		{
+			name: "ignored file changed",
+			initial: map[string]string{
+				".gitignore":  "*.tmp\n",
+				"ignored.tmp": "before\n",
+				"main.go":     "package main\n",
+			},
+			mutate: func(t *testing.T, root string) {
+				writeWorkspaceTestFile(t, root, "ignored.tmp", "after\n")
+			},
+			want: false,
+		},
+		{
+			name: "secret file changed",
+			initial: map[string]string{
+				".env":    "SECRET=before\n",
+				"main.go": "package main\n",
+			},
+			mutate: func(t *testing.T, root string) {
+				writeWorkspaceTestFile(t, root, ".env", "SECRET=after\n")
+			},
+			want: false,
+		},
+		{
+			name: "ignore policy reincludes existing asset",
+			initial: map[string]string{
+				".gitignore":  "docs/\n",
+				"docs/one.md": "knowledge\n",
+				"main.go":     "package main\n",
+			},
+			mutate: func(t *testing.T, root string) {
+				writeWorkspaceTestFile(t, root, ".augmentignore", "!docs/**/*.md\n")
+			},
+			want: true,
+		},
+		{
+			name: "indexed file becomes too large",
+			env: map[string]string{
+				"OPENACE_MAX_FILE_BYTES": "10",
+			},
+			initial: map[string]string{
+				"main.go":   "package main\n",
+				"small.txt": "1234567890",
+			},
+			mutate: func(t *testing.T, root string) {
+				writeWorkspaceTestFile(t, root, "small.txt", "12345678901")
+			},
+			want: true,
+		},
+		{
+			name: "indexed file becomes invalid utf8",
+			initial: map[string]string{
+				"main.go": "package main\n",
+				"text.md": "valid\n",
+			},
+			mutate: func(t *testing.T, root string) {
+				path := filepath.Join(root, "text.md")
+				if err := os.WriteFile(path, []byte{0xff, 0xfe, 'x'}, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+			for key, value := range tt.env {
+				t.Setenv(key, value)
+			}
+			for rel, content := range tt.initial {
+				writeWorkspaceTestFile(t, root, rel, content)
+			}
+			syncer := NewSyncer(&recordingClient{})
+			if _, err := syncer.Sync(context.Background(), root); err != nil {
+				t.Fatal(err)
+			}
+
+			tt.mutate(t, root)
+			changed, err := syncer.WorkspaceChanged(context.Background(), root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if changed != tt.want {
+				t.Fatalf("WorkspaceChanged = %v, want %v", changed, tt.want)
+			}
+		})
+	}
+}
+
+func TestSyncRejectsMidSyncMutation(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	path := filepath.Join(root, "main.go")
+	if err := os.WriteFile(path, []byte("package main\nconst Version = 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &mutatingSyncClient{
+		path:    path,
+		content: []byte("package main\nconst Version = 2\n"),
+	}
+	_, err := NewSyncer(client).Sync(context.Background(), root)
+	if err == nil {
+		t.Fatal("sync should fail when a file changes after asset discovery")
+	}
+	if !strings.Contains(err.Error(), "file changed during sync: main.go") {
+		t.Fatalf("unexpected sync error: %v", err)
+	}
+	if client.batchUploadCalls != 0 {
+		t.Fatalf("batch upload should not run after mid-sync mutation, got %d", client.batchUploadCalls)
+	}
+	if client.checkpointCalls != 0 {
+		t.Fatalf("checkpoint should not run after mid-sync mutation, got %d", client.checkpointCalls)
+	}
+	st, _, err := loadState(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.CheckpointID != "" || len(st.BlobNames) != 0 {
+		t.Fatalf("failed sync should not write state: %#v", st)
+	}
+}
+
 func TestSyncerListsWorkspaceStatuses(t *testing.T) {
 	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
 	rootA := t.TempDir()
@@ -802,6 +959,54 @@ func (c *recordingClient) CheckpointBlobs(context.Context, string, []string, []s
 }
 
 func (c *recordingClient) CodebaseRetrieval(context.Context, string, ace.RetrievalOptions) (string, error) {
+	return "", nil
+}
+
+func writeWorkspaceTestFile(t *testing.T, root string, rel string, content string) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type mutatingSyncClient struct {
+	path             string
+	content          []byte
+	batchUploadCalls int
+	checkpointCalls  int
+}
+
+func (c *mutatingSyncClient) FindMissing(ctx context.Context, names []string) ([]string, []string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if err := os.WriteFile(c.path, c.content, 0o600); err != nil {
+		return nil, nil, err
+	}
+	return append([]string(nil), names...), nil, nil
+}
+
+func (c *mutatingSyncClient) BatchUpload(ctx context.Context, uploads []ace.BlobUpload) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.batchUploadCalls++
+	return nil
+}
+
+func (c *mutatingSyncClient) CheckpointBlobs(ctx context.Context, previous string, added []string, deleted []string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	c.checkpointCalls++
+	return "checkpoint-mutated", nil
+}
+
+func (c *mutatingSyncClient) CodebaseRetrieval(context.Context, string, ace.RetrievalOptions) (string, error) {
 	return "", nil
 }
 
