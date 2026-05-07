@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -88,9 +89,10 @@ type TaskStore struct {
 }
 
 type taskRecord struct {
-	snapshot TaskSnapshot
-	request  TaskRequest
-	cancel   context.CancelFunc
+	snapshot        TaskSnapshot
+	request         TaskRequest
+	cancel          context.CancelFunc
+	acceptedSidecar bool
 }
 
 var ErrTaskQueueFull = errors.New("task queue is full")
@@ -210,16 +212,36 @@ func (s *TaskStore) Submit(req TaskRequest) (TaskSnapshot, error) {
 		return TaskSnapshot{}, ErrTaskStoreClosed
 	}
 	s.tasks[id] = record
-	s.pruneLocked(taskHistoryLimit())
-	s.persistLocked()
-	snapshot := cloneTask(record.snapshot)
 	select {
 	case s.queue <- id:
+		record.acceptedSidecar = s.storeDir != ""
+		accepted := cloneTask(record.snapshot)
 		s.mu.Unlock()
-		return snapshot, nil
+
+		if err := saveAcceptedTaskSnapshot(s.storeDir, accepted); err != nil {
+			s.mu.Lock()
+			if current := s.tasks[id]; current != nil {
+				current.acceptedSidecar = false
+				if current.snapshot.State == TaskStateQueued {
+					delete(s.tasks, id)
+				} else {
+					s.persistLocked()
+				}
+			}
+			s.mu.Unlock()
+			return TaskSnapshot{}, err
+		}
+
+		s.mu.Lock()
+		if current := s.tasks[id]; current != nil {
+			current.acceptedSidecar = s.storeDir != ""
+		}
+		s.pruneLocked(taskHistoryLimit())
+		s.persistLocked()
+		s.mu.Unlock()
+		return accepted, nil
 	default:
 		delete(s.tasks, id)
-		s.persistLocked()
 		s.mu.Unlock()
 		return TaskSnapshot{}, ErrTaskQueueFull
 	}
@@ -462,32 +484,42 @@ func (s *TaskStore) loadPersisted() {
 	}
 	path := filepath.Join(s.storeDir, "tasks.json")
 	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	var manifest taskManifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		_ = os.Rename(path, path+".corrupt-"+time.Now().UTC().Format("20060102150405"))
-		return
-	}
 	now := time.Now().UTC()
-	for _, snapshot := range manifest.Tasks {
-		if snapshot.ID == "" {
+	if err == nil {
+		var manifest taskManifest
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			_ = os.Rename(path, path+".corrupt-"+time.Now().UTC().Format("20060102150405"))
+		} else {
+			for _, snapshot := range manifest.Tasks {
+				s.addRecoveredTaskLocked(snapshot, now, false)
+			}
+		}
+	}
+	for _, snapshot := range loadAcceptedTaskSnapshots(s.storeDir) {
+		if _, exists := s.tasks[snapshot.ID]; exists {
 			continue
 		}
-		snapshot = cloneTask(snapshot)
-		if !isTerminal(snapshot.State) {
-			snapshot.State = TaskStateFailed
-			snapshot.Error = "abandoned after daemon restart"
-			snapshot.CompletedAt = &now
-		}
-		s.tasks[snapshot.ID] = &taskRecord{
-			request:  requestFromSnapshot(snapshot),
-			snapshot: snapshot,
-		}
+		s.addRecoveredTaskLocked(snapshot, now, true)
 	}
 	s.pruneLocked(taskHistoryLimit())
 	s.persistLocked()
+}
+
+func (s *TaskStore) addRecoveredTaskLocked(snapshot TaskSnapshot, now time.Time, acceptedSidecar bool) {
+	if snapshot.ID == "" {
+		return
+	}
+	snapshot = cloneTask(snapshot)
+	if !isTerminal(snapshot.State) {
+		snapshot.State = TaskStateFailed
+		snapshot.Error = "abandoned after daemon restart"
+		snapshot.CompletedAt = &now
+	}
+	s.tasks[snapshot.ID] = &taskRecord{
+		request:         requestFromSnapshot(snapshot),
+		snapshot:        snapshot,
+		acceptedSidecar: acceptedSidecar,
+	}
 }
 
 func (s *TaskStore) persistLocked() {
@@ -510,15 +542,27 @@ func (s *TaskStore) persistNow() {
 	}
 	s.mu.Lock()
 	manifest := s.manifestLocked()
+	sidecarIDs := s.acceptedSidecarIDsLocked(manifest)
 	s.mu.Unlock()
-	_ = saveTaskManifest(s.storeDir, manifest)
+	if err := saveTaskManifest(s.storeDir, manifest); err == nil {
+		s.clearAcceptedSidecars(sidecarIDs)
+	}
 }
 
 func (s *TaskStore) persistNowLocked() {
 	if s.storeDir == "" {
 		return
 	}
-	_ = saveTaskManifest(s.storeDir, s.manifestLocked())
+	manifest := s.manifestLocked()
+	sidecarIDs := s.acceptedSidecarIDsLocked(manifest)
+	if err := saveTaskManifest(s.storeDir, manifest); err == nil {
+		for _, id := range sidecarIDs {
+			_ = removeAcceptedTaskSnapshot(s.storeDir, id)
+			if record := s.tasks[id]; record != nil {
+				record.acceptedSidecar = false
+			}
+		}
+	}
 }
 
 func (s *TaskStore) manifestLocked() taskManifest {
@@ -526,7 +570,7 @@ func (s *TaskStore) manifestLocked() taskManifest {
 	prunable := make([]TaskSnapshot, 0, len(s.tasks))
 	for _, record := range s.tasks {
 		snapshot := cloneTask(record.snapshot)
-		if isPrunableTask(snapshot) {
+		if isPrunableTask(snapshot) && !record.acceptedSidecar {
 			prunable = append(prunable, snapshot)
 			continue
 		}
@@ -548,6 +592,34 @@ func (s *TaskStore) manifestLocked() taskManifest {
 		return tasks[i].SubmittedAt.After(tasks[j].SubmittedAt)
 	})
 	return taskManifest{Tasks: tasks}
+}
+
+func (s *TaskStore) acceptedSidecarIDsLocked(manifest taskManifest) []string {
+	ids := make([]string, 0)
+	for _, snapshot := range manifest.Tasks {
+		record := s.tasks[snapshot.ID]
+		if record == nil || !record.acceptedSidecar {
+			continue
+		}
+		ids = append(ids, snapshot.ID)
+	}
+	return ids
+}
+
+func (s *TaskStore) clearAcceptedSidecars(ids []string) {
+	if len(ids) == 0 || s.storeDir == "" {
+		return
+	}
+	for _, id := range ids {
+		_ = removeAcceptedTaskSnapshot(s.storeDir, id)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range ids {
+		if record := s.tasks[id]; record != nil {
+			record.acceptedSidecar = false
+		}
+	}
 }
 
 func isPrunableTask(snapshot TaskSnapshot) bool {
@@ -585,7 +657,97 @@ func saveTaskManifest(dir string, manifest taskManifest) error {
 	if err := os.Chmod(tmpPath, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, filepath.Join(dir, "tasks.json"))
+	if err := os.Rename(tmpPath, filepath.Join(dir, "tasks.json")); err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
+
+func saveAcceptedTaskSnapshot(dir string, snapshot TaskSnapshot) error {
+	if dir == "" {
+		return nil
+	}
+	path, err := acceptedTaskSnapshotPath(dir, snapshot.ID)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cloneTask(snapshot), "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func loadAcceptedTaskSnapshots(dir string) []TaskSnapshot {
+	entries, err := os.ReadDir(acceptedTaskSnapshotDir(dir))
+	if err != nil {
+		return nil
+	}
+	snapshots := make([]TaskSnapshot, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(acceptedTaskSnapshotDir(dir), entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var snapshot TaskSnapshot
+		if err := json.Unmarshal(data, &snapshot); err != nil {
+			_ = os.Rename(path, path+".corrupt-"+time.Now().UTC().Format("20060102150405"))
+			continue
+		}
+		if snapshot.ID == "" {
+			continue
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].SubmittedAt.After(snapshots[j].SubmittedAt)
+	})
+	return snapshots
+}
+
+func removeAcceptedTaskSnapshot(dir string, id string) error {
+	path, err := acceptedTaskSnapshotPath(dir, id)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+func acceptedTaskSnapshotDir(dir string) string {
+	return filepath.Join(dir, "accepted")
+}
+
+func acceptedTaskSnapshotPath(dir string, id string) (string, error) {
+	id = strings.TrimSpace(id)
+	if id == "" || filepath.Base(id) != id {
+		return "", fmt.Errorf("invalid task id for accepted snapshot: %q", id)
+	}
+	return filepath.Join(acceptedTaskSnapshotDir(dir), id+".json"), nil
 }
 
 func requestFromSnapshot(snapshot TaskSnapshot) TaskRequest {

@@ -458,6 +458,95 @@ func TestTaskStorePersistsCompletedTasks(t *testing.T) {
 	}
 }
 
+func TestTaskStoreRecoversAcceptedSidecarAsAbandoned(t *testing.T) {
+	dir := useTempTaskStore(t)
+	task := TaskSnapshot{
+		ID:                 "accepted-task",
+		Kind:               TaskKindRetrieve,
+		State:              TaskStateQueued,
+		DirectoryPath:      "/tmp/workspace",
+		InformationRequest: "find code",
+		SubmittedAt:        time.Now().UTC(),
+	}
+	if err := saveAcceptedTaskSnapshot(dir, task); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+		t.Fatal("sidecar-only accepted task should not run after restart")
+		return workspace.Result{}, nil
+	}, 2, 1)
+	cleanupTaskStore(t, recovered)
+	got, ok := recovered.Get(task.ID)
+	if !ok {
+		t.Fatalf("recovered task %s not found", task.ID)
+	}
+	if got.State != TaskStateFailed || got.Error != "abandoned after daemon restart" {
+		t.Fatalf("sidecar-only task should be marked abandoned: %+v", got)
+	}
+}
+
+func TestTaskStoreManifestWinsOverAcceptedSidecar(t *testing.T) {
+	dir := useTempTaskStore(t)
+	now := time.Now().UTC()
+	queued := TaskSnapshot{
+		ID:            "task-1",
+		Kind:          TaskKindSync,
+		State:         TaskStateQueued,
+		DirectoryPath: "/tmp/workspace",
+		SubmittedAt:   now.Add(-time.Second),
+	}
+	completed := queued
+	completed.State = TaskStateCompleted
+	completed.CompletedAt = &now
+	completed.Result = &workspace.Result{Text: "persisted", FileCount: 1}
+	if err := saveTaskManifest(dir, taskManifest{Tasks: []TaskSnapshot{completed}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveAcceptedTaskSnapshot(dir, queued); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+		t.Fatal("manifest task should not run after restart")
+		return workspace.Result{}, nil
+	}, 2, 1)
+	cleanupTaskStore(t, recovered)
+	got, ok := recovered.Get(queued.ID)
+	if !ok {
+		t.Fatalf("recovered task %s not found", queued.ID)
+	}
+	if got.State != TaskStateCompleted || got.Result == nil || got.Result.Text != "persisted" {
+		t.Fatalf("manifest should win over stale sidecar: %+v", got)
+	}
+}
+
+func TestTaskStoreQueueFullDoesNotLeaveAcceptedSidecar(t *testing.T) {
+	dir := useTempTaskStore(t)
+	store := &TaskStore{
+		runner:      func(ctx context.Context, req TaskRequest) (workspace.Result, error) { return workspace.Result{}, nil },
+		queue:       make(chan string, 1),
+		tasks:       make(map[string]*taskRecord),
+		workerCount: 0,
+		storeDir:    dir,
+		persistCh:   make(chan struct{}, 1),
+	}
+	cleanupTaskStore(t, store)
+
+	first, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/two"}); !errors.Is(err, ErrTaskQueueFull) {
+		t.Fatalf("second submit error = %v, want %v", err, ErrTaskQueueFull)
+	}
+
+	snapshots := loadAcceptedTaskSnapshots(dir)
+	if len(snapshots) != 1 || snapshots[0].ID != first.ID {
+		t.Fatalf("queue-full submit should not leave phantom sidecar: %+v", snapshots)
+	}
+}
+
 func TestTaskStoreMarksRunningTaskAbandonedOnRestart(t *testing.T) {
 	dir := useTempTaskStore(t)
 	now := time.Now().UTC()
