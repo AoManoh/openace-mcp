@@ -10,6 +10,7 @@
 - 默认 `OPENACE_MODE=auto`，AI IDE 只需要配置一个 MCP server；`openace-mcp` 会自动复用或启动本机 daemon。
 - daemon 异步任务使用可配置 worker pool，默认 4 个 worker。
 - daemon 任务快照已支持本地持久化，重启后仍可通过 `list_tasks` / `task_status` 找回最近任务。
+- 支持可选 `provider_profile_id` 显式选择 ACE provider profile；同一 daemon 只共享控制面，provider 的 ACE client、checkpoint state、inflight、watch 和上游退避状态互相隔离。
 - 已在大仓库场景完成 5 并发冷/热缓存压力测试。
 - 默认扫描会跳过 workspace 内 `.gitignore` / `.ignore` 命中内容，并排除 `.env*`、session、credentials、私钥、证书等敏感文件；需要索引被 Git 忽略的项目资产时，可用 `.augmentignore` 显式纳入。
 
@@ -25,6 +26,43 @@
 - `AUGMENT_SESSION_AUTH`
 - `OPENACE_SESSION_FILE`
 - 已登录插件留下的 `~/.augment/session.json`
+- `OPENACE_PROFILES_FILE`，用于需要显式切换多个 ACE provider profile 的高级场景
+
+## 多 Provider Profile
+
+默认情况下 openACE 沿用单账号凭据链。需要在同一个 daemon 里测试或显式使用多个账号时，可以配置一个本地 profile 文件：
+
+```json
+{
+  "default_profile_id": "primary",
+  "profiles": [
+    {
+      "id": "primary",
+      "accessToken": "your-primary-token",
+      "tenantURL": "https://<primary-tenant>.api.augmentcode.com/"
+    },
+    {
+      "id": "standby",
+      "accessToken": "your-standby-token",
+      "tenantURL": "https://<standby-tenant>.api.augmentcode.com/"
+    }
+  ]
+}
+```
+
+然后在 MCP 或 daemon 环境里设置：
+
+```bash
+export OPENACE_PROFILES_FILE="/absolute/path/to/openace-profiles.json"
+```
+
+profile 文件包含上游 token/session，必须当作本地 secret 管理，不要提交到 Git。
+
+`codebase_retrieval`、`multi_codebase_retrieval`、`sync_workspace`、`start_*` 和 `workspace_status` 都支持可选 `provider_profile_id`；省略时使用默认 profile。
+
+profile 在 daemon 启动时加载；修改 profile 文件或从单账号切换到多 profile 后，需要重启已有 daemon，避免 shim 复用旧 daemon。
+
+边界：openACE 不会因为某个 profile 出现 `429`、quota exhausted 或临时不可用而自动切换到另一个 profile。Augment / ACE 的代码索引跟随账号/租户，上游索引状态可能不同；自动接管会把“可用账号”误当成“同等索引状态”。当前实现只提供显式调度和状态隔离，是否切换由调用方或用户决定。
 
 ## 推荐模式
 
@@ -171,6 +209,7 @@ openace-mcp daemon
 - daemon 重启后可继续用 `list_tasks` 找回最近 completed / failed / cancelled 任务；重启前仍在 queued / running 的任务会标记为 failed，并附带 `abandoned after daemon restart`。
 - 忘记 task id 时用 `list_tasks`。
 - 多项目或压测排查时用 `list_workspaces` 和 `workspace_status` 观察 daemon 状态。
+- 多 provider 压测或排障时显式传 `provider_profile_id`；不要把它当作自动 failover 开关。
 
 ## 环境变量
 
@@ -180,6 +219,7 @@ openace-mcp daemon
 | `AUGMENT_TENANT` | 上游 ACE tenant/base URL |
 | `AUGMENT_SESSION_AUTH` | 完整 session JSON，优先级最高 |
 | `OPENACE_SESSION_FILE` | 显式 session 文件路径 |
+| `OPENACE_PROFILES_FILE` | 多 provider profile JSON；设置后替代单账号凭据链，工具通过 `provider_profile_id` 显式选择 |
 | `OPENACE_MODE` | `auto` / `direct` / `manual-daemon`，默认 `auto` |
 | `OPENACE_CACHE_DIR` | workspace checkpoint/cache 目录，省略时走 `os.UserCacheDir()`；支持 `~/`、`$HOME`、`${HOME}`、`%USERPROFILE%` 占位符，但仍推荐绝对路径 |
 | `OPENACE_CACHE_NAMESPACE` | cache 命名空间，用于隔离账号、tenant 或测试批次 |
@@ -248,14 +288,15 @@ Git ignore 和 openACE index ignore 是两条不同边界：`docs/`、`skills/` 
 
 ## 后台增量与状态
 
-daemon 模式会记住已经被 `sync_workspace` / `codebase_retrieval` / `multi_codebase_retrieval` 显式访问过的 workspace，并在后台做增量检查。后台检查先在本地重新扫描索引范围并比较 blob 集；只有发现新增、删除或内容变化时，才触发后台 `sync` 进入 ACE 上传与 checkpoint 流程，避免无变化时反复消耗上游 quota。
+daemon 模式会记住已经被 `sync_workspace` / `codebase_retrieval` / `multi_codebase_retrieval` 显式访问过的 workspace，并在后台做增量检查。后台检查先在本地重新扫描索引范围并比较 blob 集；只有发现新增、删除或内容变化时，才触发后台 `sync` 进入 ACE 上传与 checkpoint 流程，避免无变化时反复消耗上游 quota。配置多 provider profile 时，已见 workspace、inflight、checkpoint/cache 和后台 watch 状态都会按 provider profile 隔离；一个 profile 的冷索引、错误或退避不会污染另一个 profile。
 
-`workspace_status` 和 `list_workspaces` 会返回可解释状态字段：`stage` 表示当前同步阶段（`scanning` / `reconciling` / `uploading` / `checkpointing` / `ready` / `failed`），`last_sync_reason` 区分 `manual`、`retrieval` 和 `background`，watch 字段会展示后台检查是否启用、下次检查时间、最近检查时间、最近后台同步时间和探测错误。后台探测失败会按 `OPENACE_WATCH_BACKOFF_MIN` / `OPENACE_WATCH_BACKOFF_MAX` 退避重试。上游 ACE 返回 `429` / `5xx` 时，status 还会通过 `upstream_status`、`upstream_last_status_code`、`upstream_retry_after`、`upstream_backoff_until`、`upstream_last_error`、`upstream_last_failure` 和 `upstream_last_success` 暴露当前 daemon / client 共享的最近退避与错误摘要；这些字段不是单 workspace 指标，而是帮助多 agent 场景判断是否应暂停真实上游压力的上游信号。
+`workspace_status` 和 `list_workspaces` 会返回可解释状态字段：`stage` 表示当前同步阶段（`scanning` / `reconciling` / `uploading` / `checkpointing` / `ready` / `failed`），`provider_profile_id` / `provider_state` 表示当前 provider 维度的本地状态，`last_sync_reason` 区分 `manual`、`retrieval` 和 `background`，watch 字段会展示后台检查是否启用、下次检查时间、最近检查时间、最近后台同步时间和探测错误。后台探测失败会按 `OPENACE_WATCH_BACKOFF_MIN` / `OPENACE_WATCH_BACKOFF_MAX` 退避重试。上游 ACE 返回 `429` / `5xx` 时，status 还会通过 `upstream_status`、`upstream_last_status_code`、`upstream_retry_after`、`upstream_backoff_until`、`upstream_last_error`、`upstream_last_failure` 和 `upstream_last_success` 暴露当前 provider 的最近退避与错误摘要；这些字段不是单 workspace 指标，而是帮助多 agent 场景判断是否应暂停真实上游压力的上游信号。
 
 ## 安全与边界
 
 - openACE 不绕过 Augment / ACE 的认证、quota、tenant 或 rate limit。
 - 检索质量取决于你的上游 ACE 账号和服务状态。
+- `OPENACE_PROFILES_FILE` 指向的 profile 文件包含凭据，应作为本地 secret 保存，不应进入公共 Git 历史。
 - 默认只索引 UTF-8 文本文件，并跳过常见敏感文件；`.augmentignore` 只能覆盖索引排除规则，不能覆盖 hard safety denylist。
 - daemon 默认只允许 loopback 监听；远程暴露前必须自行加网络访问控制。
 

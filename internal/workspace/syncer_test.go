@@ -46,6 +46,28 @@ func TestStateFileUsesCacheNamespace(t *testing.T) {
 	}
 }
 
+func TestStateFileUsesSeparateProviderProfilePath(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", cacheDir)
+
+	root := "/tmp/workspace"
+	defaultPath, err := stateFileForProvider(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerPath, err := stateFileForProvider(root, "standby/B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultPath == providerPath {
+		t.Fatalf("provider state path should differ from default path: %s", defaultPath)
+	}
+	wantProviderPrefix := filepath.Join(cacheDir, "workspaces", "default", "profiles", "standby-B") + string(os.PathSeparator)
+	if !strings.HasPrefix(providerPath, wantProviderPrefix) {
+		t.Fatalf("provider state file %q does not use provider prefix %q", providerPath, wantProviderPrefix)
+	}
+}
+
 func TestLoadStateRecoversCorruptState(t *testing.T) {
 	cacheDir := t.TempDir()
 	t.Setenv("OPENACE_CACHE_DIR", cacheDir)
@@ -655,6 +677,57 @@ func TestSyncerWorkspaceStatusLoadsDiskState(t *testing.T) {
 	}
 }
 
+func TestSyncerProviderProfilesUseIndependentCheckpointState(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	defaultClient := &providerRecordingClient{checkpoint: "checkpoint-default"}
+	standbyClient := &providerRecordingClient{checkpoint: "checkpoint-standby"}
+	syncer := NewSyncerWithRouter(testProviderRouter{
+		defaultID: "primary",
+		clients: map[string]*providerRecordingClient{
+			"primary": defaultClient,
+			"standby": standbyClient,
+		},
+	})
+
+	defaultResult, err := syncer.Sync(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	standbyResult, err := syncer.SyncWithProvider(context.Background(), root, "standby")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultResult.CheckpointID != "checkpoint-default" || standbyResult.CheckpointID != "checkpoint-standby" {
+		t.Fatalf("unexpected checkpoints: default=%+v standby=%+v", defaultResult, standbyResult)
+	}
+	if len(defaultClient.previousCheckpoints) != 1 || defaultClient.previousCheckpoints[0] != "" {
+		t.Fatalf("default provider should cold-sync once: %+v", defaultClient.previousCheckpoints)
+	}
+	if len(standbyClient.previousCheckpoints) != 1 || standbyClient.previousCheckpoints[0] != "" {
+		t.Fatalf("standby provider should not inherit default checkpoint: %+v", standbyClient.previousCheckpoints)
+	}
+
+	defaultStatus, err := syncer.WorkspaceStatus(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	standbyStatus, err := syncer.WorkspaceStatusWithProvider(context.Background(), root, "standby")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultStatus.ProviderProfileID != "" || defaultStatus.CheckpointID != "checkpoint-default" {
+		t.Fatalf("unexpected default status: %+v", defaultStatus)
+	}
+	if standbyStatus.ProviderProfileID != "standby" || standbyStatus.CheckpointID != "checkpoint-standby" {
+		t.Fatalf("unexpected standby status: %+v", standbyStatus)
+	}
+}
+
 func TestSyncerWorkspaceStatusRecordsFailureStage(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
@@ -971,6 +1044,65 @@ type healthReportingClient struct {
 
 func (c *healthReportingClient) HealthSnapshot() ace.HealthSnapshot {
 	return c.health
+}
+
+type testProviderRouter struct {
+	defaultID string
+	clients   map[string]*providerRecordingClient
+	health    map[string]ace.HealthSnapshot
+}
+
+func (r testProviderRouter) DefaultProviderProfileID() string {
+	return r.defaultID
+}
+
+func (r testProviderRouter) ClientForProviderProfile(providerProfileID string) (ACEClient, error) {
+	id := strings.TrimSpace(providerProfileID)
+	if id == "" {
+		id = r.defaultID
+	}
+	client := r.clients[id]
+	if client == nil {
+		return nil, errors.New("unknown provider")
+	}
+	return client, nil
+}
+
+func (r testProviderRouter) HealthSnapshotForProviderProfile(providerProfileID string) (ace.HealthSnapshot, bool) {
+	id := strings.TrimSpace(providerProfileID)
+	if id == "" {
+		id = r.defaultID
+	}
+	health, ok := r.health[id]
+	return health, ok
+}
+
+type providerRecordingClient struct {
+	checkpoint          string
+	previousCheckpoints []string
+}
+
+func (c *providerRecordingClient) FindMissing(ctx context.Context, names []string) ([]string, []string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	return append([]string(nil), names...), nil, nil
+}
+
+func (c *providerRecordingClient) BatchUpload(ctx context.Context, uploads []ace.BlobUpload) error {
+	return ctx.Err()
+}
+
+func (c *providerRecordingClient) CheckpointBlobs(ctx context.Context, previous string, added []string, deleted []string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	c.previousCheckpoints = append(c.previousCheckpoints, previous)
+	return c.checkpoint, nil
+}
+
+func (c *providerRecordingClient) CodebaseRetrieval(context.Context, string, ace.RetrievalOptions) (string, error) {
+	return "", nil
 }
 
 func (c *recordingClient) FindMissing(ctx context.Context, names []string) ([]string, []string, error) {

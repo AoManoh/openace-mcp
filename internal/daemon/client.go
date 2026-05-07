@@ -22,6 +22,12 @@ type Client struct {
 	token   string
 }
 
+type healthResponse struct {
+	Status       string          `json:"status"`
+	Service      string          `json:"service"`
+	Capabilities map[string]bool `json:"capabilities,omitempty"`
+}
+
 func NewClient(addr string) *Client {
 	return &Client{
 		baseURL: baseURL(addr),
@@ -33,29 +39,63 @@ func NewClient(addr string) *Client {
 }
 
 func (c *Client) Health(ctx context.Context) error {
-	var result struct {
-		Status  string `json:"status"`
-		Service string `json:"service"`
-	}
+	_, err := c.health(ctx)
+	return err
+}
+
+func (c *Client) health(ctx context.Context) (healthResponse, error) {
+	var result healthResponse
 	if err := c.get(ctx, "/healthz", &result); err != nil {
-		return err
+		return healthResponse{}, err
 	}
 	if result.Status != "ok" || result.Service != "openace-daemon" {
-		return fmt.Errorf("daemon /healthz returned unexpected service %q with status %q", result.Service, result.Status)
+		return healthResponse{}, fmt.Errorf("daemon /healthz returned unexpected service %q with status %q", result.Service, result.Status)
+	}
+	return result, nil
+}
+
+func (c *Client) ensureProviderProfiles(ctx context.Context, providerProfileID string) error {
+	if strings.TrimSpace(providerProfileID) == "" {
+		return nil
+	}
+	health, err := c.health(ctx)
+	if err != nil {
+		return err
+	}
+	if !health.Capabilities["provider_profiles"] {
+		return fmt.Errorf("daemon does not advertise provider profile support; restart the openACE daemon")
 	}
 	return nil
 }
 
 func (c *Client) Sync(ctx context.Context, dir string) (workspace.Result, error) {
+	return c.SyncWithProvider(ctx, dir, "")
+}
+
+func (c *Client) SyncWithProvider(ctx context.Context, dir string, providerProfileID string) (workspace.Result, error) {
 	var result workspace.Result
-	err := c.post(ctx, "/v1/sync", syncRequest{DirectoryPath: dir}, &result)
+	if err := c.ensureProviderProfiles(ctx, providerProfileID); err != nil {
+		return result, err
+	}
+	err := c.post(ctx, "/v1/sync", syncRequest{
+		DirectoryPath:     dir,
+		ProviderProfileID: strings.TrimSpace(providerProfileID),
+	}, &result)
 	return result, err
 }
 
 func (c *Client) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
+	return c.RetrieveWithProvider(ctx, dir, "", query, maxOutputLen)
+}
+
+func (c *Client) RetrieveWithProvider(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (workspace.Result, error) {
 	var result workspace.Result
+	if err := c.ensureProviderProfiles(ctx, providerProfileID); err != nil {
+		return result, err
+	}
 	err := c.post(ctx, "/v1/retrieve", retrieveRequest{
 		DirectoryPath:      dir,
+		ProviderProfileID:  strings.TrimSpace(providerProfileID),
 		InformationRequest: query,
 		MaxOutputLength:    maxOutputLen,
 	}, &result)
@@ -71,13 +111,26 @@ func (c *Client) ListWorkspaceStatuses(ctx context.Context) ([]workspace.Workspa
 }
 
 func (c *Client) WorkspaceStatus(ctx context.Context, dir string) (workspace.WorkspaceStatus, error) {
+	return c.WorkspaceStatusWithProvider(ctx, dir, "")
+}
+
+func (c *Client) WorkspaceStatusWithProvider(ctx context.Context, dir string, providerProfileID string) (workspace.WorkspaceStatus, error) {
 	var result workspace.WorkspaceStatus
-	err := c.post(ctx, "/v1/workspace/status", workspaceStatusRequest{DirectoryPath: dir}, &result)
+	if err := c.ensureProviderProfiles(ctx, providerProfileID); err != nil {
+		return result, err
+	}
+	err := c.post(ctx, "/v1/workspace/status", workspaceStatusRequest{
+		DirectoryPath:     dir,
+		ProviderProfileID: strings.TrimSpace(providerProfileID),
+	}, &result)
 	return result, err
 }
 
 func (c *Client) StartTask(ctx context.Context, req TaskRequest) (TaskSnapshot, error) {
 	var result TaskSnapshot
+	if err := c.ensureProviderProfiles(ctx, req.ProviderProfileID); err != nil {
+		return result, err
+	}
 	err := c.post(ctx, "/v1/tasks", req, &result)
 	return result, err
 }

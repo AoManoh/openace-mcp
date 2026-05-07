@@ -24,6 +24,11 @@ type Syncer interface {
 	Sync(context.Context, string) (workspace.Result, error)
 }
 
+type ProviderSyncer interface {
+	RetrieveWithProvider(context.Context, string, string, string, int) (workspace.Result, error)
+	SyncWithProvider(context.Context, string, string) (workspace.Result, error)
+}
+
 type Tasker interface {
 	CancelTask(context.Context, string) (daemon.TaskSnapshot, error)
 	ListTasks(context.Context, int) ([]daemon.TaskSnapshot, error)
@@ -34,6 +39,10 @@ type Tasker interface {
 type WorkspaceInspector interface {
 	ListWorkspaceStatuses(context.Context) ([]workspace.WorkspaceStatus, error)
 	WorkspaceStatus(context.Context, string) (workspace.WorkspaceStatus, error)
+}
+
+type ProviderWorkspaceInspector interface {
+	WorkspaceStatusWithProvider(context.Context, string, string) (workspace.WorkspaceStatus, error)
 }
 
 type Server struct {
@@ -69,17 +78,20 @@ type toolCallParams struct {
 type retrievalArgs struct {
 	InformationRequest string `json:"information_request"`
 	DirectoryPath      string `json:"directory_path"`
+	ProviderProfileID  string `json:"provider_profile_id,omitempty"`
 	MaxOutputLength    int    `json:"max_output_length,omitempty"`
 }
 
 type multiRetrievalArgs struct {
 	InformationRequest string   `json:"information_request"`
 	DirectoryPaths     []string `json:"directory_paths"`
+	ProviderProfileID  string   `json:"provider_profile_id,omitempty"`
 	MaxOutputLength    int      `json:"max_output_length,omitempty"`
 }
 
 type syncArgs struct {
-	DirectoryPath string `json:"directory_path"`
+	DirectoryPath     string `json:"directory_path"`
+	ProviderProfileID string `json:"provider_profile_id,omitempty"`
 }
 
 type taskIDArgs struct {
@@ -203,7 +215,7 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		}
 		toolCtx, cancel := toolTimeoutContext(ctx)
 		defer cancel()
-		result, err := s.syncer.Retrieve(toolCtx, args.DirectoryPath, args.InformationRequest, args.MaxOutputLength)
+		result, err := s.retrieve(toolCtx, args.DirectoryPath, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength)
 		if err != nil {
 			return toolError(req.ID, err.Error())
 		}
@@ -226,7 +238,7 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		}
 		toolCtx, cancel := toolTimeoutContext(ctx)
 		defer cancel()
-		results := s.retrieveMultiple(toolCtx, paths, args.InformationRequest, args.MaxOutputLength)
+		results := s.retrieveMultiple(toolCtx, paths, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength)
 		text := formatMultiRetrievalResults(results)
 		if err := toolCtx.Err(); err != nil {
 			return toolError(req.ID, text)
@@ -245,7 +257,7 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		}
 		toolCtx, cancel := toolTimeoutContext(ctx)
 		defer cancel()
-		result, err := s.syncer.Sync(toolCtx, args.DirectoryPath)
+		result, err := s.syncWorkspace(toolCtx, args.DirectoryPath, args.ProviderProfileID)
 		if err != nil {
 			return toolError(req.ID, err.Error())
 		}
@@ -267,6 +279,7 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		task, err := s.tasker.StartTask(ctx, daemon.TaskRequest{
 			Kind:               daemon.TaskKindRetrieve,
 			DirectoryPath:      args.DirectoryPath,
+			ProviderProfileID:  strings.TrimSpace(args.ProviderProfileID),
 			InformationRequest: args.InformationRequest,
 			MaxOutputLength:    args.MaxOutputLength,
 		})
@@ -292,6 +305,7 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		task, err := s.tasker.StartTask(ctx, daemon.TaskRequest{
 			Kind:               daemon.TaskKindMultiRetrieve,
 			DirectoryPaths:     paths,
+			ProviderProfileID:  strings.TrimSpace(args.ProviderProfileID),
 			InformationRequest: args.InformationRequest,
 			MaxOutputLength:    args.MaxOutputLength,
 		})
@@ -311,8 +325,9 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 			return toolError(req.ID, "directory_path is required")
 		}
 		task, err := s.tasker.StartTask(ctx, daemon.TaskRequest{
-			Kind:          daemon.TaskKindSync,
-			DirectoryPath: args.DirectoryPath,
+			Kind:              daemon.TaskKindSync,
+			DirectoryPath:     args.DirectoryPath,
+			ProviderProfileID: strings.TrimSpace(args.ProviderProfileID),
 		})
 		if err != nil {
 			return toolError(req.ID, err.Error())
@@ -385,7 +400,7 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		if args.DirectoryPath == "" {
 			return toolError(req.ID, "directory_path is required")
 		}
-		status, err := s.inspector.WorkspaceStatus(ctx, args.DirectoryPath)
+		status, err := s.workspaceStatus(ctx, args.DirectoryPath, args.ProviderProfileID)
 		if err != nil {
 			return toolError(req.ID, err.Error())
 		}
@@ -400,6 +415,42 @@ type multiRetrievalResult struct {
 	Text          string
 	Summary       string
 	Error         string
+}
+
+func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (workspace.Result, error) {
+	providerProfileID = strings.TrimSpace(providerProfileID)
+	if providerProfileID == "" {
+		return s.syncer.Retrieve(ctx, dir, query, maxOutputLen)
+	}
+	providerSyncer, ok := s.syncer.(ProviderSyncer)
+	if !ok {
+		return workspace.Result{}, fmt.Errorf("provider_profile_id is not supported by this openACE mode")
+	}
+	return providerSyncer.RetrieveWithProvider(ctx, dir, providerProfileID, query, maxOutputLen)
+}
+
+func (s *Server) syncWorkspace(ctx context.Context, dir string, providerProfileID string) (workspace.Result, error) {
+	providerProfileID = strings.TrimSpace(providerProfileID)
+	if providerProfileID == "" {
+		return s.syncer.Sync(ctx, dir)
+	}
+	providerSyncer, ok := s.syncer.(ProviderSyncer)
+	if !ok {
+		return workspace.Result{}, fmt.Errorf("provider_profile_id is not supported by this openACE mode")
+	}
+	return providerSyncer.SyncWithProvider(ctx, dir, providerProfileID)
+}
+
+func (s *Server) workspaceStatus(ctx context.Context, dir string, providerProfileID string) (workspace.WorkspaceStatus, error) {
+	providerProfileID = strings.TrimSpace(providerProfileID)
+	if providerProfileID == "" {
+		return s.inspector.WorkspaceStatus(ctx, dir)
+	}
+	providerInspector, ok := s.inspector.(ProviderWorkspaceInspector)
+	if !ok {
+		return workspace.WorkspaceStatus{}, fmt.Errorf("provider_profile_id is not supported by this openACE mode")
+	}
+	return providerInspector.WorkspaceStatusWithProvider(ctx, dir, providerProfileID)
 }
 
 func normalizeDirectoryPaths(paths []string) ([]string, error) {
@@ -420,7 +471,7 @@ func normalizeDirectoryPaths(paths []string) ([]string, error) {
 	return normalized, nil
 }
 
-func (s *Server) retrieveMultiple(ctx context.Context, paths []string, query string, maxOutputLen int) []multiRetrievalResult {
+func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerProfileID string, query string, maxOutputLen int) []multiRetrievalResult {
 	results := make([]multiRetrievalResult, len(paths))
 	var wg sync.WaitGroup
 	for i, path := range paths {
@@ -429,7 +480,7 @@ func (s *Server) retrieveMultiple(ctx context.Context, paths []string, query str
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := s.syncer.Retrieve(ctx, path, query, maxOutputLen)
+			result, err := s.retrieve(ctx, path, providerProfileID, query, maxOutputLen)
 			if err != nil {
 				results[i].Error = err.Error()
 				return
@@ -488,6 +539,7 @@ func retrievalTool() map[string]any {
 			"properties": map[string]any{
 				"information_request": map[string]any{"type": "string"},
 				"directory_path":      map[string]any{"type": "string"},
+				"provider_profile_id": map[string]any{"type": "string", "description": "Optional ACE provider profile ID. Omit to use the daemon default provider state."},
 				"max_output_length":   map[string]any{"type": "integer"},
 			},
 			"required": []string{"information_request", "directory_path"},
@@ -507,7 +559,8 @@ func multiRetrievalTool() map[string]any {
 					"type":  "array",
 					"items": map[string]any{"type": "string"},
 				},
-				"max_output_length": map[string]any{"type": "integer"},
+				"provider_profile_id": map[string]any{"type": "string", "description": "Optional ACE provider profile ID. Omit to use the daemon default provider state."},
+				"max_output_length":   map[string]any{"type": "integer"},
 			},
 			"required": []string{"information_request", "directory_paths"},
 		},
@@ -521,7 +574,8 @@ func syncTool() map[string]any {
 		"inputSchema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"directory_path": map[string]any{"type": "string"},
+				"directory_path":      map[string]any{"type": "string"},
+				"provider_profile_id": map[string]any{"type": "string", "description": "Optional ACE provider profile ID. Omit to use the daemon default provider state."},
 			},
 			"required": []string{"directory_path"},
 		},
@@ -537,6 +591,7 @@ func startRetrievalTool() map[string]any {
 			"properties": map[string]any{
 				"information_request": map[string]any{"type": "string"},
 				"directory_path":      map[string]any{"type": "string"},
+				"provider_profile_id": map[string]any{"type": "string", "description": "Optional ACE provider profile ID. Omit to use the daemon default provider state."},
 				"max_output_length":   map[string]any{"type": "integer"},
 			},
 			"required": []string{"information_request", "directory_path"},
@@ -556,7 +611,8 @@ func startMultiRetrievalTool() map[string]any {
 					"type":  "array",
 					"items": map[string]any{"type": "string"},
 				},
-				"max_output_length": map[string]any{"type": "integer"},
+				"provider_profile_id": map[string]any{"type": "string", "description": "Optional ACE provider profile ID. Omit to use the daemon default provider state."},
+				"max_output_length":   map[string]any{"type": "integer"},
 			},
 			"required": []string{"information_request", "directory_paths"},
 		},
@@ -570,7 +626,8 @@ func startSyncTool() map[string]any {
 		"inputSchema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"directory_path": map[string]any{"type": "string"},
+				"directory_path":      map[string]any{"type": "string"},
+				"provider_profile_id": map[string]any{"type": "string", "description": "Optional ACE provider profile ID. Omit to use the daemon default provider state."},
 			},
 			"required": []string{"directory_path"},
 		},
@@ -636,7 +693,8 @@ func workspaceStatusTool() map[string]any {
 		"inputSchema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"directory_path": map[string]any{"type": "string"},
+				"directory_path":      map[string]any{"type": "string"},
+				"provider_profile_id": map[string]any{"type": "string", "description": "Optional ACE provider profile ID. Omit to use the daemon default provider state."},
 			},
 			"required": []string{"directory_path"},
 		},

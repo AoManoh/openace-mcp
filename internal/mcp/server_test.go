@@ -65,7 +65,7 @@ func (timeoutMultiSyncer) Sync(ctx context.Context, dir string) (workspace.Resul
 }
 
 func (fakeTasker) StartTask(ctx context.Context, req daemon.TaskRequest) (daemon.TaskSnapshot, error) {
-	return daemon.TaskSnapshot{ID: "task-1", Kind: req.Kind, State: daemon.TaskStateQueued, DirectoryPath: req.DirectoryPath, DirectoryPaths: append([]string(nil), req.DirectoryPaths...)}, nil
+	return daemon.TaskSnapshot{ID: "task-1", Kind: req.Kind, State: daemon.TaskStateQueued, DirectoryPath: req.DirectoryPath, DirectoryPaths: append([]string(nil), req.DirectoryPaths...), ProviderProfileID: req.ProviderProfileID}, nil
 }
 
 func (fakeTasker) ListTasks(ctx context.Context, limit int) ([]daemon.TaskSnapshot, error) {
@@ -102,6 +102,29 @@ func (fakeTasker) WorkspaceStatus(ctx context.Context, dir string) (workspace.Wo
 	}, nil
 }
 
+type fakeProviderSyncer struct {
+	fakeTasker
+}
+
+func (fakeProviderSyncer) RetrieveWithProvider(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (workspace.Result, error) {
+	return workspace.Result{Text: "retrieved with " + providerProfileID, ProviderProfileID: providerProfileID}, nil
+}
+
+func (fakeProviderSyncer) SyncWithProvider(ctx context.Context, dir string, providerProfileID string) (workspace.Result, error) {
+	return workspace.Result{CheckpointID: "checkpoint-" + providerProfileID, ProviderProfileID: providerProfileID, FileCount: 1}, nil
+}
+
+func (fakeProviderSyncer) WorkspaceStatusWithProvider(ctx context.Context, dir string, providerProfileID string) (workspace.WorkspaceStatus, error) {
+	return workspace.WorkspaceStatus{
+		DirectoryPath:          dir,
+		ProviderProfileID:      providerProfileID,
+		ProviderState:          "ready",
+		CheckpointID:           "checkpoint-" + providerProfileID,
+		FileCount:              1,
+		UpstreamLastStatusCode: 0,
+	}, nil
+}
+
 func TestToolsListOnlyIncludesTaskToolsForTasker(t *testing.T) {
 	direct := runMCP(t, NewServer(fakeSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
 	if !strings.Contains(direct, "multi_codebase_retrieval") {
@@ -126,6 +149,30 @@ func TestToolsListOnlyIncludesTaskToolsForTasker(t *testing.T) {
 	}
 	if !strings.Contains(withTasks, "list_workspaces") {
 		t.Fatalf("daemon tasker should list workspace diagnostics tool: %s", withTasks)
+	}
+}
+
+func TestProviderProfileArgumentPassesThroughRetrievalTool(t *testing.T) {
+	out := runMCP(t, NewServer(fakeProviderSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"/tmp/workspace","provider_profile_id":"standby","information_request":"find code"}}}`)
+	if !strings.Contains(out, "retrieved with standby") {
+		t.Fatalf("retrieval should use provider-aware syncer: %s", out)
+	}
+	if !strings.Contains(out, "provider_profile_id") || !strings.Contains(out, "standby") {
+		t.Fatalf("retrieval summary should include provider result metadata: %s", out)
+	}
+}
+
+func TestProviderProfileArgumentPassesThroughTaskTool(t *testing.T) {
+	out := runMCP(t, NewServer(fakeProviderSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"start_sync_workspace","arguments":{"directory_path":"/tmp/workspace","provider_profile_id":"standby"}}}`)
+	if !strings.Contains(out, "provider_profile_id") || !strings.Contains(out, "standby") {
+		t.Fatalf("task response should retain provider profile: %s", out)
+	}
+}
+
+func TestProviderProfileArgumentPassesThroughWorkspaceStatusTool(t *testing.T) {
+	out := runMCP(t, NewServer(fakeProviderSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"workspace_status","arguments":{"directory_path":"/tmp/workspace","provider_profile_id":"standby"}}}`)
+	if !strings.Contains(out, "provider_profile_id") || !strings.Contains(out, "standby") || !strings.Contains(out, "checkpoint-standby") {
+		t.Fatalf("workspace status should use provider-aware inspector: %s", out)
 	}
 }
 

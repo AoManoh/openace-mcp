@@ -77,6 +77,29 @@ func TestTaskStoreCompletesMultiRetrieveTask(t *testing.T) {
 	}
 }
 
+func TestTaskStorePersistsProviderProfileID(t *testing.T) {
+	useTempTaskStore(t)
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+		if req.ProviderProfileID != "standby" {
+			t.Fatalf("runner provider_profile_id = %q, want standby", req.ProviderProfileID)
+		}
+		return workspace.Result{ProviderProfileID: req.ProviderProfileID, FileCount: 1}, nil
+	}, 2)
+	cleanupTaskStore(t, store)
+
+	task, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/workspace", ProviderProfileID: " standby "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.ProviderProfileID != "standby" {
+		t.Fatalf("submitted task should trim provider profile: %+v", task)
+	}
+	completed := waitForTaskState(t, store, task.ID, TaskStateCompleted)
+	if completed.ProviderProfileID != "standby" || completed.Result == nil || completed.Result.ProviderProfileID != "standby" {
+		t.Fatalf("completed task should retain provider profile: %+v", completed)
+	}
+}
+
 func TestTaskStoreRejectsTooManyMultiRetrievePaths(t *testing.T) {
 	useTempTaskStore(t)
 	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {

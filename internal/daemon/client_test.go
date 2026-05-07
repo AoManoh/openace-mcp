@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/AoManoh/openace-mcp/internal/workspace"
@@ -34,6 +35,52 @@ func TestClientHealthRejectsUnexpectedService(t *testing.T) {
 
 	if err := NewClient(server.URL).Health(context.Background()); err == nil {
 		t.Fatal("health should reject non-openace service")
+	}
+}
+
+func TestClientRequiresProviderCapabilityBeforeProviderRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			t.Fatalf("provider request should stop at health check, got %s", r.URL.Path)
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","service":"openace-daemon"}`))
+	}))
+	defer server.Close()
+
+	_, err := NewClient(server.URL).SyncWithProvider(context.Background(), "/tmp/project", "standby")
+	if err == nil || !strings.Contains(err.Error(), "provider profile support") {
+		t.Fatalf("expected provider capability error, got %v", err)
+	}
+}
+
+func TestClientSendsProviderProfileWhenDaemonAdvertisesCapability(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/healthz":
+			_, _ = w.Write([]byte(`{"status":"ok","service":"openace-daemon","capabilities":{"provider_profiles":true}}`))
+		case "/v1/retrieve":
+			var req retrieveRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			if req.ProviderProfileID != "standby" {
+				t.Fatalf("provider_profile_id = %q, want standby", req.ProviderProfileID)
+			}
+			_ = json.NewEncoder(w).Encode(workspace.Result{Text: "ok", ProviderProfileID: req.ProviderProfileID})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	result, err := NewClient(server.URL).RetrieveWithProvider(context.Background(), "/tmp/project", "standby", "find code", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ProviderProfileID != "standby" {
+		t.Fatalf("unexpected result: %+v", result)
 	}
 }
 

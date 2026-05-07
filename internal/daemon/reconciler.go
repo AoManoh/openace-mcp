@@ -25,8 +25,16 @@ type workspaceChangeDetector interface {
 	WorkspaceChanged(context.Context, string) (bool, error)
 }
 
+type providerWorkspaceChangeDetector interface {
+	WorkspaceChangedWithProvider(context.Context, string, string) (bool, error)
+}
+
 type backgroundSyncer interface {
 	SyncBackground(context.Context, string) (workspace.Result, error)
+}
+
+type providerBackgroundSyncer interface {
+	SyncBackgroundWithProvider(context.Context, string, string) (workspace.Result, error)
 }
 
 type workspaceReconciler struct {
@@ -53,6 +61,7 @@ type workspaceReconciler struct {
 
 type watchState struct {
 	directoryPath        string
+	providerProfileID    string
 	pending              bool
 	running              bool
 	lastWatchAt          *time.Time
@@ -96,7 +105,28 @@ func newWorkspaceReconciler(syncer Syncer) *workspaceReconciler {
 	return reconciler
 }
 
+type watchTarget struct {
+	root              string
+	providerProfileID string
+}
+
+func (t watchTarget) key() string {
+	return watchKey(t.root, t.providerProfileID)
+}
+
+func watchKey(root string, providerProfileID string) string {
+	providerProfileID = strings.TrimSpace(providerProfileID)
+	if providerProfileID == "" {
+		return root
+	}
+	return providerProfileID + "\x00" + root
+}
+
 func (r *workspaceReconciler) Observe(dir string) {
+	r.ObserveWithProvider(dir, "")
+}
+
+func (r *workspaceReconciler) ObserveWithProvider(dir string, providerProfileID string) {
 	if r == nil {
 		return
 	}
@@ -110,16 +140,18 @@ func (r *workspaceReconciler) Observe(dir string) {
 	}
 	now := time.Now().UTC()
 	next := now.Add(r.debounce)
+	providerProfileID = strings.TrimSpace(providerProfileID)
+	key := watchKey(root, providerProfileID)
 
 	r.mu.Lock()
-	if _, ok := r.states[root]; !ok && len(r.states) >= r.maxRoots {
+	if _, ok := r.states[key]; !ok && len(r.states) >= r.maxRoots {
 		r.mu.Unlock()
 		return
 	}
-	state := r.states[root]
+	state := r.states[key]
 	if state == nil {
-		state = &watchState{directoryPath: root}
-		r.states[root] = state
+		state = &watchState{directoryPath: root, providerProfileID: providerProfileID}
+		r.states[key] = state
 	}
 	state.pending = true
 	state.nextWatchAt = &next
@@ -137,8 +169,9 @@ func (r *workspaceReconciler) Decorate(status *workspace.WorkspaceStatus) {
 	if err != nil {
 		return
 	}
+	key := watchKey(root, status.ProviderProfileID)
 	r.mu.Lock()
-	state := r.states[root]
+	state := r.states[key]
 	if state == nil {
 		r.mu.Unlock()
 		return
@@ -178,8 +211,8 @@ func (r *workspaceReconciler) run() {
 			stopTimer(timer)
 		case <-timer.C:
 		}
-		for _, root := range r.dueWorkspaces(time.Now().UTC()) {
-			r.reconcile(root)
+		for _, target := range r.dueWorkspaces(time.Now().UTC()) {
+			r.reconcile(target)
 		}
 	}
 }
@@ -215,42 +248,38 @@ func stopTimer(timer *time.Timer) {
 	}
 }
 
-func (r *workspaceReconciler) dueWorkspaces(now time.Time) []string {
+func (r *workspaceReconciler) dueWorkspaces(now time.Time) []watchTarget {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var roots []string
-	for root, state := range r.states {
+	var targets []watchTarget
+	for _, state := range r.states {
 		if state.running || !state.pending || state.nextWatchAt == nil || now.Before(*state.nextWatchAt) {
 			continue
 		}
 		state.running = true
-		roots = append(roots, root)
+		targets = append(targets, watchTarget{root: state.directoryPath, providerProfileID: state.providerProfileID})
 	}
-	return roots
+	return targets
 }
 
-func (r *workspaceReconciler) reconcile(root string) {
+func (r *workspaceReconciler) reconcile(target watchTarget) {
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
 
-	if r.workspaceInFlight(ctx, root) {
-		r.deferReconcile(root, time.Now().UTC(), r.debounce)
+	if r.workspaceInFlight(ctx, target.root, target.providerProfileID) {
+		r.deferReconcile(target, time.Now().UTC(), r.debounce)
 		return
 	}
 
-	changed, err := r.detector.WorkspaceChanged(ctx, root)
+	changed, err := r.workspaceChanged(ctx, target.root, target.providerProfileID)
 	if err == nil && changed {
-		if r.bgSyncer != nil {
-			_, err = r.bgSyncer.SyncBackground(ctx, root)
-		} else {
-			_, err = r.syncer.Sync(ctx, root)
-		}
+		_, err = r.syncBackground(ctx, target.root, target.providerProfileID)
 	}
 
 	now := time.Now().UTC()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state := r.states[root]
+	state := r.states[target.key()]
 	if state == nil {
 		return
 	}
@@ -274,21 +303,64 @@ func (r *workspaceReconciler) reconcile(root string) {
 	state.nextWatchAt = &next
 }
 
-func (r *workspaceReconciler) workspaceInFlight(ctx context.Context, root string) bool {
+func (r *workspaceReconciler) workspaceInFlight(ctx context.Context, root string, providerProfileID string) bool {
 	if r.inspector == nil {
 		return false
 	}
-	status, err := r.inspector.WorkspaceStatus(ctx, root)
+	providerProfileID = strings.TrimSpace(providerProfileID)
+	var (
+		status workspace.WorkspaceStatus
+		err    error
+	)
+	if providerProfileID == "" {
+		status, err = r.inspector.WorkspaceStatus(ctx, root)
+	} else {
+		providerInspector, ok := r.syncer.(ProviderWorkspaceInspector)
+		if !ok {
+			return false
+		}
+		status, err = providerInspector.WorkspaceStatusWithProvider(ctx, root, providerProfileID)
+	}
 	return err == nil && status.InFlight
 }
 
-func (r *workspaceReconciler) deferReconcile(root string, now time.Time, delay time.Duration) {
+func (r *workspaceReconciler) workspaceChanged(ctx context.Context, root string, providerProfileID string) (bool, error) {
+	providerProfileID = strings.TrimSpace(providerProfileID)
+	if providerProfileID == "" {
+		return r.detector.WorkspaceChanged(ctx, root)
+	}
+	providerDetector, ok := r.syncer.(providerWorkspaceChangeDetector)
+	if !ok {
+		return false, nil
+	}
+	return providerDetector.WorkspaceChangedWithProvider(ctx, root, providerProfileID)
+}
+
+func (r *workspaceReconciler) syncBackground(ctx context.Context, root string, providerProfileID string) (workspace.Result, error) {
+	providerProfileID = strings.TrimSpace(providerProfileID)
+	if providerProfileID == "" {
+		if r.bgSyncer != nil {
+			return r.bgSyncer.SyncBackground(ctx, root)
+		}
+		return r.syncer.Sync(ctx, root)
+	}
+	if providerSyncer, ok := r.syncer.(providerBackgroundSyncer); ok {
+		return providerSyncer.SyncBackgroundWithProvider(ctx, root, providerProfileID)
+	}
+	providerSyncer, ok := r.syncer.(ProviderSyncer)
+	if !ok {
+		return workspace.Result{}, nil
+	}
+	return providerSyncer.SyncWithProvider(ctx, root, providerProfileID)
+}
+
+func (r *workspaceReconciler) deferReconcile(target watchTarget, now time.Time, delay time.Duration) {
 	if delay <= 0 {
 		delay = r.debounce
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state := r.states[root]
+	state := r.states[target.key()]
 	if state == nil {
 		return
 	}

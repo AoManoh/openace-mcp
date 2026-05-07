@@ -23,9 +23,18 @@ type Syncer interface {
 	Sync(context.Context, string) (workspace.Result, error)
 }
 
+type ProviderSyncer interface {
+	RetrieveWithProvider(context.Context, string, string, string, int) (workspace.Result, error)
+	SyncWithProvider(context.Context, string, string) (workspace.Result, error)
+}
+
 type WorkspaceInspector interface {
 	ListWorkspaceStatuses(context.Context) ([]workspace.WorkspaceStatus, error)
 	WorkspaceStatus(context.Context, string) (workspace.WorkspaceStatus, error)
+}
+
+type ProviderWorkspaceInspector interface {
+	WorkspaceStatusWithProvider(context.Context, string, string) (workspace.WorkspaceStatus, error)
 }
 
 type Server struct {
@@ -36,15 +45,18 @@ type Server struct {
 }
 
 type syncRequest struct {
-	DirectoryPath string `json:"directory_path"`
+	DirectoryPath     string `json:"directory_path"`
+	ProviderProfileID string `json:"provider_profile_id,omitempty"`
 }
 
 type workspaceStatusRequest struct {
-	DirectoryPath string `json:"directory_path"`
+	DirectoryPath     string `json:"directory_path"`
+	ProviderProfileID string `json:"provider_profile_id,omitempty"`
 }
 
 type retrieveRequest struct {
 	DirectoryPath      string `json:"directory_path"`
+	ProviderProfileID  string `json:"provider_profile_id,omitempty"`
 	InformationRequest string `json:"information_request"`
 	MaxOutputLength    int    `json:"max_output_length,omitempty"`
 }
@@ -164,8 +176,9 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":  "ok",
-		"service": "openace-daemon",
+		"status":       "ok",
+		"service":      "openace-daemon",
+		"capabilities": map[string]any{"provider_profiles": true},
 	})
 }
 
@@ -183,7 +196,7 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "directory_path is required")
 		return
 	}
-	result, err := s.runSync(r.Context(), req.DirectoryPath)
+	result, err := s.runSync(r.Context(), req.DirectoryPath, req.ProviderProfileID)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -209,7 +222,7 @@ func (s *Server) retrieve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "information_request is required")
 		return
 	}
-	result, err := s.runRetrieve(r.Context(), req.DirectoryPath, req.InformationRequest, req.MaxOutputLength)
+	result, err := s.runRetrieve(r.Context(), req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -257,7 +270,7 @@ func (s *Server) workspaceStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "directory_path is required")
 		return
 	}
-	status, err := inspector.WorkspaceStatus(r.Context(), req.DirectoryPath)
+	status, err := s.workspaceStatusForProvider(r.Context(), inspector, req.DirectoryPath, req.ProviderProfileID)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -269,6 +282,18 @@ func (s *Server) workspaceStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) workspaceInspector() (WorkspaceInspector, bool) {
 	inspector, ok := s.syncer.(WorkspaceInspector)
 	return inspector, ok
+}
+
+func (s *Server) workspaceStatusForProvider(ctx context.Context, inspector WorkspaceInspector, dir string, providerProfileID string) (workspace.WorkspaceStatus, error) {
+	providerProfileID = strings.TrimSpace(providerProfileID)
+	if providerProfileID == "" {
+		return inspector.WorkspaceStatus(ctx, dir)
+	}
+	providerInspector, ok := s.syncer.(ProviderWorkspaceInspector)
+	if !ok {
+		return workspace.WorkspaceStatus{}, fmt.Errorf("provider_profile_id is not supported by this daemon")
+	}
+	return providerInspector.WorkspaceStatusWithProvider(ctx, dir, providerProfileID)
 }
 
 func (s *Server) decorateWorkspaceStatus(status *workspace.WorkspaceStatus) {
@@ -359,29 +384,45 @@ func (s *Server) taskItem(w http.ResponseWriter, r *http.Request) {
 func (s *Server) runTask(ctx context.Context, req TaskRequest) (workspace.Result, error) {
 	switch req.Kind {
 	case TaskKindSync:
-		return s.runSync(ctx, req.DirectoryPath)
+		return s.runSync(ctx, req.DirectoryPath, req.ProviderProfileID)
 	case TaskKindRetrieve:
-		return s.runRetrieve(ctx, req.DirectoryPath, req.InformationRequest, req.MaxOutputLength)
+		return s.runRetrieve(ctx, req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength)
 	case TaskKindMultiRetrieve:
-		return s.runMultiRetrieve(ctx, req.DirectoryPaths, req.InformationRequest, req.MaxOutputLength)
+		return s.runMultiRetrieve(ctx, req.DirectoryPaths, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength)
 	default:
 		return workspace.Result{}, fmt.Errorf("unknown task kind: %s", req.Kind)
 	}
 }
 
-func (s *Server) runSync(ctx context.Context, dir string) (workspace.Result, error) {
-	s.observeWorkspace(dir)
+func (s *Server) runSync(ctx context.Context, dir string, providerProfileID string) (workspace.Result, error) {
+	s.observeWorkspace(dir, providerProfileID)
+	providerProfileID = strings.TrimSpace(providerProfileID)
+	if providerProfileID != "" {
+		providerSyncer, ok := s.syncer.(ProviderSyncer)
+		if !ok {
+			return workspace.Result{}, fmt.Errorf("provider_profile_id is not supported by this daemon")
+		}
+		return providerSyncer.SyncWithProvider(ctx, dir, providerProfileID)
+	}
 	return s.syncer.Sync(ctx, dir)
 }
 
-func (s *Server) runRetrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
-	s.observeWorkspace(dir)
+func (s *Server) runRetrieve(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (workspace.Result, error) {
+	s.observeWorkspace(dir, providerProfileID)
+	providerProfileID = strings.TrimSpace(providerProfileID)
+	if providerProfileID != "" {
+		providerSyncer, ok := s.syncer.(ProviderSyncer)
+		if !ok {
+			return workspace.Result{}, fmt.Errorf("provider_profile_id is not supported by this daemon")
+		}
+		return providerSyncer.RetrieveWithProvider(ctx, dir, providerProfileID, query, maxOutputLen)
+	}
 	return s.syncer.Retrieve(ctx, dir, query, maxOutputLen)
 }
 
-func (s *Server) observeWorkspace(dir string) {
+func (s *Server) observeWorkspace(dir string, providerProfileID string) {
 	if s.reconciler != nil {
-		s.reconciler.Observe(dir)
+		s.reconciler.ObserveWithProvider(dir, providerProfileID)
 	}
 }
 
@@ -391,7 +432,7 @@ type multiRetrieveResult struct {
 	err           error
 }
 
-func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, query string, maxOutputLen int) (workspace.Result, error) {
+func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, providerProfileID string, query string, maxOutputLen int) (workspace.Result, error) {
 	results := make([]multiRetrieveResult, len(dirs))
 	var wg sync.WaitGroup
 	for i, dir := range dirs {
@@ -400,7 +441,7 @@ func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, query stri
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := s.runRetrieve(ctx, dir, query, maxOutputLen)
+			result, err := s.runRetrieve(ctx, dir, providerProfileID, query, maxOutputLen)
 			results[i].result = result
 			results[i].err = err
 		}()

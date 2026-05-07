@@ -7,9 +7,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/AoManoh/openace-mcp/internal/ace"
 	"github.com/AoManoh/openace-mcp/internal/auth"
 	"github.com/AoManoh/openace-mcp/internal/daemon"
+	"github.com/AoManoh/openace-mcp/internal/provider"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
@@ -25,9 +25,11 @@ func main() {
 		addr = daemon.DefaultAddr
 	}
 
-	loader := auth.NewLoader()
-	client := ace.NewClient(loader)
-	syncer := workspace.NewSyncer(client)
+	syncer, err := buildLocalSyncer(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "openace-daemon: %v\n", err)
+		os.Exit(1)
+	}
 	server := daemon.NewServer(syncer)
 
 	fmt.Fprintf(os.Stderr, "openace-daemon: listening on %s\n", addr)
@@ -35,4 +37,17 @@ func main() {
 		fmt.Fprintf(os.Stderr, "openace-daemon: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func buildLocalSyncer(ctx context.Context) (*workspace.Syncer, error) {
+	loader := auth.NewLoader()
+	profiles, err := loader.LoadProfiles(ctx)
+	if err != nil {
+		return nil, err
+	}
+	registry, err := provider.NewRegistry(profiles)
+	if err != nil {
+		return nil, err
+	}
+	return workspace.NewSyncerWithRouter(registry), nil
 }

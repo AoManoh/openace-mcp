@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -46,6 +47,13 @@ const (
 	SyncReasonBackground SyncReason = "background"
 )
 
+const (
+	providerStateCold    = "cold"
+	providerStateReady   = "ready"
+	providerStateFailed  = "failed"
+	providerStateBackoff = "backoff"
+)
+
 type ACEClient interface {
 	FindMissing(context.Context, []string) ([]string, []string, error)
 	BatchUpload(context.Context, []ace.BlobUpload) error
@@ -57,11 +65,29 @@ type upstreamHealthReporter interface {
 	HealthSnapshot() ace.HealthSnapshot
 }
 
+type ClientRouter interface {
+	DefaultProviderProfileID() string
+	ClientForProviderProfile(providerProfileID string) (ACEClient, error)
+	HealthSnapshotForProviderProfile(providerProfileID string) (ace.HealthSnapshot, bool)
+}
+
 type Syncer struct {
-	client   ACEClient
+	router   ClientRouter
 	mu       sync.Mutex
 	inflight map[string]*syncCall
 	statuses map[string]WorkspaceStatus
+}
+
+type stateKey struct {
+	root              string
+	providerProfileID string
+}
+
+func (k stateKey) mapKey() string {
+	if k.providerProfileID == "" {
+		return k.root
+	}
+	return k.providerProfileID + "\x00" + k.root
 }
 
 type syncCall struct {
@@ -74,16 +100,19 @@ type syncCall struct {
 }
 
 type Result struct {
-	Text         string
-	CheckpointID string
-	FileCount    int
-	Uploaded     int
-	Added        int
-	Deleted      int
+	Text              string
+	ProviderProfileID string `json:"provider_profile_id,omitempty"`
+	CheckpointID      string
+	FileCount         int
+	Uploaded          int
+	Added             int
+	Deleted           int
 }
 
 type WorkspaceStatus struct {
 	DirectoryPath          string     `json:"directory_path"`
+	ProviderProfileID      string     `json:"provider_profile_id,omitempty"`
+	ProviderState          string     `json:"provider_state,omitempty"`
 	CheckpointID           string     `json:"checkpoint_id,omitempty"`
 	FileCount              int        `json:"file_count"`
 	InFlight               bool       `json:"in_flight"`
@@ -127,21 +156,69 @@ type fileBlob struct {
 }
 
 func NewSyncer(client ACEClient) *Syncer {
+	return NewSyncerWithRouter(staticClientRouter{client: client})
+}
+
+func NewSyncerWithRouter(router ClientRouter) *Syncer {
 	return &Syncer{
-		client:   client,
+		router:   router,
 		inflight: make(map[string]*syncCall),
 		statuses: make(map[string]WorkspaceStatus),
 	}
 }
 
+type staticClientRouter struct {
+	client ACEClient
+}
+
+func (r staticClientRouter) DefaultProviderProfileID() string {
+	return ""
+}
+
+func (r staticClientRouter) ClientForProviderProfile(providerProfileID string) (ACEClient, error) {
+	if strings.TrimSpace(providerProfileID) != "" {
+		return nil, fmt.Errorf("provider_profile_id %q is not configured", providerProfileID)
+	}
+	if r.client == nil {
+		return nil, errors.New("ACE client is not configured")
+	}
+	return r.client, nil
+}
+
+func (r staticClientRouter) HealthSnapshotForProviderProfile(providerProfileID string) (ace.HealthSnapshot, bool) {
+	if strings.TrimSpace(providerProfileID) != "" {
+		return ace.HealthSnapshot{}, false
+	}
+	reporter, ok := r.client.(upstreamHealthReporter)
+	if !ok {
+		return ace.HealthSnapshot{}, false
+	}
+	return reporter.HealthSnapshot(), true
+}
+
+func (s *Syncer) clientForProvider(providerProfileID string) (ACEClient, error) {
+	if s.router == nil {
+		return nil, errors.New("ACE client router is not configured")
+	}
+	return s.router.ClientForProviderProfile(providerProfileID)
+}
+
 func (s *Syncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (Result, error) {
-	sync, err := s.sync(ctx, dir, SyncReasonRetrieval)
+	return s.RetrieveWithProvider(ctx, dir, "", query, maxOutputLen)
+}
+
+func (s *Syncer) RetrieveWithProvider(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (Result, error) {
+	sync, err := s.sync(ctx, dir, providerProfileID, SyncReasonRetrieval)
+	if err != nil {
+		return Result{}, err
+	}
+	client, err := s.clientForProvider(sync.ProviderProfileID)
 	if err != nil {
 		return Result{}, err
 	}
 	retrieveCtx, cancel := retrievalTimeoutContext(ctx)
 	defer cancel()
-	text, err := s.client.CodebaseRetrieval(retrieveCtx, query, ace.RetrievalOptions{
+	text, err := client.CodebaseRetrieval(retrieveCtx, query, ace.RetrievalOptions{
 		CheckpointID: sync.CheckpointID,
 		MaxOutputLen: maxOutputLen,
 	})
@@ -153,22 +230,47 @@ func (s *Syncer) Retrieve(ctx context.Context, dir string, query string, maxOutp
 }
 
 func (s *Syncer) Sync(ctx context.Context, dir string) (Result, error) {
-	return s.sync(ctx, dir, SyncReasonManual)
+	return s.SyncWithProvider(ctx, dir, "")
+}
+
+func (s *Syncer) SyncWithProvider(ctx context.Context, dir string, providerProfileID string) (Result, error) {
+	return s.sync(ctx, dir, providerProfileID, SyncReasonManual)
 }
 
 func (s *Syncer) SyncBackground(ctx context.Context, dir string) (Result, error) {
-	return s.sync(ctx, dir, SyncReasonBackground)
+	return s.SyncBackgroundWithProvider(ctx, dir, "")
 }
 
-func (s *Syncer) sync(ctx context.Context, dir string, reason SyncReason) (Result, error) {
+func (s *Syncer) SyncBackgroundWithProvider(ctx context.Context, dir string, providerProfileID string) (Result, error) {
+	return s.sync(ctx, dir, providerProfileID, SyncReasonBackground)
+}
+
+func (s *Syncer) sync(ctx context.Context, dir string, providerProfileID string, reason SyncReason) (Result, error) {
 	root, err := filepath.Abs(dir)
 	if err != nil {
 		return Result{}, err
 	}
-	return s.syncSingleflight(ctx, root, reason)
+	key := s.stateKey(root, providerProfileID)
+	return s.syncSingleflight(ctx, key, reason)
+}
+
+func (s *Syncer) stateKey(root string, providerProfileID string) stateKey {
+	id := strings.TrimSpace(providerProfileID)
+	defaultID := ""
+	if s.router != nil {
+		defaultID = strings.TrimSpace(s.router.DefaultProviderProfileID())
+	}
+	if id == defaultID {
+		id = ""
+	}
+	return stateKey{root: root, providerProfileID: id}
 }
 
 func (s *Syncer) WorkspaceStatus(ctx context.Context, dir string) (WorkspaceStatus, error) {
+	return s.WorkspaceStatusWithProvider(ctx, dir, "")
+}
+
+func (s *Syncer) WorkspaceStatusWithProvider(ctx context.Context, dir string, providerProfileID string) (WorkspaceStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return WorkspaceStatus{}, err
 	}
@@ -176,19 +278,20 @@ func (s *Syncer) WorkspaceStatus(ctx context.Context, dir string) (WorkspaceStat
 	if err != nil {
 		return WorkspaceStatus{}, err
 	}
+	key := s.stateKey(root, providerProfileID)
 
 	s.mu.Lock()
-	if status, ok := s.statuses[root]; ok {
+	if status, ok := s.statuses[key.mapKey()]; ok {
 		s.mu.Unlock()
-		return s.withUpstreamHealth(cloneWorkspaceStatus(status)), nil
+		return s.withUpstreamHealth(key, cloneWorkspaceStatus(status)), nil
 	}
 	s.mu.Unlock()
 
-	st, _, err := loadState(root)
+	st, _, err := loadStateForProvider(root, key.providerProfileID)
 	if err != nil {
 		return WorkspaceStatus{}, err
 	}
-	return s.withUpstreamHealth(workspaceStatusFromState(root, st)), nil
+	return s.withUpstreamHealth(key, workspaceStatusFromState(key, st)), nil
 }
 
 func (s *Syncer) ListWorkspaceStatuses(ctx context.Context) ([]WorkspaceStatus, error) {
@@ -198,16 +301,24 @@ func (s *Syncer) ListWorkspaceStatuses(ctx context.Context) ([]WorkspaceStatus, 
 	s.mu.Lock()
 	statuses := make([]WorkspaceStatus, 0, len(s.statuses))
 	for _, status := range s.statuses {
-		statuses = append(statuses, s.withUpstreamHealth(cloneWorkspaceStatus(status)))
+		key := s.stateKey(status.DirectoryPath, status.ProviderProfileID)
+		statuses = append(statuses, s.withUpstreamHealth(key, cloneWorkspaceStatus(status)))
 	}
 	s.mu.Unlock()
 	sort.Slice(statuses, func(i, j int) bool {
+		if statuses[i].DirectoryPath == statuses[j].DirectoryPath {
+			return statuses[i].ProviderProfileID < statuses[j].ProviderProfileID
+		}
 		return statuses[i].DirectoryPath < statuses[j].DirectoryPath
 	})
 	return statuses, nil
 }
 
 func (s *Syncer) WorkspaceChanged(ctx context.Context, dir string) (bool, error) {
+	return s.WorkspaceChangedWithProvider(ctx, dir, "")
+}
+
+func (s *Syncer) WorkspaceChangedWithProvider(ctx context.Context, dir string, providerProfileID string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -215,11 +326,12 @@ func (s *Syncer) WorkspaceChanged(ctx context.Context, dir string) (bool, error)
 	if err != nil {
 		return false, err
 	}
+	key := s.stateKey(root, providerProfileID)
 	assets, err := FileAssetSource{}.Load(ctx, root)
 	if err != nil {
 		return false, err
 	}
-	st, _, err := loadState(root)
+	st, _, err := loadStateForProvider(root, key.providerProfileID)
 	if err != nil {
 		return false, err
 	}
@@ -227,7 +339,8 @@ func (s *Syncer) WorkspaceChanged(ctx context.Context, dir string) (bool, error)
 	return !sameBlobMap(st.BlobNames, current), nil
 }
 
-func (s *Syncer) syncSingleflight(ctx context.Context, root string, reason SyncReason) (Result, error) {
+func (s *Syncer) syncSingleflight(ctx context.Context, key stateKey, reason SyncReason) (Result, error) {
+	mapKey := key.mapKey()
 	for {
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
@@ -237,7 +350,7 @@ func (s *Syncer) syncSingleflight(ctx context.Context, root string, reason SyncR
 		if s.inflight == nil {
 			s.inflight = make(map[string]*syncCall)
 		}
-		if call, ok := s.inflight[root]; ok {
+		if call, ok := s.inflight[mapKey]; ok {
 			if call.cancelled {
 				done := call.done
 				s.mu.Unlock()
@@ -250,7 +363,7 @@ func (s *Syncer) syncSingleflight(ctx context.Context, root string, reason SyncR
 			}
 			call.waiters++
 			s.mu.Unlock()
-			return s.waitSyncCall(ctx, root, call)
+			return s.waitSyncCall(ctx, key, call)
 		}
 
 		runCtx, cancel := context.WithCancel(context.Background())
@@ -259,30 +372,31 @@ func (s *Syncer) syncSingleflight(ctx context.Context, root string, reason SyncR
 			cancel:  cancel,
 			waiters: 1,
 		}
-		s.inflight[root] = call
-		s.markSyncStartedLocked(root, reason)
+		s.inflight[mapKey] = call
+		s.markSyncStartedLocked(key, reason)
 		s.mu.Unlock()
 
-		go s.runSyncCall(runCtx, root, call)
-		return s.waitSyncCall(ctx, root, call)
+		go s.runSyncCall(runCtx, key, call)
+		return s.waitSyncCall(ctx, key, call)
 	}
 }
 
-func (s *Syncer) runSyncCall(ctx context.Context, root string, call *syncCall) {
-	result, err := s.syncRoot(ctx, root)
+func (s *Syncer) runSyncCall(ctx context.Context, key stateKey, call *syncCall) {
+	result, err := s.syncRoot(ctx, key)
 
 	s.mu.Lock()
 	call.result = result
 	call.err = err
-	s.markSyncFinishedLocked(root, result, err)
-	if current, ok := s.inflight[root]; ok && current == call {
-		delete(s.inflight, root)
+	s.markSyncFinishedLocked(key, result, err)
+	mapKey := key.mapKey()
+	if current, ok := s.inflight[mapKey]; ok && current == call {
+		delete(s.inflight, mapKey)
 	}
 	close(call.done)
 	s.mu.Unlock()
 }
 
-func (s *Syncer) waitSyncCall(ctx context.Context, root string, call *syncCall) (Result, error) {
+func (s *Syncer) waitSyncCall(ctx context.Context, key stateKey, call *syncCall) (Result, error) {
 	select {
 	case <-call.done:
 		return call.result, call.err
@@ -292,15 +406,15 @@ func (s *Syncer) waitSyncCall(ctx context.Context, root string, call *syncCall) 
 			return call.result, call.err
 		default:
 		}
-		s.releaseSyncCall(root, call)
+		s.releaseSyncCall(key, call)
 		return Result{}, ctx.Err()
 	}
 }
 
-func (s *Syncer) releaseSyncCall(root string, call *syncCall) {
+func (s *Syncer) releaseSyncCall(key stateKey, call *syncCall) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	current, ok := s.inflight[root]
+	current, ok := s.inflight[key.mapKey()]
 	if !ok || current != call {
 		return
 	}
@@ -313,44 +427,54 @@ func (s *Syncer) releaseSyncCall(root string, call *syncCall) {
 	}
 }
 
-func (s *Syncer) markSyncStartedLocked(root string, reason SyncReason) {
+func (s *Syncer) markSyncStartedLocked(key stateKey, reason SyncReason) {
 	if s.statuses == nil {
 		s.statuses = make(map[string]WorkspaceStatus)
 	}
 	now := time.Now().UTC()
-	status := s.statuses[root]
-	status.DirectoryPath = root
+	mapKey := key.mapKey()
+	status := s.statuses[mapKey]
+	status.DirectoryPath = key.root
+	status.ProviderProfileID = key.providerProfileID
+	status.ProviderState = providerStateCold
 	status.InFlight = true
 	status.Stage = IndexStageScanning
 	status.StageStartedAt = &now
 	status.LastSyncReason = reason
 	status.LastErrorStage = ""
 	status.LastStartedAt = &now
-	s.statuses[root] = status
+	s.statuses[mapKey] = status
 }
 
-func (s *Syncer) markSyncStage(root string, stage IndexStage) {
+func (s *Syncer) markSyncStage(key stateKey, stage IndexStage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.statuses == nil {
 		s.statuses = make(map[string]WorkspaceStatus)
 	}
 	now := time.Now().UTC()
-	status := s.statuses[root]
-	status.DirectoryPath = root
+	mapKey := key.mapKey()
+	status := s.statuses[mapKey]
+	status.DirectoryPath = key.root
+	status.ProviderProfileID = key.providerProfileID
 	status.Stage = stage
 	status.StageStartedAt = &now
 	status.InFlight = true
-	s.statuses[root] = status
+	if status.ProviderState == "" {
+		status.ProviderState = providerStateCold
+	}
+	s.statuses[mapKey] = status
 }
 
-func (s *Syncer) markSyncFinishedLocked(root string, result Result, err error) {
+func (s *Syncer) markSyncFinishedLocked(key stateKey, result Result, err error) {
 	if s.statuses == nil {
 		s.statuses = make(map[string]WorkspaceStatus)
 	}
 	now := time.Now().UTC()
-	status := s.statuses[root]
-	status.DirectoryPath = root
+	mapKey := key.mapKey()
+	status := s.statuses[mapKey]
+	status.DirectoryPath = key.root
+	status.ProviderProfileID = key.providerProfileID
 	status.InFlight = false
 	status.LastFinishedAt = &now
 	if err != nil {
@@ -362,7 +486,8 @@ func (s *Syncer) markSyncFinishedLocked(root string, result Result, err error) {
 		status.StageStartedAt = &now
 		status.LastErrorStage = errorStage
 		status.LastError = err.Error()
-		s.statuses[root] = status
+		status.ProviderState = providerStateFailed
+		s.statuses[mapKey] = status
 		return
 	}
 	status.Stage = IndexStageReady
@@ -374,19 +499,23 @@ func (s *Syncer) markSyncFinishedLocked(root string, result Result, err error) {
 	status.LastDeleted = result.Deleted
 	status.LastError = ""
 	status.LastErrorStage = ""
+	status.ProviderState = providerStateReady
 	status.UpdatedAt = &now
-	s.statuses[root] = status
+	s.statuses[mapKey] = status
 }
 
-func workspaceStatusFromState(root string, st state) WorkspaceStatus {
+func workspaceStatusFromState(key stateKey, st state) WorkspaceStatus {
 	status := WorkspaceStatus{
-		DirectoryPath: root,
-		CheckpointID:  st.CheckpointID,
-		FileCount:     len(st.BlobNames),
-		Stage:         IndexStageIdle,
+		DirectoryPath:     key.root,
+		ProviderProfileID: key.providerProfileID,
+		ProviderState:     providerStateCold,
+		CheckpointID:      st.CheckpointID,
+		FileCount:         len(st.BlobNames),
+		Stage:             IndexStageIdle,
 	}
 	if st.CheckpointID != "" || len(st.BlobNames) > 0 {
 		status.Stage = IndexStageReady
+		status.ProviderState = providerStateReady
 	}
 	if !st.UpdatedAt.IsZero() {
 		updated := st.UpdatedAt.UTC()
@@ -409,16 +538,21 @@ func cloneWorkspaceStatus(status WorkspaceStatus) WorkspaceStatus {
 	return status
 }
 
-func (s *Syncer) withUpstreamHealth(status WorkspaceStatus) WorkspaceStatus {
-	reporter, ok := s.client.(upstreamHealthReporter)
+func (s *Syncer) withUpstreamHealth(key stateKey, status WorkspaceStatus) WorkspaceStatus {
+	if s.router == nil {
+		return status
+	}
+	health, ok := s.router.HealthSnapshotForProviderProfile(key.providerProfileID)
 	if !ok {
 		return status
 	}
-	health := reporter.HealthSnapshot()
 	if health.Status == "" && health.LastStatusCode == 0 && health.LastError == "" && health.BackoffUntil == nil && health.LastFailureAt == nil && health.LastSuccessAt == nil {
 		return status
 	}
 	status.UpstreamStatus = health.Status
+	if health.Status == "backoff" {
+		status.ProviderState = providerStateBackoff
+	}
 	status.UpstreamLastStatusCode = health.LastStatusCode
 	if health.RetryAfter > 0 {
 		status.UpstreamRetryAfter = health.RetryAfter.String()
@@ -440,13 +574,17 @@ func cloneTime(value *time.Time) *time.Time {
 	return &copied
 }
 
-func (s *Syncer) syncRoot(ctx context.Context, root string) (Result, error) {
-	s.markSyncStage(root, IndexStageScanning)
-	assets, err := FileAssetSource{}.Load(ctx, root)
+func (s *Syncer) syncRoot(ctx context.Context, key stateKey) (Result, error) {
+	client, err := s.clientForProvider(key.providerProfileID)
 	if err != nil {
 		return Result{}, err
 	}
-	st, statePath, err := loadState(root)
+	s.markSyncStage(key, IndexStageScanning)
+	assets, err := FileAssetSource{}.Load(ctx, key.root)
+	if err != nil {
+		return Result{}, err
+	}
+	st, statePath, err := loadStateForProvider(key.root, key.providerProfileID)
 	if err != nil {
 		return Result{}, err
 	}
@@ -464,15 +602,15 @@ func (s *Syncer) syncRoot(ctx context.Context, root string) (Result, error) {
 		deleted = nil
 	}
 
-	s.markSyncStage(root, IndexStageReconciling)
-	unknown, nonindexed, err := findMissingBatched(ctx, s.client, allNames, findMissingBatchSize())
+	s.markSyncStage(key, IndexStageReconciling)
+	unknown, nonindexed, err := findMissingBatched(ctx, client, allNames, findMissingBatchSize())
 	if err != nil {
 		return Result{}, err
 	}
 	toUpload := uniqueStrings(append(unknown, nonindexed...))
 	uploads := make([]ace.BlobUpload, 0, len(toUpload))
 	if len(toUpload) > 0 {
-		s.markSyncStage(root, IndexStageUploading)
+		s.markSyncStage(key, IndexStageUploading)
 	}
 	for _, name := range toUpload {
 		asset, ok := byName[name]
@@ -486,14 +624,14 @@ func (s *Syncer) syncRoot(ctx context.Context, root string) (Result, error) {
 		uploads = append(uploads, upload)
 	}
 	if len(uploads) > 0 {
-		if err := batchUpload(ctx, s.client, uploads, uploadBatchBytes()); err != nil {
+		if err := batchUpload(ctx, client, uploads, uploadBatchBytes()); err != nil {
 			return Result{}, err
 		}
 	}
 
 	if len(added) > 0 || len(deleted) > 0 || st.CheckpointID == "" {
-		s.markSyncStage(root, IndexStageCheckpointing)
-		checkpointID, err := s.client.CheckpointBlobs(ctx, st.CheckpointID, added, deleted)
+		s.markSyncStage(key, IndexStageCheckpointing)
+		checkpointID, err := client.CheckpointBlobs(ctx, st.CheckpointID, added, deleted)
 		if err != nil {
 			return Result{}, err
 		}
@@ -506,11 +644,12 @@ func (s *Syncer) syncRoot(ctx context.Context, root string) (Result, error) {
 	}
 
 	return Result{
-		CheckpointID: st.CheckpointID,
-		FileCount:    len(assets),
-		Uploaded:     len(uploads),
-		Added:        len(added),
-		Deleted:      len(deleted),
+		ProviderProfileID: key.providerProfileID,
+		CheckpointID:      st.CheckpointID,
+		FileCount:         len(assets),
+		Uploaded:          len(uploads),
+		Added:             len(added),
+		Deleted:           len(deleted),
 	}, nil
 }
 
@@ -1069,7 +1208,11 @@ func blobName(rel string, content []byte) string {
 }
 
 func loadState(root string) (state, string, error) {
-	path, err := stateFile(root)
+	return loadStateForProvider(root, "")
+}
+
+func loadStateForProvider(root string, providerProfileID string) (state, string, error) {
+	path, err := stateFileForProvider(root, providerProfileID)
 	if err != nil {
 		return state{}, "", err
 	}
@@ -1122,12 +1265,34 @@ func saveState(path string, st state) error {
 }
 
 func stateFile(root string) (string, error) {
+	return stateFileForProvider(root, "")
+}
+
+func stateFileForProvider(root string, providerProfileID string) (string, error) {
 	cache, err := cacheRoot()
 	if err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256([]byte(root))
+	providerProfileID = strings.TrimSpace(providerProfileID)
+	if providerProfileID != "" {
+		return filepath.Join(cache, "workspaces", cacheNamespace(), "profiles", safeProviderProfileID(providerProfileID), hex.EncodeToString(sum[:])+".json"), nil
+	}
 	return filepath.Join(cache, "workspaces", cacheNamespace(), hex.EncodeToString(sum[:])+".json"), nil
+}
+
+func safeProviderProfileID(providerProfileID string) string {
+	providerProfileID = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' {
+			return r
+		}
+		return '-'
+	}, strings.TrimSpace(providerProfileID))
+	providerProfileID = strings.Trim(providerProfileID, ".-")
+	if providerProfileID == "" {
+		return "default"
+	}
+	return providerProfileID
 }
 
 func cacheNamespace() string {
@@ -1224,5 +1389,8 @@ func uniqueSorted(values []string) []string {
 }
 
 func (r Result) Summary() string {
+	if r.ProviderProfileID != "" {
+		return fmt.Sprintf("provider_profile_id=%s checkpoint=%s files=%d uploaded=%d added=%d deleted=%d", r.ProviderProfileID, r.CheckpointID, r.FileCount, r.Uploaded, r.Added, r.Deleted)
+	}
 	return fmt.Sprintf("checkpoint=%s files=%d uploaded=%d added=%d deleted=%d", r.CheckpointID, r.FileCount, r.Uploaded, r.Added, r.Deleted)
 }

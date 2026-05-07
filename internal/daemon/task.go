@@ -49,6 +49,7 @@ type TaskRequest struct {
 	Kind               TaskKind `json:"kind"`
 	DirectoryPath      string   `json:"directory_path"`
 	DirectoryPaths     []string `json:"directory_paths,omitempty"`
+	ProviderProfileID  string   `json:"provider_profile_id,omitempty"`
 	InformationRequest string   `json:"information_request,omitempty"`
 	MaxOutputLength    int      `json:"max_output_length,omitempty"`
 }
@@ -59,6 +60,7 @@ type TaskSnapshot struct {
 	State              TaskState         `json:"state"`
 	DirectoryPath      string            `json:"directory_path"`
 	DirectoryPaths     []string          `json:"directory_paths,omitempty"`
+	ProviderProfileID  string            `json:"provider_profile_id,omitempty"`
 	InformationRequest string            `json:"information_request,omitempty"`
 	MaxOutputLength    int               `json:"max_output_length,omitempty"`
 	SubmittedAt        time.Time         `json:"submitted_at"`
@@ -195,6 +197,7 @@ func (s *TaskStore) Submit(req TaskRequest) (TaskSnapshot, error) {
 			State:              TaskStateQueued,
 			DirectoryPath:      normalized.DirectoryPath,
 			DirectoryPaths:     append([]string(nil), normalized.DirectoryPaths...),
+			ProviderProfileID:  normalized.ProviderProfileID,
 			InformationRequest: normalized.InformationRequest,
 			MaxOutputLength:    normalized.MaxOutputLength,
 			SubmittedAt:        time.Now().UTC(),
@@ -590,6 +593,7 @@ func requestFromSnapshot(snapshot TaskSnapshot) TaskRequest {
 		Kind:               snapshot.Kind,
 		DirectoryPath:      snapshot.DirectoryPath,
 		DirectoryPaths:     append([]string(nil), snapshot.DirectoryPaths...),
+		ProviderProfileID:  snapshot.ProviderProfileID,
 		InformationRequest: snapshot.InformationRequest,
 		MaxOutputLength:    snapshot.MaxOutputLength,
 	}
@@ -645,6 +649,7 @@ func cacheNamespace() string {
 
 func normalizeTaskRequest(req TaskRequest) (TaskRequest, error) {
 	req.DirectoryPath = strings.TrimSpace(req.DirectoryPath)
+	req.ProviderProfileID = strings.TrimSpace(req.ProviderProfileID)
 	req.InformationRequest = strings.TrimSpace(req.InformationRequest)
 	switch strings.TrimSpace(string(req.Kind)) {
 	case "sync", "sync_workspace", "sync-workspace":

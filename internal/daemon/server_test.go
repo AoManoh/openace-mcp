@@ -56,6 +56,28 @@ func (fakeWorkspaceSyncer) WorkspaceStatus(ctx context.Context, dir string) (wor
 	}, nil
 }
 
+type fakeProviderWorkspaceSyncer struct {
+	fakeWorkspaceSyncer
+}
+
+func (fakeProviderWorkspaceSyncer) SyncWithProvider(ctx context.Context, dir string, providerProfileID string) (workspace.Result, error) {
+	return workspace.Result{ProviderProfileID: providerProfileID, CheckpointID: "checkpoint-" + providerProfileID, FileCount: 1}, nil
+}
+
+func (fakeProviderWorkspaceSyncer) RetrieveWithProvider(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (workspace.Result, error) {
+	return workspace.Result{Text: "retrieved " + providerProfileID, ProviderProfileID: providerProfileID, CheckpointID: "checkpoint-" + providerProfileID, FileCount: 1}, nil
+}
+
+func (fakeProviderWorkspaceSyncer) WorkspaceStatusWithProvider(ctx context.Context, dir string, providerProfileID string) (workspace.WorkspaceStatus, error) {
+	return workspace.WorkspaceStatus{
+		DirectoryPath:     dir,
+		ProviderProfileID: providerProfileID,
+		ProviderState:     "ready",
+		CheckpointID:      "checkpoint-" + providerProfileID,
+		FileCount:         1,
+	}, nil
+}
+
 type fakeWatchWorkspaceSyncer struct {
 	fakeSyncer
 }
@@ -264,6 +286,56 @@ func TestServerWorkspaceStatus(t *testing.T) {
 	}
 	if status.UpstreamStatus != "backoff" || status.UpstreamRetryAfter != "30s" {
 		t.Fatalf("workspace status should include upstream health: %+v", status)
+	}
+}
+
+func TestServerRoutesProviderProfileRequests(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	server := newDaemonHTTPTestServer(t, fakeProviderWorkspaceSyncer{})
+
+	retrievePayload, err := json.Marshal(retrieveRequest{
+		DirectoryPath:      "/tmp/project",
+		ProviderProfileID:  "standby",
+		InformationRequest: "find code",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(server.URL+"/v1/retrieve", "application/json", bytes.NewReader(retrievePayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected retrieve status: %s", resp.Status)
+	}
+	var result workspace.Result
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.ProviderProfileID != "standby" || result.CheckpointID != "checkpoint-standby" {
+		t.Fatalf("unexpected provider retrieve result: %+v", result)
+	}
+
+	statusPayload, err := json.Marshal(workspaceStatusRequest{DirectoryPath: "/tmp/project", ProviderProfileID: "standby"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err = http.Post(server.URL+"/v1/workspace/status", "application/json", bytes.NewReader(statusPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status response: %s", resp.Status)
+	}
+	var status workspace.WorkspaceStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status.ProviderProfileID != "standby" || status.CheckpointID != "checkpoint-standby" {
+		t.Fatalf("unexpected provider workspace status: %+v", status)
 	}
 }
 
