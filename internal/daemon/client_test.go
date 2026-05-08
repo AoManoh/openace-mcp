@@ -6,7 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
@@ -81,6 +84,101 @@ func TestClientSendsProviderProfileWhenDaemonAdvertisesCapability(t *testing.T) 
 	}
 	if result.ProviderProfileID != "standby" {
 		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+func TestClientCachesProviderCapability(t *testing.T) {
+	healthCalls := 0
+	retrieveCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/healthz":
+			healthCalls++
+			_, _ = w.Write([]byte(`{"status":"ok","service":"openace-daemon","capabilities":{"provider_profiles":true}}`))
+		case "/v1/retrieve":
+			retrieveCalls++
+			var req retrieveRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			if req.ProviderProfileID != "standby" {
+				t.Fatalf("provider_profile_id = %q, want standby", req.ProviderProfileID)
+			}
+			_ = json.NewEncoder(w).Encode(workspace.Result{Text: "ok", ProviderProfileID: req.ProviderProfileID})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	for i := 0; i < 2; i++ {
+		if _, err := client.RetrieveWithProvider(context.Background(), "/tmp/project", "standby", "find code", 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if healthCalls != 1 {
+		t.Fatalf("health calls = %d, want 1", healthCalls)
+	}
+	if retrieveCalls != 2 {
+		t.Fatalf("retrieve calls = %d, want 2", retrieveCalls)
+	}
+}
+
+func TestClientCachesProviderCapabilityForConcurrentRequests(t *testing.T) {
+	var healthCalls atomic.Int64
+	var retrieveCalls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/healthz":
+			healthCalls.Add(1)
+			time.Sleep(20 * time.Millisecond)
+			_, _ = w.Write([]byte(`{"status":"ok","service":"openace-daemon","capabilities":{"provider_profiles":true}}`))
+		case "/v1/retrieve":
+			retrieveCalls.Add(1)
+			var req retrieveRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Error(err)
+				return
+			}
+			if req.ProviderProfileID != "standby" {
+				t.Errorf("provider_profile_id = %q, want standby", req.ProviderProfileID)
+			}
+			_ = json.NewEncoder(w).Encode(workspace.Result{Text: "ok", ProviderProfileID: req.ProviderProfileID})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	start := make(chan struct{})
+	errs := make(chan error, 16)
+	var wg sync.WaitGroup
+	for i := 0; i < cap(errs); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := client.RetrieveWithProvider(context.Background(), "/tmp/project", "standby", "find code", 0)
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := healthCalls.Load(); got != 1 {
+		t.Fatalf("health calls = %d, want 1", got)
+	}
+	if got := retrieveCalls.Load(); got != int64(cap(errs)) {
+		t.Fatalf("retrieve calls = %d, want %d", got, cap(errs))
 	}
 }
 

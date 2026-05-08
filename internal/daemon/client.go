@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/workspace"
@@ -20,6 +21,9 @@ type Client struct {
 	baseURL string
 	http    *http.Client
 	token   string
+
+	capMu                     sync.Mutex
+	providerProfilesSupported bool
 }
 
 type healthResponse struct {
@@ -58,6 +62,11 @@ func (c *Client) ensureProviderProfiles(ctx context.Context, providerProfileID s
 	if strings.TrimSpace(providerProfileID) == "" {
 		return nil
 	}
+	c.capMu.Lock()
+	defer c.capMu.Unlock()
+	if c.providerProfilesSupported {
+		return nil
+	}
 	health, err := c.health(ctx)
 	if err != nil {
 		return err
@@ -65,6 +74,7 @@ func (c *Client) ensureProviderProfiles(ctx context.Context, providerProfileID s
 	if !health.Capabilities["provider_profiles"] {
 		return fmt.Errorf("daemon does not advertise provider profile support; restart the openACE daemon")
 	}
+	c.providerProfilesSupported = true
 	return nil
 }
 

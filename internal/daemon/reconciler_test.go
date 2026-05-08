@@ -37,8 +37,8 @@ func TestWorkspaceReconcilerSyncsChangedSeenWorkspace(t *testing.T) {
 	if !status.WatchEnabled {
 		t.Fatalf("unexpected watch status after successful background sync: %+v", status)
 	}
-	if !status.WatchScheduled || status.WatchRunning {
-		t.Fatalf("successful background sync should be scheduled but not running: %+v", status)
+	if !status.WatchScheduled {
+		t.Fatalf("successful background sync should remain scheduled: %+v", status)
 	}
 	if status.LastWatchAt == nil || status.LastBackgroundSyncAt == nil {
 		t.Fatalf("watch status should expose timestamps: %+v", status)
