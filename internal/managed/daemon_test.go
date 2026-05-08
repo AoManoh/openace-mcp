@@ -95,6 +95,28 @@ func TestStartupTimeout(t *testing.T) {
 	}
 }
 
+func TestAcquireStartupLockSerializesByAddress(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	release, err := acquireStartupLock(context.Background(), "127.0.0.1:9911", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	if _, err := acquireStartupLock(ctx, "127.0.0.1:9911", time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second lock should wait for context deadline, got %v", err)
+	}
+
+	release()
+	releaseAgain, err := acquireStartupLock(context.Background(), "127.0.0.1:9911", time.Second)
+	if err != nil {
+		t.Fatalf("lock should be acquirable after release: %v", err)
+	}
+	releaseAgain()
+}
+
 func TestWithDaemonLogAppendsCapturedStderr(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "daemon.log")
 	if err := os.WriteFile(path, []byte("real validation error\n"), 0o600); err != nil {

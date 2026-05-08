@@ -27,6 +27,17 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 	if managedAddr != addr && healthy(ctx, managedClient) {
 		return managedClient, nil
 	}
+	releaseLock, err := acquireStartupLock(ctx, managedAddr, startupTimeout())
+	if err != nil {
+		if healthy(ctx, managedClient) {
+			return managedClient, nil
+		}
+		return nil, err
+	}
+	defer releaseLock()
+	if healthy(ctx, managedClient) {
+		return managedClient, nil
+	}
 	logPath, err := startDaemon(managedAddr)
 	if err != nil {
 		return nil, err
@@ -35,6 +46,68 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 		return nil, withDaemonLog(err, logPath)
 	}
 	return managedClient, nil
+}
+
+func acquireStartupLock(ctx context.Context, addr string, timeout time.Duration) (func(), error) {
+	dir := startupLockDir(addr)
+	if dir == "" {
+		return func() {}, nil
+	}
+	if timeout <= 0 {
+		timeout = defaultStartupTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	staleAfter := timeout * 2
+	if staleAfter < 30*time.Second {
+		staleAfter = 30 * time.Second
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+		return nil, fmt.Errorf("create managed daemon startup lock dir: %w", err)
+	}
+	for {
+		err := os.Mkdir(dir, 0o700)
+		if err == nil {
+			_ = os.WriteFile(filepath.Join(dir, "owner"), []byte(fmt.Sprintf("pid=%d\naddr=%s\n", os.Getpid(), addr)), 0o600)
+			return func() { _ = os.RemoveAll(dir) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, fmt.Errorf("create managed daemon startup lock: %w", err)
+		}
+		if info, statErr := os.Stat(dir); statErr == nil && time.Since(info.ModTime()) > staleAfter {
+			_ = os.RemoveAll(dir)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for managed daemon startup lock %s", dir)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func startupLockDir(addr string) string {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(cache, "openace-mcp", "daemon-start-locks", safeLockName(listenAddr(addr)))
+}
+
+func safeLockName(value string) string {
+	value = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' {
+			return r
+		}
+		return '-'
+	}, strings.TrimSpace(value))
+	value = strings.Trim(value, ".-")
+	if value == "" {
+		return "default"
+	}
+	return value
 }
 
 func daemonAddrFromEnv() string {

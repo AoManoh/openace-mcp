@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -206,6 +207,30 @@ func TestTaskStoreListOmitsResultText(t *testing.T) {
 	}
 	if detail.Result == nil || detail.Result.Text == "" {
 		t.Fatalf("detail should retain result text: %+v", detail)
+	}
+}
+
+func TestTaskStoreLimitsLargeResultText(t *testing.T) {
+	useTempTaskStore(t)
+	largeText := strings.Repeat("x", maxTaskResultTextBytes+1024)
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+		return workspace.Result{Text: largeText, FileCount: 1}, nil
+	}, 2)
+	cleanupTaskStore(t, store)
+
+	task, err := store.Submit(TaskRequest{Kind: TaskKindRetrieve, DirectoryPath: "/tmp/workspace", InformationRequest: "find code"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := waitForTaskState(t, store, task.ID, TaskStateCompleted)
+	if completed.Result == nil {
+		t.Fatal("completed task should include result")
+	}
+	if len(completed.Result.Text) > maxTaskResultTextBytes+64 {
+		t.Fatalf("result text was not capped: len=%d", len(completed.Result.Text))
+	}
+	if !strings.Contains(completed.Result.Text, "task result truncated") {
+		t.Fatalf("truncated result should include marker")
 	}
 }
 

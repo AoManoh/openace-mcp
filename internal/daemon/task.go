@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
@@ -28,6 +29,7 @@ const defaultTaskWorkerCount = 4
 const maxTaskWorkerCount = 32
 const MaxMultiWorkspacePaths = 8
 const MaxOutputLengthLimit = 1_000_000
+const maxTaskResultTextBytes = 1 << 20
 
 type TaskKind string
 
@@ -402,9 +404,22 @@ func (s *TaskStore) finish(id string, result workspace.Result, err error) {
 		return
 	}
 	record.snapshot.State = TaskStateCompleted
+	result = limitTaskResult(result)
 	record.snapshot.Result = &result
 	s.saveAcceptedSidecarLocked(record)
 	s.persistLocked()
+}
+
+func limitTaskResult(result workspace.Result) workspace.Result {
+	if len(result.Text) <= maxTaskResultTextBytes {
+		return result
+	}
+	cut := maxTaskResultTextBytes
+	for cut > 0 && !utf8.ValidString(result.Text[:cut]) {
+		cut--
+	}
+	result.Text = result.Text[:cut] + "\n\n[openACE: task result truncated]"
+	return result
 }
 
 func (s *TaskStore) saveAcceptedSidecarLocked(record *taskRecord) {
