@@ -22,6 +22,7 @@ pnpm-debug.log*
 
 # Root-level local helper scripts are private by default.
 # Reusable public automation should live under the owning skill directory.
+/AGENTS.md
 /scripts/
 /skills/
 /.augmentignore
