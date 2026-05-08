@@ -241,14 +241,16 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 		toolCtx, cancel := toolTimeoutContext(ctx)
 		defer cancel()
 		results := s.retrieveMultiple(toolCtx, paths, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength)
-		text := formatMultiRetrievalResults(results)
+		status := summarizeMultiRetrievalResults(args.ProviderProfileID, results)
+		text := formatMultiRetrievalResults(results, status)
+		structured := map[string]any{"multi_status": status}
 		if err := toolCtx.Err(); err != nil {
-			return toolError(req.ID, text)
+			return ok(req.ID, toolResultWithStructured(text, true, structured))
 		}
-		if allMultiRetrievalsFailed(results) {
-			return toolError(req.ID, text)
+		if status.FailureCount > 0 {
+			return ok(req.ID, toolResultWithStructured(text, true, structured))
 		}
-		return ok(req.ID, toolResult(text, false))
+		return ok(req.ID, toolResultWithStructured(text, false, structured))
 	case "sync_workspace", "sync-workspace":
 		var args syncArgs
 		if err := json.Unmarshal(params.Arguments, &args); err != nil {
@@ -548,9 +550,36 @@ func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerP
 	return results
 }
 
-func formatMultiRetrievalResults(results []multiRetrievalResult) string {
+func summarizeMultiRetrievalResults(providerProfileID string, results []multiRetrievalResult) workspace.MultiRetrievalStatus {
+	status := workspace.MultiRetrievalStatus{
+		ProviderProfileID: strings.TrimSpace(providerProfileID),
+		TotalWorkspaces:   len(results),
+		Workspaces:        make([]workspace.MultiWorkspaceStatus, 0, len(results)),
+	}
+	for _, result := range results {
+		item := workspace.MultiWorkspaceStatus{
+			DirectoryPath: result.DirectoryPath,
+			Status:        "success",
+		}
+		if result.Error != "" {
+			item.Status = "error"
+			item.Error = result.Error
+			status.FailureCount++
+		} else {
+			status.SuccessCount++
+		}
+		status.Workspaces = append(status.Workspaces, item)
+	}
+	status.PartialFailure = status.SuccessCount > 0 && status.FailureCount > 0
+	return status
+}
+
+func formatMultiRetrievalResults(results []multiRetrievalResult, status workspace.MultiRetrievalStatus) string {
 	var out strings.Builder
 	out.WriteString("Cross-workspace retrieval results")
+	if status.FailureCount > 0 {
+		out.WriteString(fmt.Sprintf("\nWARNING: %d of %d workspaces failed; successful results are partial.", status.FailureCount, status.TotalWorkspaces))
+	}
 	for _, result := range results {
 		out.WriteString("\n\n## ")
 		out.WriteString(result.DirectoryPath)
@@ -567,18 +596,6 @@ func formatMultiRetrievalResults(results []multiRetrievalResult) string {
 		}
 	}
 	return out.String()
-}
-
-func allMultiRetrievalsFailed(results []multiRetrievalResult) bool {
-	if len(results) == 0 {
-		return false
-	}
-	for _, result := range results {
-		if result.Error == "" {
-			return false
-		}
-	}
-	return true
 }
 
 func retrievalTool() map[string]any {
@@ -770,6 +787,14 @@ func toolResult(text string, isError bool) map[string]any {
 	}
 	if isError {
 		result["isError"] = true
+	}
+	return result
+}
+
+func toolResultWithStructured(text string, isError bool, structured any) map[string]any {
+	result := toolResult(text, isError)
+	if structured != nil {
+		result["structuredContent"] = structured
 	}
 	return result
 }

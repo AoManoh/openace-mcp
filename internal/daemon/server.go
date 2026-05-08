@@ -455,23 +455,35 @@ func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, providerPr
 	if err := ctx.Err(); err != nil {
 		return workspace.Result{}, err
 	}
-	result, successCount := aggregateMultiRetrieveResults(results)
+	result, successCount := aggregateMultiRetrieveResults(providerProfileID, results)
 	if successCount == 0 {
 		return workspace.Result{}, fmt.Errorf("all workspace retrievals failed\n\n%s", strings.TrimSpace(result.Text))
 	}
 	return result, nil
 }
 
-func aggregateMultiRetrieveResults(results []multiRetrieveResult) (workspace.Result, int) {
+func aggregateMultiRetrieveResults(providerProfileID string, results []multiRetrieveResult) (workspace.Result, int) {
 	var out strings.Builder
 	out.WriteString("Cross-workspace retrieval results")
-	aggregate := workspace.Result{Text: ""}
-	successCount := 0
+	status := workspace.MultiRetrievalStatus{
+		ProviderProfileID: strings.TrimSpace(providerProfileID),
+		TotalWorkspaces:   len(results),
+		Workspaces:        make([]workspace.MultiWorkspaceStatus, 0, len(results)),
+	}
+	aggregate := workspace.Result{Text: "", ProviderProfileID: status.ProviderProfileID, MultiStatus: &status}
 	for _, item := range results {
 		out.WriteString("\n\n## ")
 		out.WriteString(item.directoryPath)
 		out.WriteString("\n")
+		workspaceStatus := workspace.MultiWorkspaceStatus{
+			DirectoryPath: item.directoryPath,
+			Status:        "success",
+		}
 		if item.err != nil {
+			status.FailureCount++
+			workspaceStatus.Status = "error"
+			workspaceStatus.Error = item.err.Error()
+			status.Workspaces = append(status.Workspaces, workspaceStatus)
 			out.WriteString("ERROR: ")
 			out.WriteString(item.err.Error())
 			continue
@@ -480,7 +492,8 @@ func aggregateMultiRetrieveResults(results []multiRetrieveResult) (workspace.Res
 		if text == "" {
 			text = "No relevant code sections were found."
 		}
-		successCount++
+		status.SuccessCount++
+		status.Workspaces = append(status.Workspaces, workspaceStatus)
 		out.WriteString(text)
 		out.WriteString("\n\n")
 		out.WriteString(item.result.Summary())
@@ -489,8 +502,17 @@ func aggregateMultiRetrieveResults(results []multiRetrieveResult) (workspace.Res
 		aggregate.Added += item.result.Added
 		aggregate.Deleted += item.result.Deleted
 	}
+	status.PartialFailure = status.SuccessCount > 0 && status.FailureCount > 0
+	if status.FailureCount > 0 {
+		outString := out.String()
+		out.Reset()
+		out.WriteString("Cross-workspace retrieval results")
+		out.WriteString(fmt.Sprintf("\nWARNING: %d of %d workspaces failed; successful results are partial.", status.FailureCount, status.TotalWorkspaces))
+		out.WriteString(strings.TrimPrefix(outString, "Cross-workspace retrieval results"))
+	}
+	aggregate.MultiStatus = &status
 	aggregate.Text = out.String()
-	return aggregate, successCount
+	return aggregate, status.SuccessCount
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

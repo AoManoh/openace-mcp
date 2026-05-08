@@ -426,6 +426,12 @@ func TestServerCompletesMultiRetrieveTask(t *testing.T) {
 	if !strings.Contains(completed.Result.Text, "/tmp/bad") || !strings.Contains(completed.Result.Text, "workspace failed") {
 		t.Fatalf("result should include failed workspace error: %+v", completed.Result)
 	}
+	if completed.Result.MultiStatus == nil {
+		t.Fatalf("partial multi retrieve should expose structured status: %+v", completed.Result)
+	}
+	if !completed.Result.MultiStatus.PartialFailure || completed.Result.MultiStatus.SuccessCount != 1 || completed.Result.MultiStatus.FailureCount != 1 {
+		t.Fatalf("partial multi retrieve status should expose success/failure counts: %+v", completed.Result.MultiStatus)
+	}
 	if len(completed.DirectoryPaths) != 2 {
 		t.Fatalf("task should retain directory paths: %+v", completed)
 	}

@@ -242,6 +242,7 @@ openace-mcp daemon
 | `OPENACE_WATCH_MAX_WORKSPACES` | 单个 daemon 维护的已见 workspace 上限，默认 `64` |
 | `OPENACE_TOOL_TIMEOUT` | 同步 MCP 工具调用超时，默认 `110s`；大仓库长任务优先使用 `start_*` 异步工具 |
 | `OPENACE_RETRIEVAL_TIMEOUT` | 单次上游 ACE retrieval 超时，默认 `90s` |
+| `OPENACE_RETRIEVAL_CONCURRENCY_PER_PROVIDER` | 单个 provider profile 的并发 ACE retrieval 上限，默认 `8`，最大 `64` |
 | `OPENACE_ALLOW_REMOTE_DAEMON` | 显式允许监听非 loopback 地址 |
 | `OPENACE_UPLOAD_BATCH_BYTES` | batch-upload 估算上限，默认 `1048576` |
 | `OPENACE_FIND_MISSING_BATCH_SIZE` | find-missing 分批 blob 数，默认 `1000` |

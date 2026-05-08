@@ -26,6 +26,8 @@ const defaultUploadBatchBytes = 1 << 20
 const defaultFindMissingBatchSize = 1000
 const defaultMaxFileBytes = 1 << 20
 const defaultRetrievalTimeout = 90 * time.Second
+const defaultRetrievalConcurrencyPerProvider = 8
+const maxRetrievalConcurrencyPerProvider = 64
 
 type IndexStage string
 
@@ -72,10 +74,12 @@ type ClientRouter interface {
 }
 
 type Syncer struct {
-	router   ClientRouter
-	mu       sync.Mutex
-	inflight map[string]*syncCall
-	statuses map[string]WorkspaceStatus
+	router             ClientRouter
+	mu                 sync.Mutex
+	inflight           map[string]*syncCall
+	statuses           map[string]WorkspaceStatus
+	retrieveLimit      int
+	retrieveSemaphores map[string]chan struct{}
 }
 
 type stateKey struct {
@@ -107,6 +111,22 @@ type Result struct {
 	Uploaded          int
 	Added             int
 	Deleted           int
+	MultiStatus       *MultiRetrievalStatus `json:"multi_status,omitempty"`
+}
+
+type MultiRetrievalStatus struct {
+	ProviderProfileID string                 `json:"provider_profile_id,omitempty"`
+	TotalWorkspaces   int                    `json:"total_workspaces"`
+	SuccessCount      int                    `json:"success_count"`
+	FailureCount      int                    `json:"failure_count"`
+	PartialFailure    bool                   `json:"partial_failure"`
+	Workspaces        []MultiWorkspaceStatus `json:"workspaces"`
+}
+
+type MultiWorkspaceStatus struct {
+	DirectoryPath string `json:"directory_path"`
+	Status        string `json:"status"`
+	Error         string `json:"error,omitempty"`
 }
 
 type WorkspaceStatus struct {
@@ -161,9 +181,11 @@ func NewSyncer(client ACEClient) *Syncer {
 
 func NewSyncerWithRouter(router ClientRouter) *Syncer {
 	return &Syncer{
-		router:   router,
-		inflight: make(map[string]*syncCall),
-		statuses: make(map[string]WorkspaceStatus),
+		router:             router,
+		inflight:           make(map[string]*syncCall),
+		statuses:           make(map[string]WorkspaceStatus),
+		retrieveLimit:      retrievalConcurrencyPerProvider(),
+		retrieveSemaphores: make(map[string]chan struct{}),
 	}
 }
 
@@ -218,6 +240,11 @@ func (s *Syncer) RetrieveWithProvider(ctx context.Context, dir string, providerP
 	}
 	retrieveCtx, cancel := retrievalTimeoutContext(ctx)
 	defer cancel()
+	release, err := s.acquireRetrievalSlot(retrieveCtx, sync.ProviderProfileID)
+	if err != nil {
+		return Result{}, err
+	}
+	defer release()
 	text, err := client.CodebaseRetrieval(retrieveCtx, query, ace.RetrievalOptions{
 		CheckpointID: sync.CheckpointID,
 		MaxOutputLen: maxOutputLen,
@@ -227,6 +254,26 @@ func (s *Syncer) RetrieveWithProvider(ctx context.Context, dir string, providerP
 	}
 	sync.Text = text
 	return sync, nil
+}
+
+func (s *Syncer) acquireRetrievalSlot(ctx context.Context, providerProfileID string) (func(), error) {
+	if s.retrieveLimit <= 0 {
+		return func() {}, nil
+	}
+	key := strings.TrimSpace(providerProfileID)
+	s.mu.Lock()
+	sem := s.retrieveSemaphores[key]
+	if sem == nil {
+		sem = make(chan struct{}, s.retrieveLimit)
+		s.retrieveSemaphores[key] = sem
+	}
+	s.mu.Unlock()
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (s *Syncer) Sync(ctx context.Context, dir string) (Result, error) {
@@ -799,6 +846,14 @@ func retrievalTimeout() time.Duration {
 
 func retrievalTimeoutContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, retrievalTimeout())
+}
+
+func retrievalConcurrencyPerProvider() int {
+	value := positiveIntEnv("OPENACE_RETRIEVAL_CONCURRENCY_PER_PROVIDER", defaultRetrievalConcurrencyPerProvider)
+	if value > maxRetrievalConcurrencyPerProvider {
+		return maxRetrievalConcurrencyPerProvider
+	}
+	return value
 }
 
 func positiveIntEnv(name string, fallback int) int {

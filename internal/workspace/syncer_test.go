@@ -1058,6 +1058,50 @@ func TestRetrieveAppliesRetrievalTimeout(t *testing.T) {
 	}
 }
 
+func TestRetrieveLimitsConcurrentCallsPerProvider(t *testing.T) {
+	rootOne := t.TempDir()
+	rootTwo := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	t.Setenv("OPENACE_RETRIEVAL_CONCURRENCY_PER_PROVIDER", "1")
+	writeWorkspaceTestFile(t, rootOne, "one.go", "package one\n")
+	writeWorkspaceTestFile(t, rootTwo, "two.go", "package two\n")
+
+	client := newConcurrentRetrievalClient()
+	syncer := NewSyncer(client)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, root := range []string{rootOne, rootTwo} {
+		root := root
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := syncer.Retrieve(ctx, root, "find code", 0)
+			errs <- err
+		}()
+	}
+
+	client.waitForStarts(t, 1)
+	select {
+	case <-client.started:
+		t.Fatal("second retrieval should wait for the provider-level slot")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(client.release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := client.maxActive(); got != 1 {
+		t.Fatalf("max active retrievals = %d, want 1", got)
+	}
+}
+
 type recordingClient struct {
 	batches            [][]ace.BlobUpload
 	findMissingBatches [][]string
@@ -1255,6 +1299,77 @@ func (c *blockingRetrievalClient) CodebaseRetrieval(ctx context.Context, query s
 	c.startOnce.Do(func() { close(c.started) })
 	<-ctx.Done()
 	return "", ctx.Err()
+}
+
+type concurrentRetrievalClient struct {
+	mu      sync.Mutex
+	started chan struct{}
+	release chan struct{}
+	active  int
+	max     int
+}
+
+func newConcurrentRetrievalClient() *concurrentRetrievalClient {
+	return &concurrentRetrievalClient{
+		started: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+}
+
+func (c *concurrentRetrievalClient) FindMissing(ctx context.Context, names []string) ([]string, []string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	return append([]string(nil), names...), nil, nil
+}
+
+func (c *concurrentRetrievalClient) BatchUpload(ctx context.Context, uploads []ace.BlobUpload) error {
+	return ctx.Err()
+}
+
+func (c *concurrentRetrievalClient) CheckpointBlobs(ctx context.Context, previous string, added []string, deleted []string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return "checkpoint-concurrent", nil
+}
+
+func (c *concurrentRetrievalClient) CodebaseRetrieval(ctx context.Context, query string, options ace.RetrievalOptions) (string, error) {
+	c.mu.Lock()
+	c.active++
+	if c.active > c.max {
+		c.max = c.active
+	}
+	c.mu.Unlock()
+	c.started <- struct{}{}
+	defer func() {
+		c.mu.Lock()
+		c.active--
+		c.mu.Unlock()
+	}()
+	select {
+	case <-c.release:
+		return "retrieved", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (c *concurrentRetrievalClient) waitForStarts(t *testing.T, count int) {
+	t.Helper()
+	for i := 0; i < count; i++ {
+		select {
+		case <-c.started:
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for retrieval start %d", i+1)
+		}
+	}
+}
+
+func (c *concurrentRetrievalClient) maxActive() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.max
 }
 
 type blockingSyncClient struct {

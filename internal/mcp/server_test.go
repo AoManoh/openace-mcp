@@ -307,8 +307,11 @@ func TestMultiCodebaseRetrievalKeepsPartialResults(t *testing.T) {
 	if !strings.Contains(out, "/tmp/bad") || !strings.Contains(out, "workspace failed") {
 		t.Fatalf("multi retrieval should include failed workspace error: %s", out)
 	}
-	if strings.Contains(out, `"isError":true`) {
-		t.Fatalf("partial failures should not fail whole tool: %s", out)
+	if !strings.Contains(out, `"isError":true`) {
+		t.Fatalf("partial failures should be visible as tool errors: %s", out)
+	}
+	if !strings.Contains(out, `"partial_failure":true`) || !strings.Contains(out, `"failure_count":1`) {
+		t.Fatalf("partial failures should include structured status: %s", out)
 	}
 }
 
@@ -319,6 +322,9 @@ func TestMultiCodebaseRetrievalReportsAllFailuresAsToolError(t *testing.T) {
 	}
 	if !strings.Contains(out, "workspace failed") || !strings.Contains(out, `"isError":true`) {
 		t.Fatalf("all failures should return tool error: %s", out)
+	}
+	if !strings.Contains(out, `"partial_failure":false`) || !strings.Contains(out, `"failure_count":2`) {
+		t.Fatalf("all failures should include structured status: %s", out)
 	}
 }
 
@@ -338,6 +344,9 @@ func TestMultiCodebaseRetrievalTimeoutReportsToolErrorEvenWithPartialResults(t *
 	}
 	if !strings.Contains(out, "context deadline exceeded") || !strings.Contains(out, `"isError":true`) {
 		t.Fatalf("timeout should return tool error: %s", out)
+	}
+	if !strings.Contains(out, `"failure_count":1`) {
+		t.Fatalf("timeout should include structured partial status: %s", out)
 	}
 }
 
