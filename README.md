@@ -304,7 +304,7 @@ daemon 默认只监听 loopback。不要把 daemon 直接暴露到公网。
 - IDE 启动 MCP 子进程时通常不会经过 shell，`$HOME`、`%USERPROFILE%` 这类占位符不一定会展开。配置路径时优先写绝对路径。
 - 使用本地安装方式后，升级需要重新 `go install` 并重启 MCP 会话；运行中的进程不会自动换成新版本。
 - 切换 `OPENACE_PROFILES_FILE` 或修改 profile 文件后，需要重启 daemon。
-- 如果看到 checkpoint 相关 400 错误，先确认你运行的是哪个 commit/tag，并优先升级到最新 `@main` 或固定到已验证版本复现。
+- 最新版本会在已有 checkpoint 的 `checkpoint-blobs` HTTP 400 上自动尝试一次 fresh checkpoint；如果旧版本仍持续失败，先确认你运行的是哪个 commit/tag，并优先升级到最新 `@main` 或固定到已验证版本复现。
 
 ## 本地开发
 
