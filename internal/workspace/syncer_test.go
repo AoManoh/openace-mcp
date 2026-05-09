@@ -2,15 +2,20 @@ package workspace
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/ace"
+	"github.com/AoManoh/openace-mcp/internal/auth"
 )
 
 func TestStateFileUsesOpenACECacheDir(t *testing.T) {
@@ -974,6 +979,165 @@ func TestSyncerWorkspaceChangedAssetTransitions(t *testing.T) {
 	}
 }
 
+func TestSyncerSendsIncrementalCheckpointDelta(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+
+	same := []byte("package same\n")
+	modifiedOld := []byte("package modified\nconst Version = 1\n")
+	modifiedNew := []byte("package modified\nconst Version = 2\n")
+	renamedOld := []byte("package renamed\n")
+	renamedNew := []byte("package renamed\n")
+
+	writeWorkspaceTestFile(t, root, "same.go", string(same))
+	writeWorkspaceTestFile(t, root, "modified.go", string(modifiedNew))
+	writeWorkspaceTestFile(t, root, "renamed-new.go", string(renamedNew))
+
+	statePath, err := stateFile(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveState(statePath, state{
+		CheckpointID: "checkpoint-old",
+		BlobNames: map[string]string{
+			"same.go":        blobName("same.go", same),
+			"modified.go":    blobName("modified.go", modifiedOld),
+			"renamed-old.go": blobName("renamed-old.go", renamedOld),
+		},
+		UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &deltaRecordingClient{checkpoint: "checkpoint-new"}
+	result, err := NewSyncer(client).Sync(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantAdded := uniqueSorted([]string{
+		blobName("modified.go", modifiedNew),
+		blobName("renamed-new.go", renamedNew),
+	})
+	wantDeleted := uniqueSorted([]string{
+		blobName("modified.go", modifiedOld),
+		blobName("renamed-old.go", renamedOld),
+	})
+	if len(client.checkpoints) != 1 {
+		t.Fatalf("checkpoint calls = %d, want 1", len(client.checkpoints))
+	}
+	call := client.checkpoints[0]
+	if call.previous != "checkpoint-old" {
+		t.Fatalf("previous checkpoint = %q", call.previous)
+	}
+	if !slices.Equal(call.added, wantAdded) {
+		t.Fatalf("added = %#v, want %#v", call.added, wantAdded)
+	}
+	if !slices.Equal(call.deleted, wantDeleted) {
+		t.Fatalf("deleted = %#v, want %#v", call.deleted, wantDeleted)
+	}
+	if result.CheckpointID != "checkpoint-new" || result.Added != len(wantAdded) || result.Deleted != len(wantDeleted) {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+func TestSyncFallsBackToFreshCheckpointOnCheckpointBlobsHTTP400(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+
+	changedOld := []byte("package changed\nconst Version = 1\n")
+	changedNew := []byte("package changed\nconst Version = 2\n")
+	removed := []byte("package removed\n")
+	newFile := []byte("package newfile\n")
+
+	writeWorkspaceTestFile(t, root, "changed.go", string(changedNew))
+	writeWorkspaceTestFile(t, root, "new.go", string(newFile))
+
+	statePath, err := stateFile(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveState(statePath, state{
+		CheckpointID: "checkpoint-old",
+		BlobNames: map[string]string{
+			"changed.go": blobName("changed.go", changedOld),
+			"removed.go": blobName("removed.go", removed),
+		},
+		UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	current := map[string]string{
+		"changed.go": blobName("changed.go", changedNew),
+		"new.go":     blobName("new.go", newFile),
+	}
+	wantFreshAdded := uniqueSorted([]string{current["changed.go"], current["new.go"]})
+	wantIncrementalAdded := append([]string(nil), wantFreshAdded...)
+	wantIncrementalDeleted := uniqueSorted([]string{
+		blobName("changed.go", changedOld),
+		blobName("removed.go", removed),
+	})
+	var checkpointCalls []checkpointRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/find-missing":
+			_ = json.NewEncoder(w).Encode(map[string]any{"unknown_blob_names": []string{}})
+		case "/checkpoint-blobs":
+			var req checkpointRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			checkpointCalls = append(checkpointCalls, req)
+			if len(checkpointCalls) == 1 {
+				http.Error(w, "Json deserialize error: invalid type: null, expected a sequence at line 1 column 16008", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"new_checkpoint_id": "checkpoint-fresh"})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := ace.NewClient(workspaceStaticSessionLoader{session: auth.Session{
+		AccessToken: "token",
+		TenantURL:   server.URL,
+	}})
+	result, err := NewSyncer(client).Sync(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(checkpointCalls) != 2 {
+		t.Fatalf("checkpoint calls = %d, want 2", len(checkpointCalls))
+	}
+	first := checkpointCalls[0].Blobs
+	if first.CheckpointID != "checkpoint-old" {
+		t.Fatalf("first checkpoint_id = %q", first.CheckpointID)
+	}
+	if !slices.Equal(first.Added, wantIncrementalAdded) || !slices.Equal(first.Deleted, wantIncrementalDeleted) {
+		t.Fatalf("first checkpoint delta added=%#v deleted=%#v", first.Added, first.Deleted)
+	}
+	second := checkpointCalls[1].Blobs
+	if second.CheckpointID != "" {
+		t.Fatalf("fallback checkpoint_id = %q, want omitted", second.CheckpointID)
+	}
+	if !slices.Equal(second.Added, wantFreshAdded) || len(second.Deleted) != 0 {
+		t.Fatalf("fallback payload added=%#v deleted=%#v", second.Added, second.Deleted)
+	}
+	if result.CheckpointID != "checkpoint-fresh" || result.Added != len(wantFreshAdded) || result.Deleted != 0 || result.Uploaded != 0 {
+		t.Fatalf("unexpected fallback result: %+v", result)
+	}
+	st, _, err := loadState(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.CheckpointID != "checkpoint-fresh" || !sameBlobMap(st.BlobNames, current) {
+		t.Fatalf("fallback should persist fresh state, got %#v", st)
+	}
+}
+
 func TestSyncRejectsMidSyncMutation(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
@@ -1204,6 +1368,57 @@ func (c *recordingClient) CheckpointBlobs(context.Context, string, []string, []s
 
 func (c *recordingClient) CodebaseRetrieval(context.Context, string, ace.RetrievalOptions) (string, error) {
 	return "", nil
+}
+
+type checkpointCall struct {
+	previous string
+	added    []string
+	deleted  []string
+}
+
+type deltaRecordingClient struct {
+	checkpoint  string
+	checkpoints []checkpointCall
+}
+
+func (c *deltaRecordingClient) FindMissing(context.Context, []string) ([]string, []string, error) {
+	return nil, nil, nil
+}
+
+func (c *deltaRecordingClient) BatchUpload(context.Context, []ace.BlobUpload) error {
+	return nil
+}
+
+func (c *deltaRecordingClient) CheckpointBlobs(_ context.Context, previous string, added []string, deleted []string) (string, error) {
+	c.checkpoints = append(c.checkpoints, checkpointCall{
+		previous: previous,
+		added:    append([]string(nil), added...),
+		deleted:  append([]string(nil), deleted...),
+	})
+	return c.checkpoint, nil
+}
+
+func (c *deltaRecordingClient) CodebaseRetrieval(context.Context, string, ace.RetrievalOptions) (string, error) {
+	return "", nil
+}
+
+type checkpointRequest struct {
+	Blobs struct {
+		Added        []string `json:"added_blobs"`
+		Deleted      []string `json:"deleted_blobs"`
+		CheckpointID string   `json:"checkpoint_id"`
+	} `json:"blobs"`
+}
+
+type workspaceStaticSessionLoader struct {
+	session auth.Session
+}
+
+func (l workspaceStaticSessionLoader) Load(ctx context.Context) (auth.Session, error) {
+	if err := ctx.Err(); err != nil {
+		return auth.Session{}, err
+	}
+	return l.session, nil
 }
 
 func writeWorkspaceTestFile(t *testing.T, root string, rel string, content string) {

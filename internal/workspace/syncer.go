@@ -690,7 +690,17 @@ func (s *Syncer) syncRoot(ctx context.Context, key stateKey) (Result, error) {
 		s.markSyncStage(key, IndexStageCheckpointing)
 		checkpointID, err := client.CheckpointBlobs(ctx, st.CheckpointID, added, deleted)
 		if err != nil {
-			return Result{}, err
+			if st.CheckpointID == "" || !ace.IsCheckpointBlobsBadRequest(err) {
+				return Result{}, err
+			}
+			fallbackAdded := append([]string(nil), allNames...)
+			var fallbackErr error
+			checkpointID, fallbackErr = client.CheckpointBlobs(ctx, "", fallbackAdded, nil)
+			if fallbackErr != nil {
+				return Result{}, fmt.Errorf("%w; fresh checkpoint fallback failed: %v", err, fallbackErr)
+			}
+			added = fallbackAdded
+			deleted = nil
 		}
 		st.CheckpointID = checkpointID
 	}

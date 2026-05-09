@@ -71,6 +71,12 @@ func (e apiError) Error() string {
 	return fmt.Sprintf("%s returned HTTP %d: %s", e.endpoint, e.status, e.body)
 }
 
+// IsCheckpointBlobsBadRequest reports whether err is a checkpoint-blobs HTTP 400 response.
+func IsCheckpointBlobsBadRequest(err error) bool {
+	var api apiError
+	return errors.As(err, &api) && api.endpoint == "checkpoint-blobs" && api.status == http.StatusBadRequest
+}
+
 // HealthSnapshot summarizes the latest upstream ACE availability signal.
 type HealthSnapshot struct {
 	Status         string

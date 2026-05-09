@@ -257,6 +257,18 @@ func TestCheckpointBlobsHTTP400IncludesSafePayloadShape(t *testing.T) {
 	}
 }
 
+func TestIsCheckpointBlobsBadRequest(t *testing.T) {
+	if !IsCheckpointBlobsBadRequest(apiError{endpoint: "checkpoint-blobs", status: http.StatusBadRequest}) {
+		t.Fatal("checkpoint-blobs HTTP 400 should match")
+	}
+	if IsCheckpointBlobsBadRequest(apiError{endpoint: "find-missing", status: http.StatusBadRequest}) {
+		t.Fatal("other endpoint should not match")
+	}
+	if IsCheckpointBlobsBadRequest(apiError{endpoint: "checkpoint-blobs", status: http.StatusInternalServerError}) {
+		t.Fatal("other status should not match")
+	}
+}
+
 func TestTrimForErrorRedactsSensitiveValues(t *testing.T) {
 	t.Setenv("AUGMENT_TOKEN", "fake-token-value-abcdefghijklmnopqrstuvwxyz")
 	t.Setenv("AUGMENT_TENANT", "https://tenant.example.invalid/")

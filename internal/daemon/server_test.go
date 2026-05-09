@@ -7,11 +7,15 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/AoManoh/openace-mcp/internal/ace"
+	"github.com/AoManoh/openace-mcp/internal/auth"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
@@ -106,6 +110,62 @@ func (fakeWatchWorkspaceSyncer) WorkspaceStatus(ctx context.Context, dir string)
 	}, nil
 }
 
+type daemonStaticSessionLoader struct {
+	session auth.Session
+}
+
+func (l daemonStaticSessionLoader) Load(ctx context.Context) (auth.Session, error) {
+	if err := ctx.Err(); err != nil {
+		return auth.Session{}, err
+	}
+	return l.session, nil
+}
+
+func newCheckpointFallbackFixture(t *testing.T) (string, *workspace.Syncer, *int) {
+	t.Helper()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nconst Version = 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	checkpointCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/find-missing":
+			_ = json.NewEncoder(w).Encode(map[string]any{"unknown_blob_names": []string{}})
+		case "/checkpoint-blobs":
+			checkpointCalls++
+			if checkpointCalls == 2 {
+				http.Error(w, "Json deserialize error: invalid type: null, expected a sequence at line 1 column 531", http.StatusBadRequest)
+				return
+			}
+			checkpointID := "checkpoint-initial"
+			if checkpointCalls == 3 {
+				checkpointID = "checkpoint-fresh"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"new_checkpoint_id": checkpointID})
+		case "/agents/codebase-retrieval":
+			_ = json.NewEncoder(w).Encode(map[string]string{"formatted_retrieval": "retrieved after fallback"})
+		default:
+			t.Fatalf("unexpected upstream path %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	syncer := workspace.NewSyncer(ace.NewClient(daemonStaticSessionLoader{session: auth.Session{
+		AccessToken: "token",
+		TenantURL:   upstream.URL,
+	}}))
+	if _, err := syncer.Sync(context.Background(), root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nconst Version = 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return root, syncer, &checkpointCalls
+}
+
 func TestServerTaskLifecycle(t *testing.T) {
 	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "")
@@ -126,6 +186,47 @@ func TestServerTaskLifecycle(t *testing.T) {
 	}
 	if !strings.Contains(completed.Result.Text, "retrieved") {
 		t.Fatalf("unexpected task result: %+v", completed.Result)
+	}
+}
+
+func TestServerRetrieveTaskCompletesAfterCheckpointHTTP400Fallback(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	root, syncer, checkpointCalls := newCheckpointFallbackFixture(t)
+	server := newDaemonHTTPTestServer(t, syncer)
+
+	task := postTask(t, server.URL, TaskRequest{
+		Kind:               TaskKindRetrieve,
+		DirectoryPath:      root,
+		InformationRequest: "find code after checkpoint fallback",
+	})
+	completed := pollHTTPTask(t, server.URL, task.ID, TaskStateCompleted)
+	if completed.Error != "" {
+		t.Fatalf("fallback task should not expose checkpoint error: %+v", completed)
+	}
+	if completed.Result == nil || completed.Result.CheckpointID != "checkpoint-fresh" || !strings.Contains(completed.Result.Text, "retrieved after fallback") {
+		t.Fatalf("unexpected fallback task result: %+v", completed.Result)
+	}
+	if *checkpointCalls != 3 {
+		t.Fatalf("checkpoint calls = %d, want initial + failed delta + fallback", *checkpointCalls)
+	}
+}
+
+func TestServerRetrieveCompletesAfterCheckpointHTTP400Fallback(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	root, syncer, checkpointCalls := newCheckpointFallbackFixture(t)
+	server := newDaemonHTTPTestServer(t, syncer)
+
+	result, err := NewClient(server.URL).Retrieve(context.Background(), root, "find code after checkpoint fallback", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CheckpointID != "checkpoint-fresh" || !strings.Contains(result.Text, "retrieved after fallback") {
+		t.Fatalf("unexpected fallback retrieve result: %+v", result)
+	}
+	if *checkpointCalls != 3 {
+		t.Fatalf("checkpoint calls = %d, want initial + failed delta + fallback", *checkpointCalls)
 	}
 }
 
