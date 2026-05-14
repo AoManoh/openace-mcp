@@ -47,6 +47,21 @@ func (c *Client) Health(ctx context.Context) error {
 	return err
 }
 
+func (c *Client) Endpoint() string {
+	return c.baseURL
+}
+
+func (c *Client) DaemonStatus(ctx context.Context) (Status, error) {
+	var result Status
+	if err := c.get(ctx, "/v1/daemon/status", &result); err != nil {
+		return Status{}, err
+	}
+	if result.Status != "ok" || result.Service != "openace-daemon" {
+		return Status{}, fmt.Errorf("daemon /v1/daemon/status returned unexpected service %q with status %q", result.Service, result.Status)
+	}
+	return result, nil
+}
+
 func (c *Client) health(ctx context.Context) (healthResponse, error) {
 	var result healthResponse
 	if err := c.get(ctx, "/healthz", &result); err != nil {

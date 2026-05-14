@@ -42,6 +42,9 @@ type Server struct {
 	tasks      *TaskStore
 	reconciler *workspaceReconciler
 	authToken  string
+	startedAt  time.Time
+	statusMu   sync.Mutex
+	listenAddr string
 }
 
 type syncRequest struct {
@@ -65,6 +68,7 @@ func NewServer(syncer Syncer) *Server {
 	server := &Server{
 		syncer:    syncer,
 		authToken: strings.TrimSpace(os.Getenv("OPENACE_DAEMON_TOKEN")),
+		startedAt: time.Now().UTC(),
 	}
 	server.tasks = NewTaskStore(server.runTask, 0)
 	server.reconciler = newWorkspaceReconciler(syncer)
@@ -78,6 +82,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 	if err := validateListenAddr(addr); err != nil {
 		return err
 	}
+	s.setListenAddr(addr)
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -152,6 +157,7 @@ func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.health)
 	mux.HandleFunc("/readyz", s.health)
+	mux.HandleFunc("/v1/daemon/status", s.daemonStatus)
 	mux.HandleFunc("/v1/sync", s.sync)
 	mux.HandleFunc("/v1/retrieve", s.retrieve)
 	mux.HandleFunc("/v1/workspaces", s.workspaces)
@@ -175,11 +181,27 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":       "ok",
-		"service":      "openace-daemon",
-		"capabilities": map[string]any{"provider_profiles": true},
-	})
+	writeJSON(w, http.StatusOK, s.statusSnapshot(r.Context()))
+}
+
+func (s *Server) daemonStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.statusSnapshot(r.Context()))
+}
+
+func (s *Server) setListenAddr(addr string) {
+	s.statusMu.Lock()
+	defer s.statusMu.Unlock()
+	s.listenAddr = addr
+}
+
+func (s *Server) currentListenAddr() string {
+	s.statusMu.Lock()
+	defer s.statusMu.Unlock()
+	return s.listenAddr
 }
 
 func (s *Server) sync(w http.ResponseWriter, r *http.Request) {
@@ -201,6 +223,7 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	s.attachResultServedBy(&result)
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -232,6 +255,7 @@ func (s *Server) retrieve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	s.attachResultServedBy(&result)
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -252,6 +276,7 @@ func (s *Server) workspaces(w http.ResponseWriter, r *http.Request) {
 	}
 	for i := range statuses {
 		s.decorateWorkspaceStatus(&statuses[i])
+		s.attachWorkspaceStatusServedBy(&statuses[i])
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"workspaces": statuses})
 }
@@ -281,6 +306,7 @@ func (s *Server) workspaceStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.decorateWorkspaceStatus(&status)
+	s.attachWorkspaceStatusServedBy(&status)
 	writeJSON(w, http.StatusOK, status)
 }
 
@@ -307,11 +333,42 @@ func (s *Server) decorateWorkspaceStatus(status *workspace.WorkspaceStatus) {
 	}
 }
 
+func (s *Server) attachResultServedBy(result *workspace.Result) {
+	if result == nil {
+		return
+	}
+	identity := s.servedBy()
+	result.ServedBy = &identity
+}
+
+func (s *Server) attachWorkspaceStatusServedBy(status *workspace.WorkspaceStatus) {
+	if status == nil {
+		return
+	}
+	identity := s.servedBy()
+	status.ServedBy = &identity
+}
+
+func (s *Server) attachTaskServedBy(task *TaskSnapshot) {
+	if task == nil {
+		return
+	}
+	identity := s.servedBy()
+	task.ServedBy = &identity
+	if task.Result != nil && task.Result.ServedBy == nil {
+		task.Result.ServedBy = &identity
+	}
+}
+
 func (s *Server) tasksCollection(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		limit := parsePositiveInt(r.URL.Query().Get("limit"))
-		writeJSON(w, http.StatusOK, map[string]any{"tasks": s.tasks.List(limit)})
+		tasks := s.tasks.List(limit)
+		for i := range tasks {
+			s.attachTaskServedBy(&tasks[i])
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"tasks": tasks})
 		return
 	case http.MethodPost:
 	default:
@@ -336,6 +393,7 @@ func (s *Server) tasksCollection(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.attachTaskServedBy(&task)
 	writeJSON(w, http.StatusAccepted, task)
 }
 
@@ -367,6 +425,7 @@ func (s *Server) taskItem(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "task not found")
 			return
 		}
+		s.attachTaskServedBy(&task)
 		writeJSON(w, http.StatusOK, task)
 		return
 	}
@@ -383,20 +442,28 @@ func (s *Server) taskItem(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
+	s.attachTaskServedBy(&task)
 	writeJSON(w, http.StatusOK, task)
 }
 
 func (s *Server) runTask(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	var result workspace.Result
+	var err error
 	switch req.Kind {
 	case TaskKindSync:
-		return s.runSync(ctx, req.DirectoryPath, req.ProviderProfileID)
+		result, err = s.runSync(ctx, req.DirectoryPath, req.ProviderProfileID)
 	case TaskKindRetrieve:
-		return s.runRetrieve(ctx, req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength)
+		result, err = s.runRetrieve(ctx, req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength)
 	case TaskKindMultiRetrieve:
-		return s.runMultiRetrieve(ctx, req.DirectoryPaths, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength)
+		result, err = s.runMultiRetrieve(ctx, req.DirectoryPaths, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength)
 	default:
 		return workspace.Result{}, fmt.Errorf("unknown task kind: %s", req.Kind)
 	}
+	if err != nil {
+		return workspace.Result{}, err
+	}
+	s.attachResultServedBy(&result)
+	return result, nil
 }
 
 func (s *Server) runSync(ctx context.Context, dir string, providerProfileID string) (workspace.Result, error) {

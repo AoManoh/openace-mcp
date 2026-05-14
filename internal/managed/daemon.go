@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AoManoh/openace-mcp/internal/buildinfo"
 	"github.com/AoManoh/openace-mcp/internal/daemon"
 )
 
@@ -19,24 +20,39 @@ const defaultStartupTimeout = 10 * time.Second
 func Connect(ctx context.Context) (*daemon.Client, error) {
 	addr := daemonAddrFromEnv()
 	client := daemon.NewClient(addr)
-	if healthy(ctx, client) {
+	if err := reusable(ctx, client); err == nil {
 		return client, nil
+	} else if healthy(ctx, client) {
+		return nil, err
 	}
 	managedAddr := managedDaemonAddr(addr)
 	managedClient := daemon.NewClient(managedAddr)
-	if managedAddr != addr && healthy(ctx, managedClient) {
+	if managedAddr != addr {
+		if err := reusable(ctx, managedClient); err == nil {
+			return managedClient, nil
+		} else if healthy(ctx, managedClient) {
+			return nil, err
+		}
+	}
+	if err := reusable(ctx, managedClient); err == nil {
 		return managedClient, nil
+	} else if healthy(ctx, managedClient) {
+		return nil, err
 	}
 	releaseLock, err := acquireStartupLock(ctx, managedAddr, startupTimeout())
 	if err != nil {
-		if healthy(ctx, managedClient) {
+		if err := reusable(ctx, managedClient); err == nil {
 			return managedClient, nil
+		} else if healthy(ctx, managedClient) {
+			return nil, err
 		}
 		return nil, err
 	}
 	defer releaseLock()
-	if healthy(ctx, managedClient) {
+	if err := reusable(ctx, managedClient); err == nil {
 		return managedClient, nil
+	} else if healthy(ctx, managedClient) {
+		return nil, err
 	}
 	logPath, err := startDaemon(managedAddr)
 	if err != nil {
@@ -46,6 +62,32 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 		return nil, withDaemonLog(err, logPath)
 	}
 	return managedClient, nil
+}
+
+func reusable(ctx context.Context, client *daemon.Client) error {
+	statusCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	status, err := client.DaemonStatus(statusCtx)
+	if err != nil {
+		return fmt.Errorf("openACE daemon at %s does not expose runtime identity; restart it with a current openACE build: %w", client.Endpoint(), err)
+	}
+	if !status.Capabilities["runtime_identity"] {
+		return fmt.Errorf("openACE daemon at %s does not advertise runtime_identity; restart it with a current openACE build", client.Endpoint())
+	}
+	if err := compatibleDaemonBuild(buildinfo.Current(), status.Build); err != nil {
+		return fmt.Errorf("openACE daemon at %s is not compatible with this MCP wrapper: %w", client.Endpoint(), err)
+	}
+	return nil
+}
+
+func compatibleDaemonBuild(wrapper buildinfo.Info, daemonBuild buildinfo.Info) error {
+	if wrapper.VCSRevision != "" && daemonBuild.VCSRevision != "" && wrapper.VCSRevision != daemonBuild.VCSRevision {
+		return fmt.Errorf("wrapper revision %s != daemon revision %s", wrapper.VCSRevision, daemonBuild.VCSRevision)
+	}
+	if wrapper.Version != "" && daemonBuild.Version != "" && wrapper.Version != "(devel)" && daemonBuild.Version != "(devel)" && wrapper.Version != daemonBuild.Version {
+		return fmt.Errorf("wrapper version %s != daemon version %s", wrapper.Version, daemonBuild.Version)
+	}
+	return nil
 }
 
 func acquireStartupLock(ctx context.Context, addr string, timeout time.Duration) (func(), error) {

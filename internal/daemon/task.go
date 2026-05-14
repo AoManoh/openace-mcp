@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
+	"github.com/AoManoh/openace-mcp/internal/runtimeinfo"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
@@ -59,19 +60,20 @@ type TaskRequest struct {
 }
 
 type TaskSnapshot struct {
-	ID                 string            `json:"id"`
-	Kind               TaskKind          `json:"kind"`
-	State              TaskState         `json:"state"`
-	DirectoryPath      string            `json:"directory_path"`
-	DirectoryPaths     []string          `json:"directory_paths,omitempty"`
-	ProviderProfileID  string            `json:"provider_profile_id,omitempty"`
-	InformationRequest string            `json:"information_request,omitempty"`
-	MaxOutputLength    int               `json:"max_output_length,omitempty"`
-	SubmittedAt        time.Time         `json:"submitted_at"`
-	StartedAt          *time.Time        `json:"started_at,omitempty"`
-	CompletedAt        *time.Time        `json:"completed_at,omitempty"`
-	Error              string            `json:"error,omitempty"`
-	Result             *workspace.Result `json:"result,omitempty"`
+	ID                 string                `json:"id"`
+	Kind               TaskKind              `json:"kind"`
+	State              TaskState             `json:"state"`
+	ServedBy           *runtimeinfo.ServedBy `json:"served_by,omitempty"`
+	DirectoryPath      string                `json:"directory_path"`
+	DirectoryPaths     []string              `json:"directory_paths,omitempty"`
+	ProviderProfileID  string                `json:"provider_profile_id,omitempty"`
+	InformationRequest string                `json:"information_request,omitempty"`
+	MaxOutputLength    int                   `json:"max_output_length,omitempty"`
+	SubmittedAt        time.Time             `json:"submitted_at"`
+	StartedAt          *time.Time            `json:"started_at,omitempty"`
+	CompletedAt        *time.Time            `json:"completed_at,omitempty"`
+	Error              string                `json:"error,omitempty"`
+	Result             *workspace.Result     `json:"result,omitempty"`
 }
 
 type TaskRunner func(context.Context, TaskRequest) (workspace.Result, error)
@@ -918,6 +920,10 @@ func cloneTask(in TaskSnapshot) TaskSnapshot {
 	if in.Result != nil {
 		result := *in.Result
 		out.Result = &result
+	}
+	if in.ServedBy != nil {
+		servedBy := *in.ServedBy
+		out.ServedBy = &servedBy
 	}
 	return out
 }

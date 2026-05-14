@@ -41,6 +41,25 @@ func TestClientHealthRejectsUnexpectedService(t *testing.T) {
 	}
 }
 
+func TestClientDaemonStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/daemon/status" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","service":"openace-daemon","pid":123,"capabilities":{"runtime_identity":true},"cache_namespace":"test"}`))
+	}))
+	defer server.Close()
+
+	status, err := NewClient(server.URL).DaemonStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.PID != 123 || !status.Capabilities["runtime_identity"] || status.CacheNamespace != "test" {
+		t.Fatalf("unexpected status: %+v", status)
+	}
+}
+
 func TestClientRequiresProviderCapabilityBeforeProviderRequest(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/healthz" {

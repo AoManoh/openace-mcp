@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AoManoh/openace-mcp/internal/buildinfo"
 	"github.com/AoManoh/openace-mcp/internal/daemon"
 )
 
@@ -59,11 +60,11 @@ func TestManagedDaemonAddrUsesPlainListenAddress(t *testing.T) {
 
 func TestConnectFallsBackToPlainHTTPForManagedDaemonURL(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/healthz" {
+		if r.URL.Path != "/healthz" && r.URL.Path != "/v1/daemon/status" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
 		w.Header().Set("content-type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok","service":"openace-daemon"}`))
+		_, _ = w.Write([]byte(`{"status":"ok","service":"openace-daemon","capabilities":{"runtime_identity":true}}`))
 	}))
 	defer server.Close()
 
@@ -77,6 +78,43 @@ func TestConnectFallsBackToPlainHTTPForManagedDaemonURL(t *testing.T) {
 	}
 	if err := client.Health(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestConnectRejectsHealthyDaemonWithoutRuntimeIdentity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","service":"openace-daemon"}`))
+	}))
+	defer server.Close()
+
+	t.Setenv("OPENACE_DAEMON_ADDR", server.URL)
+	t.Setenv("OPENACE_DAEMON_START_TIMEOUT", "200ms")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := Connect(ctx)
+	if err == nil || !strings.Contains(err.Error(), "runtime identity") {
+		t.Fatalf("expected runtime identity compatibility error, got %v", err)
+	}
+}
+
+func TestCompatibleDaemonBuildRejectsMismatchedRevision(t *testing.T) {
+	err := compatibleDaemonBuild(
+		buildinfo.Info{Version: "v0.0.0-test", VCSRevision: "wrapper-revision"},
+		buildinfo.Info{Version: "v0.0.0-test", VCSRevision: "daemon-revision"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "wrapper revision") {
+		t.Fatalf("expected revision mismatch error, got %v", err)
+	}
+}
+
+func TestCompatibleDaemonBuildAllowsUnknownDevelopmentRevision(t *testing.T) {
+	if err := compatibleDaemonBuild(buildinfo.Info{Version: "(devel)"}, buildinfo.Info{Version: "(devel)"}); err != nil {
+		t.Fatalf("development builds without VCS metadata should not be rejected: %v", err)
 	}
 }
 
