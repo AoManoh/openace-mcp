@@ -20,6 +20,7 @@ import (
 
 	"github.com/AoManoh/openace-mcp/internal/ace"
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
+	"github.com/AoManoh/openace-mcp/internal/runtimeinfo"
 )
 
 const defaultUploadBatchBytes = 1 << 20
@@ -85,6 +86,8 @@ type Syncer struct {
 type stateKey struct {
 	root              string
 	providerProfileID string
+	pathKind          string
+	hostOS            string
 }
 
 func (k stateKey) mapKey() string {
@@ -112,6 +115,7 @@ type Result struct {
 	Added             int
 	Deleted           int
 	MultiStatus       *MultiRetrievalStatus `json:"multi_status,omitempty"`
+	ServedBy          *runtimeinfo.ServedBy `json:"served_by,omitempty"`
 }
 
 type MultiRetrievalStatus struct {
@@ -130,43 +134,50 @@ type MultiWorkspaceStatus struct {
 }
 
 type WorkspaceStatus struct {
-	DirectoryPath          string     `json:"directory_path"`
-	ProviderProfileID      string     `json:"provider_profile_id,omitempty"`
-	ProviderState          string     `json:"provider_state,omitempty"`
-	CheckpointID           string     `json:"checkpoint_id,omitempty"`
-	FileCount              int        `json:"file_count"`
-	InFlight               bool       `json:"in_flight"`
-	Stage                  IndexStage `json:"stage"`
-	LastSyncReason         SyncReason `json:"last_sync_reason,omitempty"`
-	LastErrorStage         IndexStage `json:"last_error_stage,omitempty"`
-	LastUploaded           int        `json:"last_uploaded,omitempty"`
-	LastAdded              int        `json:"last_added,omitempty"`
-	LastDeleted            int        `json:"last_deleted,omitempty"`
-	WatchEnabled           bool       `json:"watch_enabled,omitempty"`
-	WatchScheduled         bool       `json:"watch_scheduled,omitempty"`
-	WatchRunning           bool       `json:"watch_running,omitempty"`
-	LastError              string     `json:"last_error,omitempty"`
-	WatchError             string     `json:"watch_error,omitempty"`
-	UpstreamStatus         string     `json:"upstream_status,omitempty"`
-	UpstreamLastStatusCode int        `json:"upstream_last_status_code,omitempty"`
-	UpstreamRetryAfter     string     `json:"upstream_retry_after,omitempty"`
-	UpstreamBackoffUntil   *time.Time `json:"upstream_backoff_until,omitempty"`
-	UpstreamLastError      string     `json:"upstream_last_error,omitempty"`
-	UpstreamLastFailure    *time.Time `json:"upstream_last_failure,omitempty"`
-	UpstreamLastSuccess    *time.Time `json:"upstream_last_success,omitempty"`
-	LastStartedAt          *time.Time `json:"last_started_at,omitempty"`
-	LastFinishedAt         *time.Time `json:"last_finished_at,omitempty"`
-	StageStartedAt         *time.Time `json:"stage_started_at,omitempty"`
-	LastWatchAt            *time.Time `json:"last_watch_at,omitempty"`
-	NextWatchAt            *time.Time `json:"next_watch_at,omitempty"`
-	LastBackgroundSyncAt   *time.Time `json:"last_background_sync_at,omitempty"`
-	UpdatedAt              *time.Time `json:"updated_at,omitempty"`
+	DirectoryPath          string                `json:"directory_path"`
+	PathKind               string                `json:"path_kind,omitempty"`
+	HostOS                 string                `json:"host_os,omitempty"`
+	ServedBy               *runtimeinfo.ServedBy `json:"served_by,omitempty"`
+	ProviderProfileID      string                `json:"provider_profile_id,omitempty"`
+	ProviderState          string                `json:"provider_state,omitempty"`
+	CheckpointID           string                `json:"checkpoint_id,omitempty"`
+	FileCount              int                   `json:"file_count"`
+	InFlight               bool                  `json:"in_flight"`
+	Stage                  IndexStage            `json:"stage"`
+	LastSyncReason         SyncReason            `json:"last_sync_reason,omitempty"`
+	LastErrorStage         IndexStage            `json:"last_error_stage,omitempty"`
+	LastUploaded           int                   `json:"last_uploaded,omitempty"`
+	LastAdded              int                   `json:"last_added,omitempty"`
+	LastDeleted            int                   `json:"last_deleted,omitempty"`
+	WatchEnabled           bool                  `json:"watch_enabled,omitempty"`
+	WatchScheduled         bool                  `json:"watch_scheduled,omitempty"`
+	WatchRunning           bool                  `json:"watch_running,omitempty"`
+	LastError              string                `json:"last_error,omitempty"`
+	WatchError             string                `json:"watch_error,omitempty"`
+	UpstreamStatus         string                `json:"upstream_status,omitempty"`
+	UpstreamLastStatusCode int                   `json:"upstream_last_status_code,omitempty"`
+	UpstreamRetryAfter     string                `json:"upstream_retry_after,omitempty"`
+	UpstreamBackoffUntil   *time.Time            `json:"upstream_backoff_until,omitempty"`
+	UpstreamLastError      string                `json:"upstream_last_error,omitempty"`
+	UpstreamLastFailure    *time.Time            `json:"upstream_last_failure,omitempty"`
+	UpstreamLastSuccess    *time.Time            `json:"upstream_last_success,omitempty"`
+	LastStartedAt          *time.Time            `json:"last_started_at,omitempty"`
+	LastFinishedAt         *time.Time            `json:"last_finished_at,omitempty"`
+	StageStartedAt         *time.Time            `json:"stage_started_at,omitempty"`
+	LastWatchAt            *time.Time            `json:"last_watch_at,omitempty"`
+	NextWatchAt            *time.Time            `json:"next_watch_at,omitempty"`
+	LastBackgroundSyncAt   *time.Time            `json:"last_background_sync_at,omitempty"`
+	UpdatedAt              *time.Time            `json:"updated_at,omitempty"`
 }
 
 type state struct {
-	CheckpointID string            `json:"checkpoint_id,omitempty"`
-	BlobNames    map[string]string `json:"blob_names,omitempty"`
-	UpdatedAt    time.Time         `json:"updated_at"`
+	SchemaVersion int               `json:"schema_version,omitempty"`
+	CanonicalPath string            `json:"canonical_path,omitempty"`
+	PathKind      string            `json:"path_kind,omitempty"`
+	HostOS        string            `json:"host_os,omitempty"`
+	CheckpointID  string            `json:"checkpoint_id,omitempty"`
+	BlobNames     map[string]string `json:"blob_names,omitempty"`
+	UpdatedAt     time.Time         `json:"updated_at"`
 }
 
 type fileBlob struct {
@@ -293,7 +304,7 @@ func (s *Syncer) SyncBackgroundWithProvider(ctx context.Context, dir string, pro
 }
 
 func (s *Syncer) sync(ctx context.Context, dir string, providerProfileID string, reason SyncReason) (Result, error) {
-	root, err := filepath.Abs(dir)
+	root, err := pathutil.ResolveWorkspaceRoot(dir)
 	if err != nil {
 		return Result{}, err
 	}
@@ -301,7 +312,11 @@ func (s *Syncer) sync(ctx context.Context, dir string, providerProfileID string,
 	return s.syncSingleflight(ctx, key, reason)
 }
 
-func (s *Syncer) stateKey(root string, providerProfileID string) stateKey {
+func (s *Syncer) stateKey(root pathutil.WorkspaceRoot, providerProfileID string) stateKey {
+	return s.stateKeyFromCanonical(root.CanonicalPath, string(root.PathKind), root.HostOS, providerProfileID)
+}
+
+func (s *Syncer) stateKeyFromCanonical(root string, pathKind string, hostOS string, providerProfileID string) stateKey {
 	id := strings.TrimSpace(providerProfileID)
 	defaultID := ""
 	if s.router != nil {
@@ -310,7 +325,12 @@ func (s *Syncer) stateKey(root string, providerProfileID string) stateKey {
 	if id == defaultID {
 		id = ""
 	}
-	return stateKey{root: root, providerProfileID: id}
+	return stateKey{
+		root:              root,
+		providerProfileID: id,
+		pathKind:          pathKind,
+		hostOS:            hostOS,
+	}
 }
 
 func (s *Syncer) WorkspaceStatus(ctx context.Context, dir string) (WorkspaceStatus, error) {
@@ -321,7 +341,7 @@ func (s *Syncer) WorkspaceStatusWithProvider(ctx context.Context, dir string, pr
 	if err := ctx.Err(); err != nil {
 		return WorkspaceStatus{}, err
 	}
-	root, err := filepath.Abs(dir)
+	root, err := pathutil.ResolveWorkspaceRoot(dir)
 	if err != nil {
 		return WorkspaceStatus{}, err
 	}
@@ -339,7 +359,7 @@ func (s *Syncer) WorkspaceStatusWithProvider(ctx context.Context, dir string, pr
 	}
 	s.mu.Unlock()
 
-	st, _, err := loadStateForProvider(root, key.providerProfileID)
+	st, _, err := loadStateForProvider(key.root, key.providerProfileID)
 	if err != nil {
 		return WorkspaceStatus{}, err
 	}
@@ -353,7 +373,7 @@ func (s *Syncer) ListWorkspaceStatuses(ctx context.Context) ([]WorkspaceStatus, 
 	s.mu.Lock()
 	statuses := make([]WorkspaceStatus, 0, len(s.statuses))
 	for _, status := range s.statuses {
-		key := s.stateKey(status.DirectoryPath, status.ProviderProfileID)
+		key := s.stateKeyFromCanonical(status.DirectoryPath, status.PathKind, status.HostOS, status.ProviderProfileID)
 		statuses = append(statuses, s.withUpstreamHealth(key, cloneWorkspaceStatus(status)))
 	}
 	s.mu.Unlock()
@@ -374,7 +394,7 @@ func (s *Syncer) WorkspaceChangedWithProvider(ctx context.Context, dir string, p
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	root, err := filepath.Abs(dir)
+	root, err := pathutil.ResolveWorkspaceRoot(dir)
 	if err != nil {
 		return false, err
 	}
@@ -384,11 +404,11 @@ func (s *Syncer) WorkspaceChangedWithProvider(ctx context.Context, dir string, p
 			return false, err
 		}
 	}
-	assets, err := FileAssetSource{}.Load(ctx, root)
+	assets, err := FileAssetSource{}.Load(ctx, key.root)
 	if err != nil {
 		return false, err
 	}
-	st, _, err := loadStateForProvider(root, key.providerProfileID)
+	st, _, err := loadStateForProvider(key.root, key.providerProfileID)
 	if err != nil {
 		return false, err
 	}
@@ -492,6 +512,8 @@ func (s *Syncer) markSyncStartedLocked(key stateKey, reason SyncReason) {
 	mapKey := key.mapKey()
 	status := s.statuses[mapKey]
 	status.DirectoryPath = key.root
+	status.PathKind = key.pathKind
+	status.HostOS = key.hostOS
 	status.ProviderProfileID = key.providerProfileID
 	status.ProviderState = providerStateCold
 	status.InFlight = true
@@ -513,6 +535,8 @@ func (s *Syncer) markSyncStage(key stateKey, stage IndexStage) {
 	mapKey := key.mapKey()
 	status := s.statuses[mapKey]
 	status.DirectoryPath = key.root
+	status.PathKind = key.pathKind
+	status.HostOS = key.hostOS
 	status.ProviderProfileID = key.providerProfileID
 	status.Stage = stage
 	status.StageStartedAt = &now
@@ -531,6 +555,8 @@ func (s *Syncer) markSyncFinishedLocked(key stateKey, result Result, err error) 
 	mapKey := key.mapKey()
 	status := s.statuses[mapKey]
 	status.DirectoryPath = key.root
+	status.PathKind = key.pathKind
+	status.HostOS = key.hostOS
 	status.ProviderProfileID = key.providerProfileID
 	status.InFlight = false
 	status.LastFinishedAt = &now
@@ -564,6 +590,8 @@ func (s *Syncer) markSyncFinishedLocked(key stateKey, result Result, err error) 
 func workspaceStatusFromState(key stateKey, st state) WorkspaceStatus {
 	status := WorkspaceStatus{
 		DirectoryPath:     key.root,
+		PathKind:          statePathKind(key, st),
+		HostOS:            stateHostOS(key, st),
 		ProviderProfileID: key.providerProfileID,
 		ProviderState:     providerStateCold,
 		CheckpointID:      st.CheckpointID,
@@ -579,6 +607,20 @@ func workspaceStatusFromState(key stateKey, st state) WorkspaceStatus {
 		status.UpdatedAt = &updated
 	}
 	return status
+}
+
+func statePathKind(key stateKey, st state) string {
+	if st.PathKind != "" {
+		return st.PathKind
+	}
+	return key.pathKind
+}
+
+func stateHostOS(key stateKey, st state) string {
+	if st.HostOS != "" {
+		return st.HostOS
+	}
+	return key.hostOS
 }
 
 func cloneWorkspaceStatus(status WorkspaceStatus) WorkspaceStatus {
@@ -704,6 +746,10 @@ func (s *Syncer) syncRoot(ctx context.Context, key stateKey) (Result, error) {
 		}
 		st.CheckpointID = checkpointID
 	}
+	st.SchemaVersion = 1
+	st.CanonicalPath = key.root
+	st.PathKind = key.pathKind
+	st.HostOS = key.hostOS
 	st.BlobNames = current
 	st.UpdatedAt = time.Now().UTC()
 	if err := saveState(statePath, st); err != nil {
@@ -1405,6 +1451,22 @@ func cacheRoot() (string, error) {
 		return "", err
 	}
 	return filepath.Join(cache, "openace-mcp"), nil
+}
+
+type CacheSnapshot struct {
+	Dir       string `json:"cache_dir"`
+	Namespace string `json:"cache_namespace"`
+}
+
+func CurrentCacheSnapshot() (CacheSnapshot, error) {
+	dir, err := cacheRoot()
+	if err != nil {
+		return CacheSnapshot{}, err
+	}
+	return CacheSnapshot{
+		Dir:       dir,
+		Namespace: cacheNamespace(),
+	}, nil
 }
 
 func diff(old map[string]string, current map[string]string) ([]string, []string) {

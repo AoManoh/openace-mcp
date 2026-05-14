@@ -3,11 +3,13 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
 	"github.com/AoManoh/openace-mcp/internal/daemon"
+	"github.com/AoManoh/openace-mcp/internal/runtimeinfo"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
@@ -82,6 +84,18 @@ func (fakeTasker) TaskStatus(ctx context.Context, id string) (daemon.TaskSnapsho
 
 func (fakeTasker) CancelTask(ctx context.Context, id string) (daemon.TaskSnapshot, error) {
 	return daemon.TaskSnapshot{ID: id, State: daemon.TaskStateCancelled}, nil
+}
+
+func (fakeTasker) DaemonStatus(ctx context.Context) (daemon.Status, error) {
+	return daemon.Status{
+		Status: "ok",
+		ServedBy: runtimeinfo.ServedBy{
+			Service:        "openace-daemon",
+			PID:            123,
+			CacheNamespace: "test",
+			Capabilities:   map[string]bool{"runtime_identity": true},
+		},
+	}, nil
 }
 
 func (blockingDiagnosticTasker) StartTask(ctx context.Context, req daemon.TaskRequest) (daemon.TaskSnapshot, error) {
@@ -173,6 +187,9 @@ func TestToolsListOnlyIncludesTaskToolsForTasker(t *testing.T) {
 	}
 	if !strings.Contains(withTasks, "list_workspaces") {
 		t.Fatalf("daemon tasker should list workspace diagnostics tool: %s", withTasks)
+	}
+	if !strings.Contains(withTasks, "daemon_status") {
+		t.Fatalf("daemon tasker should list daemon status tool: %s", withTasks)
 	}
 }
 
@@ -273,6 +290,38 @@ func TestListWorkspacesTool(t *testing.T) {
 	}
 	if !strings.Contains(out, "upstream_status") || !strings.Contains(out, "backoff") {
 		t.Fatalf("workspace list should include upstream health: %s", out)
+	}
+}
+
+func TestDaemonStatusTool(t *testing.T) {
+	out := runMCP(t, NewServer(fakeTasker{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"daemon_status","arguments":{}}}`)
+	var response struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out), &response); err != nil {
+		t.Fatalf("decode MCP response: %v\n%s", err, out)
+	}
+	if len(response.Result.Content) == 0 {
+		t.Fatalf("daemon_status should return content: %s", out)
+	}
+	var payload struct {
+		MCPBuild map[string]any `json:"mcp_build"`
+		Daemon   struct {
+			Service        string          `json:"service"`
+			PID            int             `json:"pid"`
+			CacheNamespace string          `json:"cache_namespace"`
+			Capabilities   map[string]bool `json:"capabilities"`
+		} `json:"daemon"`
+	}
+	if err := json.Unmarshal([]byte(response.Result.Content[0].Text), &payload); err != nil {
+		t.Fatalf("decode daemon_status payload: %v\n%s", err, response.Result.Content[0].Text)
+	}
+	if len(payload.MCPBuild) == 0 || payload.Daemon.Service != "openace-daemon" || payload.Daemon.PID != 123 || !payload.Daemon.Capabilities["runtime_identity"] {
+		t.Fatalf("daemon_status should include wrapper and daemon identity: %+v", payload)
 	}
 }
 

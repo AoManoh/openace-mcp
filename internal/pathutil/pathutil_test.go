@@ -128,3 +128,56 @@ func TestExpandUser_GenericEnvVar(t *testing.T) {
 		t.Fatalf("expand -> %q, want %q", got, want)
 	}
 }
+
+func TestResolveWorkspaceRootForLinuxKeepsWSLMountPath(t *testing.T) {
+	root, err := ResolveWorkspaceRootForOS("/mnt/d/Go-Project/GoZero-AI", "linux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.CanonicalPath != "/mnt/d/Go-Project/GoZero-AI" {
+		t.Fatalf("canonical path = %q", root.CanonicalPath)
+	}
+	if root.PathKind != WorkspacePathNative || root.HostOS != "linux" {
+		t.Fatalf("unexpected root metadata: %+v", root)
+	}
+}
+
+func TestResolveWorkspaceRootForWindowsTranslatesWSLMountPath(t *testing.T) {
+	root, err := ResolveWorkspaceRootForOS("/mnt/d/Go-Project/GoZero-AI", "windows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.CanonicalPath != `D:\Go-Project\GoZero-AI` {
+		t.Fatalf("canonical path = %q", root.CanonicalPath)
+	}
+	if root.PathKind != WorkspacePathWSLMount || root.HostOS != "windows" {
+		t.Fatalf("unexpected root metadata: %+v", root)
+	}
+}
+
+func TestResolveWorkspaceRootForWindowsNormalizesDrivePath(t *testing.T) {
+	root, err := ResolveWorkspaceRootForOS(`d:/Go-Project/../GoZero-AI`, "Windows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.CanonicalPath != `D:\GoZero-AI` {
+		t.Fatalf("canonical path = %q", root.CanonicalPath)
+	}
+	if root.PathKind != WorkspacePathNative {
+		t.Fatalf("unexpected path kind: %+v", root)
+	}
+}
+
+func TestResolveWorkspaceRootForWindowsRejectsOtherPOSIXPath(t *testing.T) {
+	_, err := ResolveWorkspaceRootForOS("/home/aomanoh/project", "windows")
+	if err == nil {
+		t.Fatal("expected Windows daemon to reject non-WSL POSIX path")
+	}
+}
+
+func TestResolveWorkspaceRootForWindowsRejectsDriveRelativePath(t *testing.T) {
+	_, err := ResolveWorkspaceRootForOS(`D:GoZero-AI`, "windows")
+	if err == nil {
+		t.Fatal("expected Windows daemon to reject drive-relative workspace path")
+	}
+}

@@ -390,6 +390,30 @@ func TestServerWorkspaceStatus(t *testing.T) {
 	}
 }
 
+func TestServerDaemonStatus(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_CACHE_NAMESPACE", "status-test")
+	server := newDaemonHTTPTestServer(t, fakeWorkspaceSyncer{})
+
+	status, err := NewClient(server.URL).DaemonStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Service != "openace-daemon" || !status.Capabilities["runtime_identity"] {
+		t.Fatalf("status should expose runtime identity capability: %+v", status)
+	}
+	if status.PID == 0 || status.Build.GOOS == "" || status.Build.GOARCH == "" {
+		t.Fatalf("status should expose pid and build identity: %+v", status)
+	}
+	if status.CacheNamespace != "status-test" {
+		t.Fatalf("status should expose cache namespace: %+v", status)
+	}
+	if status.ActiveWorkspaceCount != 1 {
+		t.Fatalf("status should expose workspace count: %+v", status)
+	}
+}
+
 func TestServerRoutesProviderProfileRequests(t *testing.T) {
 	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "")
@@ -418,6 +442,9 @@ func TestServerRoutesProviderProfileRequests(t *testing.T) {
 	if result.ProviderProfileID != "standby" || result.CheckpointID != "checkpoint-standby" {
 		t.Fatalf("unexpected provider retrieve result: %+v", result)
 	}
+	if result.ServedBy == nil || result.ServedBy.Service != "openace-daemon" || !result.ServedBy.Capabilities["runtime_identity"] {
+		t.Fatalf("retrieve result should include served_by identity: %+v", result.ServedBy)
+	}
 
 	statusPayload, err := json.Marshal(workspaceStatusRequest{DirectoryPath: "/tmp/project", ProviderProfileID: "standby"})
 	if err != nil {
@@ -437,6 +464,9 @@ func TestServerRoutesProviderProfileRequests(t *testing.T) {
 	}
 	if status.ProviderProfileID != "standby" || status.CheckpointID != "checkpoint-standby" {
 		t.Fatalf("unexpected provider workspace status: %+v", status)
+	}
+	if status.ServedBy == nil || status.ServedBy.Service != "openace-daemon" || !status.ServedBy.Capabilities["runtime_identity"] {
+		t.Fatalf("workspace status should include served_by identity: %+v", status.ServedBy)
 	}
 }
 

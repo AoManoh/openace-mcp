@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AoManoh/openace-mcp/internal/buildinfo"
 	"github.com/AoManoh/openace-mcp/internal/daemon"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
@@ -41,6 +42,10 @@ type WorkspaceInspector interface {
 	WorkspaceStatus(context.Context, string) (workspace.WorkspaceStatus, error)
 }
 
+type DaemonStatuser interface {
+	DaemonStatus(context.Context) (daemon.Status, error)
+}
+
 type ProviderWorkspaceInspector interface {
 	WorkspaceStatusWithProvider(context.Context, string, string) (workspace.WorkspaceStatus, error)
 }
@@ -49,6 +54,7 @@ type Server struct {
 	syncer    Syncer
 	tasker    Tasker
 	inspector WorkspaceInspector
+	statuser  DaemonStatuser
 }
 
 type rpcRequest struct {
@@ -110,6 +116,9 @@ func NewServer(syncer Syncer) *Server {
 	if inspector, ok := syncer.(WorkspaceInspector); ok && server.tasker != nil {
 		server.inspector = inspector
 	}
+	if statuser, ok := syncer.(DaemonStatuser); ok {
+		server.statuser = statuser
+	}
 	return server
 }
 
@@ -160,6 +169,9 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
 		tools := []any{retrievalTool(), multiRetrievalTool(), syncTool()}
 		if s.tasker != nil {
 			tools = append(tools, startRetrievalTool(), startMultiRetrievalTool(), startSyncTool(), taskStatusTool(), listTasksTool(), cancelTaskTool())
+		}
+		if s.statuser != nil {
+			tools = append(tools, daemonStatusTool())
 		}
 		if s.inspector != nil {
 			tools = append(tools, listWorkspacesTool(), workspaceStatusTool())
@@ -404,6 +416,20 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 			return toolError(req.ID, err.Error())
 		}
 		return ok(req.ID, toolResult(jsonText(task), false))
+	case "daemon_status", "daemon-status":
+		if s.statuser == nil {
+			return toolError(req.ID, "daemon_status requires daemon mode")
+		}
+		toolCtx, cancel := toolTimeoutContext(ctx)
+		defer cancel()
+		status, err := s.statuser.DaemonStatus(toolCtx)
+		if err != nil {
+			return toolError(req.ID, err.Error())
+		}
+		return ok(req.ID, toolResult(jsonText(map[string]any{
+			"mcp_build": buildinfo.Current(),
+			"daemon":    status,
+		}), false))
 	case "list_workspaces", "list-workspaces":
 		if s.inspector == nil {
 			return toolError(req.ID, "workspace status tools require daemon mode")
@@ -739,6 +765,17 @@ func cancelTaskTool() map[string]any {
 				"task_id": map[string]any{"type": "string"},
 			},
 			"required": []string{"task_id"},
+		},
+	}
+}
+
+func daemonStatusTool() map[string]any {
+	return map[string]any{
+		"name":        "daemon_status",
+		"description": "Show the MCP wrapper and openACE daemon runtime identity, build revision, cache namespace, and capabilities.",
+		"inputSchema": map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
 		},
 	}
 }

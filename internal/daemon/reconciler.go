@@ -3,12 +3,12 @@ package daemon
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/AoManoh/openace-mcp/internal/pathutil"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
@@ -134,14 +134,14 @@ func (r *workspaceReconciler) ObserveWithProvider(dir string, providerProfileID 
 	if dir == "" {
 		return
 	}
-	root, err := filepath.Abs(dir)
+	root, err := pathutil.ResolveWorkspaceRoot(dir)
 	if err != nil {
 		return
 	}
 	now := time.Now().UTC()
 	next := now.Add(r.debounce)
 	providerProfileID = strings.TrimSpace(providerProfileID)
-	key := watchKey(root, providerProfileID)
+	key := watchKey(root.CanonicalPath, providerProfileID)
 
 	r.mu.Lock()
 	if _, ok := r.states[key]; !ok && len(r.states) >= r.maxRoots {
@@ -150,7 +150,7 @@ func (r *workspaceReconciler) ObserveWithProvider(dir string, providerProfileID 
 	}
 	state := r.states[key]
 	if state == nil {
-		state = &watchState{directoryPath: root, providerProfileID: providerProfileID}
+		state = &watchState{directoryPath: root.CanonicalPath, providerProfileID: providerProfileID}
 		r.states[key] = state
 	}
 	state.pending = true
@@ -165,11 +165,11 @@ func (r *workspaceReconciler) Decorate(status *workspace.WorkspaceStatus) {
 	if r == nil || status == nil {
 		return
 	}
-	root, err := filepath.Abs(status.DirectoryPath)
+	root, err := pathutil.ResolveWorkspaceRoot(status.DirectoryPath)
 	if err != nil {
 		return
 	}
-	key := watchKey(root, status.ProviderProfileID)
+	key := watchKey(root.CanonicalPath, status.ProviderProfileID)
 	r.mu.Lock()
 	state := r.states[key]
 	if state == nil {
