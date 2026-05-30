@@ -726,3 +726,54 @@ func (s *concurrentSyncer) leave() {
 	s.active--
 	s.mu.Unlock()
 }
+
+type rateLimitedSyncer struct{}
+
+func (rateLimitedSyncer) Sync(ctx context.Context, dir string) (workspace.Result, error) {
+	return workspace.Result{CheckpointID: "checkpoint", FileCount: 1}, nil
+}
+
+func (rateLimitedSyncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
+	return workspace.Result{}, testRateLimitError{retryAfter: 30 * time.Second}
+}
+
+type testRateLimitError struct {
+	retryAfter time.Duration
+}
+
+func (e testRateLimitError) Error() string {
+	return `agents/codebase-retrieval returned HTTP 429: {"error":"Too many requests"}`
+}
+
+func (e testRateLimitError) RateLimitRetryAfter() (time.Duration, bool) {
+	return e.retryAfter, true
+}
+
+func TestRetrieveRateLimitReturns429(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	server := newDaemonHTTPTestServer(t, rateLimitedSyncer{})
+
+	payload, err := json.Marshal(retrieveRequest{DirectoryPath: "/tmp/project", InformationRequest: "q"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(server.URL+"/v1/retrieve", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("rate-limited retrieval should return 429, got %s", resp.Status)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "30" {
+		t.Fatalf("expected Retry-After: 30, got %q", got)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(body["error"], "429") || !strings.Contains(body["error"], "app.augmentcode.com") {
+		t.Fatalf("error should classify 429 and point to the usage page: %q", body["error"])
+	}
+}
