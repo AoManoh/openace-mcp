@@ -71,10 +71,39 @@ func (e apiError) Error() string {
 	return fmt.Sprintf("%s returned HTTP %d: %s", e.endpoint, e.status, e.body)
 }
 
+// RateLimitRetryAfter implements RateLimitSignal. It reports ok only when the
+// underlying upstream response was HTTP 429, along with any Retry-After delay the
+// upstream advertised (zero when none was provided).
+func (e apiError) RateLimitRetryAfter() (time.Duration, bool) {
+	if e.status == http.StatusTooManyRequests {
+		return e.retryAfterDuration, true
+	}
+	return 0, false
+}
+
 // IsCheckpointBlobsBadRequest reports whether err is a checkpoint-blobs HTTP 400 response.
 func IsCheckpointBlobsBadRequest(err error) bool {
 	var api apiError
 	return errors.As(err, &api) && api.endpoint == "checkpoint-blobs" && api.status == http.StatusBadRequest
+}
+
+// RateLimitSignal is implemented by errors that represent an upstream HTTP 429
+// response (short-term rate limiting or an exhausted credit budget). It lets callers
+// outside this package classify rate-limit errors without depending on internal types.
+type RateLimitSignal interface {
+	// RateLimitRetryAfter reports whether the error is a rate-limit (429) and, if so,
+	// the Retry-After delay advertised by the upstream (zero when none was provided).
+	RateLimitRetryAfter() (retryAfter time.Duration, ok bool)
+}
+
+// RateLimitInfo reports whether err (or any error it wraps) is an upstream HTTP 429
+// rate-limit/quota error and returns the advertised Retry-After delay when present.
+func RateLimitInfo(err error) (retryAfter time.Duration, ok bool) {
+	var signal RateLimitSignal
+	if errors.As(err, &signal) {
+		return signal.RateLimitRetryAfter()
+	}
+	return 0, false
 }
 
 // HealthSnapshot summarizes the latest upstream ACE availability signal.
@@ -269,10 +298,29 @@ func retryable(err error) bool {
 
 func retryDelay(err error, attempt int) time.Duration {
 	var api apiError
-	if errors.As(err, &api) && api.retryAfterDuration > 0 {
-		return api.retryAfterDuration
+	if errors.As(err, &api) {
+		if api.retryAfterDuration > 0 {
+			return api.retryAfterDuration
+		}
+		if api.status == http.StatusTooManyRequests {
+			return rateLimitBackoff()
+		}
 	}
 	return time.Duration(attempt+1) * 500 * time.Millisecond
+}
+
+const defaultRateLimitBackoff = 30 * time.Second
+
+// rateLimitBackoff is the cooldown applied after an upstream HTTP 429 that did not
+// include a Retry-After header. It throttles otherwise-futile high-frequency retries
+// against a rate-limited or credit-exhausted tenant. Tunable via OPENACE_RATE_LIMIT_BACKOFF.
+func rateLimitBackoff() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("OPENACE_RATE_LIMIT_BACKOFF")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultRateLimitBackoff
 }
 
 func isRateLimited(err error) bool {

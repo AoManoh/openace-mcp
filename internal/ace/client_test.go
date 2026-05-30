@@ -403,3 +403,36 @@ func TestClientServerErrorRecordsDegradedHealth(t *testing.T) {
 		t.Fatalf("5xx should expose retry timing: %+v", health)
 	}
 }
+
+func TestRateLimitBackoffFloorWithoutRetryAfter(t *testing.T) {
+	t.Setenv("OPENACE_RATE_LIMIT_BACKOFF", "")
+	if delay := retryDelay(apiError{endpoint: "agents/codebase-retrieval", status: http.StatusTooManyRequests}, 0); delay != defaultRateLimitBackoff {
+		t.Fatalf("429 without Retry-After should use floor %v, got %v", defaultRateLimitBackoff, delay)
+	}
+	if delay := retryDelay(apiError{endpoint: "agents/codebase-retrieval", status: http.StatusInternalServerError}, 0); delay != 500*time.Millisecond {
+		t.Fatalf("5xx without Retry-After should keep incremental backoff, got %v", delay)
+	}
+	if delay := retryDelay(apiError{status: http.StatusTooManyRequests, retryAfterDuration: 2 * time.Second}, 0); delay != 2*time.Second {
+		t.Fatalf("Retry-After should take precedence over the floor, got %v", delay)
+	}
+	t.Setenv("OPENACE_RATE_LIMIT_BACKOFF", "45s")
+	if delay := retryDelay(apiError{status: http.StatusTooManyRequests}, 0); delay != 45*time.Second {
+		t.Fatalf("env override should set rate-limit backoff, got %v", delay)
+	}
+}
+
+func TestRateLimitInfoClassifiesUpstream429(t *testing.T) {
+	retryAfter, ok := RateLimitInfo(apiError{endpoint: "agents/codebase-retrieval", status: http.StatusTooManyRequests, retryAfterDuration: 12 * time.Second})
+	if !ok || retryAfter != 12*time.Second {
+		t.Fatalf("RateLimitInfo should report retry-after for 429: %v %v", retryAfter, ok)
+	}
+	if retryAfter, ok := RateLimitInfo(apiError{status: http.StatusTooManyRequests}); !ok || retryAfter != 0 {
+		t.Fatalf("RateLimitInfo should report ok with zero delay when upstream omits Retry-After: %v %v", retryAfter, ok)
+	}
+	if _, ok := RateLimitInfo(apiError{status: http.StatusBadGateway}); ok {
+		t.Fatal("RateLimitInfo should be false for non-429 api errors")
+	}
+	if _, ok := RateLimitInfo(errors.New("boom")); ok {
+		t.Fatal("RateLimitInfo should be false for non-api errors")
+	}
+}
