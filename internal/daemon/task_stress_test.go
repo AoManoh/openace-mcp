@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AoManoh/openace-mcp/internal/workspace"
+	"github.com/AoManoh/openace-mcp/internal/engine"
 )
 
 func TestStressTaskStoreHighConcurrency(t *testing.T) {
@@ -21,7 +21,7 @@ func TestStressTaskStoreHighConcurrency(t *testing.T) {
 	var active int32
 	var maxActive int32
 
-	store := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	store := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
 		nowActive := atomic.AddInt32(&active, 1)
 		for {
 			old := atomic.LoadInt32(&maxActive)
@@ -33,9 +33,9 @@ func TestStressTaskStoreHighConcurrency(t *testing.T) {
 
 		select {
 		case <-time.After(5 * time.Millisecond):
-			return workspace.Result{FileCount: 1}, nil
+			return engine.Result{FileCount: 1}, nil
 		case <-ctx.Done():
-			return workspace.Result{}, ctx.Err()
+			return engine.Result{}, ctx.Err()
 		}
 	}, taskCount, workers)
 	defer func() {

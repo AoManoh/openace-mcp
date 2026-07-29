@@ -16,28 +16,35 @@ import (
 
 	"github.com/AoManoh/openace-mcp/internal/ace"
 	"github.com/AoManoh/openace-mcp/internal/auth"
+	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
 type fakeSyncer struct{}
 
-func (fakeSyncer) Sync(ctx context.Context, dir string) (workspace.Result, error) {
-	return workspace.Result{CheckpointID: "checkpoint", FileCount: 1}, nil
+func (fakeSyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
+	if profile := strings.TrimSpace(req.Workspace.ProviderProfileID); profile != "" {
+		return engine.Result{ProviderProfileID: profile, CheckpointID: "checkpoint-" + profile, FileCount: 1}, nil
+	}
+	return engine.Result{CheckpointID: "checkpoint", FileCount: 1}, nil
 }
 
-func (fakeSyncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
-	if strings.Contains(dir, "bad") {
-		return workspace.Result{}, errors.New("workspace failed")
+func (fakeSyncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	if strings.Contains(req.Workspace.DirectoryPath, "bad") {
+		return engine.Result{}, errors.New("workspace failed")
 	}
-	return workspace.Result{Text: "retrieved " + dir, CheckpointID: "checkpoint", FileCount: 1}, nil
+	if profile := strings.TrimSpace(req.Workspace.ProviderProfileID); profile != "" {
+		return engine.Result{Text: "retrieved " + profile, ProviderProfileID: profile, CheckpointID: "checkpoint-" + profile, FileCount: 1}, nil
+	}
+	return engine.Result{Text: "retrieved " + req.Workspace.DirectoryPath, CheckpointID: "checkpoint", FileCount: 1}, nil
 }
 
 type fakeWorkspaceSyncer struct {
 	fakeSyncer
 }
 
-func (fakeWorkspaceSyncer) ListWorkspaceStatuses(ctx context.Context) ([]workspace.WorkspaceStatus, error) {
-	return []workspace.WorkspaceStatus{{
+func (fakeWorkspaceSyncer) ListWorkspaceStatuses(ctx context.Context) ([]engine.WorkspaceStatus, error) {
+	return []engine.WorkspaceStatus{{
 		DirectoryPath:          "/tmp/project",
 		CheckpointID:           "checkpoint",
 		FileCount:              3,
@@ -48,9 +55,18 @@ func (fakeWorkspaceSyncer) ListWorkspaceStatuses(ctx context.Context) ([]workspa
 	}}, nil
 }
 
-func (fakeWorkspaceSyncer) WorkspaceStatus(ctx context.Context, dir string) (workspace.WorkspaceStatus, error) {
-	return workspace.WorkspaceStatus{
-		DirectoryPath:          dir,
+func (fakeWorkspaceSyncer) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (engine.WorkspaceStatus, error) {
+	if profile := strings.TrimSpace(ref.ProviderProfileID); profile != "" {
+		return engine.WorkspaceStatus{
+			DirectoryPath:     ref.DirectoryPath,
+			ProviderProfileID: profile,
+			ProviderState:     "ready",
+			CheckpointID:      "checkpoint-" + profile,
+			FileCount:         1,
+		}, nil
+	}
+	return engine.WorkspaceStatus{
+		DirectoryPath:          ref.DirectoryPath,
 		CheckpointID:           "checkpoint",
 		FileCount:              3,
 		UpstreamStatus:         "backoff",
@@ -64,47 +80,29 @@ type fakeProviderWorkspaceSyncer struct {
 	fakeWorkspaceSyncer
 }
 
-func (fakeProviderWorkspaceSyncer) SyncWithProvider(ctx context.Context, dir string, providerProfileID string) (workspace.Result, error) {
-	return workspace.Result{ProviderProfileID: providerProfileID, CheckpointID: "checkpoint-" + providerProfileID, FileCount: 1}, nil
-}
-
-func (fakeProviderWorkspaceSyncer) RetrieveWithProvider(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (workspace.Result, error) {
-	return workspace.Result{Text: "retrieved " + providerProfileID, ProviderProfileID: providerProfileID, CheckpointID: "checkpoint-" + providerProfileID, FileCount: 1}, nil
-}
-
-func (fakeProviderWorkspaceSyncer) WorkspaceStatusWithProvider(ctx context.Context, dir string, providerProfileID string) (workspace.WorkspaceStatus, error) {
-	return workspace.WorkspaceStatus{
-		DirectoryPath:     dir,
-		ProviderProfileID: providerProfileID,
-		ProviderState:     "ready",
-		CheckpointID:      "checkpoint-" + providerProfileID,
-		FileCount:         1,
-	}, nil
-}
-
 type fakeWatchWorkspaceSyncer struct {
 	fakeSyncer
 }
 
-func (fakeWatchWorkspaceSyncer) WorkspaceChanged(context.Context, string) (bool, error) {
+func (fakeWatchWorkspaceSyncer) WorkspaceChanged(context.Context, engine.WorkspaceRef) (bool, error) {
 	return false, nil
 }
 
-func (fakeWatchWorkspaceSyncer) SyncBackground(context.Context, string) (workspace.Result, error) {
-	return workspace.Result{CheckpointID: "checkpoint-background", FileCount: 3}, nil
+func (fakeWatchWorkspaceSyncer) SyncBackground(context.Context, engine.SyncRequest) (engine.Result, error) {
+	return engine.Result{CheckpointID: "checkpoint-background", FileCount: 3}, nil
 }
 
-func (fakeWatchWorkspaceSyncer) ListWorkspaceStatuses(context.Context) ([]workspace.WorkspaceStatus, error) {
-	return []workspace.WorkspaceStatus{{
+func (fakeWatchWorkspaceSyncer) ListWorkspaceStatuses(context.Context) ([]engine.WorkspaceStatus, error) {
+	return []engine.WorkspaceStatus{{
 		DirectoryPath: "/tmp/project",
 		CheckpointID:  "checkpoint",
 		FileCount:     3,
 	}}, nil
 }
 
-func (fakeWatchWorkspaceSyncer) WorkspaceStatus(ctx context.Context, dir string) (workspace.WorkspaceStatus, error) {
-	return workspace.WorkspaceStatus{
-		DirectoryPath: dir,
+func (fakeWatchWorkspaceSyncer) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (engine.WorkspaceStatus, error) {
+	return engine.WorkspaceStatus{
+		DirectoryPath: ref.DirectoryPath,
 		CheckpointID:  "checkpoint",
 		FileCount:     3,
 	}, nil
@@ -157,7 +155,7 @@ func newCheckpointFallbackFixture(t *testing.T) (string, *workspace.Syncer, *int
 		AccessToken: "token",
 		TenantURL:   upstream.URL,
 	}}))
-	if _, err := syncer.Sync(context.Background(), root); err != nil {
+	if _, err := syncer.Sync(context.Background(), syncReq(root)); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nconst Version = 2\n"), 0o600); err != nil {
@@ -218,7 +216,7 @@ func TestServerRetrieveCompletesAfterCheckpointHTTP400Fallback(t *testing.T) {
 	root, syncer, checkpointCalls := newCheckpointFallbackFixture(t)
 	server := newDaemonHTTPTestServer(t, syncer)
 
-	result, err := NewClient(server.URL).Retrieve(context.Background(), root, "find code after checkpoint fallback", 0)
+	result, err := NewClient(server.URL).Search(context.Background(), searchReq(root, "find code after checkpoint fallback", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +352,7 @@ func TestServerWorkspaceStatus(t *testing.T) {
 		t.Fatalf("unexpected list status: %s", resp.Status)
 	}
 	var list struct {
-		Workspaces []workspace.WorkspaceStatus `json:"workspaces"`
+		Workspaces []engine.WorkspaceStatus `json:"workspaces"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
 		t.Fatal(err)
@@ -378,7 +376,7 @@ func TestServerWorkspaceStatus(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("unexpected status response: %s", resp.Status)
 	}
-	var status workspace.WorkspaceStatus
+	var status engine.WorkspaceStatus
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +433,7 @@ func TestServerRoutesProviderProfileRequests(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("unexpected retrieve status: %s", resp.Status)
 	}
-	var result workspace.Result
+	var result engine.Result
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		t.Fatal(err)
 	}
@@ -458,7 +456,7 @@ func TestServerRoutesProviderProfileRequests(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("unexpected status response: %s", resp.Status)
 	}
-	var status workspace.WorkspaceStatus
+	var status engine.WorkspaceStatus
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
 		t.Fatal(err)
 	}
@@ -493,7 +491,7 @@ func TestServerWorkspaceStatusIncludesWatchDiagnosticsForSeenWorkspace(t *testin
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("unexpected status response: %s", resp.Status)
 	}
-	var status workspace.WorkspaceStatus
+	var status engine.WorkspaceStatus
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
 		t.Fatal(err)
 	}
@@ -528,7 +526,7 @@ func TestServerMultiRetrieveRegistersWatchDiagnostics(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("unexpected status response: %s", resp.Status)
 	}
-	var status workspace.WorkspaceStatus
+	var status engine.WorkspaceStatus
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
 		t.Fatal(err)
 	}
@@ -587,9 +585,9 @@ func TestServerFailsMultiRetrieveTaskWhenAllWorkspacesFail(t *testing.T) {
 	}
 }
 
-func newDaemonHTTPTestServer(t *testing.T, syncer Syncer) *httptest.Server {
+func newDaemonHTTPTestServer(t *testing.T, service engine.Service) *httptest.Server {
 	t.Helper()
-	openace := NewServer(syncer)
+	openace := NewServer(service)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -678,7 +676,7 @@ func newConcurrentSyncer() *concurrentSyncer {
 	}
 }
 
-func (s *concurrentSyncer) Sync(ctx context.Context, dir string) (workspace.Result, error) {
+func (s *concurrentSyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
 	s.mu.Lock()
 	s.active++
 	if s.active > s.maxActive {
@@ -697,15 +695,15 @@ func (s *concurrentSyncer) Sync(ctx context.Context, dir string) (workspace.Resu
 	case <-s.releaseCh:
 	case <-ctx.Done():
 		s.leave()
-		return workspace.Result{}, ctx.Err()
+		return engine.Result{}, ctx.Err()
 	}
 
 	s.leave()
-	return workspace.Result{CheckpointID: "checkpoint", FileCount: 1}, nil
+	return engine.Result{CheckpointID: "checkpoint", FileCount: 1}, nil
 }
 
-func (s *concurrentSyncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
-	return s.Sync(ctx, dir)
+func (s *concurrentSyncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	return s.Sync(ctx, engine.SyncRequest{Workspace: req.Workspace})
 }
 
 func (s *concurrentSyncer) waitForOverlap(t *testing.T) {
@@ -729,12 +727,12 @@ func (s *concurrentSyncer) leave() {
 
 type rateLimitedSyncer struct{}
 
-func (rateLimitedSyncer) Sync(ctx context.Context, dir string) (workspace.Result, error) {
-	return workspace.Result{CheckpointID: "checkpoint", FileCount: 1}, nil
+func (rateLimitedSyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
+	return engine.Result{CheckpointID: "checkpoint", FileCount: 1}, nil
 }
 
-func (rateLimitedSyncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
-	return workspace.Result{}, testRateLimitError{retryAfter: 30 * time.Second}
+func (rateLimitedSyncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	return engine.Result{}, testRateLimitError{retryAfter: 30 * time.Second}
 }
 
 type testRateLimitError struct {

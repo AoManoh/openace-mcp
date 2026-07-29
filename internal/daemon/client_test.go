@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AoManoh/openace-mcp/internal/workspace"
+	"github.com/AoManoh/openace-mcp/internal/engine"
 )
 
 func TestClientHealth(t *testing.T) {
@@ -70,7 +70,7 @@ func TestClientRequiresProviderCapabilityBeforeProviderRequest(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := NewClient(server.URL).SyncWithProvider(context.Background(), "/tmp/project", "standby")
+	_, err := NewClient(server.URL).Sync(context.Background(), syncReqP("/tmp/project", "standby"))
 	if err == nil || !strings.Contains(err.Error(), "provider profile support") {
 		t.Fatalf("expected provider capability error, got %v", err)
 	}
@@ -90,14 +90,14 @@ func TestClientSendsProviderProfileWhenDaemonAdvertisesCapability(t *testing.T) 
 			if req.ProviderProfileID != "standby" {
 				t.Fatalf("provider_profile_id = %q, want standby", req.ProviderProfileID)
 			}
-			_ = json.NewEncoder(w).Encode(workspace.Result{Text: "ok", ProviderProfileID: req.ProviderProfileID})
+			_ = json.NewEncoder(w).Encode(engine.Result{Text: "ok", ProviderProfileID: req.ProviderProfileID})
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
 	}))
 	defer server.Close()
 
-	result, err := NewClient(server.URL).RetrieveWithProvider(context.Background(), "/tmp/project", "standby", "find code", 0)
+	result, err := NewClient(server.URL).Search(context.Background(), searchReqP("/tmp/project", "standby", "find code", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestClientCachesProviderCapability(t *testing.T) {
 			if req.ProviderProfileID != "standby" {
 				t.Fatalf("provider_profile_id = %q, want standby", req.ProviderProfileID)
 			}
-			_ = json.NewEncoder(w).Encode(workspace.Result{Text: "ok", ProviderProfileID: req.ProviderProfileID})
+			_ = json.NewEncoder(w).Encode(engine.Result{Text: "ok", ProviderProfileID: req.ProviderProfileID})
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -133,7 +133,7 @@ func TestClientCachesProviderCapability(t *testing.T) {
 
 	client := NewClient(server.URL)
 	for i := 0; i < 2; i++ {
-		if _, err := client.RetrieveWithProvider(context.Background(), "/tmp/project", "standby", "find code", 0); err != nil {
+		if _, err := client.Search(context.Background(), searchReqP("/tmp/project", "standby", "find code", 0)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -165,7 +165,7 @@ func TestClientCachesProviderCapabilityForConcurrentRequests(t *testing.T) {
 			if req.ProviderProfileID != "standby" {
 				t.Errorf("provider_profile_id = %q, want standby", req.ProviderProfileID)
 			}
-			_ = json.NewEncoder(w).Encode(workspace.Result{Text: "ok", ProviderProfileID: req.ProviderProfileID})
+			_ = json.NewEncoder(w).Encode(engine.Result{Text: "ok", ProviderProfileID: req.ProviderProfileID})
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
@@ -181,7 +181,7 @@ func TestClientCachesProviderCapabilityForConcurrentRequests(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, err := client.RetrieveWithProvider(context.Background(), "/tmp/project", "standby", "find code", 0)
+			_, err := client.Search(context.Background(), searchReqP("/tmp/project", "standby", "find code", 0))
 			errs <- err
 		}()
 	}
@@ -207,7 +207,7 @@ func TestClientDecodesWorkspaceUpstreamHealth(t *testing.T) {
 		switch r.URL.Path {
 		case "/v1/workspaces":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"workspaces": []workspace.WorkspaceStatus{{
+				"workspaces": []engine.WorkspaceStatus{{
 					DirectoryPath:          "/tmp/project",
 					UpstreamStatus:         "backoff",
 					UpstreamLastStatusCode: 429,
@@ -215,7 +215,7 @@ func TestClientDecodesWorkspaceUpstreamHealth(t *testing.T) {
 				}},
 			})
 		case "/v1/workspace/status":
-			_ = json.NewEncoder(w).Encode(workspace.WorkspaceStatus{
+			_ = json.NewEncoder(w).Encode(engine.WorkspaceStatus{
 				DirectoryPath:          "/tmp/project",
 				UpstreamStatus:         "backoff",
 				UpstreamLastStatusCode: 429,
@@ -236,7 +236,7 @@ func TestClientDecodesWorkspaceUpstreamHealth(t *testing.T) {
 		t.Fatalf("workspace list should decode upstream health: %+v", statuses)
 	}
 
-	status, err := client.WorkspaceStatus(context.Background(), "/tmp/project")
+	status, err := client.WorkspaceStatus(context.Background(), wsRef("/tmp/project"))
 	if err != nil {
 		t.Fatal(err)
 	}

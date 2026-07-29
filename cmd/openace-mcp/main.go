@@ -10,6 +10,7 @@ import (
 
 	"github.com/AoManoh/openace-mcp/internal/auth"
 	"github.com/AoManoh/openace-mcp/internal/daemon"
+	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/managed"
 	"github.com/AoManoh/openace-mcp/internal/mcp"
 	"github.com/AoManoh/openace-mcp/internal/provider"
@@ -24,12 +25,12 @@ func main() {
 
 	ctx := context.Background()
 
-	syncer, err := buildSyncer(ctx)
+	service, err := buildService(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "openace-mcp: %v\n", err)
 		os.Exit(1)
 	}
-	server := mcp.NewServer(syncer)
+	server := mcp.NewServer(service)
 
 	if err := server.Run(ctx, os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "openace-mcp: %v\n", err)
@@ -37,10 +38,10 @@ func main() {
 	}
 }
 
-func buildSyncer(ctx context.Context) (mcp.Syncer, error) {
+func buildService(ctx context.Context) (engine.Service, error) {
 	switch openaceMode() {
 	case "direct":
-		return buildDirectSyncer(ctx)
+		return buildLocalService(ctx)
 	case "manual-daemon":
 		return daemon.NewClient(daemonAddr()), nil
 	case "auto":
@@ -74,11 +75,7 @@ func daemonAddr() string {
 	return daemon.DefaultAddr
 }
 
-func buildDirectSyncer(ctx context.Context) (mcp.Syncer, error) {
-	return buildLocalSyncer(ctx)
-}
-
-func buildLocalSyncer(ctx context.Context) (*workspace.Syncer, error) {
+func buildLocalService(ctx context.Context) (engine.Service, error) {
 	loader := auth.NewLoader()
 	profiles, err := loader.LoadProfiles(ctx)
 	if err != nil {
@@ -103,12 +100,12 @@ func runDaemon() {
 		addr = daemon.DefaultAddr
 	}
 
-	syncer, err := buildLocalSyncer(ctx)
+	service, err := buildLocalService(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "openace-daemon: %v\n", err)
 		os.Exit(1)
 	}
-	server := daemon.NewServer(syncer)
+	server := daemon.NewServer(service)
 
 	fmt.Fprintf(os.Stderr, "openace-daemon: listening on %s\n", addr)
 	if err := server.ListenAndServe(ctx, addr); err != nil && err != context.Canceled {

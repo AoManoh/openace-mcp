@@ -19,8 +19,16 @@ import (
 	"unicode/utf8"
 
 	"github.com/AoManoh/openace-mcp/internal/ace"
+	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
-	"github.com/AoManoh/openace-mcp/internal/runtimeinfo"
+)
+
+// legacy ACE Syncer 必须完整实现通用 engine contract。
+var (
+	_ engine.Service            = (*Syncer)(nil)
+	_ engine.WorkspaceInspector = (*Syncer)(nil)
+	_ engine.ChangeDetector     = (*Syncer)(nil)
+	_ engine.BackgroundSyncer   = (*Syncer)(nil)
 )
 
 const defaultUploadBatchBytes = 1 << 20
@@ -29,26 +37,6 @@ const defaultMaxFileBytes = 1 << 20
 const defaultRetrievalTimeout = 90 * time.Second
 const defaultRetrievalConcurrencyPerProvider = 8
 const maxRetrievalConcurrencyPerProvider = 64
-
-type IndexStage string
-
-const (
-	IndexStageIdle          IndexStage = "idle"
-	IndexStageScanning      IndexStage = "scanning"
-	IndexStageReconciling   IndexStage = "reconciling"
-	IndexStageUploading     IndexStage = "uploading"
-	IndexStageCheckpointing IndexStage = "checkpointing"
-	IndexStageReady         IndexStage = "ready"
-	IndexStageFailed        IndexStage = "failed"
-)
-
-type SyncReason string
-
-const (
-	SyncReasonManual     SyncReason = "manual"
-	SyncReasonRetrieval  SyncReason = "retrieval"
-	SyncReasonBackground SyncReason = "background"
-)
 
 const (
 	providerStateCold    = "cold"
@@ -78,7 +66,7 @@ type Syncer struct {
 	router             ClientRouter
 	mu                 sync.Mutex
 	inflight           map[string]*syncCall
-	statuses           map[string]WorkspaceStatus
+	statuses           map[string]engine.WorkspaceStatus
 	retrieveLimit      int
 	retrieveSemaphores map[string]chan struct{}
 }
@@ -100,74 +88,10 @@ func (k stateKey) mapKey() string {
 type syncCall struct {
 	done      chan struct{}
 	cancel    context.CancelFunc
-	result    Result
+	result    engine.Result
 	err       error
 	waiters   int
 	cancelled bool
-}
-
-type Result struct {
-	Text              string
-	ProviderProfileID string `json:"provider_profile_id,omitempty"`
-	CheckpointID      string
-	FileCount         int
-	Uploaded          int
-	Added             int
-	Deleted           int
-	MultiStatus       *MultiRetrievalStatus `json:"multi_status,omitempty"`
-	ServedBy          *runtimeinfo.ServedBy `json:"served_by,omitempty"`
-}
-
-type MultiRetrievalStatus struct {
-	ProviderProfileID string                 `json:"provider_profile_id,omitempty"`
-	TotalWorkspaces   int                    `json:"total_workspaces"`
-	SuccessCount      int                    `json:"success_count"`
-	FailureCount      int                    `json:"failure_count"`
-	PartialFailure    bool                   `json:"partial_failure"`
-	Workspaces        []MultiWorkspaceStatus `json:"workspaces"`
-}
-
-type MultiWorkspaceStatus struct {
-	DirectoryPath string `json:"directory_path"`
-	Status        string `json:"status"`
-	Error         string `json:"error,omitempty"`
-}
-
-type WorkspaceStatus struct {
-	DirectoryPath          string                `json:"directory_path"`
-	PathKind               string                `json:"path_kind,omitempty"`
-	HostOS                 string                `json:"host_os,omitempty"`
-	ServedBy               *runtimeinfo.ServedBy `json:"served_by,omitempty"`
-	ProviderProfileID      string                `json:"provider_profile_id,omitempty"`
-	ProviderState          string                `json:"provider_state,omitempty"`
-	CheckpointID           string                `json:"checkpoint_id,omitempty"`
-	FileCount              int                   `json:"file_count"`
-	InFlight               bool                  `json:"in_flight"`
-	Stage                  IndexStage            `json:"stage"`
-	LastSyncReason         SyncReason            `json:"last_sync_reason,omitempty"`
-	LastErrorStage         IndexStage            `json:"last_error_stage,omitempty"`
-	LastUploaded           int                   `json:"last_uploaded,omitempty"`
-	LastAdded              int                   `json:"last_added,omitempty"`
-	LastDeleted            int                   `json:"last_deleted,omitempty"`
-	WatchEnabled           bool                  `json:"watch_enabled,omitempty"`
-	WatchScheduled         bool                  `json:"watch_scheduled,omitempty"`
-	WatchRunning           bool                  `json:"watch_running,omitempty"`
-	LastError              string                `json:"last_error,omitempty"`
-	WatchError             string                `json:"watch_error,omitempty"`
-	UpstreamStatus         string                `json:"upstream_status,omitempty"`
-	UpstreamLastStatusCode int                   `json:"upstream_last_status_code,omitempty"`
-	UpstreamRetryAfter     string                `json:"upstream_retry_after,omitempty"`
-	UpstreamBackoffUntil   *time.Time            `json:"upstream_backoff_until,omitempty"`
-	UpstreamLastError      string                `json:"upstream_last_error,omitempty"`
-	UpstreamLastFailure    *time.Time            `json:"upstream_last_failure,omitempty"`
-	UpstreamLastSuccess    *time.Time            `json:"upstream_last_success,omitempty"`
-	LastStartedAt          *time.Time            `json:"last_started_at,omitempty"`
-	LastFinishedAt         *time.Time            `json:"last_finished_at,omitempty"`
-	StageStartedAt         *time.Time            `json:"stage_started_at,omitempty"`
-	LastWatchAt            *time.Time            `json:"last_watch_at,omitempty"`
-	NextWatchAt            *time.Time            `json:"next_watch_at,omitempty"`
-	LastBackgroundSyncAt   *time.Time            `json:"last_background_sync_at,omitempty"`
-	UpdatedAt              *time.Time            `json:"updated_at,omitempty"`
 }
 
 type state struct {
@@ -194,7 +118,7 @@ func NewSyncerWithRouter(router ClientRouter) *Syncer {
 	return &Syncer{
 		router:             router,
 		inflight:           make(map[string]*syncCall),
-		statuses:           make(map[string]WorkspaceStatus),
+		statuses:           make(map[string]engine.WorkspaceStatus),
 		retrieveLimit:      retrievalConcurrencyPerProvider(),
 		retrieveSemaphores: make(map[string]chan struct{}),
 	}
@@ -236,32 +160,29 @@ func (s *Syncer) clientForProvider(providerProfileID string) (ACEClient, error) 
 	return s.router.ClientForProviderProfile(providerProfileID)
 }
 
-func (s *Syncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (Result, error) {
-	return s.RetrieveWithProvider(ctx, dir, "", query, maxOutputLen)
-}
-
-func (s *Syncer) RetrieveWithProvider(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (Result, error) {
-	sync, err := s.sync(ctx, dir, providerProfileID, SyncReasonRetrieval)
+// Search 实现 engine.Service：先按需同步工作区，再执行 legacy ACE 检索。
+func (s *Syncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	sync, err := s.sync(ctx, req.Workspace.DirectoryPath, req.Workspace.ProviderProfileID, engine.SyncReasonRetrieval)
 	if err != nil {
-		return Result{}, err
+		return engine.Result{}, err
 	}
 	client, err := s.clientForProvider(sync.ProviderProfileID)
 	if err != nil {
-		return Result{}, err
+		return engine.Result{}, err
 	}
 	retrieveCtx, cancel := retrievalTimeoutContext(ctx)
 	defer cancel()
 	release, err := s.acquireRetrievalSlot(retrieveCtx, sync.ProviderProfileID)
 	if err != nil {
-		return Result{}, err
+		return engine.Result{}, err
 	}
 	defer release()
-	text, err := client.CodebaseRetrieval(retrieveCtx, query, ace.RetrievalOptions{
+	text, err := client.CodebaseRetrieval(retrieveCtx, req.Query, ace.RetrievalOptions{
 		CheckpointID: sync.CheckpointID,
-		MaxOutputLen: maxOutputLen,
+		MaxOutputLen: req.MaxOutputLen,
 	})
 	if err != nil {
-		return Result{}, err
+		return engine.Result{}, err
 	}
 	sync.Text = text
 	return sync, nil
@@ -287,26 +208,20 @@ func (s *Syncer) acquireRetrievalSlot(ctx context.Context, providerProfileID str
 	}
 }
 
-func (s *Syncer) Sync(ctx context.Context, dir string) (Result, error) {
-	return s.SyncWithProvider(ctx, dir, "")
+// Sync 实现 engine.Service：以 manual 语义同步工作区索引。
+func (s *Syncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
+	return s.sync(ctx, req.Workspace.DirectoryPath, req.Workspace.ProviderProfileID, engine.SyncReasonManual)
 }
 
-func (s *Syncer) SyncWithProvider(ctx context.Context, dir string, providerProfileID string) (Result, error) {
-	return s.sync(ctx, dir, providerProfileID, SyncReasonManual)
+// SyncBackground 实现 engine.BackgroundSyncer：以 background 语义同步。
+func (s *Syncer) SyncBackground(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
+	return s.sync(ctx, req.Workspace.DirectoryPath, req.Workspace.ProviderProfileID, engine.SyncReasonBackground)
 }
 
-func (s *Syncer) SyncBackground(ctx context.Context, dir string) (Result, error) {
-	return s.SyncBackgroundWithProvider(ctx, dir, "")
-}
-
-func (s *Syncer) SyncBackgroundWithProvider(ctx context.Context, dir string, providerProfileID string) (Result, error) {
-	return s.sync(ctx, dir, providerProfileID, SyncReasonBackground)
-}
-
-func (s *Syncer) sync(ctx context.Context, dir string, providerProfileID string, reason SyncReason) (Result, error) {
+func (s *Syncer) sync(ctx context.Context, dir string, providerProfileID string, reason engine.SyncReason) (engine.Result, error) {
 	root, err := pathutil.ResolveWorkspaceRoot(dir)
 	if err != nil {
-		return Result{}, err
+		return engine.Result{}, err
 	}
 	key := s.stateKey(root, providerProfileID)
 	return s.syncSingleflight(ctx, key, reason)
@@ -333,22 +248,19 @@ func (s *Syncer) stateKeyFromCanonical(root string, pathKind string, hostOS stri
 	}
 }
 
-func (s *Syncer) WorkspaceStatus(ctx context.Context, dir string) (WorkspaceStatus, error) {
-	return s.WorkspaceStatusWithProvider(ctx, dir, "")
-}
-
-func (s *Syncer) WorkspaceStatusWithProvider(ctx context.Context, dir string, providerProfileID string) (WorkspaceStatus, error) {
+// WorkspaceStatus 实现 engine.WorkspaceInspector。
+func (s *Syncer) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (engine.WorkspaceStatus, error) {
 	if err := ctx.Err(); err != nil {
-		return WorkspaceStatus{}, err
+		return engine.WorkspaceStatus{}, err
 	}
-	root, err := pathutil.ResolveWorkspaceRoot(dir)
+	root, err := pathutil.ResolveWorkspaceRoot(ref.DirectoryPath)
 	if err != nil {
-		return WorkspaceStatus{}, err
+		return engine.WorkspaceStatus{}, err
 	}
-	key := s.stateKey(root, providerProfileID)
-	if strings.TrimSpace(providerProfileID) != "" {
+	key := s.stateKey(root, ref.ProviderProfileID)
+	if strings.TrimSpace(ref.ProviderProfileID) != "" {
 		if _, err := s.clientForProvider(key.providerProfileID); err != nil {
-			return WorkspaceStatus{}, err
+			return engine.WorkspaceStatus{}, err
 		}
 	}
 
@@ -361,17 +273,17 @@ func (s *Syncer) WorkspaceStatusWithProvider(ctx context.Context, dir string, pr
 
 	st, _, err := loadStateForProvider(key.root, key.providerProfileID)
 	if err != nil {
-		return WorkspaceStatus{}, err
+		return engine.WorkspaceStatus{}, err
 	}
 	return s.withUpstreamHealth(key, workspaceStatusFromState(key, st)), nil
 }
 
-func (s *Syncer) ListWorkspaceStatuses(ctx context.Context) ([]WorkspaceStatus, error) {
+func (s *Syncer) ListWorkspaceStatuses(ctx context.Context) ([]engine.WorkspaceStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
-	statuses := make([]WorkspaceStatus, 0, len(s.statuses))
+	statuses := make([]engine.WorkspaceStatus, 0, len(s.statuses))
 	for _, status := range s.statuses {
 		key := s.stateKeyFromCanonical(status.DirectoryPath, status.PathKind, status.HostOS, status.ProviderProfileID)
 		statuses = append(statuses, s.withUpstreamHealth(key, cloneWorkspaceStatus(status)))
@@ -386,20 +298,17 @@ func (s *Syncer) ListWorkspaceStatuses(ctx context.Context) ([]WorkspaceStatus, 
 	return statuses, nil
 }
 
-func (s *Syncer) WorkspaceChanged(ctx context.Context, dir string) (bool, error) {
-	return s.WorkspaceChangedWithProvider(ctx, dir, "")
-}
-
-func (s *Syncer) WorkspaceChangedWithProvider(ctx context.Context, dir string, providerProfileID string) (bool, error) {
+// WorkspaceChanged 实现 engine.ChangeDetector。
+func (s *Syncer) WorkspaceChanged(ctx context.Context, ref engine.WorkspaceRef) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	root, err := pathutil.ResolveWorkspaceRoot(dir)
+	root, err := pathutil.ResolveWorkspaceRoot(ref.DirectoryPath)
 	if err != nil {
 		return false, err
 	}
-	key := s.stateKey(root, providerProfileID)
-	if strings.TrimSpace(providerProfileID) != "" {
+	key := s.stateKey(root, ref.ProviderProfileID)
+	if strings.TrimSpace(ref.ProviderProfileID) != "" {
 		if _, err := s.clientForProvider(key.providerProfileID); err != nil {
 			return false, err
 		}
@@ -416,11 +325,11 @@ func (s *Syncer) WorkspaceChangedWithProvider(ctx context.Context, dir string, p
 	return !sameBlobMap(st.BlobNames, current), nil
 }
 
-func (s *Syncer) syncSingleflight(ctx context.Context, key stateKey, reason SyncReason) (Result, error) {
+func (s *Syncer) syncSingleflight(ctx context.Context, key stateKey, reason engine.SyncReason) (engine.Result, error) {
 	mapKey := key.mapKey()
 	for {
 		if err := ctx.Err(); err != nil {
-			return Result{}, err
+			return engine.Result{}, err
 		}
 
 		s.mu.Lock()
@@ -435,7 +344,7 @@ func (s *Syncer) syncSingleflight(ctx context.Context, key stateKey, reason Sync
 				case <-done:
 					continue
 				case <-ctx.Done():
-					return Result{}, ctx.Err()
+					return engine.Result{}, ctx.Err()
 				}
 			}
 			call.waiters++
@@ -473,7 +382,7 @@ func (s *Syncer) runSyncCall(ctx context.Context, key stateKey, call *syncCall) 
 	s.mu.Unlock()
 }
 
-func (s *Syncer) waitSyncCall(ctx context.Context, key stateKey, call *syncCall) (Result, error) {
+func (s *Syncer) waitSyncCall(ctx context.Context, key stateKey, call *syncCall) (engine.Result, error) {
 	select {
 	case <-call.done:
 		return call.result, call.err
@@ -484,7 +393,7 @@ func (s *Syncer) waitSyncCall(ctx context.Context, key stateKey, call *syncCall)
 		default:
 		}
 		s.releaseSyncCall(key, call)
-		return Result{}, ctx.Err()
+		return engine.Result{}, ctx.Err()
 	}
 }
 
@@ -504,9 +413,9 @@ func (s *Syncer) releaseSyncCall(key stateKey, call *syncCall) {
 	}
 }
 
-func (s *Syncer) markSyncStartedLocked(key stateKey, reason SyncReason) {
+func (s *Syncer) markSyncStartedLocked(key stateKey, reason engine.SyncReason) {
 	if s.statuses == nil {
-		s.statuses = make(map[string]WorkspaceStatus)
+		s.statuses = make(map[string]engine.WorkspaceStatus)
 	}
 	now := time.Now().UTC()
 	mapKey := key.mapKey()
@@ -517,7 +426,7 @@ func (s *Syncer) markSyncStartedLocked(key stateKey, reason SyncReason) {
 	status.ProviderProfileID = key.providerProfileID
 	status.ProviderState = providerStateCold
 	status.InFlight = true
-	status.Stage = IndexStageScanning
+	status.Stage = engine.IndexStageScanning
 	status.StageStartedAt = &now
 	status.LastSyncReason = reason
 	status.LastErrorStage = ""
@@ -525,11 +434,11 @@ func (s *Syncer) markSyncStartedLocked(key stateKey, reason SyncReason) {
 	s.statuses[mapKey] = status
 }
 
-func (s *Syncer) markSyncStage(key stateKey, stage IndexStage) {
+func (s *Syncer) markSyncStage(key stateKey, stage engine.IndexStage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.statuses == nil {
-		s.statuses = make(map[string]WorkspaceStatus)
+		s.statuses = make(map[string]engine.WorkspaceStatus)
 	}
 	now := time.Now().UTC()
 	mapKey := key.mapKey()
@@ -547,9 +456,9 @@ func (s *Syncer) markSyncStage(key stateKey, stage IndexStage) {
 	s.statuses[mapKey] = status
 }
 
-func (s *Syncer) markSyncFinishedLocked(key stateKey, result Result, err error) {
+func (s *Syncer) markSyncFinishedLocked(key stateKey, result engine.Result, err error) {
 	if s.statuses == nil {
-		s.statuses = make(map[string]WorkspaceStatus)
+		s.statuses = make(map[string]engine.WorkspaceStatus)
 	}
 	now := time.Now().UTC()
 	mapKey := key.mapKey()
@@ -562,10 +471,10 @@ func (s *Syncer) markSyncFinishedLocked(key stateKey, result Result, err error) 
 	status.LastFinishedAt = &now
 	if err != nil {
 		errorStage := status.Stage
-		if errorStage == "" || errorStage == IndexStageReady {
-			errorStage = IndexStageFailed
+		if errorStage == "" || errorStage == engine.IndexStageReady {
+			errorStage = engine.IndexStageFailed
 		}
-		status.Stage = IndexStageFailed
+		status.Stage = engine.IndexStageFailed
 		status.StageStartedAt = &now
 		status.LastErrorStage = errorStage
 		status.LastError = err.Error()
@@ -573,7 +482,7 @@ func (s *Syncer) markSyncFinishedLocked(key stateKey, result Result, err error) 
 		s.statuses[mapKey] = status
 		return
 	}
-	status.Stage = IndexStageReady
+	status.Stage = engine.IndexStageReady
 	status.StageStartedAt = &now
 	status.CheckpointID = result.CheckpointID
 	status.FileCount = result.FileCount
@@ -587,8 +496,8 @@ func (s *Syncer) markSyncFinishedLocked(key stateKey, result Result, err error) 
 	s.statuses[mapKey] = status
 }
 
-func workspaceStatusFromState(key stateKey, st state) WorkspaceStatus {
-	status := WorkspaceStatus{
+func workspaceStatusFromState(key stateKey, st state) engine.WorkspaceStatus {
+	status := engine.WorkspaceStatus{
 		DirectoryPath:     key.root,
 		PathKind:          statePathKind(key, st),
 		HostOS:            stateHostOS(key, st),
@@ -596,10 +505,10 @@ func workspaceStatusFromState(key stateKey, st state) WorkspaceStatus {
 		ProviderState:     providerStateCold,
 		CheckpointID:      st.CheckpointID,
 		FileCount:         len(st.BlobNames),
-		Stage:             IndexStageIdle,
+		Stage:             engine.IndexStageIdle,
 	}
 	if st.CheckpointID != "" || len(st.BlobNames) > 0 {
-		status.Stage = IndexStageReady
+		status.Stage = engine.IndexStageReady
 		status.ProviderState = providerStateReady
 	}
 	if !st.UpdatedAt.IsZero() {
@@ -623,7 +532,7 @@ func stateHostOS(key stateKey, st state) string {
 	return key.hostOS
 }
 
-func cloneWorkspaceStatus(status WorkspaceStatus) WorkspaceStatus {
+func cloneWorkspaceStatus(status engine.WorkspaceStatus) engine.WorkspaceStatus {
 	status.LastStartedAt = cloneTime(status.LastStartedAt)
 	status.LastFinishedAt = cloneTime(status.LastFinishedAt)
 	status.StageStartedAt = cloneTime(status.StageStartedAt)
@@ -637,7 +546,7 @@ func cloneWorkspaceStatus(status WorkspaceStatus) WorkspaceStatus {
 	return status
 }
 
-func (s *Syncer) withUpstreamHealth(key stateKey, status WorkspaceStatus) WorkspaceStatus {
+func (s *Syncer) withUpstreamHealth(key stateKey, status engine.WorkspaceStatus) engine.WorkspaceStatus {
 	if s.router == nil {
 		return status
 	}
@@ -673,19 +582,19 @@ func cloneTime(value *time.Time) *time.Time {
 	return &copied
 }
 
-func (s *Syncer) syncRoot(ctx context.Context, key stateKey) (Result, error) {
+func (s *Syncer) syncRoot(ctx context.Context, key stateKey) (engine.Result, error) {
 	client, err := s.clientForProvider(key.providerProfileID)
 	if err != nil {
-		return Result{}, err
+		return engine.Result{}, err
 	}
-	s.markSyncStage(key, IndexStageScanning)
+	s.markSyncStage(key, engine.IndexStageScanning)
 	assets, err := FileAssetSource{}.Load(ctx, key.root)
 	if err != nil {
-		return Result{}, err
+		return engine.Result{}, err
 	}
 	st, statePath, err := loadStateForProvider(key.root, key.providerProfileID)
 	if err != nil {
-		return Result{}, err
+		return engine.Result{}, err
 	}
 	if st.BlobNames == nil {
 		st.BlobNames = map[string]string{}
@@ -701,15 +610,15 @@ func (s *Syncer) syncRoot(ctx context.Context, key stateKey) (Result, error) {
 		deleted = nil
 	}
 
-	s.markSyncStage(key, IndexStageReconciling)
+	s.markSyncStage(key, engine.IndexStageReconciling)
 	unknown, nonindexed, err := findMissingBatched(ctx, client, allNames, findMissingBatchSize())
 	if err != nil {
-		return Result{}, err
+		return engine.Result{}, err
 	}
 	toUpload := uniqueStrings(append(unknown, nonindexed...))
 	uploads := make([]ace.BlobUpload, 0, len(toUpload))
 	if len(toUpload) > 0 {
-		s.markSyncStage(key, IndexStageUploading)
+		s.markSyncStage(key, engine.IndexStageUploading)
 	}
 	for _, name := range toUpload {
 		asset, ok := byName[name]
@@ -718,28 +627,28 @@ func (s *Syncer) syncRoot(ctx context.Context, key stateKey) (Result, error) {
 		}
 		upload, err := asset.upload(ctx)
 		if err != nil {
-			return Result{}, err
+			return engine.Result{}, err
 		}
 		uploads = append(uploads, upload)
 	}
 	if len(uploads) > 0 {
 		if err := batchUpload(ctx, client, uploads, uploadBatchBytes()); err != nil {
-			return Result{}, err
+			return engine.Result{}, err
 		}
 	}
 
 	if len(added) > 0 || len(deleted) > 0 || st.CheckpointID == "" {
-		s.markSyncStage(key, IndexStageCheckpointing)
+		s.markSyncStage(key, engine.IndexStageCheckpointing)
 		checkpointID, err := client.CheckpointBlobs(ctx, st.CheckpointID, added, deleted)
 		if err != nil {
 			if st.CheckpointID == "" || !ace.IsCheckpointBlobsBadRequest(err) {
-				return Result{}, err
+				return engine.Result{}, err
 			}
 			fallbackAdded := append([]string(nil), allNames...)
 			var fallbackErr error
 			checkpointID, fallbackErr = client.CheckpointBlobs(ctx, "", fallbackAdded, nil)
 			if fallbackErr != nil {
-				return Result{}, fmt.Errorf("%w; fresh checkpoint fallback failed: %v", err, fallbackErr)
+				return engine.Result{}, fmt.Errorf("%w; fresh checkpoint fallback failed: %v", err, fallbackErr)
 			}
 			added = fallbackAdded
 			deleted = nil
@@ -753,10 +662,10 @@ func (s *Syncer) syncRoot(ctx context.Context, key stateKey) (Result, error) {
 	st.BlobNames = current
 	st.UpdatedAt = time.Now().UTC()
 	if err := saveState(statePath, st); err != nil {
-		return Result{}, err
+		return engine.Result{}, err
 	}
 
-	return Result{
+	return engine.Result{
 		ProviderProfileID: key.providerProfileID,
 		CheckpointID:      st.CheckpointID,
 		FileCount:         len(assets),
@@ -1527,11 +1436,4 @@ func uniqueSorted(values []string) []string {
 	}
 	sort.Strings(result)
 	return result
-}
-
-func (r Result) Summary() string {
-	if r.ProviderProfileID != "" {
-		return fmt.Sprintf("provider_profile_id=%s checkpoint=%s files=%d uploaded=%d added=%d deleted=%d", r.ProviderProfileID, r.CheckpointID, r.FileCount, r.Uploaded, r.Added, r.Deleted)
-	}
-	return fmt.Sprintf("checkpoint=%s files=%d uploaded=%d added=%d deleted=%d", r.CheckpointID, r.FileCount, r.Uploaded, r.Added, r.Deleted)
 }

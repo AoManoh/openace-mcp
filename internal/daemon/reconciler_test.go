@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AoManoh/openace-mcp/internal/workspace"
+	"github.com/AoManoh/openace-mcp/internal/engine"
 )
 
 func TestWorkspaceReconcilerDisabledByMode(t *testing.T) {
@@ -32,7 +32,7 @@ func TestWorkspaceReconcilerSyncsChangedSeenWorkspace(t *testing.T) {
 	reconciler.Observe("/tmp/project")
 	syncer.waitForBackgroundSync(t)
 
-	status := workspace.WorkspaceStatus{DirectoryPath: "/tmp/project"}
+	status := engine.WorkspaceStatus{DirectoryPath: "/tmp/project"}
 	reconciler.Decorate(&status)
 	if !status.WatchEnabled {
 		t.Fatalf("unexpected watch status after successful background sync: %+v", status)
@@ -78,7 +78,7 @@ func TestWorkspaceReconcilerBacksOffAfterProbeError(t *testing.T) {
 	reconciler.Observe("/tmp/project")
 	syncer.waitForChangeCheck(t)
 
-	status := workspace.WorkspaceStatus{DirectoryPath: "/tmp/project"}
+	status := engine.WorkspaceStatus{DirectoryPath: "/tmp/project"}
 	reconciler.Decorate(&status)
 	if !status.WatchEnabled || !status.WatchScheduled {
 		t.Fatalf("failed probe should leave watch pending: %+v", status)
@@ -110,7 +110,7 @@ func TestWorkspaceReconcilerDefersWhileWorkspaceSyncInFlight(t *testing.T) {
 	if got := syncer.backgroundSyncCount(); got != 0 {
 		t.Fatalf("in-flight workspace should not be background synced, got %d", got)
 	}
-	status := workspace.WorkspaceStatus{DirectoryPath: "/tmp/project"}
+	status := engine.WorkspaceStatus{DirectoryPath: "/tmp/project"}
 	reconciler.Decorate(&status)
 	if !status.WatchEnabled || !status.WatchScheduled || status.LastBackgroundSyncAt != nil {
 		t.Fatalf("in-flight deferral should only reschedule watcher: %+v", status)
@@ -147,7 +147,7 @@ func newFakeWatchSyncer() *fakeWatchSyncer {
 	}
 }
 
-func (s *fakeWatchSyncer) WorkspaceChanged(context.Context, string) (bool, error) {
+func (s *fakeWatchSyncer) WorkspaceChanged(context.Context, engine.WorkspaceRef) (bool, error) {
 	s.mu.Lock()
 	s.checks++
 	changed := s.changed
@@ -157,36 +157,36 @@ func (s *fakeWatchSyncer) WorkspaceChanged(context.Context, string) (bool, error
 	return changed, err
 }
 
-func (s *fakeWatchSyncer) ListWorkspaceStatuses(context.Context) ([]workspace.WorkspaceStatus, error) {
+func (s *fakeWatchSyncer) ListWorkspaceStatuses(context.Context) ([]engine.WorkspaceStatus, error) {
 	return nil, nil
 }
 
-func (s *fakeWatchSyncer) WorkspaceStatus(ctx context.Context, dir string) (workspace.WorkspaceStatus, error) {
+func (s *fakeWatchSyncer) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (engine.WorkspaceStatus, error) {
 	s.mu.Lock()
 	s.statusChecks++
 	inFlight := s.inFlight
 	s.mu.Unlock()
 	s.signal(s.statusCh)
-	return workspace.WorkspaceStatus{DirectoryPath: dir, InFlight: inFlight}, nil
+	return engine.WorkspaceStatus{DirectoryPath: ref.DirectoryPath, InFlight: inFlight}, nil
 }
 
-func (s *fakeWatchSyncer) SyncBackground(context.Context, string) (workspace.Result, error) {
+func (s *fakeWatchSyncer) SyncBackground(context.Context, engine.SyncRequest) (engine.Result, error) {
 	s.mu.Lock()
 	s.backgroundSyncs++
 	s.changed = false
 	s.mu.Unlock()
 	s.signal(s.syncCh)
-	return workspace.Result{CheckpointID: "checkpoint-background", FileCount: 1}, nil
+	return engine.Result{CheckpointID: "checkpoint-background", FileCount: 1}, nil
 }
 
-func (s *fakeWatchSyncer) Sync(ctx context.Context, dir string) (workspace.Result, error) {
-	return s.SyncBackground(ctx, dir)
+func (s *fakeWatchSyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
+	return s.SyncBackground(ctx, req)
 }
 
-func (s *fakeWatchSyncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
-	result, err := s.Sync(ctx, dir)
+func (s *fakeWatchSyncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	result, err := s.Sync(ctx, engine.SyncRequest{Workspace: req.Workspace})
 	if err != nil {
-		return workspace.Result{}, err
+		return engine.Result{}, err
 	}
 	result.Text = "retrieved"
 	return result, nil

@@ -9,6 +9,7 @@ import (
 
 	"github.com/AoManoh/openace-mcp/internal/auth"
 	"github.com/AoManoh/openace-mcp/internal/daemon"
+	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/provider"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
@@ -25,12 +26,12 @@ func main() {
 		addr = daemon.DefaultAddr
 	}
 
-	syncer, err := buildLocalSyncer(ctx)
+	service, err := buildLocalService(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "openace-daemon: %v\n", err)
 		os.Exit(1)
 	}
-	server := daemon.NewServer(syncer)
+	server := daemon.NewServer(service)
 
 	fmt.Fprintf(os.Stderr, "openace-daemon: listening on %s\n", addr)
 	if err := server.ListenAndServe(ctx, addr); err != nil && err != context.Canceled {
@@ -39,7 +40,7 @@ func main() {
 	}
 }
 
-func buildLocalSyncer(ctx context.Context) (*workspace.Syncer, error) {
+func buildLocalService(ctx context.Context) (engine.Service, error) {
 	loader := auth.NewLoader()
 	profiles, err := loader.LoadProfiles(ctx)
 	if err != nil {
