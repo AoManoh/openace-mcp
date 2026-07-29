@@ -104,7 +104,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}
 	}
 	if s.tasks != nil {
-		return s.tasks.Shutdown(ctx)
+		if err := s.tasks.Shutdown(ctx); err != nil {
+			return err
+		}
+	}
+	// 持有本地资源的引擎（如 local-hybrid 的索引句柄）随 daemon 一并释放。
+	if lifecycle, ok := s.service.(engine.Lifecycle); ok {
+		return lifecycle.Close(ctx)
 	}
 	return nil
 }

@@ -18,6 +18,11 @@ const (
 	IndexStageCheckpointing IndexStage = "checkpointing"
 	IndexStageReady         IndexStage = "ready"
 	IndexStageFailed        IndexStage = "failed"
+
+	// local-hybrid 引擎的构建阶段（发现阶段复用 IndexStageScanning）。
+	IndexStageChunking   IndexStage = "chunking"
+	IndexStageIndexing   IndexStage = "indexing"
+	IndexStagePublishing IndexStage = "publishing"
 )
 
 // SyncReason 表示一次同步的触发来源。

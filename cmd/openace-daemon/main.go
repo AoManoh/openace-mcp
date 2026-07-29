@@ -10,6 +10,7 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/auth"
 	"github.com/AoManoh/openace-mcp/internal/daemon"
 	"github.com/AoManoh/openace-mcp/internal/engine"
+	"github.com/AoManoh/openace-mcp/internal/localengine"
 	"github.com/AoManoh/openace-mcp/internal/provider"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
@@ -41,6 +42,14 @@ func main() {
 }
 
 func buildLocalService(ctx context.Context) (engine.Service, error) {
+	engineID, err := engine.NormalizeEngineID(os.Getenv("OPENACE_ENGINE"))
+	if err != nil {
+		return nil, err
+	}
+	// local-hybrid 不依赖任何上游凭据：无 AUGMENT_* 也必须可启动。
+	if engineID == engine.EngineLocalHybrid {
+		return localengine.New(), nil
+	}
 	loader := auth.NewLoader()
 	profiles, err := loader.LoadProfiles(ctx)
 	if err != nil {
