@@ -1,7 +1,37 @@
-# Local environment and secrets
+# Local environment and secrets.
+# .env files commonly contain DB URLs, API keys, OAuth secrets.
+# .env.example documents variable names without values and IS safe to commit.
 .env
 .env.*
 !.env.example
+.envrc
+
+# Credentials, keys, certificates and tokens.
+# These should NEVER be committed even to private repositories; rotate
+# immediately if any of them appear in `git status` unexpectedly.
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+*.kdbx
+*.gpg
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.ppk
+*credentials*.json
+*credentials*.yml
+*credentials*.yaml
+*secret*.json
+*secret*.yml
+*secret*.yaml
+*.token
+auth.json
+.netrc
+secrets/
 
 # Dependency and build outputs
 node_modules/
@@ -10,8 +40,22 @@ build/
 coverage/
 .cache/
 .turbo/
+
+# Compiled openACE binaries (built locally via `go build ./cmd/...`)
 /openace-mcp
 /openace-daemon
+
+# Cross-language test caches and coverage artifacts.
+# Go test caches live under the toolchain cache, not the repo; these cover
+# tooling that may be run alongside the project.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nyc_output/
+htmlcov/
+.coverage
+.coverage.*
 
 # Runtime logs
 *.log
@@ -20,8 +64,36 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Root-level local helper scripts are private by default.
-# Reusable public automation should live under the owning skill directory.
+# OS-level junk files
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editor / IDE local state.
+.idea/
+.cursor/
+.vscode/
+*.swp
+*.swo
+*~
+.#*
+
+# AI coding tool local caches (not configuration).
+.claude/cache/
+.codeium/
+.aider*
+.history/
+
+# Private AI governance layer (project policy: keep local, do NOT ship in the
+# public repo). AGENTS.md, skills/ and .augmentignore are this project's
+# local-only AI collaboration governance. Root-level helper scripts are private
+# by default; reusable public automation should live under the owning skill
+# directory.
 /AGENTS.md
 /scripts/
 /skills/
