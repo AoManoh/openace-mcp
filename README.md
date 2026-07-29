@@ -254,6 +254,24 @@ profile 文件包含 token/session，必须当作本地 secret 管理，不要�
 
 `auto` 只会复用暴露运行时身份能力且 build revision 兼容的 daemon。若本机 `127.0.0.1:8765` 上已有旧 daemon、缺少 `runtime_identity` capability，或能确认与当前 MCP wrapper revision 不一致，MCP shim 会明确失败并要求重启/升级，而不是静默复用一个未知版本的长驻进程。daemon 返回的 sync、retrieve、workspace status 和 task 响应也会带 `served_by`，用于排查 WSL/Windows、多 IDE、多 cache namespace 混用时到底是哪一个 daemon 在响应。
 
+## 实验性能力：本地词法引擎（local-hybrid）
+
+设置 `OPENACE_ENGINE=local-hybrid` 后，openACE 使用自有的本地检索引擎：本机扫描、按 AST/行窗口切分、构建 BM25 词法索引并在本地完成检索，全程**不需要任何凭据或网络**。
+
+```jsonc
+"env": {
+  "OPENACE_ENGINE": "local-hybrid"
+}
+```
+
+当前边界（如实声明）：
+
+- 本阶段只提供关键词/词法检索（BM25），语义检索在后续阶段加入；词法结果是该模式的完整能力，不是降级。
+- Go 文件按 AST 声明切分，其余语言按确定性行窗口切分；`workspace_status` 会如实上报每种语言是 `ast` 还是 `fallback`。
+- 索引以不可变 revision 形式保存在 cache 目录（`engines/local-hybrid/` 子树），发布原子切换，损坏时自动回退上一 revision。
+- `provider_profile_id` 仅适用于默认 ACE 引擎；local-hybrid 收到该参数会明确报错。
+- 引擎按进程选择：切换 `OPENACE_ENGINE` 需重启 daemon；`auto` 模式只会复用引擎一致的 daemon。
+
 ## 索引范围与安全边界
 
 openACE 默认尊重 `.gitignore` / `.ignore`，并跳过 `.env*`、session、credentials、私钥、证书和 keystore 等敏感文件。
@@ -292,6 +310,7 @@ openACE 默认尊重 `.gitignore` / `.ignore`，并跳过 `.env*`、session、cr
 | `AUGMENT_SESSION_AUTH` | 完整 session JSON，优先级最高 |
 | `OPENACE_SESSION_FILE` | 显式 session 文件路径 |
 | `OPENACE_PROFILES_FILE` | 实验性多 profile JSON；设置后替代单账号凭据链 |
+| `OPENACE_ENGINE` | `ace`（默认）/ `local-hybrid`（实验性本地词法引擎，无需凭据） |
 | `OPENACE_MODE` | `auto` / `direct` / `manual-daemon`，默认 `auto` |
 | `OPENACE_CACHE_NAMESPACE` | cache 命名空间，用于隔离账号、tenant 或测试批次 |
 | `OPENACE_DAEMON_ADDR` | MCP shim 连接 daemon 的地址 |

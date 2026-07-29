@@ -11,6 +11,7 @@ import (
 // can expose identity without depending on the daemon implementation.
 type ServedBy struct {
 	Service        string          `json:"service,omitempty"`
+	Engine         string          `json:"engine,omitempty"`
 	PID            int             `json:"pid,omitempty"`
 	StartedAt      time.Time       `json:"started_at,omitempty"`
 	ListenAddr     string          `json:"listen_addr,omitempty"`

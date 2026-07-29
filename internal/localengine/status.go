@@ -1,0 +1,247 @@
+package localengine
+
+import (
+	"context"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/AoManoh/openace-mcp/internal/engine"
+	"github.com/AoManoh/openace-mcp/internal/index"
+	"github.com/AoManoh/openace-mcp/internal/pathutil"
+)
+
+// wsStatus 跟踪单个工作区的构建与索引状态。
+// 词法检索是本模式的完整能力：状态不出现 semantic/degraded 字段（阶段计划 D2）。
+type wsStatus struct {
+	mu sync.Mutex
+
+	root         pathutil.WorkspaceRoot
+	workspaceKey string
+
+	inFlight         bool
+	stage            engine.IndexStage
+	revision         string
+	fileCount        int
+	chunkCount       int
+	revisionCount    int
+	skippedFiles     int
+	capabilities     map[string]string
+	lastError        string
+	skippedRevisions []string
+	startedAt        *time.Time
+	finishedAt       *time.Time
+	updatedAt        time.Time
+}
+
+// setSkippedFiles 记录内容门禁跳过的文件数（暗坑 K6）。
+func (s *wsStatus) setSkippedFiles(count int) {
+	s.mu.Lock()
+	s.skippedFiles = count
+	s.mu.Unlock()
+}
+
+// statusFor 返回（必要时创建）工作区状态跟踪器。
+func (e *Engine) statusFor(root pathutil.WorkspaceRoot, workspaceKey string) *wsStatus {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if status, ok := e.statuses[workspaceKey]; ok {
+		return status
+	}
+	status := &wsStatus{root: root, workspaceKey: workspaceKey, stage: engine.IndexStageIdle}
+	e.statuses[workspaceKey] = status
+	return status
+}
+
+func (s *wsStatus) begin() {
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inFlight = true
+	s.lastError = ""
+	s.startedAt = &now
+	s.finishedAt = nil
+	s.updatedAt = now
+}
+
+func (s *wsStatus) setStage(stage engine.IndexStage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stage = stage
+	s.updatedAt = time.Now().UTC()
+}
+
+func (s *wsStatus) ready(manifest *index.Manifest, revisions int) {
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inFlight = false
+	s.stage = engine.IndexStageReady
+	s.revision = manifest.Revision
+	s.fileCount = manifest.Counts.Files
+	s.chunkCount = manifest.Counts.Chunks
+	s.revisionCount = revisions
+	s.capabilities = manifest.ChunkerCapabilities
+	s.lastError = ""
+	s.finishedAt = &now
+	s.updatedAt = now
+}
+
+func (s *wsStatus) fail(err error) {
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inFlight = false
+	s.stage = engine.IndexStageFailed
+	s.lastError = sanitizeError(err)
+	s.finishedAt = &now
+	s.updatedAt = now
+}
+
+// noteSkippedRevisions 记录检索期发现的损坏 revision（回退可见性）。
+func (e *Engine) noteSkippedRevisions(workspaceKey string, skipped []string) {
+	e.mu.Lock()
+	status, ok := e.statuses[workspaceKey]
+	e.mu.Unlock()
+	if !ok {
+		return
+	}
+	status.mu.Lock()
+	status.skippedRevisions = skipped
+	status.updatedAt = time.Now().UTC()
+	status.mu.Unlock()
+}
+
+// sanitizeError 收敛错误文本：去除多行与首尾空白，长度封顶。
+func sanitizeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.Join(strings.Fields(err.Error()), " ")
+	const maxLen = 512
+	if len(text) > maxLen {
+		text = text[:maxLen] + "…"
+	}
+	return text
+}
+
+// snapshot 生成对外状态。
+func (s *wsStatus) snapshot() engine.WorkspaceStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	status := engine.WorkspaceStatus{
+		DirectoryPath: s.root.CanonicalPath,
+		PathKind:      string(s.root.PathKind),
+		HostOS:        s.root.HostOS,
+		Engine:        EngineID,
+		IndexRevision: s.revision,
+		FileCount:     s.fileCount,
+		InFlight:      s.inFlight,
+		Stage:         s.stage,
+		LastAdded:     s.chunkCount,
+		LastError:     s.lastError,
+	}
+	if s.startedAt != nil {
+		started := *s.startedAt
+		status.LastStartedAt = &started
+	}
+	if s.finishedAt != nil {
+		finished := *s.finishedAt
+		status.LastFinishedAt = &finished
+	}
+	if !s.updatedAt.IsZero() {
+		updated := s.updatedAt
+		status.UpdatedAt = &updated
+	}
+	if len(s.capabilities) > 0 || s.revisionCount > 0 || len(s.skippedRevisions) > 0 || s.skippedFiles > 0 {
+		status.UpstreamStatus = capabilitySummary(s.capabilities, s.revisionCount, s.skippedFiles, s.skippedRevisions)
+	}
+	return status
+}
+
+// capabilitySummary 把 chunker 能力、revision 保留数、内容门禁跳过数
+// 与损坏回退信息压缩为一行可读文本（Stage 2 复用现有 UpstreamStatus
+// 字段承载本地引擎详情，避免提前扩表；Stage 3 状态扩展时再字段化）。
+func capabilitySummary(capabilities map[string]string, revisions int, skippedFiles int, skippedRevisions []string) string {
+	parts := make([]string, 0, len(capabilities)+3)
+	languages := make([]string, 0, len(capabilities))
+	for language := range capabilities {
+		languages = append(languages, language)
+	}
+	sort.Strings(languages)
+	for _, language := range languages {
+		parts = append(parts, language+"="+capabilities[language])
+	}
+	if revisions > 0 {
+		parts = append(parts, "revisions="+strconv.Itoa(revisions))
+	}
+	if skippedFiles > 0 {
+		parts = append(parts, "skipped_files="+strconv.Itoa(skippedFiles))
+	}
+	if len(skippedRevisions) > 0 {
+		parts = append(parts, "skipped="+strings.Join(skippedRevisions, ","))
+	}
+	return "chunker[" + strings.Join(parts, " ") + "]"
+}
+
+// WorkspaceStatus 实现 engine.WorkspaceInspector。
+func (e *Engine) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (engine.WorkspaceStatus, error) {
+	if err := rejectProfileID(ref); err != nil {
+		return engine.WorkspaceStatus{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return engine.WorkspaceStatus{}, err
+	}
+	root, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
+	if err != nil {
+		return engine.WorkspaceStatus{}, err
+	}
+	e.mu.Lock()
+	status, ok := e.statuses[workspaceKey]
+	e.mu.Unlock()
+	if ok {
+		return status.snapshot(), nil
+	}
+	// 冷启动：内存无状态时从持久化 manifest 恢复视图。
+	store, err := e.storeFor(workspaceKey)
+	if err != nil {
+		return engine.WorkspaceStatus{}, err
+	}
+	manifest, _, err := store.ResolveUsable()
+	if err != nil {
+		if isNoRevision(err) {
+			return engine.WorkspaceStatus{
+				DirectoryPath: root.CanonicalPath,
+				PathKind:      string(root.PathKind),
+				HostOS:        root.HostOS,
+				Engine:        EngineID,
+				Stage:         engine.IndexStageIdle,
+			}, nil
+		}
+		return engine.WorkspaceStatus{}, err
+	}
+	tracker := e.statusFor(root, workspaceKey)
+	tracker.ready(manifest, revisionCount(store, manifest))
+	return tracker.snapshot(), nil
+}
+
+// ListWorkspaceStatuses 实现 engine.WorkspaceInspector。
+func (e *Engine) ListWorkspaceStatuses(ctx context.Context) ([]engine.WorkspaceStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	e.mu.Lock()
+	trackers := make([]*wsStatus, 0, len(e.statuses))
+	for _, status := range e.statuses {
+		trackers = append(trackers, status)
+	}
+	e.mu.Unlock()
+	statuses := make([]engine.WorkspaceStatus, 0, len(trackers))
+	for _, tracker := range trackers {
+		statuses = append(statuses, tracker.snapshot())
+	}
+	sort.Slice(statuses, func(i, j int) bool { return statuses[i].DirectoryPath < statuses[j].DirectoryPath })
+	return statuses, nil
+}

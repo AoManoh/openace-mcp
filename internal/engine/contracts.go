@@ -9,7 +9,36 @@
 // 决策推迟到 SearchResult 引入结构化 hits 的阶段执行。
 package engine
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"strings"
+)
+
+// 引擎标识常量；OPENACE_ENGINE 环境变量取值。
+const (
+	EngineACE         = "ace"
+	EngineLocalHybrid = "local-hybrid"
+)
+
+// NormalizeEngineID 规范化引擎选择：空值与 "ace" 归一为 legacy ACE，
+// 其余非法值显式报错（不静默回退）。
+func NormalizeEngineID(value string) (string, error) {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case "", EngineACE:
+		return EngineACE, nil
+	case EngineLocalHybrid:
+		return EngineLocalHybrid, nil
+	default:
+		return "", fmt.Errorf("invalid OPENACE_ENGINE %q; use %q or %q", value, EngineACE, EngineLocalHybrid)
+	}
+}
+
+// Identifier 是可选能力：实现方自述引擎类型，供 daemon 身份广播
+// 与跨进程复用兼容性判定使用（阶段计划暗坑 K8）。
+type Identifier interface {
+	EngineID() string
+}
 
 // WorkspaceRef 标识一次请求指向的工作区与引擎/档案身份。
 // DirectoryPath 允许是调用方提供的原始路径；canonical 化由实现负责。

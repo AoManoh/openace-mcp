@@ -208,6 +208,11 @@ func (s *Syncer) acquireRetrievalSlot(ctx context.Context, providerProfileID str
 	}
 }
 
+// EngineID 实现 engine.Identifier：本实现是 legacy ACE 引擎。
+func (s *Syncer) EngineID() string {
+	return engine.EngineACE
+}
+
 // Sync 实现 engine.Service：以 manual 语义同步工作区索引。
 func (s *Syncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
 	return s.sync(ctx, req.Workspace.DirectoryPath, req.Workspace.ProviderProfileID, engine.SyncReasonManual)
