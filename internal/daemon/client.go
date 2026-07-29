@@ -14,7 +14,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AoManoh/openace-mcp/internal/workspace"
+	"github.com/AoManoh/openace-mcp/internal/engine"
+)
+
+// daemon HTTP client 对上层暴露与本地引擎一致的通用 contract。
+var (
+	_ engine.Service            = (*Client)(nil)
+	_ engine.WorkspaceInspector = (*Client)(nil)
 )
 
 type Client struct {
@@ -93,60 +99,54 @@ func (c *Client) ensureProviderProfiles(ctx context.Context, providerProfileID s
 	return nil
 }
 
-func (c *Client) Sync(ctx context.Context, dir string) (workspace.Result, error) {
-	return c.SyncWithProvider(ctx, dir, "")
-}
-
-func (c *Client) SyncWithProvider(ctx context.Context, dir string, providerProfileID string) (workspace.Result, error) {
-	var result workspace.Result
+// Sync 实现 engine.Service：把同步请求转发给 daemon HTTP API（wire 格式不变）。
+func (c *Client) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
+	var result engine.Result
+	providerProfileID := strings.TrimSpace(req.Workspace.ProviderProfileID)
 	if err := c.ensureProviderProfiles(ctx, providerProfileID); err != nil {
 		return result, err
 	}
 	err := c.post(ctx, "/v1/sync", syncRequest{
-		DirectoryPath:     dir,
-		ProviderProfileID: strings.TrimSpace(providerProfileID),
+		DirectoryPath:     req.Workspace.DirectoryPath,
+		ProviderProfileID: providerProfileID,
 	}, &result)
 	return result, err
 }
 
-func (c *Client) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
-	return c.RetrieveWithProvider(ctx, dir, "", query, maxOutputLen)
-}
-
-func (c *Client) RetrieveWithProvider(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (workspace.Result, error) {
-	var result workspace.Result
+// Search 实现 engine.Service：把检索请求转发给 daemon HTTP API（wire 格式不变）。
+func (c *Client) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	var result engine.Result
+	providerProfileID := strings.TrimSpace(req.Workspace.ProviderProfileID)
 	if err := c.ensureProviderProfiles(ctx, providerProfileID); err != nil {
 		return result, err
 	}
 	err := c.post(ctx, "/v1/retrieve", retrieveRequest{
-		DirectoryPath:      dir,
-		ProviderProfileID:  strings.TrimSpace(providerProfileID),
-		InformationRequest: query,
-		MaxOutputLength:    maxOutputLen,
+		DirectoryPath:      req.Workspace.DirectoryPath,
+		ProviderProfileID:  providerProfileID,
+		InformationRequest: req.Query,
+		MaxOutputLength:    req.MaxOutputLen,
 	}, &result)
 	return result, err
 }
 
-func (c *Client) ListWorkspaceStatuses(ctx context.Context) ([]workspace.WorkspaceStatus, error) {
+func (c *Client) ListWorkspaceStatuses(ctx context.Context) ([]engine.WorkspaceStatus, error) {
 	var result struct {
-		Workspaces []workspace.WorkspaceStatus `json:"workspaces"`
+		Workspaces []engine.WorkspaceStatus `json:"workspaces"`
 	}
 	err := c.get(ctx, "/v1/workspaces", &result)
 	return result.Workspaces, err
 }
 
-func (c *Client) WorkspaceStatus(ctx context.Context, dir string) (workspace.WorkspaceStatus, error) {
-	return c.WorkspaceStatusWithProvider(ctx, dir, "")
-}
-
-func (c *Client) WorkspaceStatusWithProvider(ctx context.Context, dir string, providerProfileID string) (workspace.WorkspaceStatus, error) {
-	var result workspace.WorkspaceStatus
+// WorkspaceStatus 实现 engine.WorkspaceInspector。
+func (c *Client) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (engine.WorkspaceStatus, error) {
+	var result engine.WorkspaceStatus
+	providerProfileID := strings.TrimSpace(ref.ProviderProfileID)
 	if err := c.ensureProviderProfiles(ctx, providerProfileID); err != nil {
 		return result, err
 	}
 	err := c.post(ctx, "/v1/workspace/status", workspaceStatusRequest{
-		DirectoryPath:     dir,
-		ProviderProfileID: strings.TrimSpace(providerProfileID),
+		DirectoryPath:     ref.DirectoryPath,
+		ProviderProfileID: providerProfileID,
 	}, &result)
 	return result, err
 }

@@ -113,7 +113,7 @@ func TestLiveAccountsProbe(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), perAccountTimeout)
 		start := time.Now()
-		res, rerr := syncer.Retrieve(ctx, ws, query, 0)
+		res, rerr := syncer.Search(ctx, searchReq(ws, query, 0))
 		elapsed := time.Since(start)
 		cancel()
 
@@ -186,7 +186,7 @@ func printLiveSummary(t *testing.T, outcomes []liveOutcome) {
 func writeProbeWorkspace(t *testing.T, dir string) {
 	t.Helper()
 	files := map[string]string{
-		"main.go": "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"openace live probe\")\n}\n",
+		"main.go":   "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"openace live probe\")\n}\n",
 		"README.md": "# Live Probe Workspace\n\nThrowaway repository used only to exercise ACE sync + retrieval.\n",
 	}
 	for name, content := range files {

@@ -14,32 +14,13 @@ import (
 	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/ace"
-	"github.com/AoManoh/openace-mcp/internal/workspace"
+	"github.com/AoManoh/openace-mcp/internal/engine"
 )
 
 const DefaultAddr = "127.0.0.1:8765"
 
-type Syncer interface {
-	Retrieve(context.Context, string, string, int) (workspace.Result, error)
-	Sync(context.Context, string) (workspace.Result, error)
-}
-
-type ProviderSyncer interface {
-	RetrieveWithProvider(context.Context, string, string, string, int) (workspace.Result, error)
-	SyncWithProvider(context.Context, string, string) (workspace.Result, error)
-}
-
-type WorkspaceInspector interface {
-	ListWorkspaceStatuses(context.Context) ([]workspace.WorkspaceStatus, error)
-	WorkspaceStatus(context.Context, string) (workspace.WorkspaceStatus, error)
-}
-
-type ProviderWorkspaceInspector interface {
-	WorkspaceStatusWithProvider(context.Context, string, string) (workspace.WorkspaceStatus, error)
-}
-
 type Server struct {
-	syncer     Syncer
+	service    engine.Service
 	tasks      *TaskStore
 	reconciler *workspaceReconciler
 	authToken  string
@@ -65,14 +46,14 @@ type retrieveRequest struct {
 	MaxOutputLength    int    `json:"max_output_length,omitempty"`
 }
 
-func NewServer(syncer Syncer) *Server {
+func NewServer(service engine.Service) *Server {
 	server := &Server{
-		syncer:    syncer,
+		service:   service,
 		authToken: strings.TrimSpace(os.Getenv("OPENACE_DAEMON_TOKEN")),
 		startedAt: time.Now().UTC(),
 	}
 	server.tasks = NewTaskStore(server.runTask, 0)
-	server.reconciler = newWorkspaceReconciler(syncer)
+	server.reconciler = newWorkspaceReconciler(service)
 	return server
 }
 
@@ -311,30 +292,25 @@ func (s *Server) workspaceStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, status)
 }
 
-func (s *Server) workspaceInspector() (WorkspaceInspector, bool) {
-	inspector, ok := s.syncer.(WorkspaceInspector)
+func (s *Server) workspaceInspector() (engine.WorkspaceInspector, bool) {
+	inspector, ok := s.service.(engine.WorkspaceInspector)
 	return inspector, ok
 }
 
-func (s *Server) workspaceStatusForProvider(ctx context.Context, inspector WorkspaceInspector, dir string, providerProfileID string) (workspace.WorkspaceStatus, error) {
-	providerProfileID = strings.TrimSpace(providerProfileID)
-	if providerProfileID == "" {
-		return inspector.WorkspaceStatus(ctx, dir)
-	}
-	providerInspector, ok := s.syncer.(ProviderWorkspaceInspector)
-	if !ok {
-		return workspace.WorkspaceStatus{}, fmt.Errorf("provider_profile_id is not supported by this daemon")
-	}
-	return providerInspector.WorkspaceStatusWithProvider(ctx, dir, providerProfileID)
+func (s *Server) workspaceStatusForProvider(ctx context.Context, inspector engine.WorkspaceInspector, dir string, providerProfileID string) (engine.WorkspaceStatus, error) {
+	return inspector.WorkspaceStatus(ctx, engine.WorkspaceRef{
+		DirectoryPath:     dir,
+		ProviderProfileID: strings.TrimSpace(providerProfileID),
+	})
 }
 
-func (s *Server) decorateWorkspaceStatus(status *workspace.WorkspaceStatus) {
+func (s *Server) decorateWorkspaceStatus(status *engine.WorkspaceStatus) {
 	if s.reconciler != nil {
 		s.reconciler.Decorate(status)
 	}
 }
 
-func (s *Server) attachResultServedBy(result *workspace.Result) {
+func (s *Server) attachResultServedBy(result *engine.Result) {
 	if result == nil {
 		return
 	}
@@ -342,7 +318,7 @@ func (s *Server) attachResultServedBy(result *workspace.Result) {
 	result.ServedBy = &identity
 }
 
-func (s *Server) attachWorkspaceStatusServedBy(status *workspace.WorkspaceStatus) {
+func (s *Server) attachWorkspaceStatusServedBy(status *engine.WorkspaceStatus) {
 	if status == nil {
 		return
 	}
@@ -447,8 +423,8 @@ func (s *Server) taskItem(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, task)
 }
 
-func (s *Server) runTask(ctx context.Context, req TaskRequest) (workspace.Result, error) {
-	var result workspace.Result
+func (s *Server) runTask(ctx context.Context, req TaskRequest) (engine.Result, error) {
+	var result engine.Result
 	var err error
 	switch req.Kind {
 	case TaskKindSync:
@@ -458,39 +434,33 @@ func (s *Server) runTask(ctx context.Context, req TaskRequest) (workspace.Result
 	case TaskKindMultiRetrieve:
 		result, err = s.runMultiRetrieve(ctx, req.DirectoryPaths, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength)
 	default:
-		return workspace.Result{}, fmt.Errorf("unknown task kind: %s", req.Kind)
+		return engine.Result{}, fmt.Errorf("unknown task kind: %s", req.Kind)
 	}
 	if err != nil {
-		return workspace.Result{}, err
+		return engine.Result{}, err
 	}
 	s.attachResultServedBy(&result)
 	return result, nil
 }
 
-func (s *Server) runSync(ctx context.Context, dir string, providerProfileID string) (workspace.Result, error) {
+func (s *Server) runSync(ctx context.Context, dir string, providerProfileID string) (engine.Result, error) {
 	s.observeWorkspace(dir, providerProfileID)
-	providerProfileID = strings.TrimSpace(providerProfileID)
-	if providerProfileID != "" {
-		providerSyncer, ok := s.syncer.(ProviderSyncer)
-		if !ok {
-			return workspace.Result{}, fmt.Errorf("provider_profile_id is not supported by this daemon")
-		}
-		return providerSyncer.SyncWithProvider(ctx, dir, providerProfileID)
-	}
-	return s.syncer.Sync(ctx, dir)
+	return s.service.Sync(ctx, engine.SyncRequest{Workspace: engine.WorkspaceRef{
+		DirectoryPath:     dir,
+		ProviderProfileID: strings.TrimSpace(providerProfileID),
+	}})
 }
 
-func (s *Server) runRetrieve(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (workspace.Result, error) {
+func (s *Server) runRetrieve(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (engine.Result, error) {
 	s.observeWorkspace(dir, providerProfileID)
-	providerProfileID = strings.TrimSpace(providerProfileID)
-	if providerProfileID != "" {
-		providerSyncer, ok := s.syncer.(ProviderSyncer)
-		if !ok {
-			return workspace.Result{}, fmt.Errorf("provider_profile_id is not supported by this daemon")
-		}
-		return providerSyncer.RetrieveWithProvider(ctx, dir, providerProfileID, query, maxOutputLen)
-	}
-	return s.syncer.Retrieve(ctx, dir, query, maxOutputLen)
+	return s.service.Search(ctx, engine.SearchRequest{
+		Workspace: engine.WorkspaceRef{
+			DirectoryPath:     dir,
+			ProviderProfileID: strings.TrimSpace(providerProfileID),
+		},
+		Query:        query,
+		MaxOutputLen: maxOutputLen,
+	})
 }
 
 func (s *Server) observeWorkspace(dir string, providerProfileID string) {
@@ -501,11 +471,11 @@ func (s *Server) observeWorkspace(dir string, providerProfileID string) {
 
 type multiRetrieveResult struct {
 	directoryPath string
-	result        workspace.Result
+	result        engine.Result
 	err           error
 }
 
-func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, providerProfileID string, query string, maxOutputLen int) (workspace.Result, error) {
+func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, providerProfileID string, query string, maxOutputLen int) (engine.Result, error) {
 	results := make([]multiRetrieveResult, len(dirs))
 	var wg sync.WaitGroup
 	for i, dir := range dirs {
@@ -521,29 +491,29 @@ func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, providerPr
 	}
 	wg.Wait()
 	if err := ctx.Err(); err != nil {
-		return workspace.Result{}, err
+		return engine.Result{}, err
 	}
 	result, successCount := aggregateMultiRetrieveResults(providerProfileID, results)
 	if successCount == 0 {
-		return workspace.Result{}, fmt.Errorf("all workspace retrievals failed\n\n%s", strings.TrimSpace(result.Text))
+		return engine.Result{}, fmt.Errorf("all workspace retrievals failed\n\n%s", strings.TrimSpace(result.Text))
 	}
 	return result, nil
 }
 
-func aggregateMultiRetrieveResults(providerProfileID string, results []multiRetrieveResult) (workspace.Result, int) {
+func aggregateMultiRetrieveResults(providerProfileID string, results []multiRetrieveResult) (engine.Result, int) {
 	var out strings.Builder
 	out.WriteString("Cross-workspace retrieval results")
-	status := workspace.MultiRetrievalStatus{
+	status := engine.MultiRetrievalStatus{
 		ProviderProfileID: strings.TrimSpace(providerProfileID),
 		TotalWorkspaces:   len(results),
-		Workspaces:        make([]workspace.MultiWorkspaceStatus, 0, len(results)),
+		Workspaces:        make([]engine.MultiWorkspaceStatus, 0, len(results)),
 	}
-	aggregate := workspace.Result{Text: "", ProviderProfileID: status.ProviderProfileID, MultiStatus: &status}
+	aggregate := engine.Result{Text: "", ProviderProfileID: status.ProviderProfileID, MultiStatus: &status}
 	for _, item := range results {
 		out.WriteString("\n\n## ")
 		out.WriteString(item.directoryPath)
 		out.WriteString("\n")
-		workspaceStatus := workspace.MultiWorkspaceStatus{
+		workspaceStatus := engine.MultiWorkspaceStatus{
 			DirectoryPath: item.directoryPath,
 			Status:        "success",
 		}

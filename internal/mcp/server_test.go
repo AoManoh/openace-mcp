@@ -9,18 +9,24 @@ import (
 	"testing"
 
 	"github.com/AoManoh/openace-mcp/internal/daemon"
+	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/runtimeinfo"
-	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
 type fakeSyncer struct{}
 
-func (fakeSyncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
-	return workspace.Result{Text: "retrieved"}, nil
+func (fakeSyncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	if profile := strings.TrimSpace(req.Workspace.ProviderProfileID); profile != "" {
+		return engine.Result{Text: "retrieved with " + profile, ProviderProfileID: profile}, nil
+	}
+	return engine.Result{Text: "retrieved"}, nil
 }
 
-func (fakeSyncer) Sync(ctx context.Context, dir string) (workspace.Result, error) {
-	return workspace.Result{FileCount: 1}, nil
+func (fakeSyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
+	if profile := strings.TrimSpace(req.Workspace.ProviderProfileID); profile != "" {
+		return engine.Result{CheckpointID: "checkpoint-" + profile, ProviderProfileID: profile, FileCount: 1}, nil
+	}
+	return engine.Result{FileCount: 1}, nil
 }
 
 type fakeTasker struct {
@@ -33,41 +39,43 @@ type blockingDiagnosticTasker struct {
 
 type fakeMultiSyncer struct{}
 
-func (fakeMultiSyncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
+func (fakeMultiSyncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	dir := req.Workspace.DirectoryPath
 	if strings.Contains(dir, "bad") {
-		return workspace.Result{}, errors.New("workspace failed")
+		return engine.Result{}, errors.New("workspace failed")
 	}
-	return workspace.Result{Text: "retrieved from " + dir, CheckpointID: "checkpoint-" + dir, FileCount: 2}, nil
+	return engine.Result{Text: "retrieved from " + dir, CheckpointID: "checkpoint-" + dir, FileCount: 2}, nil
 }
 
-func (fakeMultiSyncer) Sync(ctx context.Context, dir string) (workspace.Result, error) {
-	return workspace.Result{CheckpointID: "checkpoint-" + dir, FileCount: 2}, nil
+func (fakeMultiSyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
+	return engine.Result{CheckpointID: "checkpoint-" + req.Workspace.DirectoryPath, FileCount: 2}, nil
 }
 
 type blockingToolSyncer struct{}
 
-func (blockingToolSyncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
+func (blockingToolSyncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
 	<-ctx.Done()
-	return workspace.Result{}, ctx.Err()
+	return engine.Result{}, ctx.Err()
 }
 
-func (blockingToolSyncer) Sync(ctx context.Context, dir string) (workspace.Result, error) {
+func (blockingToolSyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
 	<-ctx.Done()
-	return workspace.Result{}, ctx.Err()
+	return engine.Result{}, ctx.Err()
 }
 
 type timeoutMultiSyncer struct{}
 
-func (timeoutMultiSyncer) Retrieve(ctx context.Context, dir string, query string, maxOutputLen int) (workspace.Result, error) {
+func (timeoutMultiSyncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	dir := req.Workspace.DirectoryPath
 	if strings.Contains(dir, "slow") {
 		<-ctx.Done()
-		return workspace.Result{}, ctx.Err()
+		return engine.Result{}, ctx.Err()
 	}
-	return workspace.Result{Text: "retrieved from " + dir, CheckpointID: "checkpoint-" + dir, FileCount: 2}, nil
+	return engine.Result{Text: "retrieved from " + dir, CheckpointID: "checkpoint-" + dir, FileCount: 2}, nil
 }
 
-func (timeoutMultiSyncer) Sync(ctx context.Context, dir string) (workspace.Result, error) {
-	return workspace.Result{CheckpointID: "checkpoint-" + dir, FileCount: 2}, nil
+func (timeoutMultiSyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
+	return engine.Result{CheckpointID: "checkpoint-" + req.Workspace.DirectoryPath, FileCount: 2}, nil
 }
 
 func (fakeTasker) StartTask(ctx context.Context, req daemon.TaskRequest) (daemon.TaskSnapshot, error) {
@@ -118,8 +126,8 @@ func (blockingDiagnosticTasker) CancelTask(ctx context.Context, id string) (daem
 	return daemon.TaskSnapshot{}, ctx.Err()
 }
 
-func (fakeTasker) ListWorkspaceStatuses(ctx context.Context) ([]workspace.WorkspaceStatus, error) {
-	return []workspace.WorkspaceStatus{{
+func (fakeTasker) ListWorkspaceStatuses(ctx context.Context) ([]engine.WorkspaceStatus, error) {
+	return []engine.WorkspaceStatus{{
 		DirectoryPath:          "/tmp/workspace",
 		CheckpointID:           "checkpoint",
 		FileCount:              3,
@@ -129,9 +137,18 @@ func (fakeTasker) ListWorkspaceStatuses(ctx context.Context) ([]workspace.Worksp
 	}}, nil
 }
 
-func (fakeTasker) WorkspaceStatus(ctx context.Context, dir string) (workspace.WorkspaceStatus, error) {
-	return workspace.WorkspaceStatus{
-		DirectoryPath:          dir,
+func (fakeTasker) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (engine.WorkspaceStatus, error) {
+	if profile := strings.TrimSpace(ref.ProviderProfileID); profile != "" {
+		return engine.WorkspaceStatus{
+			DirectoryPath:     ref.DirectoryPath,
+			ProviderProfileID: profile,
+			ProviderState:     "ready",
+			CheckpointID:      "checkpoint-" + profile,
+			FileCount:         1,
+		}, nil
+	}
+	return engine.WorkspaceStatus{
+		DirectoryPath:          ref.DirectoryPath,
 		CheckpointID:           "checkpoint",
 		FileCount:              3,
 		UpstreamStatus:         "backoff",
@@ -142,25 +159,6 @@ func (fakeTasker) WorkspaceStatus(ctx context.Context, dir string) (workspace.Wo
 
 type fakeProviderSyncer struct {
 	fakeTasker
-}
-
-func (fakeProviderSyncer) RetrieveWithProvider(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (workspace.Result, error) {
-	return workspace.Result{Text: "retrieved with " + providerProfileID, ProviderProfileID: providerProfileID}, nil
-}
-
-func (fakeProviderSyncer) SyncWithProvider(ctx context.Context, dir string, providerProfileID string) (workspace.Result, error) {
-	return workspace.Result{CheckpointID: "checkpoint-" + providerProfileID, ProviderProfileID: providerProfileID, FileCount: 1}, nil
-}
-
-func (fakeProviderSyncer) WorkspaceStatusWithProvider(ctx context.Context, dir string, providerProfileID string) (workspace.WorkspaceStatus, error) {
-	return workspace.WorkspaceStatus{
-		DirectoryPath:          dir,
-		ProviderProfileID:      providerProfileID,
-		ProviderState:          "ready",
-		CheckpointID:           "checkpoint-" + providerProfileID,
-		FileCount:              1,
-		UpstreamLastStatusCode: 0,
-	}, nil
 }
 
 func TestToolsListOnlyIncludesTaskToolsForTasker(t *testing.T) {

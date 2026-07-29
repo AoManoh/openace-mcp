@@ -17,9 +17,9 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
 	"github.com/AoManoh/openace-mcp/internal/runtimeinfo"
-	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
 const defaultTaskQueueSize = 256
@@ -73,10 +73,10 @@ type TaskSnapshot struct {
 	StartedAt          *time.Time            `json:"started_at,omitempty"`
 	CompletedAt        *time.Time            `json:"completed_at,omitempty"`
 	Error              string                `json:"error,omitempty"`
-	Result             *workspace.Result     `json:"result,omitempty"`
+	Result             *engine.Result        `json:"result,omitempty"`
 }
 
-type TaskRunner func(context.Context, TaskRequest) (workspace.Result, error)
+type TaskRunner func(context.Context, TaskRequest) (engine.Result, error)
 
 type TaskStore struct {
 	mu              sync.Mutex
@@ -381,7 +381,7 @@ func (s *TaskStore) start(id string) (*taskRecord, context.Context, bool) {
 	return record, ctx, true
 }
 
-func (s *TaskStore) finish(id string, result workspace.Result, err error) {
+func (s *TaskStore) finish(id string, result engine.Result, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	record, ok := s.tasks[id]
@@ -412,7 +412,7 @@ func (s *TaskStore) finish(id string, result workspace.Result, err error) {
 	s.persistLocked()
 }
 
-func limitTaskResult(result workspace.Result) workspace.Result {
+func limitTaskResult(result engine.Result) engine.Result {
 	if len(result.Text) <= maxTaskResultTextBytes {
 		return result
 	}

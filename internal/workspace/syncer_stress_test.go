@@ -71,7 +71,7 @@ func TestStressLargeWorkspaceScanAndSync(t *testing.T) {
 	}
 
 	client := &stressACEClient{}
-	result, err := NewSyncer(client).Sync(context.Background(), root)
+	result, err := NewSyncer(client).Sync(context.Background(), syncReq(root))
 	if err != nil {
 		t.Fatal(err)
 	}

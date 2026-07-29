@@ -16,6 +16,7 @@ import (
 
 	"github.com/AoManoh/openace-mcp/internal/ace"
 	"github.com/AoManoh/openace-mcp/internal/auth"
+	"github.com/AoManoh/openace-mcp/internal/engine"
 )
 
 func TestStateFileUsesOpenACECacheDir(t *testing.T) {
@@ -473,13 +474,13 @@ func TestSyncerSingleflightSharesConcurrentWorkspaceSync(t *testing.T) {
 
 	const workers = 5
 	var wg sync.WaitGroup
-	results := make([]Result, workers)
+	results := make([]engine.Result, workers)
 	errs := make([]error, workers)
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results[i], errs[i] = syncer.Sync(context.Background(), root)
+			results[i], errs[i] = syncer.Sync(context.Background(), syncReq(root))
 		}(i)
 	}
 
@@ -520,7 +521,7 @@ func TestSyncerSingleflightCallerCancelDoesNotCancelOtherWaiters(t *testing.T) {
 
 	firstErr := make(chan error, 1)
 	go func() {
-		_, err := syncer.Sync(ctx, root)
+		_, err := syncer.Sync(ctx, syncReq(root))
 		firstErr <- err
 	}()
 	client.waitForFindMissing(t)
@@ -529,10 +530,10 @@ func TestSyncerSingleflightCallerCancelDoesNotCancelOtherWaiters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondResult := make(chan Result, 1)
+	secondResult := make(chan engine.Result, 1)
 	secondErr := make(chan error, 1)
 	go func() {
-		result, err := syncer.Sync(context.Background(), root)
+		result, err := syncer.Sync(context.Background(), syncReq(root))
 		secondResult <- result
 		secondErr <- err
 	}()
@@ -568,7 +569,7 @@ func TestSyncerSingleflightCancelsSharedSyncWhenAllWaitersCancel(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := syncer.Sync(ctx, root)
+		_, err := syncer.Sync(ctx, syncReq(root))
 		errCh <- err
 	}()
 	client.waitForFindMissing(t)
@@ -592,22 +593,22 @@ func TestSyncerWorkspaceStatusTracksInflightAndCompletion(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := syncer.Sync(context.Background(), root)
+		_, err := syncer.Sync(context.Background(), syncReq(root))
 		errCh <- err
 	}()
 	client.waitForFindMissing(t)
 
-	status, err := syncer.WorkspaceStatus(context.Background(), root)
+	status, err := syncer.WorkspaceStatus(context.Background(), wsRef(root))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !status.InFlight {
 		t.Fatalf("workspace should be in flight: %+v", status)
 	}
-	if status.Stage != IndexStageReconciling {
+	if status.Stage != engine.IndexStageReconciling {
 		t.Fatalf("workspace should expose reconciling stage while find-missing is blocked: %+v", status)
 	}
-	if status.LastSyncReason != SyncReasonManual {
+	if status.LastSyncReason != engine.SyncReasonManual {
 		t.Fatalf("workspace should record manual sync reason: %+v", status)
 	}
 	if status.LastStartedAt == nil {
@@ -622,7 +623,7 @@ func TestSyncerWorkspaceStatusTracksInflightAndCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	status, err = syncer.WorkspaceStatus(context.Background(), root)
+	status, err = syncer.WorkspaceStatus(context.Background(), wsRef(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,7 +633,7 @@ func TestSyncerWorkspaceStatusTracksInflightAndCompletion(t *testing.T) {
 	if status.CheckpointID != "checkpoint-1" || status.FileCount != 1 {
 		t.Fatalf("unexpected completed status: %+v", status)
 	}
-	if status.Stage != IndexStageReady {
+	if status.Stage != engine.IndexStageReady {
 		t.Fatalf("successful sync should end in ready stage: %+v", status)
 	}
 	if status.LastUploaded != 1 || status.LastAdded != 1 || status.LastDeleted != 0 {
@@ -668,7 +669,7 @@ func TestSyncerWorkspaceStatusLoadsDiskState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	status, err := NewSyncer(nil).WorkspaceStatus(context.Background(), root)
+	status, err := NewSyncer(nil).WorkspaceStatus(context.Background(), wsRef(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -678,7 +679,7 @@ func TestSyncerWorkspaceStatusLoadsDiskState(t *testing.T) {
 	if status.CheckpointID != "checkpoint-disk" || status.FileCount != 1 {
 		t.Fatalf("unexpected disk status: %+v", status)
 	}
-	if status.Stage != IndexStageReady {
+	if status.Stage != engine.IndexStageReady {
 		t.Fatalf("disk status with checkpoint should be ready: %+v", status)
 	}
 	if status.UpdatedAt == nil || !status.UpdatedAt.Equal(updated) {
@@ -703,11 +704,11 @@ func TestSyncerProviderProfilesUseIndependentCheckpointState(t *testing.T) {
 		},
 	})
 
-	defaultResult, err := syncer.Sync(context.Background(), root)
+	defaultResult, err := syncer.Sync(context.Background(), syncReq(root))
 	if err != nil {
 		t.Fatal(err)
 	}
-	standbyResult, err := syncer.SyncWithProvider(context.Background(), root, "standby")
+	standbyResult, err := syncer.Sync(context.Background(), syncReqP(root, "standby"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -721,11 +722,11 @@ func TestSyncerProviderProfilesUseIndependentCheckpointState(t *testing.T) {
 		t.Fatalf("standby provider should not inherit default checkpoint: %+v", standbyClient.previousCheckpoints)
 	}
 
-	defaultStatus, err := syncer.WorkspaceStatus(context.Background(), root)
+	defaultStatus, err := syncer.WorkspaceStatus(context.Background(), wsRef(root))
 	if err != nil {
 		t.Fatal(err)
 	}
-	standbyStatus, err := syncer.WorkspaceStatusWithProvider(context.Background(), root, "standby")
+	standbyStatus, err := syncer.WorkspaceStatus(context.Background(), wsRefP(root, "standby"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -750,13 +751,13 @@ func TestSyncerRejectsUnknownProviderForStatusAndChanged(t *testing.T) {
 			"standby-B": {checkpoint: "checkpoint-standby"},
 		},
 	})
-	if _, err := syncer.SyncWithProvider(context.Background(), root, "standby-B"); err != nil {
+	if _, err := syncer.Sync(context.Background(), syncReqP(root, "standby-B")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := syncer.WorkspaceStatusWithProvider(context.Background(), root, "standby/B"); err == nil {
+	if _, err := syncer.WorkspaceStatus(context.Background(), wsRefP(root, "standby/B")); err == nil {
 		t.Fatal("workspace status should reject unknown provider instead of reading an aliased state path")
 	}
-	if _, err := syncer.WorkspaceChangedWithProvider(context.Background(), root, "standby/B"); err == nil {
+	if _, err := syncer.WorkspaceChanged(context.Background(), wsRefP(root, "standby/B")); err == nil {
 		t.Fatal("workspace changed should reject unknown provider instead of reading an aliased state path")
 	}
 }
@@ -769,15 +770,15 @@ func TestSyncerWorkspaceStatusRecordsFailureStage(t *testing.T) {
 	}
 
 	syncer := NewSyncer(errorFindMissingClient{})
-	_, err := syncer.Sync(context.Background(), root)
+	_, err := syncer.Sync(context.Background(), syncReq(root))
 	if err == nil {
 		t.Fatal("sync should fail")
 	}
-	status, err := syncer.WorkspaceStatus(context.Background(), root)
+	status, err := syncer.WorkspaceStatus(context.Background(), wsRef(root))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.Stage != IndexStageFailed || status.LastErrorStage != IndexStageReconciling {
+	if status.Stage != engine.IndexStageFailed || status.LastErrorStage != engine.IndexStageReconciling {
 		t.Fatalf("failure status should retain failing stage: %+v", status)
 	}
 	if !strings.Contains(status.LastError, "find-missing failed") {
@@ -801,7 +802,7 @@ func TestSyncerWorkspaceStatusIncludesUpstreamHealth(t *testing.T) {
 		},
 	}
 
-	status, err := NewSyncer(client).WorkspaceStatus(context.Background(), root)
+	status, err := NewSyncer(client).WorkspaceStatus(context.Background(), wsRef(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -825,7 +826,7 @@ func TestSyncerWorkspaceChangedComparesCurrentScanToState(t *testing.T) {
 	}
 
 	syncer := NewSyncer(&recordingClient{})
-	changed, err := syncer.WorkspaceChanged(context.Background(), root)
+	changed, err := syncer.WorkspaceChanged(context.Background(), wsRef(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -833,10 +834,10 @@ func TestSyncerWorkspaceChangedComparesCurrentScanToState(t *testing.T) {
 		t.Fatal("workspace without state should require sync")
 	}
 
-	if _, err := syncer.Sync(context.Background(), root); err != nil {
+	if _, err := syncer.Sync(context.Background(), syncReq(root)); err != nil {
 		t.Fatal(err)
 	}
-	changed, err = syncer.WorkspaceChanged(context.Background(), root)
+	changed, err = syncer.WorkspaceChanged(context.Background(), wsRef(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -847,7 +848,7 @@ func TestSyncerWorkspaceChangedComparesCurrentScanToState(t *testing.T) {
 	if err := os.WriteFile(path, []byte("package main\nconst Version = 2\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	changed, err = syncer.WorkspaceChanged(context.Background(), root)
+	changed, err = syncer.WorkspaceChanged(context.Background(), wsRef(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -963,12 +964,12 @@ func TestSyncerWorkspaceChangedAssetTransitions(t *testing.T) {
 				writeWorkspaceTestFile(t, root, rel, content)
 			}
 			syncer := NewSyncer(&recordingClient{})
-			if _, err := syncer.Sync(context.Background(), root); err != nil {
+			if _, err := syncer.Sync(context.Background(), syncReq(root)); err != nil {
 				t.Fatal(err)
 			}
 
 			tt.mutate(t, root)
-			changed, err := syncer.WorkspaceChanged(context.Background(), root)
+			changed, err := syncer.WorkspaceChanged(context.Background(), wsRef(root))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1010,7 +1011,7 @@ func TestSyncerSendsIncrementalCheckpointDelta(t *testing.T) {
 	}
 
 	client := &deltaRecordingClient{checkpoint: "checkpoint-new"}
-	result, err := NewSyncer(client).Sync(context.Background(), root)
+	result, err := NewSyncer(client).Sync(context.Background(), syncReq(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1104,7 +1105,7 @@ func TestSyncFallsBackToFreshCheckpointOnCheckpointBlobsHTTP400(t *testing.T) {
 		AccessToken: "token",
 		TenantURL:   server.URL,
 	}})
-	result, err := NewSyncer(client).Sync(context.Background(), root)
+	result, err := NewSyncer(client).Sync(context.Background(), syncReq(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1150,7 +1151,7 @@ func TestSyncRejectsMidSyncMutation(t *testing.T) {
 		path:    path,
 		content: []byte("package main\nconst Version = 2\n"),
 	}
-	_, err := NewSyncer(client).Sync(context.Background(), root)
+	_, err := NewSyncer(client).Sync(context.Background(), syncReq(root))
 	if err == nil {
 		t.Fatal("sync should fail when a file changes after asset discovery")
 	}
@@ -1183,10 +1184,10 @@ func TestSyncerListsWorkspaceStatuses(t *testing.T) {
 	}
 
 	syncer := NewSyncer(&recordingClient{})
-	if _, err := syncer.Sync(context.Background(), rootB); err != nil {
+	if _, err := syncer.Sync(context.Background(), syncReq(rootB)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := syncer.Sync(context.Background(), rootA); err != nil {
+	if _, err := syncer.Sync(context.Background(), syncReq(rootA)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1211,7 +1212,7 @@ func TestRetrieveAppliesRetrievalTimeout(t *testing.T) {
 	}
 
 	client := &blockingRetrievalClient{started: make(chan struct{})}
-	_, err := NewSyncer(client).Retrieve(context.Background(), root, "find code", 0)
+	_, err := NewSyncer(client).Search(context.Background(), searchReq(root, "find code", 0))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("retrieve error = %v, want deadline exceeded", err)
 	}
@@ -1242,7 +1243,7 @@ func TestRetrieveLimitsConcurrentCallsPerProvider(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := syncer.Retrieve(ctx, root, "find code", 0)
+			_, err := syncer.Search(ctx, searchReq(root, "find code", 0))
 			errs <- err
 		}()
 	}
@@ -1716,13 +1717,13 @@ func waitForError(t *testing.T, ch <-chan error) error {
 	}
 }
 
-func waitForResult(t *testing.T, ch <-chan Result) Result {
+func waitForResult(t *testing.T, ch <-chan engine.Result) engine.Result {
 	t.Helper()
 	select {
 	case result := <-ch:
 		return result
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for result")
-		return Result{}
+		return engine.Result{}
 	}
 }

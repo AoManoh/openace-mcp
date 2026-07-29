@@ -14,22 +14,13 @@ import (
 
 	"github.com/AoManoh/openace-mcp/internal/buildinfo"
 	"github.com/AoManoh/openace-mcp/internal/daemon"
-	"github.com/AoManoh/openace-mcp/internal/workspace"
+	"github.com/AoManoh/openace-mcp/internal/engine"
 )
 
 const maxMultiWorkspacePaths = daemon.MaxMultiWorkspacePaths
 const defaultToolTimeout = 110 * time.Second
 
-type Syncer interface {
-	Retrieve(context.Context, string, string, int) (workspace.Result, error)
-	Sync(context.Context, string) (workspace.Result, error)
-}
-
-type ProviderSyncer interface {
-	RetrieveWithProvider(context.Context, string, string, string, int) (workspace.Result, error)
-	SyncWithProvider(context.Context, string, string) (workspace.Result, error)
-}
-
+// Tasker 描述 daemon 任务面能力；只有 daemon client 实现。
 type Tasker interface {
 	CancelTask(context.Context, string) (daemon.TaskSnapshot, error)
 	ListTasks(context.Context, int) ([]daemon.TaskSnapshot, error)
@@ -37,23 +28,15 @@ type Tasker interface {
 	TaskStatus(context.Context, string) (daemon.TaskSnapshot, error)
 }
 
-type WorkspaceInspector interface {
-	ListWorkspaceStatuses(context.Context) ([]workspace.WorkspaceStatus, error)
-	WorkspaceStatus(context.Context, string) (workspace.WorkspaceStatus, error)
-}
-
+// DaemonStatuser 描述 daemon 状态查询能力；只有 daemon client 实现。
 type DaemonStatuser interface {
 	DaemonStatus(context.Context) (daemon.Status, error)
 }
 
-type ProviderWorkspaceInspector interface {
-	WorkspaceStatusWithProvider(context.Context, string, string) (workspace.WorkspaceStatus, error)
-}
-
 type Server struct {
-	syncer    Syncer
+	service   engine.Service
 	tasker    Tasker
-	inspector WorkspaceInspector
+	inspector engine.WorkspaceInspector
 	statuser  DaemonStatuser
 }
 
@@ -108,15 +91,15 @@ type listTasksArgs struct {
 	Limit int `json:"limit,omitempty"`
 }
 
-func NewServer(syncer Syncer) *Server {
-	server := &Server{syncer: syncer}
-	if tasker, ok := syncer.(Tasker); ok {
+func NewServer(service engine.Service) *Server {
+	server := &Server{service: service}
+	if tasker, ok := service.(Tasker); ok {
 		server.tasker = tasker
 	}
-	if inspector, ok := syncer.(WorkspaceInspector); ok && server.tasker != nil {
+	if inspector, ok := service.(engine.WorkspaceInspector); ok && server.tasker != nil {
 		server.inspector = inspector
 	}
-	if statuser, ok := syncer.(DaemonStatuser); ok {
+	if statuser, ok := service.(DaemonStatuser); ok {
 		server.statuser = statuser
 	}
 	return server
@@ -473,40 +456,29 @@ type multiRetrievalResult struct {
 	Error         string
 }
 
-func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (workspace.Result, error) {
-	providerProfileID = strings.TrimSpace(providerProfileID)
-	if providerProfileID == "" {
-		return s.syncer.Retrieve(ctx, dir, query, maxOutputLen)
-	}
-	providerSyncer, ok := s.syncer.(ProviderSyncer)
-	if !ok {
-		return workspace.Result{}, fmt.Errorf("provider_profile_id is not supported by this openACE mode")
-	}
-	return providerSyncer.RetrieveWithProvider(ctx, dir, providerProfileID, query, maxOutputLen)
+func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (engine.Result, error) {
+	return s.service.Search(ctx, engine.SearchRequest{
+		Workspace: engine.WorkspaceRef{
+			DirectoryPath:     dir,
+			ProviderProfileID: strings.TrimSpace(providerProfileID),
+		},
+		Query:        query,
+		MaxOutputLen: maxOutputLen,
+	})
 }
 
-func (s *Server) syncWorkspace(ctx context.Context, dir string, providerProfileID string) (workspace.Result, error) {
-	providerProfileID = strings.TrimSpace(providerProfileID)
-	if providerProfileID == "" {
-		return s.syncer.Sync(ctx, dir)
-	}
-	providerSyncer, ok := s.syncer.(ProviderSyncer)
-	if !ok {
-		return workspace.Result{}, fmt.Errorf("provider_profile_id is not supported by this openACE mode")
-	}
-	return providerSyncer.SyncWithProvider(ctx, dir, providerProfileID)
+func (s *Server) syncWorkspace(ctx context.Context, dir string, providerProfileID string) (engine.Result, error) {
+	return s.service.Sync(ctx, engine.SyncRequest{Workspace: engine.WorkspaceRef{
+		DirectoryPath:     dir,
+		ProviderProfileID: strings.TrimSpace(providerProfileID),
+	}})
 }
 
-func (s *Server) workspaceStatus(ctx context.Context, dir string, providerProfileID string) (workspace.WorkspaceStatus, error) {
-	providerProfileID = strings.TrimSpace(providerProfileID)
-	if providerProfileID == "" {
-		return s.inspector.WorkspaceStatus(ctx, dir)
-	}
-	providerInspector, ok := s.inspector.(ProviderWorkspaceInspector)
-	if !ok {
-		return workspace.WorkspaceStatus{}, fmt.Errorf("provider_profile_id is not supported by this openACE mode")
-	}
-	return providerInspector.WorkspaceStatusWithProvider(ctx, dir, providerProfileID)
+func (s *Server) workspaceStatus(ctx context.Context, dir string, providerProfileID string) (engine.WorkspaceStatus, error) {
+	return s.inspector.WorkspaceStatus(ctx, engine.WorkspaceRef{
+		DirectoryPath:     dir,
+		ProviderProfileID: strings.TrimSpace(providerProfileID),
+	})
 }
 
 func normalizeRetrievalArgs(args *retrievalArgs) error {
@@ -576,14 +548,14 @@ func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerP
 	return results
 }
 
-func summarizeMultiRetrievalResults(providerProfileID string, results []multiRetrievalResult) workspace.MultiRetrievalStatus {
-	status := workspace.MultiRetrievalStatus{
+func summarizeMultiRetrievalResults(providerProfileID string, results []multiRetrievalResult) engine.MultiRetrievalStatus {
+	status := engine.MultiRetrievalStatus{
 		ProviderProfileID: strings.TrimSpace(providerProfileID),
 		TotalWorkspaces:   len(results),
-		Workspaces:        make([]workspace.MultiWorkspaceStatus, 0, len(results)),
+		Workspaces:        make([]engine.MultiWorkspaceStatus, 0, len(results)),
 	}
 	for _, result := range results {
-		item := workspace.MultiWorkspaceStatus{
+		item := engine.MultiWorkspaceStatus{
 			DirectoryPath: result.DirectoryPath,
 			Status:        "success",
 		}
@@ -600,7 +572,7 @@ func summarizeMultiRetrievalResults(providerProfileID string, results []multiRet
 	return status
 }
 
-func formatMultiRetrievalResults(results []multiRetrievalResult, status workspace.MultiRetrievalStatus) string {
+func formatMultiRetrievalResults(results []multiRetrievalResult, status engine.MultiRetrievalStatus) string {
 	var out strings.Builder
 	out.WriteString("Cross-workspace retrieval results")
 	if status.FailureCount > 0 {

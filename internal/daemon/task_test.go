@@ -10,19 +10,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AoManoh/openace-mcp/internal/workspace"
+	"github.com/AoManoh/openace-mcp/internal/engine"
 )
 
 func TestTaskStoreCompletesRetrieveTask(t *testing.T) {
 	useTempTaskStore(t)
-	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
 		if req.Kind != TaskKindRetrieve {
 			t.Fatalf("unexpected task kind: %s", req.Kind)
 		}
 		if req.InformationRequest != "find daemon task code" {
 			t.Fatalf("unexpected query: %s", req.InformationRequest)
 		}
-		return workspace.Result{Text: "result", FileCount: 3}, nil
+		return engine.Result{Text: "result", FileCount: 3}, nil
 	}, 2)
 	cleanupTaskStore(t, store)
 
@@ -46,14 +46,14 @@ func TestTaskStoreCompletesRetrieveTask(t *testing.T) {
 
 func TestTaskStoreCompletesMultiRetrieveTask(t *testing.T) {
 	useTempTaskStore(t)
-	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
 		if req.Kind != TaskKindMultiRetrieve {
 			t.Fatalf("unexpected task kind: %s", req.Kind)
 		}
 		if len(req.DirectoryPaths) != 2 || req.DirectoryPaths[0] != "/tmp/one" || req.DirectoryPaths[1] != "/tmp/two" {
 			t.Fatalf("unexpected directory paths: %#v", req.DirectoryPaths)
 		}
-		return workspace.Result{Text: "multi result", FileCount: 5}, nil
+		return engine.Result{Text: "multi result", FileCount: 5}, nil
 	}, 2)
 	cleanupTaskStore(t, store)
 
@@ -80,11 +80,11 @@ func TestTaskStoreCompletesMultiRetrieveTask(t *testing.T) {
 
 func TestTaskStorePersistsProviderProfileID(t *testing.T) {
 	useTempTaskStore(t)
-	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
 		if req.ProviderProfileID != "standby" {
 			t.Fatalf("runner provider_profile_id = %q, want standby", req.ProviderProfileID)
 		}
-		return workspace.Result{ProviderProfileID: req.ProviderProfileID, FileCount: 1}, nil
+		return engine.Result{ProviderProfileID: req.ProviderProfileID, FileCount: 1}, nil
 	}, 2)
 	cleanupTaskStore(t, store)
 
@@ -103,8 +103,8 @@ func TestTaskStorePersistsProviderProfileID(t *testing.T) {
 
 func TestTaskStoreRejectsTooManyMultiRetrievePaths(t *testing.T) {
 	useTempTaskStore(t)
-	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
-		return workspace.Result{}, nil
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
+		return engine.Result{}, nil
 	}, 2)
 	cleanupTaskStore(t, store)
 	paths := make([]string, MaxMultiWorkspacePaths+1)
@@ -123,10 +123,10 @@ func TestTaskStoreRejectsTooManyMultiRetrievePaths(t *testing.T) {
 func TestTaskStoreCancelsRunningTask(t *testing.T) {
 	useTempTaskStore(t)
 	started := make(chan struct{})
-	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
 		close(started)
 		<-ctx.Done()
-		return workspace.Result{}, ctx.Err()
+		return engine.Result{}, ctx.Err()
 	}, 1)
 	cleanupTaskStore(t, store)
 
@@ -151,8 +151,8 @@ func TestTaskStoreCancelsRunningTask(t *testing.T) {
 
 func TestTaskStoreListsNewestTasksFirst(t *testing.T) {
 	useTempTaskStore(t)
-	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
-		return workspace.Result{}, nil
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
+		return engine.Result{}, nil
 	}, 4)
 	cleanupTaskStore(t, store)
 
@@ -180,8 +180,8 @@ func TestTaskStoreListsNewestTasksFirst(t *testing.T) {
 
 func TestTaskStoreListOmitsResultText(t *testing.T) {
 	useTempTaskStore(t)
-	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
-		return workspace.Result{Text: "large retrieval text", FileCount: 1}, nil
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
+		return engine.Result{Text: "large retrieval text", FileCount: 1}, nil
 	}, 2)
 	cleanupTaskStore(t, store)
 
@@ -213,8 +213,8 @@ func TestTaskStoreListOmitsResultText(t *testing.T) {
 func TestTaskStoreLimitsLargeResultText(t *testing.T) {
 	useTempTaskStore(t)
 	largeText := strings.Repeat("x", maxTaskResultTextBytes+1024)
-	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
-		return workspace.Result{Text: largeText, FileCount: 1}, nil
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
+		return engine.Result{Text: largeText, FileCount: 1}, nil
 	}, 2)
 	cleanupTaskStore(t, store)
 
@@ -244,7 +244,7 @@ func TestTaskStoreRunsTasksConcurrently(t *testing.T) {
 	active := 0
 	maxActive := 0
 
-	store := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	store := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
 		mu.Lock()
 		active++
 		if active > maxActive {
@@ -258,13 +258,13 @@ func TestTaskStoreRunsTasksConcurrently(t *testing.T) {
 		select {
 		case <-release:
 		case <-ctx.Done():
-			return workspace.Result{}, ctx.Err()
+			return engine.Result{}, ctx.Err()
 		}
 
 		mu.Lock()
 		active--
 		mu.Unlock()
-		return workspace.Result{FileCount: 1}, nil
+		return engine.Result{FileCount: 1}, nil
 	}, 4, 2)
 	cleanupTaskStore(t, store)
 
@@ -300,10 +300,10 @@ func TestTaskStoreRunsTasksConcurrently(t *testing.T) {
 func TestTaskStoreShutdownCancelsRunningTasksAndRejectsSubmit(t *testing.T) {
 	useTempTaskStore(t)
 	started := make(chan struct{})
-	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
 		close(started)
 		<-ctx.Done()
-		return workspace.Result{}, ctx.Err()
+		return engine.Result{}, ctx.Err()
 	}, 1)
 
 	task, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/workspace"})
@@ -337,10 +337,10 @@ func TestTaskStorePersistsShutdownCancelledTasksBeyondHistoryLimit(t *testing.T)
 	useTempTaskStore(t)
 	t.Setenv("OPENACE_TASK_HISTORY_LIMIT", "1")
 	started := make(chan struct{}, 2)
-	store := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	store := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
 		started <- struct{}{}
 		<-ctx.Done()
-		return workspace.Result{}, ctx.Err()
+		return engine.Result{}, ctx.Err()
 	}, 2, 2)
 
 	first, err := store.Submit(TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/one"})
@@ -360,9 +360,9 @@ func TestTaskStorePersistsShutdownCancelledTasksBeyondHistoryLimit(t *testing.T)
 	}
 
 	shutdownTaskStore(t, store)
-	recovered := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	recovered := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
 		t.Fatal("shutdown-cancelled task should not run")
-		return workspace.Result{}, nil
+		return engine.Result{}, nil
 	}, 2, 1)
 	cleanupTaskStore(t, recovered)
 	for _, id := range []string{first.ID, second.ID} {
@@ -446,8 +446,8 @@ func TestTaskHistoryLimitEnvironment(t *testing.T) {
 
 func TestTaskStorePersistsCompletedTasks(t *testing.T) {
 	dir := useTempTaskStore(t)
-	store := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
-		return workspace.Result{Text: "persisted result", FileCount: 9}, nil
+	store := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
+		return engine.Result{Text: "persisted result", FileCount: 9}, nil
 	}, 2, 1)
 	cleanupTaskStore(t, store)
 
@@ -465,9 +465,9 @@ func TestTaskStorePersistsCompletedTasks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	recovered := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
 		t.Fatal("recovered terminal task should not run")
-		return workspace.Result{}, nil
+		return engine.Result{}, nil
 	}, 2, 1)
 	cleanupTaskStore(t, recovered)
 	got, ok := recovered.Get(task.ID)
@@ -497,9 +497,9 @@ func TestTaskStoreRecoversAcceptedSidecarAsAbandoned(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	recovered := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
 		t.Fatal("sidecar-only accepted task should not run after restart")
-		return workspace.Result{}, nil
+		return engine.Result{}, nil
 	}, 2, 1)
 	cleanupTaskStore(t, recovered)
 	got, ok := recovered.Get(task.ID)
@@ -524,7 +524,7 @@ func TestTaskStoreManifestWinsOverAcceptedSidecar(t *testing.T) {
 	completed := queued
 	completed.State = TaskStateCompleted
 	completed.CompletedAt = &now
-	completed.Result = &workspace.Result{Text: "persisted", FileCount: 1}
+	completed.Result = &engine.Result{Text: "persisted", FileCount: 1}
 	if err := saveTaskManifest(dir, taskManifest{Tasks: []TaskSnapshot{completed}}); err != nil {
 		t.Fatal(err)
 	}
@@ -532,9 +532,9 @@ func TestTaskStoreManifestWinsOverAcceptedSidecar(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	recovered := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
 		t.Fatal("manifest task should not run after restart")
-		return workspace.Result{}, nil
+		return engine.Result{}, nil
 	}, 2, 1)
 	cleanupTaskStore(t, recovered)
 	got, ok := recovered.Get(queued.ID)
@@ -549,7 +549,7 @@ func TestTaskStoreManifestWinsOverAcceptedSidecar(t *testing.T) {
 func TestTaskStoreQueueFullDoesNotLeaveAcceptedSidecar(t *testing.T) {
 	dir := useTempTaskStore(t)
 	store := &TaskStore{
-		runner:      func(ctx context.Context, req TaskRequest) (workspace.Result, error) { return workspace.Result{}, nil },
+		runner:      func(ctx context.Context, req TaskRequest) (engine.Result, error) { return engine.Result{}, nil },
 		queue:       make(chan string, 1),
 		tasks:       make(map[string]*taskRecord),
 		workerCount: 0,
@@ -587,9 +587,9 @@ func TestTaskStoreMarksRunningTaskAbandonedOnRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (workspace.Result, error) {
+	recovered := NewTaskStoreWithWorkers(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
 		t.Fatal("abandoned task should not run")
-		return workspace.Result{}, nil
+		return engine.Result{}, nil
 	}, 2, 1)
 	cleanupTaskStore(t, recovered)
 	got, ok := recovered.Get(task.ID)

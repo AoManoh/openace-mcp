@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
-	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
 const (
@@ -21,27 +21,11 @@ const (
 	defaultWatchMaxRoots   = 64
 )
 
-type workspaceChangeDetector interface {
-	WorkspaceChanged(context.Context, string) (bool, error)
-}
-
-type providerWorkspaceChangeDetector interface {
-	WorkspaceChangedWithProvider(context.Context, string, string) (bool, error)
-}
-
-type backgroundSyncer interface {
-	SyncBackground(context.Context, string) (workspace.Result, error)
-}
-
-type providerBackgroundSyncer interface {
-	SyncBackgroundWithProvider(context.Context, string, string) (workspace.Result, error)
-}
-
 type workspaceReconciler struct {
-	syncer    Syncer
-	detector  workspaceChangeDetector
-	bgSyncer  backgroundSyncer
-	inspector WorkspaceInspector
+	service   engine.Service
+	detector  engine.ChangeDetector
+	bgSyncer  engine.BackgroundSyncer
+	inspector engine.WorkspaceInspector
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -71,17 +55,17 @@ type watchState struct {
 	backoff              time.Duration
 }
 
-func newWorkspaceReconciler(syncer Syncer) *workspaceReconciler {
+func newWorkspaceReconciler(service engine.Service) *workspaceReconciler {
 	if watchMode() == "off" {
 		return nil
 	}
-	detector, ok := syncer.(workspaceChangeDetector)
+	detector, ok := service.(engine.ChangeDetector)
 	if !ok {
 		return nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	reconciler := &workspaceReconciler{
-		syncer:     syncer,
+		service:    service,
 		detector:   detector,
 		ctx:        ctx,
 		cancel:     cancel,
@@ -95,10 +79,10 @@ func newWorkspaceReconciler(syncer Syncer) *workspaceReconciler {
 		maxRoots:   watchMaxRoots(),
 		states:     make(map[string]*watchState),
 	}
-	if bgSyncer, ok := syncer.(backgroundSyncer); ok {
+	if bgSyncer, ok := service.(engine.BackgroundSyncer); ok {
 		reconciler.bgSyncer = bgSyncer
 	}
-	if inspector, ok := syncer.(WorkspaceInspector); ok {
+	if inspector, ok := service.(engine.WorkspaceInspector); ok {
 		reconciler.inspector = inspector
 	}
 	go reconciler.run()
@@ -161,7 +145,7 @@ func (r *workspaceReconciler) ObserveWithProvider(dir string, providerProfileID 
 	r.signal()
 }
 
-func (r *workspaceReconciler) Decorate(status *workspace.WorkspaceStatus) {
+func (r *workspaceReconciler) Decorate(status *engine.WorkspaceStatus) {
 	if r == nil || status == nil {
 		return
 	}
@@ -307,51 +291,29 @@ func (r *workspaceReconciler) workspaceInFlight(ctx context.Context, root string
 	if r.inspector == nil {
 		return false
 	}
-	providerProfileID = strings.TrimSpace(providerProfileID)
-	var (
-		status workspace.WorkspaceStatus
-		err    error
-	)
-	if providerProfileID == "" {
-		status, err = r.inspector.WorkspaceStatus(ctx, root)
-	} else {
-		providerInspector, ok := r.syncer.(ProviderWorkspaceInspector)
-		if !ok {
-			return false
-		}
-		status, err = providerInspector.WorkspaceStatusWithProvider(ctx, root, providerProfileID)
-	}
+	status, err := r.inspector.WorkspaceStatus(ctx, engine.WorkspaceRef{
+		DirectoryPath:     root,
+		ProviderProfileID: strings.TrimSpace(providerProfileID),
+	})
 	return err == nil && status.InFlight
 }
 
 func (r *workspaceReconciler) workspaceChanged(ctx context.Context, root string, providerProfileID string) (bool, error) {
-	providerProfileID = strings.TrimSpace(providerProfileID)
-	if providerProfileID == "" {
-		return r.detector.WorkspaceChanged(ctx, root)
-	}
-	providerDetector, ok := r.syncer.(providerWorkspaceChangeDetector)
-	if !ok {
-		return false, nil
-	}
-	return providerDetector.WorkspaceChangedWithProvider(ctx, root, providerProfileID)
+	return r.detector.WorkspaceChanged(ctx, engine.WorkspaceRef{
+		DirectoryPath:     root,
+		ProviderProfileID: strings.TrimSpace(providerProfileID),
+	})
 }
 
-func (r *workspaceReconciler) syncBackground(ctx context.Context, root string, providerProfileID string) (workspace.Result, error) {
-	providerProfileID = strings.TrimSpace(providerProfileID)
-	if providerProfileID == "" {
-		if r.bgSyncer != nil {
-			return r.bgSyncer.SyncBackground(ctx, root)
-		}
-		return r.syncer.Sync(ctx, root)
+func (r *workspaceReconciler) syncBackground(ctx context.Context, root string, providerProfileID string) (engine.Result, error) {
+	req := engine.SyncRequest{Workspace: engine.WorkspaceRef{
+		DirectoryPath:     root,
+		ProviderProfileID: strings.TrimSpace(providerProfileID),
+	}}
+	if r.bgSyncer != nil {
+		return r.bgSyncer.SyncBackground(ctx, req)
 	}
-	if providerSyncer, ok := r.syncer.(providerBackgroundSyncer); ok {
-		return providerSyncer.SyncBackgroundWithProvider(ctx, root, providerProfileID)
-	}
-	providerSyncer, ok := r.syncer.(ProviderSyncer)
-	if !ok {
-		return workspace.Result{}, nil
-	}
-	return providerSyncer.SyncWithProvider(ctx, root, providerProfileID)
+	return r.service.Sync(ctx, req)
 }
 
 func (r *workspaceReconciler) deferReconcile(target watchTarget, now time.Time, delay time.Duration) {
