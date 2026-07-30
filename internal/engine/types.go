@@ -68,7 +68,12 @@ type Result struct {
 }
 
 // Summary 输出一行人类可读的结果摘要，供 MCP 工具文本渲染使用。
+// local-hybrid 无 checkpoint 概念，以 revision 口径输出（Stage 4 D8/S19，
+// 文案变化仅影响实验性引擎，e2e golden 同步更新并在阶段记录声明）。
 func (r Result) Summary() string {
+	if r.Engine == EngineLocalHybrid && r.CheckpointID == "" {
+		return fmt.Sprintf("revision=%s files=%d added_chunks=%d deleted=%d", r.IndexRevision, r.FileCount, r.Added, r.Deleted)
+	}
 	if r.ProviderProfileID != "" {
 		return fmt.Sprintf("provider_profile_id=%s checkpoint=%s files=%d uploaded=%d added=%d deleted=%d", r.ProviderProfileID, r.CheckpointID, r.FileCount, r.Uploaded, r.Added, r.Deleted)
 	}
@@ -94,6 +99,14 @@ type SemanticStatus struct {
 	TotalChunks   int    `json:"total_chunks,omitempty"`
 	// RejectedChunks 是被拒绝的非法向量数（零向量/NaN，暗坑 K35）。
 	RejectedChunks int `json:"rejected_chunks,omitempty"`
+
+	// 构建期 embedding 进度（Stage 4 D8，加性 omitempty，暗坑 K53）：
+	// PendingChunks 是本次构建仍待嵌入的唯一内容数，EmbeddedChunks 是
+	// 已完成数；构建结束后归零。JournalEntries 是断点续嵌暂存区中
+	// 已付费未发布的向量条数（D4）。
+	PendingChunks  int `json:"pending_chunks,omitempty"`
+	EmbeddedChunks int `json:"embedded_chunks,omitempty"`
+	JournalEntries int `json:"journal_entries,omitempty"`
 
 	// ProviderState 是 embedding circuit 状态：healthy/backoff/candidate；
 	// backoff 时 BackoffUntil 指明恢复探测时间（§15）。

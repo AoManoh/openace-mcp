@@ -63,7 +63,9 @@ func ResolveWorkspaceKey(path string) string {
 	if strings.Contains(retrieval, `"isError":true`) {
 		t.Fatalf("retrieval 不应报错: %s", retrieval)
 	}
-	for _, want := range []string{"main.go:", "ResolveWorkspaceKey", "checkpoint="} {
+	// Stage 4 D8/S19：local-hybrid 摘要行由空 checkpoint= 改为 revision=
+	// 口径（golden 同步更新，K53）。
+	for _, want := range []string{"main.go:", "ResolveWorkspaceKey", "revision="} {
 		if !strings.Contains(retrieval, want) {
 			t.Fatalf("retrieval 结果缺少 %q: %s", want, retrieval)
 		}

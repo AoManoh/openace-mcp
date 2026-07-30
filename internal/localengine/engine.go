@@ -26,8 +26,9 @@ import (
 const (
 	// EngineID 是引擎标识，进入 manifest、状态与检索结果。
 	EngineID = "local-hybrid"
-	// EngineVersion 随引擎行为不兼容变化而更新。
-	EngineVersion = "stage3"
+	// EngineVersion 随引擎行为不兼容变化而更新（Stage 4：manifest v2
+	// 多 segment + journal + 跨进程锁；v1 数据可直读，升级无需重建）。
+	EngineVersion = "stage4"
 	// policyHash 标识当前复用的 workspace AssetPolicy 版本。
 	policyHash = "workspace-assetpolicy-v1"
 	// defaultTopK 是纯词法模式的候选深度。
@@ -63,11 +64,14 @@ type Engine struct {
 	// repair 记录查询期发现向量不可用的工作区，下次 sync 强制重建自愈
 	// （暗坑 K25；键为 workspaceKey，构建开始时消费）。
 	repair map[string]bool
-	// zeroVecHashes 记录被 K35 拒绝（零向量/NaN）的内容 hash：同一进程
-	// 生命周期内不再重复送 provider，防止 watcher 周期对病理内容反复
-	// 付费（Stage 3 自审新增，K35 修订）；重启后重试一次。
-	zeroVecHashes map[string]bool
-	closed        bool
+	// journals 是 per-workspace 的 embedding 断点续嵌暂存区与持久化
+	// 拒绝集（Stage 4 D4：取消/kill 不丢已付费批次；K35 拒绝史跨重启
+	// 生效）。仅 semanticEnabled 时创建。
+	journals map[string]*index.Journal
+	// locks 是 per-workspace 的跨进程写锁（Stage 4 D6：daemon 是唯一
+	// index owner 从假设变为机制），首次构建时获取、Close 时释放。
+	locks  map[string]*index.ProcessLock
+	closed bool
 }
 
 // 编译期断言：Engine 满足全部通用 contract。
@@ -90,7 +94,8 @@ func New(opts Options) (*Engine, error) {
 		stores:           make(map[string]*index.Store),
 		handles:          make(map[string]*revisionHandle),
 		repair:           make(map[string]bool),
-		zeroVecHashes:    make(map[string]bool),
+		journals:         make(map[string]*index.Journal),
+		locks:            make(map[string]*index.ProcessLock),
 	}
 	e.storeProfile = e.profile.ID + "-v" + e.profile.Version
 	e.embedCfg = opts.Embedding
@@ -151,6 +156,29 @@ func (e *Engine) vectorRepairPending(workspaceKey string) bool {
 	return e.repair[workspaceKey]
 }
 
+// journalFor 返回（必要时打开）工作区的 embedding journal（D4）。
+func (e *Engine) journalFor(workspaceKey string, store *index.Store) (*index.Journal, error) {
+	e.mu.Lock()
+	if journal, ok := e.journals[workspaceKey]; ok {
+		e.mu.Unlock()
+		return journal, nil
+	}
+	e.mu.Unlock()
+
+	journal, err := index.OpenJournal(store, e.embedCfg.Dimension)
+	if err != nil {
+		return nil, err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if existing, ok := e.journals[workspaceKey]; ok {
+		_ = journal.Close()
+		return existing, nil
+	}
+	e.journals[workspaceKey] = journal
+	return journal, nil
+}
+
 // EngineID 实现 engine.Identifier。
 func (e *Engine) EngineID() string {
 	return engine.EngineLocalHybrid
@@ -197,7 +225,9 @@ func sanitizeKey(name string) string {
 	return out
 }
 
-// storeFor 返回（必要时创建）工作区的索引 Store，并完成一次性 staging 清理。
+// storeFor 返回（必要时创建）工作区的索引 Store。残留清理（staging/
+// 孤儿 segment）延迟到获得跨进程写锁之后执行（D6/S15：无锁清理可能
+// 误删其他进程的在飞产物），查询只读路径不触发清理。
 func (e *Engine) storeFor(workspaceKey string) (*index.Store, error) {
 	e.mu.Lock()
 	if store, ok := e.stores[workspaceKey]; ok {
@@ -214,12 +244,6 @@ func (e *Engine) storeFor(workspaceKey string) (*index.Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := store.CleanupStaging(); err != nil {
-		return nil, fmt.Errorf("清理残留 staging: %w", err)
-	}
-	if err := store.CleanupOrphanSegments(); err != nil {
-		return nil, fmt.Errorf("清理孤儿 segment: %w", err)
-	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if existing, ok := e.stores[workspaceKey]; ok {
@@ -227,6 +251,47 @@ func (e *Engine) storeFor(workspaceKey string) (*index.Store, error) {
 	}
 	e.stores[workspaceKey] = store
 	return store, nil
+}
+
+// acquireWriteLock 获取（并缓存）工作区的跨进程写锁；首次获得后以
+// owner 身份执行一次残留清理（D6：清理只在确认所有权后进行）。
+func (e *Engine) acquireWriteLock(workspaceKey string, store *index.Store) (*index.ProcessLock, error) {
+	e.mu.Lock()
+	if lock, ok := e.locks[workspaceKey]; ok {
+		e.mu.Unlock()
+		if err := lock.Verify(); err != nil {
+			return nil, err
+		}
+		return lock, nil
+	}
+	e.mu.Unlock()
+
+	lock, err := index.AcquireLock(store)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.CleanupStaging(); err != nil {
+		lock.Release()
+		return nil, fmt.Errorf("清理残留 staging: %w", err)
+	}
+	if err := store.CleanupOrphanSegments(); err != nil {
+		lock.Release()
+		return nil, fmt.Errorf("清理孤儿 segment: %w", err)
+	}
+	e.mu.Lock()
+	if existing, ok := e.locks[workspaceKey]; ok {
+		e.mu.Unlock()
+		lock.Release()
+		return existing, nil
+	}
+	if e.closed {
+		e.mu.Unlock()
+		lock.Release()
+		return nil, errors.New("engine 已关闭")
+	}
+	e.locks[workspaceKey] = lock
+	e.mu.Unlock()
+	return lock, nil
 }
 
 // Sync 实现 engine.Service。
@@ -400,8 +465,19 @@ func (e *Engine) Close(ctx context.Context) error {
 			if err := handle.lex.Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
+			handle.closeContentFiles()
 			delete(e.handles, revision)
 		}
+	}
+	journals := make([]*index.Journal, 0, len(e.journals))
+	for key, journal := range e.journals {
+		journals = append(journals, journal)
+		delete(e.journals, key)
+	}
+	locks := make([]*index.ProcessLock, 0, len(e.locks))
+	for key, lock := range e.locks {
+		locks = append(locks, lock)
+		delete(e.locks, key)
 	}
 	e.mu.Unlock()
 
@@ -415,6 +491,16 @@ func (e *Engine) Close(ctx context.Context) error {
 			}
 			return firstErr
 		}
+	}
+	// journal 在构建退出后关闭（构建期间可能持有写句柄）。
+	for _, journal := range journals {
+		if err := journal.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	// 写锁最后释放（此后其他进程可立即接管构建所有权）。
+	for _, lock := range locks {
+		lock.Release()
 	}
 	return firstErr
 }

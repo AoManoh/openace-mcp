@@ -129,18 +129,42 @@ func Build(ctx context.Context, dir string, docs []Doc) error {
 	return idx.Close()
 }
 
-// Index 是打开的只读词法索引句柄。
+// Index 是打开的只读词法索引句柄；多 segment 时经 IndexAlias 聚合检索
+// （Stage 4 D2）。已知限制：alias 下 BM25 语料统计按各 segment 局部计算，
+// 跨段分数存在偏差——候选按 rank 进 RRF 且有 rerank 精排缓冲（暗坑 K38，
+// Stage 5 benchmark 量化）。
 type Index struct {
-	idx bleve.Index
+	idx     bleve.Index
+	members []bleve.Index
 }
 
 // Open 以只读方式打开已发布 segment 中的索引。
 func Open(dir string) (*Index, error) {
-	idx, err := bleve.OpenUsing(dir, map[string]interface{}{"read_only": true})
-	if err != nil {
-		return nil, fmt.Errorf("打开 lexical 索引: %w", err)
+	return OpenMulti([]string{dir})
+}
+
+// OpenMulti 以只读方式打开一组 segment 索引并聚合为单一检索句柄；
+// 任一打开失败即整体失败并回收已打开成员。
+func OpenMulti(dirs []string) (*Index, error) {
+	if len(dirs) == 0 {
+		return nil, errors.New("OpenMulti 需要至少一个索引目录")
 	}
-	return &Index{idx: idx}, nil
+	members := make([]bleve.Index, 0, len(dirs))
+	for _, dir := range dirs {
+		member, err := bleve.OpenUsing(dir, map[string]interface{}{"read_only": true})
+		if err != nil {
+			for _, opened := range members {
+				_ = opened.Close()
+			}
+			return nil, fmt.Errorf("打开 lexical 索引: %w", err)
+		}
+		members = append(members, member)
+	}
+	if len(members) == 1 {
+		return &Index{idx: members[0], members: members}, nil
+	}
+	alias := bleve.NewIndexAlias(members...)
+	return &Index{idx: alias, members: members}, nil
 }
 
 // ErrClosed 表示句柄已关闭。
@@ -186,12 +210,18 @@ func (i *Index) DocCount() (uint64, error) {
 	return i.idx.DocCount()
 }
 
-// Close 释放句柄；幂等。
+// Close 释放句柄（逐成员关闭）；幂等。
 func (i *Index) Close() error {
 	if i.idx == nil {
 		return nil
 	}
-	err := i.idx.Close()
+	var firstErr error
+	for _, member := range i.members {
+		if err := member.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	i.idx = nil
-	return err
+	i.members = nil
+	return firstErr
 }

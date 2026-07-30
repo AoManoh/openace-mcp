@@ -41,6 +41,18 @@ type wsStatus struct {
 	coveredChunks  int
 	rejectedChunks int
 	embedError     string
+	// 构建期 embedding 进度（Stage 4 D8）：按批更新，构建结束归零。
+	embedPending int
+	embedDone    int
+}
+
+// setEmbedProgress 按批更新构建期 embedding 进度（D8/G2 可见性）。
+func (s *wsStatus) setEmbedProgress(pending int, done int) {
+	s.mu.Lock()
+	s.embedPending = pending
+	s.embedDone = done
+	s.updatedAt = time.Now().UTC()
+	s.mu.Unlock()
 }
 
 // setSemanticOutcome 记录最近一次构建的语义路交互结果（K35 拒绝数与
@@ -96,6 +108,8 @@ func (s *wsStatus) ready(manifest *index.Manifest, revisions int) {
 	defer s.mu.Unlock()
 	s.inFlight = false
 	s.stage = engine.IndexStageReady
+	s.embedPending = 0
+	s.embedDone = 0
 	s.revision = manifest.Revision
 	s.fileCount = manifest.Counts.Files
 	s.chunkCount = manifest.Counts.Chunks
@@ -113,6 +127,8 @@ func (s *wsStatus) fail(err error) {
 	defer s.mu.Unlock()
 	s.inFlight = false
 	s.stage = engine.IndexStageFailed
+	s.embedPending = 0
+	s.embedDone = 0
 	s.lastError = sanitizeError(err)
 	s.finishedAt = &now
 	s.updatedAt = now
@@ -224,7 +240,16 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 			semantic.TotalChunks = tracker.chunkCount
 			semantic.RejectedChunks = tracker.rejectedChunks
 			semantic.LastError = tracker.embedError
+			semantic.PendingChunks = tracker.embedPending
+			semantic.EmbeddedChunks = tracker.embedDone
 			tracker.mu.Unlock()
+			// journal 条数（D4 可见性）：已打开的暂存区实时读取。
+			e.mu.Lock()
+			journal := e.journals[tracker.workspaceKey]
+			e.mu.Unlock()
+			if journal != nil {
+				semantic.JournalEntries = len(journal.Snapshot())
+			}
 			if semantic.TotalChunks == 0 {
 				semantic.Coverage = "100%"
 			} else {

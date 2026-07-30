@@ -3,6 +3,7 @@ package localengine
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/AoManoh/openace-mcp/internal/embedding"
 	"github.com/AoManoh/openace-mcp/internal/engine"
@@ -38,35 +39,46 @@ func (s semanticOutcome) improved() bool {
 	return s.enabled && s.covered > s.coveredByActive
 }
 
-// embedRecords 组装本次 revision 的向量集：先按纯 content hash 复用
-// active/previous 两跳的已有向量（阶段计划 D2，bit 级拷贝保证跨 revision
-// 一致），再对缺失的唯一内容批量调用 provider。provider 失败不阻塞构建
-// （§10.2 lexical freshness 优先），仅 ctx 取消返回错误。
-func (e *Engine) embedRecords(ctx context.Context, store *index.Store, previous *index.Manifest, records []chunkRecord, status *wsStatus) (semanticOutcome, error) {
-	out := semanticOutcome{enabled: e.semanticEnabled()}
-	if !out.enabled || len(records) == 0 {
-		return out, nil
-	}
-	status.setStage(engine.IndexStageEmbedding)
-	dimension := e.embedCfg.Dimension
+// priorVectors 是构建前装载的既有向量视图（D2 复用源 + 覆盖口径基线）。
+type priorVectors struct {
+	// activeByHash/olderByHash 分别是 active revision 与其 previous 的
+	// 向量数据（按纯 content hash 键控，revision 优先级高于 journal）。
+	activeByHash map[string][]float32
+	olderByHash  map[string][]float32
+	// activeIDs 是 active revision 中已持久化向量的 chunk ID 集
+	// （delta 构建计算未触及 chunk 覆盖时使用，暗坑 K51）。
+	activeIDs map[string]bool
+}
 
-	// 1) 复用：active（hop 0）与其 previous（hop 1）。GC 保留恰好这两个
-	// revision；损坏的向量文件被跳过，由后续新嵌入补齐（K25 自愈路径）。
-	reuse := make(map[string][]float32)
-	activeUsable := make(map[string]bool)
+// loadPriorVectors 装载 active（hop 0）与其 previous（hop 1）全部 segment
+// 的向量。GC 保留恰好这两个 revision；损坏的向量文件被跳过，由后续
+// 新嵌入补齐（K25 自愈路径）。
+func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest) priorVectors {
+	prior := priorVectors{
+		activeByHash: map[string][]float32{},
+		olderByHash:  map[string][]float32{},
+		activeIDs:    map[string]bool{},
+	}
+	dimension := e.embedCfg.Dimension
 	manifest := previous
 	for hop := 0; manifest != nil && hop < 2; hop++ {
-		if manifest.HasVectors() {
-			ix, err := vector.Load(store.SegmentPath(manifest), dimension,
-				manifest.VectorsChecksum, manifest.VectorsIndexChecksum, 0)
-			if err == nil {
-				for i, entry := range ix.Entries() {
-					if _, ok := reuse[entry.ContentHash]; !ok {
-						reuse[entry.ContentHash] = ix.Row(i)
-						if hop == 0 {
-							activeUsable[entry.ContentHash] = true
-						}
+		for _, segment := range manifest.Segments {
+			if segment.VectorsChecksum == "" {
+				continue
+			}
+			ix, err := vector.Load(store.SegmentPathFor(segment.ID), dimension,
+				segment.VectorsChecksum, segment.VectorsIndexChecksum, 0)
+			if err != nil {
+				continue
+			}
+			for i, entry := range ix.Entries() {
+				if hop == 0 {
+					prior.activeIDs[entry.ID] = true
+					if _, ok := prior.activeByHash[entry.ContentHash]; !ok {
+						prior.activeByHash[entry.ContentHash] = ix.Row(i)
 					}
+				} else if _, ok := prior.olderByHash[entry.ContentHash]; !ok {
+					prior.olderByHash[entry.ContentHash] = ix.Row(i)
 				}
 			}
 		}
@@ -79,20 +91,51 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, previous 
 		}
 		manifest = older
 	}
+	return prior
+}
+
+// embedRecords 组装 records（全量或 delta）的向量集：先按纯 content hash
+// 复用既有向量（阶段计划 D2，bit 级拷贝保证跨 revision 一致）与 journal
+// 暂存（Stage 4 D4：中断构建的已付费批次），再对缺失的唯一内容批量调用
+// provider——每批成功即落 journal，取消/kill 不再丢弃付费进度。provider
+// 失败不阻塞构建（§10.2 lexical freshness 优先），仅 ctx 取消与本地持久
+// 化故障返回错误。
+func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspaceKey string, prior priorVectors, records []chunkRecord, status *wsStatus) (semanticOutcome, error) {
+	out := semanticOutcome{enabled: e.semanticEnabled()}
+	if !out.enabled || len(records) == 0 {
+		return out, nil
+	}
+	journal, err := e.journalFor(workspaceKey, store)
+	if err != nil {
+		return out, fmt.Errorf("打开 embedding journal: %w", err)
+	}
+	status.setStage(engine.IndexStageEmbedding)
+
+	// 1) 复用优先级：active revision → previous revision → journal（K41）。
+	reuse := make(map[string][]float32, len(prior.activeByHash))
+	activeUsable := make(map[string]bool, len(prior.activeByHash))
+	for hash, vec := range prior.activeByHash {
+		reuse[hash] = vec
+		activeUsable[hash] = true
+	}
+	for hash, vec := range prior.olderByHash {
+		if _, ok := reuse[hash]; !ok {
+			reuse[hash] = vec
+		}
+	}
+	for hash, vec := range journal.Snapshot() {
+		if _, ok := reuse[hash]; !ok {
+			reuse[hash] = vec
+		}
+	}
 
 	// 2) 缺失清单：唯一 content hash，按 records 首次出现序（确定性批次；
 	// 同内容多处出现只嵌入一次——嵌入输入为纯 chunk 内容，D6）。
-	// 本进程已知的零向量内容（K35 拒绝史）不再送 provider，防止 watcher
-	// 周期对病理内容反复付费。
+	// 持久化拒绝集（K35 修订）内的零向量内容不再送 provider，跨重启
+	// 防止 watcher 周期对病理内容反复付费。
 	var missingHashes []string
 	var missingTexts []string
 	seen := make(map[string]bool, len(records))
-	e.mu.Lock()
-	knownZero := make(map[string]bool, len(e.zeroVecHashes))
-	for hash := range e.zeroVecHashes {
-		knownZero[hash] = true
-	}
-	e.mu.Unlock()
 	for _, record := range records {
 		if seen[record.ContentHash] {
 			continue
@@ -101,7 +144,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, previous 
 		if _, ok := reuse[record.ContentHash]; ok {
 			continue
 		}
-		if knownZero[record.ContentHash] {
+		if journal.Rejected(record.ContentHash) {
 			out.rejected++
 			continue
 		}
@@ -110,7 +153,10 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, previous 
 	}
 
 	// 3) 分批嵌入：单批失败记录并继续（部分成功入盘，D10）；circuit
-	// 退避即停（后续批必然拒绝，K30）；取消中止整次构建。
+	// 退避即停（后续批必然拒绝，K30）；取消中止整次构建。进度按批
+	// 写入状态（D8：构建期 workspace_status 可见嵌入进展）。
+	status.setEmbedProgress(len(missingHashes), 0)
+	embedded := 0
 	batchSize := e.embedCfg.BatchSize
 	for start := 0; start < len(missingHashes); start += batchSize {
 		end := start + batchSize
@@ -130,19 +176,32 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, previous 
 			}
 			continue
 		}
+		batchGood := make(map[string][]float32, len(vectors))
+		var batchRejected []string
 		for i, vec := range vectors {
 			if err := vector.Normalize(vec); err != nil {
-				// 零向量/NaN：该内容记为未覆盖并计数（K35），且进程内
-				// 不再重试（防重复付费）。
+				// 零向量/NaN：该内容记为未覆盖并计数（K35），持久化
+				// 拒绝史跨重启防重复付费。
 				out.rejected++
-				e.mu.Lock()
-				e.zeroVecHashes[missingHashes[start+i]] = true
-				e.mu.Unlock()
+				batchRejected = append(batchRejected, missingHashes[start+i])
 				continue
 			}
-			reuse[missingHashes[start+i]] = vec
+			batchGood[missingHashes[start+i]] = vec
+		}
+		// 批成功即落 journal（D4/G2）：随后即使构建被取消/kill，
+		// 这批付费向量也可被下次构建复用。
+		if err := journal.Append(batchGood); err != nil {
+			return out, fmt.Errorf("journal 落盘: %w", err)
+		}
+		if err := journal.MarkRejected(batchRejected); err != nil {
+			return out, fmt.Errorf("journal 拒绝集落盘: %w", err)
+		}
+		for hash, vec := range batchGood {
+			reuse[hash] = vec
 			out.newlyEmbedded++
 		}
+		embedded = end
+		status.setEmbedProgress(len(missingHashes)-embedded, embedded)
 	}
 
 	// 4) 对齐 records 组装行集（同内容多行共享同一向量值）。
