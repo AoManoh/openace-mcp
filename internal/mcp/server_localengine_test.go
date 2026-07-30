@@ -33,7 +33,10 @@ func ResolveWorkspaceKey(path string) string {
 	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte(mainGo), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	service := localengine.New()
+	service, err := localengine.New(localengine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = service.Close(context.Background()) })
 	server := NewServer(service)
 
@@ -89,7 +92,10 @@ func TestLocalEngineProfileIDRejectedViaMCP(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	service := localengine.New()
+	service, err := localengine.New(localengine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = service.Close(context.Background()) })
 	server := NewServer(service)
 	response := runMCP(t, server, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"information_request":"q","directory_path":`+jsonString(root)+`,"provider_profile_id":"p1"}}}`)

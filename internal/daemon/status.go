@@ -61,6 +61,10 @@ func (s *Server) servedBy() runtimeinfo.ServedBy {
 		ListenAddr:   s.currentListenAddr(),
 		Build:        buildinfo.Current(),
 	}
+	// 引擎配置指纹：复用判定要求与请求方一致（Stage 3 暗坑 K29）。
+	if profiled, ok := s.service.(engine.ProfileIdentifier); ok {
+		identity.EngineProfile = profiled.EngineProfileFingerprint()
+	}
 	if cache, err := workspace.CurrentCacheSnapshot(); err == nil {
 		identity.CacheDir = cache.Dir
 		identity.CacheNamespace = cache.Namespace

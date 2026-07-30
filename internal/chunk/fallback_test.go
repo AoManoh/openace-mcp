@@ -3,6 +3,7 @@ package chunk
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestFallbackLineNumbersMatchContent(t *testing.T) {
@@ -72,6 +73,59 @@ func TestFallbackEmptyFile(t *testing.T) {
 	chunks, _ := profile.Split(File{RelPath: "empty.py", Content: "   \n\n"})
 	if len(chunks) != 0 {
 		t.Fatalf("空白文件应产出 0 chunk，got %d", len(chunks))
+	}
+}
+
+// TestFallbackOversizedCJKLineKeepsValidUTF8 是 review S16：含 CJK 的
+// minified 内容按字节窗口切分时不得切断多字节 rune——非法 UTF-8 会让
+// 落盘 JSONL（U+FFFD 替换）与 ContentHash 脱钩。
+func TestFallbackOversizedCJKLineKeepsValidUTF8(t *testing.T) {
+	minified := "var 消息=1;" + strings.Repeat("处理数据(", 1500) + strings.Repeat(")", 1500) + ";"
+	profile := DefaultProfile()
+	chunks, capability := profile.Split(File{RelPath: "dist/app.min.js", Content: minified})
+	if capability != CapabilityFallback || len(chunks) < 2 {
+		t.Fatalf("CJK minified 应走字节窗口且产出多个 chunk: cap=%s n=%d", capability, len(chunks))
+	}
+	var rebuilt strings.Builder
+	for i, chunk := range chunks {
+		if !utf8.ValidString(chunk.Content) {
+			t.Fatalf("第 %d 个 chunk 含非法 UTF-8（S16/GATE-ENCODING）", i)
+		}
+		if len(chunk.Content) > profile.MaxChunkBytes {
+			t.Fatalf("字节窗口超出预算: %d", len(chunk.Content))
+		}
+		rebuilt.WriteString(chunk.Content)
+	}
+	if rebuilt.String() != minified {
+		t.Fatal("字节窗口拼接应无损还原原文")
+	}
+}
+
+// TestFallbackByteWindowEndLineExact 是 review S16 的 EndLine 修正断言：
+// 以换行结尾的窗口不得把行号多算一行。
+func TestFallbackByteWindowEndLineExact(t *testing.T) {
+	// 第 1 行超长触发字节窗口；构造窗口恰在换行后断开的场景。
+	long := strings.Repeat("x", 5000)
+	content := long + "\nshort line 2\nshort line 3"
+	profile := DefaultProfile()
+	chunks, _ := profile.Split(File{RelPath: "one.min.js", Content: content})
+	if len(chunks) == 0 {
+		t.Fatal("切分为空")
+	}
+	last := chunks[len(chunks)-1]
+	if last.EndLine != 3 {
+		t.Fatalf("最后一个 chunk 应止于第 3 行: %d-%d %q", last.StartLine, last.EndLine, last.Content)
+	}
+	for _, chunk := range chunks {
+		if chunk.EndLine < chunk.StartLine {
+			t.Fatalf("行区间非法: %d-%d", chunk.StartLine, chunk.EndLine)
+		}
+		if strings.HasSuffix(chunk.Content, "\n") {
+			body := strings.TrimSuffix(chunk.Content, "\n")
+			if want := chunk.StartLine + strings.Count(body, "\n"); chunk.EndLine != want {
+				t.Fatalf("尾换行窗口 EndLine 多算: got %d want %d", chunk.EndLine, want)
+			}
+		}
 	}
 }
 

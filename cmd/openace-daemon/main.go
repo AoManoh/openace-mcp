@@ -46,9 +46,14 @@ func buildLocalService(ctx context.Context) (engine.Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	// local-hybrid 不依赖任何上游凭据：无 AUGMENT_* 也必须可启动。
+	// local-hybrid 不依赖任何上游凭据：无 AUGMENT_* 也必须可启动
+	// （缺 key = semantic off，词法照常，阶段计划 D1）。
 	if engineID == engine.EngineLocalHybrid {
-		return localengine.New(), nil
+		opts, err := localengine.OptionsFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		return localengine.New(opts)
 	}
 	loader := auth.NewLoader()
 	profiles, err := loader.LoadProfiles(ctx)

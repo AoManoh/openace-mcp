@@ -40,6 +40,13 @@ type Identifier interface {
 	EngineID() string
 }
 
+// ProfileIdentifier 是可选能力：实现方自述引擎配置指纹（provider 身份与
+// 降级开关的 hash，不含任何凭据与运维参数），供 daemon 复用兼容性判定——
+// 用户改 provider env 后不得静默复用旧配置 daemon（Stage 3 暗坑 K29）。
+type ProfileIdentifier interface {
+	EngineProfileFingerprint() string
+}
+
 // WorkspaceRef 标识一次请求指向的工作区与引擎/档案身份。
 // DirectoryPath 允许是调用方提供的原始路径；canonical 化由实现负责。
 type WorkspaceRef struct {

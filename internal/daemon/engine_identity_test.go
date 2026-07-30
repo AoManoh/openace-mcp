@@ -42,3 +42,32 @@ func TestServedByAdvertisesEngine(t *testing.T) {
 		t.Fatal("ace daemon 应保留 provider_profiles 能力")
 	}
 }
+
+// profiledSyncer 模拟自述配置指纹的服务（Stage 3 暗坑 K29）。
+type profiledSyncer struct {
+	identifiableSyncer
+	profile string
+}
+
+func (s profiledSyncer) EngineProfileFingerprint() string { return s.profile }
+
+// TestServedByAdvertisesEngineProfile 是暗坑 K29 的 daemon 侧验收。
+func TestServedByAdvertisesEngineProfile(t *testing.T) {
+	useTempTaskStore(t)
+	server := NewServer(profiledSyncer{
+		identifiableSyncer: identifiableSyncer{id: engine.EngineLocalHybrid},
+		profile:            "abc123def456",
+	})
+	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })
+	identity := server.servedBy()
+	if identity.EngineProfile != "abc123def456" {
+		t.Fatalf("engine_profile 应广播配置指纹: %+v", identity)
+	}
+
+	// 无自述能力（legacy ACE / 旧实现）不广播该字段。
+	legacy := NewServer(fakeSyncer{})
+	t.Cleanup(func() { _ = legacy.Shutdown(context.Background()) })
+	if legacy.servedBy().EngineProfile != "" {
+		t.Fatal("无 ProfileIdentifier 的服务不应广播 engine_profile")
+	}
+}

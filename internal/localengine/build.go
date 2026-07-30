@@ -11,10 +11,12 @@ import (
 	"context"
 
 	"github.com/AoManoh/openace-mcp/internal/chunk"
+	"github.com/AoManoh/openace-mcp/internal/embedding"
 	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/index"
 	"github.com/AoManoh/openace-mcp/internal/lexical"
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
+	"github.com/AoManoh/openace-mcp/internal/vector"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
@@ -59,21 +61,33 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	if resolveErr != nil && !isNoRevision(resolveErr) {
 		return engine.Result{}, resolveErr
 	}
-	if previous != nil && !assetsChanged(assets, previous) {
-		// 无变化且当前 revision 确实可打开时才 no-op（业务验收 P2-T08a）；
-		// manifest 校验通过但 Bleve 已损坏的 revision 必须重建，
-		// 不得让工作区停留在永久失败态（review B2）。
+	contentChanged := previous == nil || assetsChanged(assets, previous)
+	repairRequested := e.consumeVectorRepair(workspaceKey)
+	// needsLexicalRebuild：内容未变但词法索引不可用/落后（review B2 自愈）。
+	needsLexicalRebuild := false
+	if previous != nil && !contentChanged {
 		if handle, probeErr := e.acquireHandle(workspaceKey); probeErr == nil {
-			usableRevision := handle.manifest.Revision
+			sameRevision := handle.manifest.Revision == previous.Revision
 			e.releaseHandle(handle)
-			if usableRevision == previous.Revision {
-				status.ready(previous, revisionCount(store, previous))
-				return engine.Result{
-					Engine:        EngineID,
-					IndexRevision: previous.Revision,
-					FileCount:     previous.Counts.Files,
-				}, nil
+			if !sameRevision {
+				needsLexicalRebuild = true
+			} else if !repairRequested {
+				// 无变化且词法可用：语义满足（或 semantic off）即 no-op；
+				// provider 退避中同样 no-op，防重建风暴（D10/K30），
+				// 覆盖缺口如实留在状态里。
+				semanticSatisfied := !e.semanticEnabled() || previous.SemanticComplete()
+				circuitBackoff := e.semanticEnabled() && e.embedClient.CircuitSnapshot().State == "backoff"
+				if semanticSatisfied || circuitBackoff {
+					status.ready(previous, revisionCount(store, previous))
+					return engine.Result{
+						Engine:        EngineID,
+						IndexRevision: previous.Revision,
+						FileCount:     previous.Counts.Files,
+					}, nil
+				}
 			}
+		} else {
+			needsLexicalRebuild = true
 		}
 	}
 
@@ -117,7 +131,9 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 				skippedFiles++
 				continue
 			}
-			chunks, capability := e.profile.Split(chunk.File{RelPath: asset.RelPath, Content: string(content)})
+			// 语言能力由逐条 record 合并得出（mergeCapability），文件级
+			// 返回值不再单独使用（review S21）。
+			chunks, _ := e.profile.Split(chunk.File{RelPath: asset.RelPath, Content: string(content)})
 			fileRecords = make([]chunkRecord, 0, len(chunks))
 			for _, c := range chunks {
 				fileRecords = append(fileRecords, chunkRecord{
@@ -126,7 +142,6 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 					Symbol: c.SymbolHint, Content: c.Content, ContentHash: c.ContentHash,
 				})
 			}
-			_ = capability
 		}
 		for _, record := range fileRecords {
 			mergeCapability(capabilities, record.Language, record.Capability)
@@ -134,6 +149,24 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 		}
 		files[asset.RelPath] = index.FileEntry{ContentHash: asset.BlobName, ChunkCount: len(fileRecords)}
 		records = append(records, fileRecords...)
+	}
+
+	// 阶段 2.5：语义路（semantic off 时零开销直通，K32）。
+	seman, err := e.embedRecords(ctx, store, previous, records, status)
+	if err != nil {
+		return engine.Result{}, err
+	}
+
+	// D10 发布判定：内容未变、词法可用且向量无实质改善时不发布新
+	// revision（防 no-op 发布膨胀）；返回现 revision，缺口如实在状态。
+	if previous != nil && !contentChanged && !needsLexicalRebuild && !seman.improved() {
+		status.setSemanticOutcome(seman.rejected, seman.lastError)
+		status.ready(previous, revisionCount(store, previous))
+		return engine.Result{
+			Engine:        EngineID,
+			IndexRevision: previous.Revision,
+			FileCount:     previous.Counts.Files,
+		}, nil
 	}
 
 	// 阶段 3：staging 写入 chunks.jsonl 与 Bleve 索引。
@@ -160,6 +193,15 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	if err := lexical.Build(ctx, filepath.Join(staging, index.LexicalDirName), docs); err != nil {
 		discard()
 		return engine.Result{}, fmt.Errorf("构建词法索引: %w", err)
+	}
+	// 向量文件写入 staging（semantic on 时恒写入，空集也合法，K10 同族）。
+	var vectorsChecksum, vectorsIndexChecksum string
+	if seman.enabled {
+		vectorsChecksum, vectorsIndexChecksum, err = vector.Write(staging, e.embedCfg.Dimension, seman.entries, seman.vectors)
+		if err != nil {
+			discard()
+			return engine.Result{}, fmt.Errorf("写入向量数据: %w", err)
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		discard()
@@ -200,6 +242,16 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	if previous != nil {
 		manifest.PreviousRevision = previous.Revision
 	}
+	if seman.enabled {
+		manifest.EmbeddingProvider = e.embedCfg.ProviderType
+		manifest.EmbeddingModel = e.embedCfg.Model
+		manifest.EmbeddingDimension = e.embedCfg.Dimension
+		manifest.EmbeddingDtype = embedding.Dtype
+		manifest.EmbeddingProfileHash = e.embedCfg.ProfileHash()
+		manifest.VectorsChecksum = vectorsChecksum
+		manifest.VectorsIndexChecksum = vectorsIndexChecksum
+		manifest.VectorCount = seman.covered
+	}
 	if err := store.Publish(manifest, staging); err != nil {
 		discard()
 		return engine.Result{}, fmt.Errorf("发布索引: %w", err)
@@ -207,6 +259,7 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	e.retireHandles(workspaceKey, manifest.Revision, manifest.PreviousRevision)
 	e.gcRevisions(store, workspaceKey, manifest.Revision, manifest.PreviousRevision)
 	status.setSkippedFiles(skippedFiles)
+	status.setSemanticOutcome(seman.rejected, seman.lastError)
 	status.ready(manifest, revisionCount(store, manifest))
 
 	return engine.Result{
@@ -337,10 +390,13 @@ func (e *Engine) gcRevisions(store *index.Store, workspaceKey string, activeRevi
 }
 
 // revisionCount 统计当前保留链上的 revision 数（状态上报）。
+// 链遍历带环检测与深度上限（review S3，与 ResolveUsable 同护栏）。
 func revisionCount(store *index.Store, manifest *index.Manifest) int {
 	count := 0
+	visited := make(map[string]bool)
 	revision := manifest.Revision
-	for revision != "" {
+	for revision != "" && !visited[revision] && count < index.MaxRevisionChain {
+		visited[revision] = true
 		count++
 		m, err := store.LoadManifest(revision)
 		if err != nil {

@@ -109,6 +109,8 @@ func (s *Store) Publish(manifest *Manifest, stagingPath string) error {
 	if err := os.Rename(stagingPath, segmentPath); err != nil {
 		return fmt.Errorf("发布 segment: %w", err)
 	}
+	// 目录项持久化与 active.json 的强度对齐（review S4，K1 原文落实）。
+	syncDirBestEffort(filepath.Join(s.root, segmentsDir))
 	manifestPath := filepath.Join(s.root, manifestsDir, manifest.Revision+".json")
 	if err := writeFileAtomic(manifestPath, mustJSON(manifest)); err != nil {
 		return fmt.Errorf("写入 manifest: %w", err)
@@ -211,30 +213,68 @@ func (s *Store) RemoveRevision(revision string) error {
 // ErrNoUsableRevision 表示 active 与 previous 均不可用。
 var ErrNoUsableRevision = errors.New("没有可用的索引 revision")
 
+// MaxRevisionChain 是 previous 链遍历的深度上限（review S3）：正常保留
+// 链长 ≤2（active+previous），上限只在链被外部损坏/成环时兜底。
+const MaxRevisionChain = 16
+
 // ResolveUsable 返回首个通过校验的 revision：active 优先，损坏时沿
 // previous 链回退（暗坑 K1/K2 的恢复路径）。回退发生时返回的 degradedFrom
-// 记录被跳过的损坏 revision，供状态上报。
+// 记录被跳过的损坏 revision，供状态上报。链遍历带环检测与深度上限
+// （review S3：被外部编辑成环的 manifest 不得挂起 daemon）。
 func (s *Store) ResolveUsable() (*Manifest, []string, error) {
 	revision, ok, err := s.ActiveRevision()
 	if err != nil || !ok {
 		return nil, nil, errOrNoRevision(err)
 	}
 	var skipped []string
-	for revision != "" {
+	visited := make(map[string]bool)
+	for revision != "" && !visited[revision] && len(visited) < MaxRevisionChain {
+		visited[revision] = true
 		manifest, err := s.LoadManifest(revision)
-		if err == nil {
-			if verifyErr := s.VerifyManifest(manifest); verifyErr == nil {
-				return manifest, skipped, nil
-			}
+		if err != nil {
+			skipped = append(skipped, revision)
+			break
+		}
+		if verifyErr := s.VerifyManifest(manifest); verifyErr == nil {
+			return manifest, skipped, nil
 		}
 		skipped = append(skipped, revision)
-		if manifest, loadErr := s.LoadManifest(revision); loadErr == nil {
-			revision = manifest.PreviousRevision
-			continue
-		}
-		break
+		revision = manifest.PreviousRevision
 	}
 	return nil, skipped, ErrNoUsableRevision
+}
+
+// CleanupOrphanSegments 删除不被任何 manifest 引用的 segment 目录
+// （review S5：Publish 在 rename 之后中断会留下孤儿 segment）。
+// 与 CleanupStaging 同时机（store 创建时）调用；单 daemon 所有权下
+// 此时不存在在飞发布（跨进程共享 cache 的防护属 Stage 4 议题 S15）。
+func (s *Store) CleanupOrphanSegments() error {
+	revisions, err := s.ListRevisions()
+	if err != nil {
+		return err
+	}
+	referenced := make(map[string]bool, len(revisions))
+	for _, revision := range revisions {
+		if manifest, err := s.LoadManifest(revision); err == nil {
+			referenced[manifest.SegmentID] = true
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(s.root, segmentsDir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || referenced[entry.Name()] {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(s.root, segmentsDir, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func errOrNoRevision(err error) error {

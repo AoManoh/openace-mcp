@@ -15,9 +15,11 @@ import (
 	"sync"
 
 	"github.com/AoManoh/openace-mcp/internal/chunk"
+	"github.com/AoManoh/openace-mcp/internal/embedding"
 	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/index"
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
+	"github.com/AoManoh/openace-mcp/internal/rerank"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
@@ -25,24 +27,47 @@ const (
 	// EngineID 是引擎标识，进入 manifest、状态与检索结果。
 	EngineID = "local-hybrid"
 	// EngineVersion 随引擎行为不兼容变化而更新。
-	EngineVersion = "stage2"
+	EngineVersion = "stage3"
 	// policyHash 标识当前复用的 workspace AssetPolicy 版本。
 	policyHash = "workspace-assetpolicy-v1"
-	// defaultTopK 是词法召回的候选深度。
+	// defaultTopK 是纯词法模式的候选深度。
 	defaultTopK = 20
+	// hybridRouteTopK 是 hybrid 模式下每路召回深度（阶段计划 D7 受测常数）。
+	hybridRouteTopK = 60
+	// rerankHeadLimit 是送审精排的头部候选上限（D7；再受 token 预算截断）。
+	rerankHeadLimit = 50
 )
 
 // Engine 是 local-hybrid 引擎；daemon 进程内唯一实例，
-// 持有全部索引句柄与构建 singleflight。
+// 持有全部索引句柄、构建 singleflight 与 provider 客户端（暗坑 K36）。
 type Engine struct {
 	profile chunk.Profile
+	// storeProfile 是索引子树 profile 段：chunk profile（semantic off，
+	// 与 Stage 2 逐字节一致）或追加 +emb-<hash>（阶段计划 D4）。
+	storeProfile string
+	// fingerprint 是配置指纹，经 ServedBy 广播用于复用判定（暗坑 K29）。
+	fingerprint string
+
+	embedCfg         embedding.Config
+	embedClient      *embedding.Client
+	rerankCfg        rerank.Config
+	rerankClient     *rerank.Client
+	retrievalDegrade DegradeMode
+	rerankDegrade    DegradeMode
 
 	mu       sync.Mutex
 	inflight map[string]*buildCall
 	statuses map[string]*wsStatus
 	stores   map[string]*index.Store
 	handles  map[string]*revisionHandle
-	closed   bool
+	// repair 记录查询期发现向量不可用的工作区，下次 sync 强制重建自愈
+	// （暗坑 K25；键为 workspaceKey，构建开始时消费）。
+	repair map[string]bool
+	// zeroVecHashes 记录被 K35 拒绝（零向量/NaN）的内容 hash：同一进程
+	// 生命周期内不再重复送 provider，防止 watcher 周期对病理内容反复
+	// 付费（Stage 3 自审新增，K35 修订）；重启后重试一次。
+	zeroVecHashes map[string]bool
+	closed        bool
 }
 
 // 编译期断言：Engine 满足全部通用 contract。
@@ -54,15 +79,76 @@ var (
 	_ engine.Lifecycle          = (*Engine)(nil)
 )
 
-// New 创建 local-hybrid 引擎。
-func New() *Engine {
-	return &Engine{
-		profile:  chunk.DefaultProfile(),
-		inflight: make(map[string]*buildCall),
-		statuses: make(map[string]*wsStatus),
-		stores:   make(map[string]*index.Store),
-		handles:  make(map[string]*revisionHandle),
+// New 创建 local-hybrid 引擎；opts 零值 = Stage 2 词法行为（K32）。
+func New(opts Options) (*Engine, error) {
+	e := &Engine{
+		profile:          chunk.DefaultProfile(),
+		retrievalDegrade: normalizeDegrade(opts.RetrievalDegrade),
+		rerankDegrade:    normalizeDegrade(opts.RerankDegrade),
+		inflight:         make(map[string]*buildCall),
+		statuses:         make(map[string]*wsStatus),
+		stores:           make(map[string]*index.Store),
+		handles:          make(map[string]*revisionHandle),
+		repair:           make(map[string]bool),
+		zeroVecHashes:    make(map[string]bool),
 	}
+	e.storeProfile = e.profile.ID + "-v" + e.profile.Version
+	e.embedCfg = opts.Embedding
+	if opts.Embedding.Enabled {
+		client, err := embedding.NewClient(opts.Embedding)
+		if err != nil {
+			return nil, err
+		}
+		e.embedClient = client
+		// 平行 profile 子树：向量身份变化即全量重建，semantic off 路径
+		// 与 Stage 2 逐字节一致（阶段计划 D4/K24）。
+		e.storeProfile += "+emb-" + opts.Embedding.ProfileHash()
+	}
+	e.rerankCfg = opts.Rerank
+	if opts.Rerank.Enabled {
+		client, err := rerank.NewClient(opts.Rerank)
+		if err != nil {
+			return nil, err
+		}
+		e.rerankClient = client
+	}
+	e.fingerprint = opts.Fingerprint()
+	return e, nil
+}
+
+// EngineProfileFingerprint 实现 engine.ProfileIdentifier（暗坑 K29）。
+func (e *Engine) EngineProfileFingerprint() string {
+	return e.fingerprint
+}
+
+// semanticEnabled 报告语义路是否已配置。
+func (e *Engine) semanticEnabled() bool {
+	return e.embedClient != nil
+}
+
+// markVectorRepair 登记查询期发现的向量损坏，触发下次 sync 自愈（K25）。
+func (e *Engine) markVectorRepair(workspaceKey string) {
+	e.mu.Lock()
+	e.repair[workspaceKey] = true
+	e.mu.Unlock()
+}
+
+// consumeVectorRepair 取出并清除自愈标记（构建开始时调用）。
+func (e *Engine) consumeVectorRepair(workspaceKey string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.repair[workspaceKey] {
+		delete(e.repair, workspaceKey)
+		return true
+	}
+	return false
+}
+
+// vectorRepairPending 只读查询自愈标记（WorkspaceChanged 用）。
+func (e *Engine) vectorRepairPending(workspaceKey string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.repair[workspaceKey]
 }
 
 // EngineID 实现 engine.Identifier。
@@ -124,12 +210,15 @@ func (e *Engine) storeFor(workspaceKey string) (*index.Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	store, err := index.NewStore(cache.Dir, cache.Namespace, workspaceKey, e.profile.ID+"-v"+e.profile.Version)
+	store, err := index.NewStore(cache.Dir, cache.Namespace, workspaceKey, e.storeProfile)
 	if err != nil {
 		return nil, err
 	}
 	if err := store.CleanupStaging(); err != nil {
 		return nil, fmt.Errorf("清理残留 staging: %w", err)
+	}
+	if err := store.CleanupOrphanSegments(); err != nil {
+		return nil, fmt.Errorf("清理孤儿 segment: %w", err)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -201,10 +290,15 @@ func (e *Engine) syncWorkspace(ctx context.Context, ref engine.WorkspaceRef) (en
 		go func() {
 			result, err := e.runBuild(runCtx, root, workspaceKey)
 			call.result, call.err = result, err
-			close(call.done)
+			// 对齐 legacy 语义（review S9）：先在锁内摘除表项（带身份
+			// 校验）再 close(done)，消除"看到 done 但表内仍是本 call"
+			// 的忙转窗口。
 			e.mu.Lock()
-			delete(e.inflight, workspaceKey)
+			if e.inflight[workspaceKey] == call {
+				delete(e.inflight, workspaceKey)
+			}
 			e.mu.Unlock()
+			close(call.done)
 		}()
 		return e.waitBuild(ctx, workspaceKey, call)
 	}
@@ -217,11 +311,22 @@ func (e *Engine) waitBuild(ctx context.Context, workspaceKey string, call *build
 		return call.result, call.err
 	case <-ctx.Done():
 	}
+	// ctx 取消后复查 done（review S9，对齐 legacy）：已完成的有效结果
+	// 不因取消竞态被丢弃。
+	select {
+	case <-call.done:
+		return call.result, call.err
+	default:
+	}
 	e.mu.Lock()
-	call.waiters--
-	if call.waiters <= 0 && !call.cancelled {
-		call.cancelled = true
-		call.cancel()
+	// 递减前校验身份（review S9）：本 call 已被摘除时不再记账，
+	// 防 waiters 负数误伤后继构建。
+	if e.inflight[workspaceKey] == call {
+		call.waiters--
+		if call.waiters <= 0 && !call.cancelled {
+			call.cancelled = true
+			call.cancel()
+		}
 	}
 	e.mu.Unlock()
 	return engine.Result{}, ctx.Err()
@@ -261,14 +366,33 @@ func (e *Engine) WorkspaceChanged(ctx context.Context, ref engine.WorkspaceRef) 
 			return true, nil
 		}
 	}
+	// 内容未变：语义缺口也是"需要同步"的信号——watcher 借此触发向量
+	// 补齐/自愈；provider 退避期间如实返回未变化，防重建风暴（D10/K30）。
+	if e.semanticEnabled() {
+		if e.vectorRepairPending(workspaceKey) {
+			return true, nil
+		}
+		if !manifest.SemanticComplete() && e.embedClient.CircuitSnapshot().State != "backoff" {
+			return true, nil
+		}
+	}
 	return false, nil
 }
 
-// Close 实现 engine.Lifecycle：关闭全部索引句柄，拒绝后续请求。
-func (e *Engine) Close(_ context.Context) error {
+// Close 实现 engine.Lifecycle：取消并等待在飞构建（review S6——provider
+// 时代构建可长达分钟级，daemon 关停不得遗留出网调用与 staging 写入）、
+// 关闭全部索引句柄，拒绝后续请求。
+func (e *Engine) Close(ctx context.Context) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.closed = true
+	var inflight []*buildCall
+	for _, call := range e.inflight {
+		if !call.cancelled {
+			call.cancelled = true
+			call.cancel()
+		}
+		inflight = append(inflight, call)
+	}
 	var firstErr error
 	for revision, handle := range e.handles {
 		handle.retired = true
@@ -277,6 +401,19 @@ func (e *Engine) Close(_ context.Context) error {
 				firstErr = err
 			}
 			delete(e.handles, revision)
+		}
+	}
+	e.mu.Unlock()
+
+	// 等待构建 goroutine 退出（有界：调用方 ctx 支配等待上限）。
+	for _, call := range inflight {
+		select {
+		case <-call.done:
+		case <-ctx.Done():
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+			return firstErr
 		}
 	}
 	return firstErr
