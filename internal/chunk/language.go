@@ -46,7 +46,8 @@ var extLanguage = map[string]string{
 	".xml":   "xml",
 	".html":  "html",
 	".css":   "css",
-	".env":   "dotenv",
+	// 注：不映射 .env——workspace 敏感文件 denylist 先于切分生效，
+	// 该扩展名在本层不可达（Stage 2 review S13，Stage 5 收编清理）。
 }
 
 // docLanguages 使用独立窗口参数的知识/配置类语言。
