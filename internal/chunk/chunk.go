@@ -59,10 +59,13 @@ type Profile struct {
 // 参数依据 docs/references/2026-07-29-chunking-provider-benchmark-expansion.md §A5。
 // Version 2（Stage 3）：字节窗口改为 rune 边界切分并修正尾换行 EndLine
 // （review S16）——切分行为变化必须升版本以保证 chunk ID 跨版本不混用（K5）。
+// Version 3（Stage 5，决策 25/D10 首批）：Python、TypeScript/TSX、JavaScript
+// 由行窗口升级为 Tree-sitter AST 声明级切分（treesitter.go），解析失败
+// 语言级回退行窗口；未变语言按纯内容 hash 复用向量零重嵌（K61）。
 func DefaultProfile() Profile {
 	return Profile{
 		ID:             "default",
-		Version:        "2",
+		Version:        "3",
 		MaxChunkBytes:  2048,
 		WindowLines:    60,
 		OverlapLines:   10,
@@ -107,12 +110,18 @@ type File struct {
 	Content string
 }
 
-// Split 对单个文件执行切分：Go 走 AST（失败回退行窗口），其余走行窗口。
-// 返回的 capability 为该文件实际使用的切分方式。
+// Split 对单个文件执行切分：Go 走标准库 AST，Python/TypeScript/TSX/
+// JavaScript 走 Tree-sitter AST（v3 批次），失败一律回退行窗口。
+// 返回的 capability 为该文件实际使用的切分方式，禁止谎报。
 func (p Profile) Split(file File) ([]Chunk, Capability) {
 	language := DetectLanguage(file.RelPath)
 	if language == "go" {
 		if chunks, ok := p.splitGo(file, language); ok {
+			return chunks, CapabilityAST
+		}
+	}
+	if grammarName := treesitterGrammar(language, file.RelPath); grammarName != "" {
+		if chunks, ok := p.splitTreeSitter(file, language, grammarName); ok {
 			return chunks, CapabilityAST
 		}
 	}

@@ -2,7 +2,10 @@ module github.com/AoManoh/openace-mcp
 
 go 1.23
 
-require github.com/blevesearch/bleve/v2 v2.5.7
+require (
+	github.com/blevesearch/bleve/v2 v2.5.7
+	github.com/odvcencio/gotreesitter v0.47.0
+)
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.4.5 // indirect
