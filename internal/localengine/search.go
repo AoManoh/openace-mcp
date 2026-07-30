@@ -212,24 +212,96 @@ type rankedHit struct {
 	score float64
 }
 
+// retrieval 是一次检索的核心产物（渲染前）；handle 由调用方负责释放。
+type retrieval struct {
+	handle     *revisionHandle
+	ordered    []rankedHit
+	mode       string
+	reasons    []string
+	coverage   string
+	syncResult engine.Result
+}
+
 // Search 实现 engine.Service：按需同步后执行 lexical（+dense RRF）
 // （+optional rerank）检索；降级行为受 D8 支配，禁止静默。
 func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
-	if err := rejectProfileID(req.Workspace); err != nil {
+	out, err := e.retrieve(ctx, req)
+	if err != nil {
 		return engine.Result{}, err
+	}
+	handle := out.handle
+	defer e.releaseHandle(handle)
+
+	text, renderErr := renderHits(handle, out.ordered, req.MaxOutputLen)
+	if renderErr != nil {
+		return engine.Result{}, renderErr
+	}
+	degradedReason := strings.Join(out.reasons, ",")
+	if degradedReason != "" {
+		text = degradedBanner(degradedReason, out.mode, out.coverage) + text
+	}
+	result := out.syncResult
+	result.Text = text
+	result.Engine = EngineID
+	result.IndexRevision = handle.manifest.Revision
+	// 透明性字段：provider 已配置或发生降级时填充；纯词法正常路径
+	// 保持空（Stage 2 wire 不变，K32/K34）。
+	if e.semanticEnabled() || e.rerankClient != nil || degradedReason != "" {
+		result.RetrievalMode = out.mode
+		result.DegradedReason = degradedReason
+		result.SemanticCoverage = out.coverage
+	}
+	return result, nil
+}
+
+// CandidateRef 是评测 harness 可见的候选块引用（Stage 5 P5A-T03 专用
+// hook；不进入 MCP 工具面）。
+type CandidateRef struct {
+	ID        string
+	RelPath   string
+	StartLine int
+	EndLine   int
+}
+
+// SearchCandidates 返回渲染前的最终候选块序（含精排效果），供评测
+// harness 按 doc/文件粒度评分；语义与 Search 完全一致，仅省去渲染。
+func (e *Engine) SearchCandidates(ctx context.Context, req engine.SearchRequest) ([]CandidateRef, error) {
+	out, err := e.retrieve(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	defer e.releaseHandle(out.handle)
+	candidates := make([]CandidateRef, 0, len(out.ordered))
+	for _, hit := range out.ordered {
+		meta, ok := out.handle.chunks[hit.id]
+		if !ok {
+			continue
+		}
+		candidates = append(candidates, CandidateRef{
+			ID: hit.id, RelPath: meta.RelPath, StartLine: meta.StartLine, EndLine: meta.EndLine,
+		})
+	}
+	return candidates, nil
+}
+
+// retrieve 执行检索核心（同步→句柄→双路召回→融合→精排），返回渲染前
+// 候选；错误路径不返回句柄。
+func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrieval, error) {
+	if err := rejectProfileID(req.Workspace); err != nil {
+		return retrieval{}, err
 	}
 	query := strings.TrimSpace(req.Query)
 	if query == "" {
-		return engine.Result{}, errors.New("查询内容为空")
+		return retrieval{}, errors.New("查询内容为空")
 	}
 	// 检索前确保索引就绪（与 legacy Syncer 的 retrieval 语义一致）。
 	syncResult, syncErr := e.syncWorkspace(ctx, req.Workspace)
 	if syncErr != nil && ctx.Err() != nil {
-		return engine.Result{}, ctx.Err()
+		return retrieval{}, ctx.Err()
 	}
 	_, workspaceKey, err := e.resolveRoot(req.Workspace.DirectoryPath)
 	if err != nil {
-		return engine.Result{}, err
+		return retrieval{}, err
 	}
 	handle, handleErr := e.acquireHandle(workspaceKey)
 	var reasons []string
@@ -237,18 +309,17 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 		// D8(d)/review S23：索引刷新失败但存在可用 revision 时，
 		// allow 以旧索引服务并显式标记 stale，deny 报错。
 		if handleErr != nil {
-			return engine.Result{}, syncErr
+			return retrieval{}, syncErr
 		}
 		if e.retrievalDegrade == DegradeDeny {
 			e.releaseHandle(handle)
-			return engine.Result{}, degradeDeniedError("index refresh failed", syncErr, EnvRetrievalDegrade)
+			return retrieval{}, degradeDeniedError("index refresh failed", syncErr, EnvRetrievalDegrade)
 		}
 		reasons = append(reasons, "stale-index")
 		syncResult = engine.Result{Engine: EngineID, FileCount: handle.manifest.Counts.Files}
 	} else if handleErr != nil {
-		return engine.Result{}, handleErr
+		return retrieval{}, handleErr
 	}
-	defer e.releaseHandle(handle)
 
 	mode := "lexical"
 	lexTopK := defaultTopK
@@ -257,7 +328,8 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	}
 	lexHits, err := handle.lex.Search(ctx, query, lexTopK)
 	if err != nil {
-		return engine.Result{}, fmt.Errorf("词法检索: %w", err)
+		e.releaseHandle(handle)
+		return retrieval{}, fmt.Errorf("词法检索: %w", err)
 	}
 	// 统一过滤 choke point（暗坑 K39/K44）：两路召回都可能命中旧
 	// segment 中被 supersede/tombstone 的死 chunk，进入融合前按存活
@@ -269,7 +341,8 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	if e.semanticEnabled() {
 		denseIDs, denseReasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query)
 		if denseErr != nil {
-			return engine.Result{}, denseErr
+			e.releaseHandle(handle)
+			return retrieval{}, denseErr
 		}
 		reasons = append(reasons, denseReasons...)
 		lexIDs := make([]string, 0, len(lexHits))
@@ -303,7 +376,8 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	if e.rerankClient != nil && len(ordered) > 0 {
 		reordered, applied, rerankReason, rerankErr := e.rerankOrder(ctx, handle, query, ordered)
 		if rerankErr != nil {
-			return engine.Result{}, rerankErr
+			e.releaseHandle(handle)
+			return retrieval{}, rerankErr
 		}
 		if applied {
 			mode += "+rerank"
@@ -314,26 +388,10 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 		}
 	}
 
-	text, renderErr := renderHits(handle, ordered, req.MaxOutputLen)
-	if renderErr != nil {
-		return engine.Result{}, renderErr
-	}
-	degradedReason := strings.Join(reasons, ",")
-	if degradedReason != "" {
-		text = degradedBanner(degradedReason, mode, coverage) + text
-	}
-	result := syncResult
-	result.Text = text
-	result.Engine = EngineID
-	result.IndexRevision = handle.manifest.Revision
-	// 透明性字段：provider 已配置或发生降级时填充；纯词法正常路径
-	// 保持空（Stage 2 wire 不变，K32/K34）。
-	if e.semanticEnabled() || e.rerankClient != nil || degradedReason != "" {
-		result.RetrievalMode = mode
-		result.DegradedReason = degradedReason
-		result.SemanticCoverage = coverage
-	}
-	return result, nil
+	return retrieval{
+		handle: handle, ordered: ordered, mode: mode,
+		reasons: reasons, coverage: coverage, syncResult: syncResult,
+	}, nil
 }
 
 // filterLiveHits 过滤词法命中中的死 chunk（统一 choke point 的词法半边）。
