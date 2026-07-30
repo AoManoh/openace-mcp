@@ -56,7 +56,7 @@ func run() error {
 		workspace = flag.String("workspace", "", "物化语料 workspace 目录")
 		queries   = flag.String("queries", "", "queries.jsonl")
 		qrels     = flag.String("qrels", "", "qrels.tsv")
-		docmap    = flag.String("docmap", "", "docmap.tsv（relpath\\tdocid；空则 relpath 去扩展名为 docid）")
+		docmap    = flag.String("docmap", "", "docmap.tsv（relpath\\tdocid；空则 docid=relpath，适配 weaksup/sealed 的文件级 qrels）")
 		out       = flag.String("out", "", "run 输出目录")
 		label     = flag.String("label", "run", "run 标签")
 		topK      = flag.Int("topk", 10, "每查询保留候选 doc 数")
@@ -141,7 +141,9 @@ func run() error {
 		for _, candidate := range candidates {
 			docID := pathToDoc[candidate.RelPath]
 			if docID == "" {
-				docID = strings.TrimSuffix(filepath.Base(candidate.RelPath), filepath.Ext(candidate.RelPath))
+				// 无 docmap 时 docid=完整相对路径（weaksup/sealed 的
+				// qrels 契约）；去扩展名取 basename 会跨目录撞名。
+				docID = candidate.RelPath
 			}
 			if seen[docID] {
 				continue

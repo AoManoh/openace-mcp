@@ -103,7 +103,8 @@ Linux / macOS / WSL:
 
 ```bash
 GOPROXY=https://goproxy.cn,direct GOSUMDB=sum.golang.google.cn \
-go install github.com/AoManoh/openace-mcp/cmd/openace-mcp@main
+go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript" \
+  github.com/AoManoh/openace-mcp/cmd/openace-mcp@main
 ```
 
 Windows PowerShell:
@@ -111,8 +112,10 @@ Windows PowerShell:
 ```powershell
 $env:GOPROXY="https://goproxy.cn,direct"
 $env:GOSUMDB="sum.golang.google.cn"
-go install github.com/AoManoh/openace-mcp/cmd/openace-mcp@main
+go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript" github.com/AoManoh/openace-mcp/cmd/openace-mcp@main
 ```
+
+> `-tags` 控制内嵌的 Tree-sitter 语法子集（当前批次：Python/TypeScript/TSX/JavaScript，二进制约 28MB）。省略 `-tags` 也能构建出功能完全一致的二进制，但会内嵌全部 206 种语法（约 46MB）——切分行为不变，只是体积更大。
 
 安装后，MCP 配置可以改成直接调用本地命令：
 
@@ -286,7 +289,7 @@ profile 文件包含 token/session，必须当作本地 secret 管理，不要�
 - **成本边界**：embedding/rerank 的调用与计费发生在你自己的模型服务上。索引期按变更内容付费——未变更 chunk 按纯内容 hash 跨 revision 复用向量，不重复付费；查询期每次消耗一次 query embedding（启用 rerank 时另加一次精排调用）。openACE 默认不做客户端预算限制，预算护栏建议设在你的服务/账户侧（托管服务的 rate limit 或 budget 配置）。
 - **数据边界**：索引会在本机 cache 目录保存被索引文件的明文片段副本（`engines/local-hybrid/` 子树，权限仅当前用户）；启用 embedding 时 chunk 内容会发送到你配置的模型服务。使用任何**托管** embedding/rerank 服务前，请自行核实其数据保留与训练条款（多数托管服务默认可将数据用于训练，需显式退出）；自部署端点无此顾虑。`.augmentignore` 与内置敏感文件 denylist 先于一切生效。
 - **向量身份隔离**：模型/维度/端点任一变化会创建平行索引子树并全量重建，禁止混用不同模型的向量；换 key 不触发重建。
-- Go 文件按 AST 声明切分，其余语言按确定性行窗口切分；`workspace_status` 如实上报每语言 `ast|fallback`、语义覆盖率、provider 健康状态（healthy/backoff/candidate）与恢复时间。
+- Go（标准库 parser）与 Python/TypeScript/TSX/JavaScript（内嵌 Tree-sitter，纯 Go 运行时，无 CGO）按 AST 声明切分——函数/类/方法独立成块并携带符号；其余语言按确定性行窗口切分。单文件解析失败（语法错误、超时、超长单行）自动回退行窗口；`workspace_status` 如实上报每语言 `ast|fallback|mixed`、语义覆盖率、provider 健康状态（healthy/backoff/candidate）与恢复时间。
 - **增量索引（变更量成本）**：首建之后，编辑只重建变更文件（delta segment），删除/重命名立即从检索结果消失；重命名且内容未变时向量零重付。delta 链达到阈值后自动本地合并（compaction），合并不产生任何模型服务调用。磁盘与内存占用有界：索引只保留最近两个 revision，检索内容按需读取不常驻内存。
 - **中断不丢付费进度**：每批嵌入成功即写入本地 journal；构建被超时/取消/进程被杀中断后，下次 sync 直接复用已付费向量，只补真正缺失的部分。构建期 embedding 进度（待嵌/已嵌/journal 条数）经 `workspace_status` 实时可见。
 - **崩溃与多进程安全**：任意时刻杀死进程，重启后自动恢复到可用索引、清理残留、无重复付费。同一索引子树的写路径跨进程互斥（构建锁），持锁进程崩溃后其他进程自动接管；只读检索不受锁影响。
@@ -364,7 +367,8 @@ daemon 默认只监听 loopback。不要把 daemon 直接暴露到公网。
 go test ./...
 go test -race ./internal/daemon ./internal/mcp ./internal/workspace
 go vet ./...
-go build ./cmd/openace-mcp ./cmd/openace-daemon
+# 发布形态构建（Tree-sitter 语法子集，体积见上文安装节说明）
+go build -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript" ./cmd/openace-mcp ./cmd/openace-daemon
 ```
 
 ## License
