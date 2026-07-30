@@ -19,6 +19,7 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/bench"
 	"github.com/AoManoh/openace-mcp/internal/buildinfo"
 	"github.com/AoManoh/openace-mcp/internal/engine"
+	"github.com/AoManoh/openace-mcp/internal/lexical"
 	"github.com/AoManoh/openace-mcp/internal/localengine"
 )
 
@@ -41,6 +42,9 @@ type runManifest struct {
 	QueryCount   int               `json:"query_count"`
 	TopK         int               `json:"top_k"`
 	InputSHA     map[string]string `json:"input_sha256"`
+	// LexWeights 记录本 run 生效的词法子句权重（run 可复现的 config
+	// 指纹组成部分；nil 字段缺省 = 引擎默认）。
+	LexWeights map[string]float64 `json:"lex_weights,omitempty"`
 }
 
 type resultLine struct {
@@ -61,6 +65,11 @@ func run() error {
 		label     = flag.String("label", "run", "run 标签")
 		topK      = flag.Int("topk", 10, "每查询保留候选 doc 数")
 		limit     = flag.Int("limit", 0, "查询数上限（0=全部）")
+		// 词法子句权重扫描（T10a）：负值 = 引擎默认；权重只影响查询期
+		// 计分，索引可跨扫描配置复用。
+		symbolWeight = flag.Float64("lex-symbol-weight", -1, "symbol 分词子句权重（<0=默认）")
+		exactBoost   = flag.Float64("lex-symbol-exact-boost", -1, "symbol_raw 精确子句 boost（<0=默认）")
+		pathWeight   = flag.Float64("lex-path-weight", -1, "path 子句权重（<0=默认）")
 	)
 	flag.Parse()
 	if *workspace == "" || *queries == "" || *qrels == "" || *out == "" {
@@ -70,6 +79,24 @@ func run() error {
 	opts, err := localengine.OptionsFromEnv()
 	if err != nil {
 		return err
+	}
+	var lexWeights map[string]float64
+	if *symbolWeight >= 0 || *exactBoost >= 0 || *pathWeight >= 0 {
+		weights := lexical.DefaultWeights()
+		if *symbolWeight >= 0 {
+			weights.Symbol = *symbolWeight
+		}
+		if *exactBoost >= 0 {
+			weights.SymbolExact = *exactBoost
+		}
+		if *pathWeight >= 0 {
+			weights.Path = *pathWeight
+		}
+		opts.LexicalWeights = &weights
+		lexWeights = map[string]float64{
+			"content": weights.Content, "path": weights.Path,
+			"symbol": weights.Symbol, "symbol_exact": weights.SymbolExact,
+		}
 	}
 	eng, err := localengine.New(opts)
 	if err != nil {
@@ -121,6 +148,7 @@ func run() error {
 		InputSHA: map[string]string{
 			"queries": fileSHA(*queries), "qrels": fileSHA(*qrels),
 		},
+		LexWeights: lexWeights,
 	}
 
 	ctx := context.Background()
