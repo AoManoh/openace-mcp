@@ -256,7 +256,9 @@ profile 文件包含 token/session，必须当作本地 secret 管理，不要�
 
 ## 实验性能力：本地引擎（local-hybrid）
 
-设置 `OPENACE_ENGINE=local-hybrid` 后，openACE 使用自有的本地检索引擎：本机扫描、按 AST/行窗口切分、构建 BM25 词法索引并在本地完成检索。**词法路径不需要任何凭据或网络**；配置 embedding provider 后自动升级为词法 + 语义的混合检索（RRF 融合，可选 rerank 精排）。
+设置 `OPENACE_ENGINE=local-hybrid` 后，openACE 使用自有的本地检索引擎：本机扫描、按 AST/行窗口切分、构建 BM25 词法索引并在本地完成检索。**词法路径不需要任何凭据或网络**。
+
+要提升语义检索召回质量，需要你**自行提供一个性能可靠的 embedding 模型服务**（可选再加一个 rerank 模型服务）：openACE 只做检索编排（本地向量索引、RRF 融合、精排调度、降级），模型能力完全来自你配置的端点。接入后检索自动升级为词法 + 语义混合。
 
 ```jsonc
 // 纯词法（零配置、零出网）
@@ -264,26 +266,31 @@ profile 文件包含 token/session，必须当作本地 secret 管理，不要�
   "OPENACE_ENGINE": "local-hybrid"
 }
 
-// 混合语义检索（自带 provider key）
+// 混合语义检索：接入你自己的 embedding 服务（OpenAI-compatible 端点，
+// 自部署或托管均可；亦支持 voyage 类型端点，见下方环境变量表）
 "env": {
   "OPENACE_ENGINE": "local-hybrid",
-  "VOYAGE_API_KEY": "<your key>"          // 或自部署端点，见下方环境变量
+  "OPENACE_EMBEDDING_PROVIDER": "openai",
+  "OPENACE_EMBEDDING_BASE_URL": "http://127.0.0.1:8080/v1",
+  "OPENACE_EMBEDDING_MODEL": "<your-embedding-model>",
+  "OPENACE_EMBEDDING_DIMENSION": "1024",
+  "OPENACE_EMBEDDING_API_KEY": "<key-if-required>"
 }
 ```
 
 行为与边界（如实声明）：
 
-- **词法路径永远可用**：无 key、断网、provider 故障时 BM25 检索继续完整工作；未配置任何 provider 时行为与纯词法模式完全一致，不出现降级标记。
-- **语义混合检索**：配置 `VOYAGE_API_KEY`（默认 preset：`voyage-code-3`）或自部署 OpenAI-compatible 端点（vLLM/TEI/Infinity/Ollama，允许无 key）后，查询同时走 BM25 与本地向量召回并按 RRF 融合；配置 rerank provider（默认 `rerank-2.5`，可 `off`）后对头部候选精排。
+- **词法路径永远可用**：无 key、断网、模型服务故障时 BM25 检索继续完整工作；未配置任何模型服务时行为与纯词法模式完全一致，不出现降级标记。
+- **语义混合检索（模型自备）**：embedding 走 OpenAI-compatible 事实标准（vLLM/TEI/Infinity/Ollama 等自部署端点或任何兼容托管服务，允许无 key），另支持 `voyage` 类型端点；接入后查询同时走 BM25 与本地向量召回并按 RRF 融合。rerank 可选，支持 `tei`（自部署 TEI 形状）与 `voyage`（兼容 Cohere/Jina 式响应）两类端点，对头部候选精排。召回质量取决于你所选模型——请选用面向代码检索、性能可靠的 embedding/rerank 模型。
 - **降级完全显式，由你支配**：语义路/精排失败或索引覆盖不完整时，结果首行出现 `[DEGRADED] <原因>; mode=...; semantic_coverage=...` 横幅，结构化字段同步携带 `retrieval_mode`/`degraded_reason`/`semantic_coverage`；`OPENACE_RETRIEVAL_DEGRADE=deny`/`OPENACE_RERANK_DEGRADE=deny` 可改为直接返回可行动错误（默认 `allow` 放行词法结果）。不存在静默降级。
-- **成本边界**：embedding/rerank 使用你自己的 API key。索引期按变更内容计费——未变更 chunk 按纯内容 hash 跨 revision 复用向量，不重复付费；查询期每次消耗一次 query embedding（启用 rerank 时另加一次精排调用）。openACE 默认不做客户端预算限制，预算护栏建议设在 provider dashboard（如 Voyage project rate limit / budget）。
-- **数据边界**：索引会在本机 cache 目录保存被索引文件的明文片段副本（`engines/local-hybrid/` 子树，权限仅当前用户）；启用 embedding 时 chunk 内容会发送到你配置的 provider。使用 Voyage 前请在其 dashboard 确认组织已切换 **Opted Out**（默认 Opted In，数据可用于训练；绑卡只是获得 opt-out 资格）。`.augmentignore` 与内置敏感文件 denylist 先于一切生效。
+- **成本边界**：embedding/rerank 的调用与计费发生在你自己的模型服务上。索引期按变更内容付费——未变更 chunk 按纯内容 hash 跨 revision 复用向量，不重复付费；查询期每次消耗一次 query embedding（启用 rerank 时另加一次精排调用）。openACE 默认不做客户端预算限制，预算护栏建议设在你的服务/账户侧（托管服务的 rate limit 或 budget 配置）。
+- **数据边界**：索引会在本机 cache 目录保存被索引文件的明文片段副本（`engines/local-hybrid/` 子树，权限仅当前用户）；启用 embedding 时 chunk 内容会发送到你配置的模型服务。使用任何**托管** embedding/rerank 服务前，请自行核实其数据保留与训练条款（多数托管服务默认可将数据用于训练，需显式退出）；自部署端点无此顾虑。`.augmentignore` 与内置敏感文件 denylist 先于一切生效。
 - **向量身份隔离**：模型/维度/端点任一变化会创建平行索引子树并全量重建，禁止混用不同模型的向量；换 key 不触发重建。
 - Go 文件按 AST 声明切分，其余语言按确定性行窗口切分；`workspace_status` 如实上报每语言 `ast|fallback`、语义覆盖率、provider 健康状态（healthy/backoff/candidate）与恢复时间。
 - 索引以不可变 revision 形式保存，发布原子切换；词法/向量数据损坏时自动回退上一 revision 并在下次 sync 自愈。
 - `provider_profile_id` 仅适用于默认 ACE 引擎；local-hybrid 收到该参数会明确报错。
 - 引擎与 provider 配置按进程生效：修改 `OPENACE_ENGINE` 或任何 provider/降级 env 后需重启 daemon；`auto` 模式只复用引擎与 provider 配置指纹一致的 daemon，不一致会明确报错而非静默复用。
-- 大仓库首次语义 sync 是分钟级操作（实测约 2400 chunks 在 Voyage 上耗时 1–5 分钟，取决于批参数与网络），可能超过默认 `OPENACE_TOOL_TIMEOUT=110s`；首次索引建议临时调大该值（如 `600s`）。批处理端点较慢时调大 `OPENACE_PROVIDER_TIMEOUT` 或调小 `OPENACE_EMBEDDING_BATCH_SIZE`。已发布 revision 的向量按内容 hash 跨次复用（后续 sync 只补缺口）；但一次被超时/取消中断的构建会整体丢弃，其间已完成的嵌入调用不落盘——首次索引请预留足够超时。
+- 大仓库首次语义 sync 是分钟级操作（实测约 2400 chunks 在托管 embedding 服务上耗时 1–5 分钟，取决于所选服务、批参数与网络），可能超过默认 `OPENACE_TOOL_TIMEOUT=110s`；首次索引建议临时调大该值（如 `600s`）。批处理端点较慢时调大 `OPENACE_PROVIDER_TIMEOUT` 或调小 `OPENACE_EMBEDDING_BATCH_SIZE`。已发布 revision 的向量按内容 hash 跨次复用（后续 sync 只补缺口）；但一次被超时/取消中断的构建会整体丢弃，其间已完成的嵌入调用不落盘——首次索引请预留足够超时。
 
 ## 索引范围与安全边界
 
@@ -323,11 +330,11 @@ openACE 默认尊重 `.gitignore` / `.ignore`，并跳过 `.env*`、session、cr
 | `AUGMENT_SESSION_AUTH` | 完整 session JSON，优先级最高 |
 | `OPENACE_SESSION_FILE` | 显式 session 文件路径 |
 | `OPENACE_PROFILES_FILE` | 实验性多 profile JSON；设置后替代单账号凭据链 |
-| `OPENACE_ENGINE` | `ace`（默认）/ `local-hybrid`（实验性本地引擎；词法无需凭据，可选语义混合） |
-| `OPENACE_EMBEDDING_PROVIDER` | local-hybrid 语义路：`voyage`（默认）/ `openai`（自部署 OpenAI-compatible）/ `off`；voyage 缺 key 时语义路自动关闭、词法照常 |
-| `OPENACE_EMBEDDING_BASE_URL` `_API_KEY` `_MODEL` `_DIMENSION` | provider 身份四项；默认 Voyage `voyage-code-3` @1024 维；key 为空时回退读 `VOYAGE_API_KEY`；任一身份变化触发平行索引全量重建 |
+| `OPENACE_ENGINE` | `ace`（默认）/ `local-hybrid`（实验性本地引擎；词法无需凭据，可接入自备模型开启语义混合） |
+| `OPENACE_EMBEDDING_PROVIDER` | local-hybrid 语义路端点类型：`openai`（OpenAI-compatible，自部署或托管）/ `voyage`（Voyage 形状端点）/ `off`。默认值为 `voyage` 且未提供 key 时语义路保持关闭、词法照常——即不配置就是纯词法 |
+| `OPENACE_EMBEDDING_BASE_URL` `_API_KEY` `_MODEL` `_DIMENSION` | 模型服务身份四项，由你按所选服务填写（`openai` 类型必填 base_url 与 model）；`voyage` 类型内置端点与模型预设，key 为空时回退读 `VOYAGE_API_KEY`；任一身份变化触发平行索引全量重建 |
 | `OPENACE_EMBEDDING_BATCH_SIZE` `_MAX_CONCURRENCY` `_RPM_BUDGET` `_TPM_BUDGET` | 索引期调用参数（默认 128 / 4 / 不限 / 不限） |
-| `OPENACE_RERANK_PROVIDER` | 可选精排：`voyage`（默认，缺 key 即关闭）/ `tei`（自部署）/ `off`；`OPENACE_RERANK_BASE_URL`/`_API_KEY`/`_MODEL`/`_MAX_TOKENS` 语义同上（默认 `rerank-2.5`，单请求 200K token 上限） |
+| `OPENACE_RERANK_PROVIDER` | 可选精排端点类型：`tei`（自部署 TEI 形状）/ `voyage`（Cohere/Jina 兼容形状）/ `off`。默认值为 `voyage` 且缺 key 即关闭；`OPENACE_RERANK_BASE_URL`/`_API_KEY`/`_MODEL`/`_MAX_TOKENS` 语义同上（单请求默认 200K token 上限） |
 | `OPENACE_PROVIDER_TIMEOUT` / `OPENACE_PROVIDER_MAX_RETRIES` | provider HTTP 超时（默认 `60s`）与单批重试上限（默认 `5`） |
 | `OPENACE_RETRIEVAL_DEGRADE` / `OPENACE_RERANK_DEGRADE` | 语义路/精排失败策略：`allow`（默认，放行并标记 `[DEGRADED]`）/ `deny`（返回可行动错误） |
 | `OPENACE_MODE` | `auto` / `direct` / `manual-daemon`，默认 `auto` |
