@@ -326,7 +326,7 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	if e.semanticEnabled() {
 		lexTopK = hybridRouteTopK
 	}
-	lexHits, err := handle.lex.Search(ctx, query, lexTopK)
+	lexHits, err := handle.lex.SearchWeighted(ctx, query, lexTopK, e.lexWeights)
 	if err != nil {
 		e.releaseHandle(handle)
 		return retrieval{}, fmt.Errorf("词法检索: %w", err)

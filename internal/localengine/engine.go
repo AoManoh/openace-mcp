@@ -18,6 +18,7 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/embedding"
 	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/index"
+	"github.com/AoManoh/openace-mcp/internal/lexical"
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
 	"github.com/AoManoh/openace-mcp/internal/rerank"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
@@ -55,6 +56,9 @@ type Engine struct {
 	rerankClient     *rerank.Client
 	retrievalDegrade DegradeMode
 	rerankDegrade    DegradeMode
+	// lexWeights 是词法子句权重（T10a 受测常数；默认 DefaultWeights，
+	// 评测 harness 可经 Options 覆盖做权重扫描）。
+	lexWeights lexical.Weights
 
 	mu       sync.Mutex
 	inflight map[string]*buildCall
@@ -89,6 +93,7 @@ func New(opts Options) (*Engine, error) {
 		profile:          chunk.DefaultProfile(),
 		retrievalDegrade: normalizeDegrade(opts.RetrievalDegrade),
 		rerankDegrade:    normalizeDegrade(opts.RerankDegrade),
+		lexWeights:       lexical.DefaultWeights(),
 		inflight:         make(map[string]*buildCall),
 		statuses:         make(map[string]*wsStatus),
 		stores:           make(map[string]*index.Store),
@@ -96,6 +101,9 @@ func New(opts Options) (*Engine, error) {
 		repair:           make(map[string]bool),
 		journals:         make(map[string]*index.Journal),
 		locks:            make(map[string]*index.ProcessLock),
+	}
+	if opts.LexicalWeights != nil {
+		e.lexWeights = *opts.LexicalWeights
 	}
 	e.storeProfile = e.profile.ID + "-v" + e.profile.Version
 	e.embedCfg = opts.Embedding

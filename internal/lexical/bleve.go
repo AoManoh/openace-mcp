@@ -39,6 +39,25 @@ type Hit struct {
 	Score float64
 }
 
+// Weights 是查询期各子句的 boost 权重；<=0 的子句整体省略。
+type Weights struct {
+	Content     float64
+	Path        float64
+	Symbol      float64
+	SymbolExact float64
+}
+
+// DefaultWeights 返回默认子句权重。Symbol=0.1 是 Stage 5 T10a 定值
+// （F1 消解）：profile v3 首次为非 Go 语言填充符号后，symbol 短字段的
+// BM25 权重在 NL 查询语料上放大噪声（旧值 1.0 使 CoSQA R@5 0.166→0.092），
+// 0.1 让 CoSQA 完全回到无符号基线（0.1660）、django weaksup 保住 +21.8%
+// 增益（0.3100→0.3775）、508 条 exact-symbol 探针全权重满分（声明行
+// content 命中已足）。SymbolExact=4 对多词查询惰性、对全串精确查询
+// 提供 +0.33pp MRR，保留。证据：docs/refactor/2026-07-30-stage5b-tuning.md。
+func DefaultWeights() Weights {
+	return Weights{Content: 1, Path: 1, Symbol: 0.1, SymbolExact: 4}
+}
+
 // blevemapping 构建索引 mapping：
 // content/path/symbol 走默认 analyzer（分词检索），
 // path_raw/symbol_raw/language 走 keyword analyzer（精确匹配与过滤）。
@@ -174,26 +193,51 @@ func OpenMulti(dirs []string) (*Index, error) {
 // ErrClosed 表示句柄已关闭。
 var ErrClosed = errors.New("lexical 索引句柄已关闭")
 
-// Search 执行 BM25 检索：查询词命中 content/path/symbol 分词字段，
-// 并对 symbol_raw 精确匹配加 boost，保证 exact identifier 强召回。
+// Search 执行 BM25 检索（默认权重）：查询词命中 content/path/symbol
+// 分词字段，并对 symbol_raw 精确匹配加 boost，保证 exact identifier
+// 强召回。
 func (i *Index) Search(ctx context.Context, queryText string, topK int) ([]Hit, error) {
+	return i.SearchWeighted(ctx, queryText, topK, DefaultWeights())
+}
+
+// SearchWeighted 按显式子句权重执行 BM25 检索；权重 <=0 的子句省略。
+func (i *Index) SearchWeighted(ctx context.Context, queryText string, topK int, w Weights) ([]Hit, error) {
 	if i.idx == nil {
 		return nil, ErrClosed
 	}
 	if topK <= 0 {
 		topK = 10
 	}
-	match := bleve.NewMatchQuery(queryText)
-	match.SetField("content")
-	pathMatch := bleve.NewMatchQuery(queryText)
-	pathMatch.SetField("path")
-	symbolMatch := bleve.NewMatchQuery(queryText)
-	symbolMatch.SetField("symbol")
-	exact := bleve.NewTermQuery(queryText)
-	exact.SetField("symbol_raw")
-	exact.SetBoost(4.0)
+	var clauses []query.Query
+	if w.Content > 0 {
+		match := bleve.NewMatchQuery(queryText)
+		match.SetField("content")
+		match.SetBoost(w.Content)
+		clauses = append(clauses, match)
+	}
+	if w.Path > 0 {
+		pathMatch := bleve.NewMatchQuery(queryText)
+		pathMatch.SetField("path")
+		pathMatch.SetBoost(w.Path)
+		clauses = append(clauses, pathMatch)
+	}
+	if w.Symbol > 0 {
+		symbolMatch := bleve.NewMatchQuery(queryText)
+		symbolMatch.SetField("symbol")
+		symbolMatch.SetBoost(w.Symbol)
+		clauses = append(clauses, symbolMatch)
+	}
+	if w.SymbolExact > 0 {
+		exact := bleve.NewTermQuery(queryText)
+		exact.SetField("symbol_raw")
+		exact.SetBoost(w.SymbolExact)
+		clauses = append(clauses, exact)
+	}
+	if len(clauses) == 0 {
+		return nil, nil
+	}
 
-	disjunction := bleve.NewDisjunctionQuery(match, pathMatch, symbolMatch, exact)
+	disjunction := bleve.NewDisjunctionQuery(clauses...)
 	request := bleve.NewSearchRequestOptions(query.Query(disjunction), topK, 0, false)
 	result, err := i.idx.SearchInContext(ctx, request)
 	if err != nil {
