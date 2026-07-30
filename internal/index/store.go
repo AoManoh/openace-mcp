@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -93,7 +94,9 @@ func (s *Store) CleanupStaging() error {
 }
 
 // Publish 原子发布一次构建：
-//  1. staging 目录整体改名为 segments/<segmentID>（同卷 rename）；
+//  1. staging 目录整体改名为 segments/<最新 segment>（同卷 rename）；
+//     stagingPath 为空表示 manifest-only 发布（如仅删除的 delta，D1），
+//     跳过本步；
 //  2. 写入 manifests/<revision>.json（temp+rename）；
 //  3. 更新 active.json 指针（temp+Sync+rename+父目录 fsync）。
 //
@@ -102,15 +105,17 @@ func (s *Store) Publish(manifest *Manifest, stagingPath string) error {
 	if err := manifest.Validate(); err != nil {
 		return err
 	}
-	segmentPath := filepath.Join(s.root, segmentsDir, manifest.SegmentID)
-	if _, err := os.Stat(segmentPath); err == nil {
-		return fmt.Errorf("segment %s 已存在，segment 不可覆盖", manifest.SegmentID)
+	if stagingPath != "" {
+		segmentPath := filepath.Join(s.root, segmentsDir, manifest.NewestSegment().ID)
+		if _, err := os.Stat(segmentPath); err == nil {
+			return fmt.Errorf("segment %s 已存在，segment 不可覆盖", manifest.NewestSegment().ID)
+		}
+		if err := renameWithRetry(stagingPath, segmentPath); err != nil {
+			return fmt.Errorf("发布 segment: %w", err)
+		}
+		// 目录项持久化与 active.json 的强度对齐（review S4，K1 原文落实）。
+		syncDirBestEffort(filepath.Join(s.root, segmentsDir))
 	}
-	if err := os.Rename(stagingPath, segmentPath); err != nil {
-		return fmt.Errorf("发布 segment: %w", err)
-	}
-	// 目录项持久化与 active.json 的强度对齐（review S4，K1 原文落实）。
-	syncDirBestEffort(filepath.Join(s.root, segmentsDir))
 	manifestPath := filepath.Join(s.root, manifestsDir, manifest.Revision+".json")
 	if err := writeFileAtomic(manifestPath, mustJSON(manifest)); err != nil {
 		return fmt.Errorf("写入 manifest: %w", err)
@@ -137,7 +142,8 @@ func (s *Store) ActiveRevision() (string, bool, error) {
 	return pointer.Revision, true, nil
 }
 
-// LoadManifest 读取并校验指定 revision 的 manifest。
+// LoadManifest 读取、校验并归一化指定 revision 的 manifest
+// （v1 归一为单段 v2 视图，D1）。
 func (s *Store) LoadManifest(revision string) (*Manifest, error) {
 	var manifest Manifest
 	if err := decodeJSONFile(filepath.Join(s.root, manifestsDir, revision+".json"), &manifest); err != nil {
@@ -146,27 +152,40 @@ func (s *Store) LoadManifest(revision string) (*Manifest, error) {
 	if err := manifest.Validate(); err != nil {
 		return nil, err
 	}
+	manifest.Normalize()
 	return &manifest, nil
 }
 
-// SegmentPath 返回 manifest 对应的 segment 目录。
-func (s *Store) SegmentPath(manifest *Manifest) string {
-	return filepath.Join(s.root, segmentsDir, manifest.SegmentID)
+// SegmentPathFor 返回指定 segment 的目录。
+func (s *Store) SegmentPathFor(segmentID string) string {
+	return filepath.Join(s.root, segmentsDir, segmentID)
 }
 
-// VerifyManifest 校验 revision 数据完整性：chunks checksum 与 lexical 目录存在性。
-// Bleve 索引自身的深度校验由打开动作完成（打开失败视为损坏）。
+// SegmentPath 返回 manifest 最新 segment 的目录（v1 语义下即唯一 segment）。
+func (s *Store) SegmentPath(manifest *Manifest) string {
+	return s.SegmentPathFor(manifest.NewestSegment().ID)
+}
+
+// VerifyManifest 校验 revision 数据完整性：逐 segment 的 chunks checksum
+// 与 lexical 目录存在性。Bleve 索引自身的深度校验由打开动作完成
+// （打开失败视为损坏）。
 func (s *Store) VerifyManifest(manifest *Manifest) error {
-	segment := s.SegmentPath(manifest)
-	sum, err := ChecksumFile(filepath.Join(segment, ChunksFileName))
-	if err != nil {
-		return fmt.Errorf("读取 chunks 数据: %w", err)
+	segments := manifest.Segments
+	if len(segments) == 0 {
+		segments = []SegmentRef{manifest.NewestSegment()}
 	}
-	if sum != manifest.ChunksChecksum {
-		return fmt.Errorf("chunks checksum 不匹配: manifest=%s 实际=%s", manifest.ChunksChecksum, sum)
-	}
-	if info, err := os.Stat(filepath.Join(segment, LexicalDirName)); err != nil || !info.IsDir() {
-		return fmt.Errorf("lexical 索引目录缺失: %v", err)
+	for _, segment := range segments {
+		dir := s.SegmentPathFor(segment.ID)
+		sum, err := ChecksumFile(filepath.Join(dir, ChunksFileName))
+		if err != nil {
+			return fmt.Errorf("读取 segment %s chunks 数据: %w", segment.ID, err)
+		}
+		if sum != segment.ChunksChecksum {
+			return fmt.Errorf("segment %s chunks checksum 不匹配: manifest=%s 实际=%s", segment.ID, segment.ChunksChecksum, sum)
+		}
+		if info, err := os.Stat(filepath.Join(dir, LexicalDirName)); err != nil || !info.IsDir() {
+			return fmt.Errorf("segment %s lexical 索引目录缺失: %v", segment.ID, err)
+		}
 	}
 	return nil
 }
@@ -191,23 +210,56 @@ func (s *Store) ListRevisions() ([]string, error) {
 	return revisions, nil
 }
 
-// RemoveRevision 删除一个 revision 的 segment 与 manifest。
-// 调用方必须保证该 revision 不是 active/previous 且无打开句柄。
-// 删除顺序为 segment 目录先、manifest 后：中断残留的孤儿 manifest
-// 在校验时会自然失败并被后续 GC 重试。
+// RemoveRevision 删除一个 revision 的 manifest，并回收仅被其引用的
+// segment。调用方必须保证该 revision 不是 active/previous 且无打开句柄。
+// v2 起 segment 可被多个 revision 共享（delta 链，D1），删除顺序为
+// manifest 先（消除引用）、无引用 segment 后：中断残留的孤儿 segment
+// 由启动清理回收（暗坑 K42）。
 func (s *Store) RemoveRevision(revision string) error {
 	manifest, err := s.LoadManifest(revision)
+	manifestPath := filepath.Join(s.root, manifestsDir, revision+".json")
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		// manifest 已不可读：仍尝试移除残留文件。
-		return os.Remove(filepath.Join(s.root, manifestsDir, revision+".json"))
+		return os.Remove(manifestPath)
 	}
-	if err := os.RemoveAll(s.SegmentPath(manifest)); err != nil {
+	if err := os.Remove(manifestPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	return os.Remove(filepath.Join(s.root, manifestsDir, revision+".json"))
+	referenced, err := s.referencedSegments()
+	if err != nil {
+		return err
+	}
+	for _, segment := range manifest.Segments {
+		if referenced[segment.ID] {
+			continue
+		}
+		if err := os.RemoveAll(s.SegmentPathFor(segment.ID)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// referencedSegments 扫描全部剩余 manifest，返回被引用的 segment 集。
+func (s *Store) referencedSegments() (map[string]bool, error) {
+	revisions, err := s.ListRevisions()
+	if err != nil {
+		return nil, err
+	}
+	referenced := make(map[string]bool, len(revisions))
+	for _, revision := range revisions {
+		manifest, err := s.LoadManifest(revision)
+		if err != nil {
+			continue
+		}
+		for _, segment := range manifest.Segments {
+			referenced[segment.ID] = true
+		}
+	}
+	return referenced, nil
 }
 
 // ErrNoUsableRevision 表示 active 与 previous 均不可用。
@@ -245,19 +297,13 @@ func (s *Store) ResolveUsable() (*Manifest, []string, error) {
 }
 
 // CleanupOrphanSegments 删除不被任何 manifest 引用的 segment 目录
-// （review S5：Publish 在 rename 之后中断会留下孤儿 segment）。
-// 与 CleanupStaging 同时机（store 创建时）调用；单 daemon 所有权下
-// 此时不存在在飞发布（跨进程共享 cache 的防护属 Stage 4 议题 S15）。
+// （review S5：Publish 在 rename 之后中断会留下孤儿 segment；
+// v2 起同时兜底 RemoveRevision 中断残留，暗坑 K42）。
+// 与 CleanupStaging 同时机（store 创建时）调用。
 func (s *Store) CleanupOrphanSegments() error {
-	revisions, err := s.ListRevisions()
+	referenced, err := s.referencedSegments()
 	if err != nil {
 		return err
-	}
-	referenced := make(map[string]bool, len(revisions))
-	for _, revision := range revisions {
-		if manifest, err := s.LoadManifest(revision); err == nil {
-			referenced[manifest.SegmentID] = true
-		}
 	}
 	entries, err := os.ReadDir(filepath.Join(s.root, segmentsDir))
 	if err != nil {
@@ -313,12 +359,42 @@ func writeFileAtomic(path string, data []byte) error {
 		os.Remove(tmpName)
 		return err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := renameWithRetry(tmpName, path); err != nil {
 		os.Remove(tmpName)
 		return err
 	}
 	syncDirBestEffort(dir)
 	return nil
+}
+
+// renameWithRetry 对访问拒绝类瞬时失败做有界重试（Stage 4 D9/S14：
+// Windows/WSL 上 AV、索引器的瞬时句柄可让 rename 短暂失败；其余错误
+// 立即返回）。
+func renameWithRetry(oldPath string, newPath string) error {
+	var err error
+	for attempt, delay := 0, 25*time.Millisecond; attempt < 3; attempt, delay = attempt+1, delay*2 {
+		err = os.Rename(oldPath, newPath)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, os.ErrPermission) && !isTransientRenameErr(err) {
+			return err
+		}
+		time.Sleep(delay)
+	}
+	return err
+}
+
+// isTransientRenameErr 识别"文件被占用"类瞬时错误文本（跨平台错误码
+// 不统一，按保守子串匹配）。
+func isTransientRenameErr(err error) bool {
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{"access is denied", "being used by another process", "resource busy", "device or resource busy"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // syncDirBestEffort 对目录执行 fsync；Windows 与部分挂载文件系统

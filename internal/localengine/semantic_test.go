@@ -149,16 +149,17 @@ func TestSyncEmbedsAllChunks(t *testing.T) {
 	if manifest.VectorCount != manifest.Counts.Chunks || manifest.VectorCount == 0 {
 		t.Fatalf("应全量覆盖: vectors=%d chunks=%d", manifest.VectorCount, manifest.Counts.Chunks)
 	}
+	segment := manifest.NewestSegment()
 	if manifest.EmbeddingProvider != "openai" || manifest.EmbeddingModel != "fake-model" ||
 		manifest.EmbeddingDimension != dim || manifest.EmbeddingDtype != "float32" ||
-		manifest.EmbeddingProfileHash == "" || manifest.VectorsChecksum == "" || manifest.VectorsIndexChecksum == "" {
+		manifest.EmbeddingProfileHash == "" || segment.VectorsChecksum == "" || segment.VectorsIndexChecksum == "" {
 		t.Fatalf("manifest 语义字段不完整: %+v", manifest)
 	}
-	if manifest.EngineVersion != "stage3" {
-		t.Fatalf("EngineVersion 应为 stage3: %q", manifest.EngineVersion)
+	if manifest.EngineVersion != "stage4" {
+		t.Fatalf("EngineVersion 应为 stage4: %q", manifest.EngineVersion)
 	}
 	// 向量文件可按 manifest 校验载入（K24/K25 链路）。
-	ix, err := vector.Load(store.SegmentPath(manifest), dim, manifest.VectorsChecksum, manifest.VectorsIndexChecksum, 0)
+	ix, err := vector.Load(store.SegmentPathFor(segment.ID), dim, segment.VectorsChecksum, segment.VectorsIndexChecksum, 0)
 	if err != nil || ix.Count() != manifest.VectorCount {
 		t.Fatalf("向量载入: count=%v err=%v", ix, err)
 	}
@@ -204,7 +205,9 @@ func TestIncrementalEmbedOnlyChangedContent(t *testing.T) {
 	}
 }
 
-// TestVectorReuseBitExact 是 D2 的 bit 级复用断言。
+// TestVectorReuseBitExact 是 D2 的 bit 级复用断言：变更文件中内容未变的
+// chunk（追加函数后前部声明不动），其向量在 delta segment 内按纯 content
+// hash 复用且 bit 级一致。
 func TestVectorReuseBitExact(t *testing.T) {
 	const dim = 8
 	server := newEmbedServer(t, dim)
@@ -214,7 +217,8 @@ func TestVectorReuseBitExact(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstManifest, store := loadActiveManifest(t, e, root)
-	firstIx, err := vector.Load(store.SegmentPath(firstManifest), dim, firstManifest.VectorsChecksum, firstManifest.VectorsIndexChecksum, 0)
+	firstSegment := firstManifest.NewestSegment()
+	firstIx, err := vector.Load(store.SegmentPathFor(firstSegment.ID), dim, firstSegment.VectorsChecksum, firstSegment.VectorsIndexChecksum, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,20 +227,25 @@ func TestVectorReuseBitExact(t *testing.T) {
 		firstByHash[entry.ContentHash] = firstIx.Row(i)
 	}
 
-	writeFixture(t, root, "README.md", fixtureReadme+"\nExtended documentation line.\n")
+	// 追加函数：main.go 变更，但原有声明的 chunk 内容逐字节不变。
+	writeFixture(t, root, "main.go", fixtureMainGo+"\n// Extra 为复用测试追加。\nfunc Extra() int {\n\treturn 42\n}\n")
 	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
 		t.Fatal(err)
 	}
 	secondManifest, _ := loadActiveManifest(t, e, root)
-	secondIx, err := vector.Load(store.SegmentPath(secondManifest), dim, secondManifest.VectorsChecksum, secondManifest.VectorsIndexChecksum, 0)
+	deltaSegment := secondManifest.NewestSegment()
+	if deltaSegment.ID == firstSegment.ID {
+		t.Fatalf("变更应产生新 delta segment")
+	}
+	deltaIx, err := vector.Load(store.SegmentPathFor(deltaSegment.ID), dim, deltaSegment.VectorsChecksum, deltaSegment.VectorsIndexChecksum, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	common := 0
-	for i, entry := range secondIx.Entries() {
+	for i, entry := range deltaIx.Entries() {
 		if old, ok := firstByHash[entry.ContentHash]; ok {
 			common++
-			if !reflect.DeepEqual(old, secondIx.Row(i)) {
+			if !reflect.DeepEqual(old, deltaIx.Row(i)) {
 				t.Fatalf("复用向量应 bit 级一致（D2）: hash=%s", entry.ContentHash)
 			}
 		}
@@ -267,8 +276,12 @@ func TestPartialEmbeddingFailurePublishesDegradedThenHeals(t *testing.T) {
 		t.Fatalf("应为部分覆盖: %d/%d", manifest.VectorCount, manifest.Counts.Chunks)
 	}
 
-	// 恢复 provider；新引擎（fresh circuit）执行补齐。
+	// 恢复 provider；关闭旧引擎（释放跨进程写锁，D6）后由新引擎
+	// （fresh circuit）执行补齐。
 	server.setFailWhen(nil)
+	if err := e.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	e2, err := New(embedOptions(server.ts.URL, dim, 1, "fake-model"))
 	if err != nil {
 		t.Fatal(err)
@@ -404,6 +417,185 @@ func TestZeroVectorNotRetriedAcrossSyncs(t *testing.T) {
 	status, err := e.WorkspaceStatus(context.Background(), engineRef(root))
 	if err != nil || status.Semantic == nil || status.Semantic.RejectedChunks != 1 {
 		t.Fatalf("拒绝计数应保持可见: %+v err=%v", status.Semantic, err)
+	}
+}
+
+// TestJournalResumesAfterInterruptedBuild 是 G2 核心承诺（D4）：
+// 构建被取消后，已成功批次的向量经 journal 复活，重跑零重复付费。
+func TestJournalResumesAfterInterruptedBuild(t *testing.T) {
+	const dim = 8
+	var mu sync.Mutex
+	var texts []string
+	blocking := true
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Input []string `json:"input"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		holdHere := blocking && len(req.Input) == 1 && strings.Contains(req.Input[0], "parse_config")
+		mu.Unlock()
+		if holdHere {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+			// 被中断的请求未成功——不计入已付费文本。
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		mu.Lock()
+		texts = append(texts, req.Input...)
+		mu.Unlock()
+		type item struct {
+			Embedding []float32 `json:"embedding"`
+			Index     int       `json:"index"`
+		}
+		items := make([]item, 0, len(req.Input))
+		for i, text := range req.Input {
+			items = append(items, item{Embedding: fakeVector(dim, text), Index: i})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": items})
+	}))
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		ts.Close()
+	}()
+
+	cacheDir := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", cacheDir)
+	t.Setenv("OPENACE_CACHE_NAMESPACE", "test")
+	root := newFixtureWorkspace(t)
+	opts := embedOptions(ts.URL, dim, 1, "fake-model") // batch=1：逐 chunk 顺序嵌入
+
+	first, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncDone := make(chan error, 1)
+	go func() {
+		_, err := first.Sync(context.Background(), syncRequest(root))
+		syncDone <- err
+	}()
+	<-started // 阻塞在 util.py chunk：此前批次已成功并落 journal
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := first.Close(closeCtx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := <-syncDone; err == nil {
+		t.Fatalf("被取消的构建不应成功")
+	}
+	mu.Lock()
+	paidBefore := len(texts)
+	blocking = false
+	mu.Unlock()
+	close(release)
+	if paidBefore < 2 {
+		t.Fatalf("中断前应已有付费批次: %d", paidBefore)
+	}
+
+	second, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close(context.Background()) })
+	if _, err := second.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatalf("恢复构建: %v", err)
+	}
+	manifest, _ := loadActiveManifest(t, second, root)
+	if !manifest.SemanticComplete() {
+		t.Fatalf("恢复后应全覆盖: %d/%d", manifest.VectorCount, manifest.Counts.Chunks)
+	}
+	// 零重复付费：恢复构建只嵌入中断点未完成的内容。
+	mu.Lock()
+	resumed := texts[paidBefore:]
+	mu.Unlock()
+	seen := make(map[string]int)
+	for _, text := range texts {
+		seen[text]++
+	}
+	for text, count := range seen {
+		if count > 1 {
+			t.Fatalf("内容被重复送 provider（违反 G2）: %q ×%d", text[:min(40, len(text))], count)
+		}
+	}
+	for _, text := range resumed {
+		if strings.Contains(text, "HandleLogin") || strings.Contains(text, "Demo App") {
+			t.Fatalf("已付费内容不应重发: %q", text[:min(40, len(text))])
+		}
+	}
+}
+
+// TestRejectedSetPersistsAcrossRestart 是 K35 修订的跨重启形态。
+func TestRejectedSetPersistsAcrossRestart(t *testing.T) {
+	const dim = 8
+	server := newEmbedServer(t, dim)
+	server.zeroWhen = func(text string) bool { return strings.Contains(text, "parse_config") }
+	cacheDir := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", cacheDir)
+	t.Setenv("OPENACE_CACHE_NAMESPACE", "test")
+	root := newFixtureWorkspace(t)
+	opts := embedOptions(server.ts.URL, dim, 16, "fake-model")
+
+	first, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatal(err)
+	}
+	_ = first.Close(context.Background())
+	callsAfterFirst := server.callCount()
+
+	second, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close(context.Background()) })
+	if _, err := second.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatal(err)
+	}
+	if server.callCount() != callsAfterFirst {
+		t.Fatalf("拒绝史应跨重启防重复付费: %d → %d", callsAfterFirst, server.callCount())
+	}
+	status, err := second.WorkspaceStatus(context.Background(), engineRef(root))
+	if err != nil || status.Semantic == nil || status.Semantic.RejectedChunks != 1 {
+		t.Fatalf("拒绝计数应跨重启可见: %+v err=%v", status.Semantic, err)
+	}
+}
+
+// TestJournalClearedAfterPublish 是暗坑 K41：发布即 GC，journal 不演化
+// 为第二事实源。
+func TestJournalClearedAfterPublish(t *testing.T) {
+	const dim = 8
+	server := newEmbedServer(t, dim)
+	e := newTestEngineWith(t, embedOptions(server.ts.URL, dim, 16, "fake-model"))
+	root := newFixtureWorkspace(t)
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatal(err)
+	}
+	_, workspaceKey, err := e.resolveRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := e.storeFor(workspaceKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := e.journalFor(workspaceKey, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := journal.Snapshot(); len(got) != 0 {
+		t.Fatalf("发布后 journal 应清空: %d 条残留", len(got))
 	}
 }
 
