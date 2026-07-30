@@ -133,6 +133,10 @@ func Build(ctx context.Context, dir string, docs []Doc) error {
 // （Stage 4 D2）。已知限制：alias 下 BM25 语料统计按各 segment 局部计算，
 // 跨段分数存在偏差——候选按 rank 进 RRF 且有 rerank 精排缓冲（暗坑 K38，
 // Stage 5 benchmark 量化）。
+//
+// 并发契约（Stage 2 review S8）：Search 可并发；Close 与 Search 的互斥
+// 由上层 revisionHandle 的引用计数保证（refs==0 才关闭），本类型自身
+// 不做加锁。禁止绕过句柄直接持有 Index 跨发布使用。
 type Index struct {
 	idx     bleve.Index
 	members []bleve.Index
