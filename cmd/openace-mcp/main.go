@@ -33,8 +33,16 @@ func main() {
 	}
 	server := mcp.NewServer(service)
 
-	if err := server.Run(ctx, os.Stdin, os.Stdout); err != nil {
-		fmt.Fprintf(os.Stderr, "openace-mcp: %v\n", err)
+	runErr := server.Run(ctx, os.Stdin, os.Stdout)
+	// direct 模式下引擎持有本地句柄，退出前有序释放（review S7，
+	// 与 daemon Shutdown 路径对称）。
+	if lifecycle, ok := service.(engine.Lifecycle); ok {
+		if err := lifecycle.Close(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "openace-mcp: close engine: %v\n", err)
+		}
+	}
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "openace-mcp: %v\n", runErr)
 		os.Exit(1)
 	}
 }
@@ -81,9 +89,14 @@ func buildLocalService(ctx context.Context) (engine.Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	// local-hybrid 不依赖任何上游凭据：无 AUGMENT_* 也必须可启动。
+	// local-hybrid 不依赖任何上游凭据：无 AUGMENT_* 也必须可启动
+	// （缺 key = semantic off，词法照常，阶段计划 D1）。
 	if engineID == engine.EngineLocalHybrid {
-		return localengine.New(), nil
+		opts, err := localengine.OptionsFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		return localengine.New(opts)
 	}
 	loader := auth.NewLoader()
 	profiles, err := loader.LoadProfiles(ctx)

@@ -60,6 +60,35 @@ type Manifest struct {
 	ChunksChecksum string    `json:"chunks_checksum"`
 	CreatedAt      time.Time `json:"created_at"`
 	ActivatedAt    time.Time `json:"activated_at"`
+
+	// —— Stage 3 语义路字段（全部 omitempty：embedding 未启用时 manifest
+	// 形状与 Stage 2 逐字节同构，旧 manifest 亦可被新代码读取，暗坑 K34）——
+
+	// EmbeddingProvider/Model/Dimension/Dtype 记录向量身份；与 profile
+	// 子树对应，禁止混用（暗坑 K24）。不含任何凭据（暗坑 K21）。
+	EmbeddingProvider  string `json:"embedding_provider,omitempty"`
+	EmbeddingModel     string `json:"embedding_model,omitempty"`
+	EmbeddingDimension int    `json:"embedding_dimension,omitempty"`
+	EmbeddingDtype     string `json:"embedding_dtype,omitempty"`
+	// EmbeddingProfileHash 与索引目录 profile 段一致（阶段计划 D4）。
+	EmbeddingProfileHash string `json:"embedding_profile_hash,omitempty"`
+	// VectorsChecksum/VectorsIndexChecksum 校验 vectors.dat/vectors.idx；
+	// 校验失败仅语义路降级，不废整个 revision（暗坑 K25）。
+	VectorsChecksum      string `json:"vectors_checksum,omitempty"`
+	VectorsIndexChecksum string `json:"vectors_index_checksum,omitempty"`
+	// VectorCount 是已覆盖 chunk 行数；semantic coverage = VectorCount /
+	// Counts.Chunks（暗坑 K31，读取时计算不落盘防口径漂移）。
+	VectorCount int `json:"vector_count,omitempty"`
+}
+
+// HasVectors 报告本 revision 是否携带向量数据文件。
+func (m *Manifest) HasVectors() bool {
+	return m.VectorsChecksum != ""
+}
+
+// SemanticComplete 报告语义覆盖是否完整（空仓库按完整计）。
+func (m *Manifest) SemanticComplete() bool {
+	return m.VectorCount >= m.Counts.Chunks
 }
 
 // Validate 检查 manifest 自身的结构完整性。

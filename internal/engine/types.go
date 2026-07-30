@@ -21,6 +21,7 @@ const (
 
 	// local-hybrid 引擎的构建阶段（发现阶段复用 IndexStageScanning）。
 	IndexStageChunking   IndexStage = "chunking"
+	IndexStageEmbedding  IndexStage = "embedding"
 	IndexStageIndexing   IndexStage = "indexing"
 	IndexStagePublishing IndexStage = "publishing"
 )
@@ -52,6 +53,18 @@ type Result struct {
 	Deleted           int
 	MultiStatus       *MultiRetrievalStatus `json:"multi_status,omitempty"`
 	ServedBy          *runtimeinfo.ServedBy `json:"served_by,omitempty"`
+
+	// —— Stage 3 检索透明性字段（决策 11；全部 omitempty：legacy ACE 与
+	// 纯词法正常路径不填充，wire 不变，暗坑 K34）——
+
+	// RetrievalMode 是本次检索实际执行的链路：lexical / hybrid /
+	// hybrid+rerank / lexical+rerank。
+	RetrievalMode string `json:"retrieval_mode,omitempty"`
+	// DegradedReason 非空表示结果处于降级（逗号分隔的稳定原因 token；
+	// 文本首行同步携带 [DEGRADED] 横幅）。
+	DegradedReason string `json:"degraded_reason,omitempty"`
+	// SemanticCoverage 是语义索引覆盖率（如 "87%"；语义路未配置时为空）。
+	SemanticCoverage string `json:"semantic_coverage,omitempty"`
 }
 
 // Summary 输出一行人类可读的结果摘要，供 MCP 工具文本渲染使用。
@@ -60,6 +73,39 @@ func (r Result) Summary() string {
 		return fmt.Sprintf("provider_profile_id=%s checkpoint=%s files=%d uploaded=%d added=%d deleted=%d", r.ProviderProfileID, r.CheckpointID, r.FileCount, r.Uploaded, r.Added, r.Deleted)
 	}
 	return fmt.Sprintf("checkpoint=%s files=%d uploaded=%d added=%d deleted=%d", r.CheckpointID, r.FileCount, r.Uploaded, r.Added, r.Deleted)
+}
+
+// SemanticStatus 描述 local-hybrid 语义路与精排 provider 的运行状态
+// （Stage 3；整块 omitempty，legacy ACE 与纯词法零配置路径不出现，暗坑
+// K34）。所有字段不含凭据（暗坑 K21）。
+type SemanticStatus struct {
+	// Enabled 为 false 时语义路未启用，DisabledReason 解释原因（off/缺 key）。
+	Enabled        bool   `json:"enabled"`
+	DisabledReason string `json:"disabled_reason,omitempty"`
+
+	Provider  string `json:"provider,omitempty"`
+	Model     string `json:"model,omitempty"`
+	Dimension int    `json:"dimension,omitempty"`
+
+	// Coverage 是 active revision 的语义覆盖率（如 "87%"）；
+	// CoveredChunks/TotalChunks 是其分子分母（暗坑 K31）。
+	Coverage      string `json:"coverage,omitempty"`
+	CoveredChunks int    `json:"covered_chunks,omitempty"`
+	TotalChunks   int    `json:"total_chunks,omitempty"`
+	// RejectedChunks 是被拒绝的非法向量数（零向量/NaN，暗坑 K35）。
+	RejectedChunks int `json:"rejected_chunks,omitempty"`
+
+	// ProviderState 是 embedding circuit 状态：healthy/backoff/candidate；
+	// backoff 时 BackoffUntil 指明恢复探测时间（§15）。
+	ProviderState string     `json:"provider_state,omitempty"`
+	BackoffUntil  *time.Time `json:"backoff_until,omitempty"`
+	// LastError 是最近一次 provider 失败的脱敏消息。
+	LastError string `json:"last_error,omitempty"`
+
+	// Rerank* 描述精排 provider（未配置时 RerankDisabledReason 解释原因）。
+	RerankProvider       string `json:"rerank_provider,omitempty"`
+	RerankState          string `json:"rerank_state,omitempty"`
+	RerankDisabledReason string `json:"rerank_disabled_reason,omitempty"`
 }
 
 // MultiRetrievalStatus 汇总一次跨工作区检索的每仓结果。
@@ -93,6 +139,7 @@ type WorkspaceStatus struct {
 	CheckpointID           string                `json:"checkpoint_id,omitempty"`
 	IndexRevision          string                `json:"index_revision,omitempty"`
 	Engine                 string                `json:"engine,omitempty"`
+	Semantic               *SemanticStatus       `json:"semantic,omitempty"`
 	FileCount              int                   `json:"file_count"`
 	InFlight               bool                  `json:"in_flight"`
 	Stage                  IndexStage            `json:"stage"`

@@ -2,6 +2,7 @@ package localengine
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,6 +35,22 @@ type wsStatus struct {
 	startedAt        *time.Time
 	finishedAt       *time.Time
 	updatedAt        time.Time
+
+	// 语义路状态（Stage 3）：covered 来自 active manifest（暗坑 K31），
+	// rejected/embedError 来自最近一次构建的 provider 交互。
+	coveredChunks  int
+	rejectedChunks int
+	embedError     string
+}
+
+// setSemanticOutcome 记录最近一次构建的语义路交互结果（K35 拒绝数与
+// 脱敏错误；provider circuit 状态由 Engine 层实时提供）。
+func (s *wsStatus) setSemanticOutcome(rejected int, lastError string) {
+	s.mu.Lock()
+	s.rejectedChunks = rejected
+	s.embedError = lastError
+	s.updatedAt = time.Now().UTC()
+	s.mu.Unlock()
 }
 
 // setSkippedFiles 记录内容门禁跳过的文件数（暗坑 K6）。
@@ -82,6 +99,7 @@ func (s *wsStatus) ready(manifest *index.Manifest, revisions int) {
 	s.revision = manifest.Revision
 	s.fileCount = manifest.Counts.Files
 	s.chunkCount = manifest.Counts.Chunks
+	s.coveredChunks = manifest.VectorCount
 	s.revisionCount = revisions
 	s.capabilities = manifest.ChunkerCapabilities
 	s.lastError = ""
@@ -186,6 +204,54 @@ func capabilitySummary(capabilities map[string]string, revisions int, skippedFil
 	return "chunker[" + strings.Join(parts, " ") + "]"
 }
 
+// attachSemantic 为状态挂接语义路/精排 provider 视图（阶段计划 T08）。
+// 两个 provider 均为零配置（Options 零值）时不挂接，保持 Stage 2 wire
+// 不变（K32/K34）；配置了但未启用（如缺 key）时如实给出原因（D1）。
+func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatus) {
+	embedConfigured := e.embedCfg.Enabled || e.embedCfg.DisabledReason != ""
+	rerankConfigured := e.rerankCfg.Enabled || e.rerankCfg.DisabledReason != ""
+	if !embedConfigured && !rerankConfigured {
+		return
+	}
+	semantic := &engine.SemanticStatus{Enabled: e.embedCfg.Enabled}
+	if e.embedCfg.Enabled {
+		semantic.Provider = e.embedCfg.ProviderType
+		semantic.Model = e.embedCfg.Model
+		semantic.Dimension = e.embedCfg.Dimension
+		if tracker != nil {
+			tracker.mu.Lock()
+			semantic.CoveredChunks = tracker.coveredChunks
+			semantic.TotalChunks = tracker.chunkCount
+			semantic.RejectedChunks = tracker.rejectedChunks
+			semantic.LastError = tracker.embedError
+			tracker.mu.Unlock()
+			if semantic.TotalChunks == 0 {
+				semantic.Coverage = "100%"
+			} else {
+				semantic.Coverage = fmt.Sprintf("%d%%", semantic.CoveredChunks*100/semantic.TotalChunks)
+			}
+		}
+		circuit := e.embedClient.CircuitSnapshot()
+		semantic.ProviderState = circuit.State
+		if !circuit.BackoffUntil.IsZero() {
+			until := circuit.BackoffUntil
+			semantic.BackoffUntil = &until
+		}
+		if semantic.LastError == "" && circuit.LastError != "" {
+			semantic.LastError = circuit.LastError
+		}
+	} else if embedConfigured {
+		semantic.DisabledReason = e.embedCfg.DisabledReason
+	}
+	if e.rerankCfg.Enabled {
+		semantic.RerankProvider = e.rerankCfg.Identity()
+		semantic.RerankState = e.rerankClient.CircuitSnapshot().State
+	} else if rerankConfigured {
+		semantic.RerankDisabledReason = e.rerankCfg.DisabledReason
+	}
+	status.Semantic = semantic
+}
+
 // WorkspaceStatus 实现 engine.WorkspaceInspector。
 func (e *Engine) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (engine.WorkspaceStatus, error) {
 	if err := rejectProfileID(ref); err != nil {
@@ -202,7 +268,9 @@ func (e *Engine) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (
 	status, ok := e.statuses[workspaceKey]
 	e.mu.Unlock()
 	if ok {
-		return status.snapshot(), nil
+		snapshot := status.snapshot()
+		e.attachSemantic(&snapshot, status)
+		return snapshot, nil
 	}
 	// 冷启动：内存无状态时从持久化 manifest 恢复视图。
 	store, err := e.storeFor(workspaceKey)
@@ -212,19 +280,23 @@ func (e *Engine) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (
 	manifest, _, err := store.ResolveUsable()
 	if err != nil {
 		if isNoRevision(err) {
-			return engine.WorkspaceStatus{
+			cold := engine.WorkspaceStatus{
 				DirectoryPath: root.CanonicalPath,
 				PathKind:      string(root.PathKind),
 				HostOS:        root.HostOS,
 				Engine:        EngineID,
 				Stage:         engine.IndexStageIdle,
-			}, nil
+			}
+			e.attachSemantic(&cold, nil)
+			return cold, nil
 		}
 		return engine.WorkspaceStatus{}, err
 	}
 	tracker := e.statusFor(root, workspaceKey)
 	tracker.ready(manifest, revisionCount(store, manifest))
-	return tracker.snapshot(), nil
+	snapshot := tracker.snapshot()
+	e.attachSemantic(&snapshot, tracker)
+	return snapshot, nil
 }
 
 // ListWorkspaceStatuses 实现 engine.WorkspaceInspector。
@@ -240,7 +312,9 @@ func (e *Engine) ListWorkspaceStatuses(ctx context.Context) ([]engine.WorkspaceS
 	e.mu.Unlock()
 	statuses := make([]engine.WorkspaceStatus, 0, len(trackers))
 	for _, tracker := range trackers {
-		statuses = append(statuses, tracker.snapshot())
+		snapshot := tracker.snapshot()
+		e.attachSemantic(&snapshot, tracker)
+		statuses = append(statuses, snapshot)
 	}
 	sort.Slice(statuses, func(i, j int) bool { return statuses[i].DirectoryPath < statuses[j].DirectoryPath })
 	return statuses, nil

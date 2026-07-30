@@ -14,6 +14,7 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/buildinfo"
 	"github.com/AoManoh/openace-mcp/internal/daemon"
 	"github.com/AoManoh/openace-mcp/internal/engine"
+	"github.com/AoManoh/openace-mcp/internal/localengine"
 )
 
 const defaultStartupTimeout = 10 * time.Second
@@ -23,9 +24,18 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	expectedProfile := ""
+	if requestedEngine == engine.EngineLocalHybrid {
+		// 期望配置指纹来自本进程 env（K29）：解析失败即配置错误，fail-fast。
+		opts, err := localengine.OptionsFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		expectedProfile = opts.Fingerprint()
+	}
 	addr := daemonAddrFromEnv()
 	client := daemon.NewClient(addr)
-	if err := reusable(ctx, client, requestedEngine); err == nil {
+	if err := reusable(ctx, client, requestedEngine, expectedProfile); err == nil {
 		return client, nil
 	} else if healthy(ctx, client) {
 		return nil, err
@@ -33,20 +43,20 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 	managedAddr := managedDaemonAddr(addr)
 	managedClient := daemon.NewClient(managedAddr)
 	if managedAddr != addr {
-		if err := reusable(ctx, managedClient, requestedEngine); err == nil {
+		if err := reusable(ctx, managedClient, requestedEngine, expectedProfile); err == nil {
 			return managedClient, nil
 		} else if healthy(ctx, managedClient) {
 			return nil, err
 		}
 	}
-	if err := reusable(ctx, managedClient, requestedEngine); err == nil {
+	if err := reusable(ctx, managedClient, requestedEngine, expectedProfile); err == nil {
 		return managedClient, nil
 	} else if healthy(ctx, managedClient) {
 		return nil, err
 	}
 	releaseLock, err := acquireStartupLock(ctx, managedAddr, startupTimeout())
 	if err != nil {
-		if err := reusable(ctx, managedClient, requestedEngine); err == nil {
+		if err := reusable(ctx, managedClient, requestedEngine, expectedProfile); err == nil {
 			return managedClient, nil
 		} else if healthy(ctx, managedClient) {
 			return nil, err
@@ -54,7 +64,7 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 		return nil, err
 	}
 	defer releaseLock()
-	if err := reusable(ctx, managedClient, requestedEngine); err == nil {
+	if err := reusable(ctx, managedClient, requestedEngine, expectedProfile); err == nil {
 		return managedClient, nil
 	} else if healthy(ctx, managedClient) {
 		return nil, err
@@ -69,7 +79,7 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 	return managedClient, nil
 }
 
-func reusable(ctx context.Context, client *daemon.Client, requestedEngine string) error {
+func reusable(ctx context.Context, client *daemon.Client, requestedEngine string, expectedProfile string) error {
 	statusCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 	status, err := client.DaemonStatus(statusCtx)
@@ -85,6 +95,9 @@ func reusable(ctx context.Context, client *daemon.Client, requestedEngine string
 	if err := compatibleEngine(requestedEngine, status.Engine); err != nil {
 		return fmt.Errorf("openACE daemon at %s is not compatible with this MCP wrapper: %w", client.Endpoint(), err)
 	}
+	if err := compatibleEngineProfile(requestedEngine, expectedProfile, status.EngineProfile); err != nil {
+		return fmt.Errorf("openACE daemon at %s is not compatible with this MCP wrapper: %w", client.Endpoint(), err)
+	}
 	return nil
 }
 
@@ -96,6 +109,23 @@ func compatibleEngine(requested string, daemonEngine string) error {
 	}
 	if requested != daemonEngine {
 		return fmt.Errorf("wrapper engine %q != daemon engine %q; stop the daemon or align OPENACE_ENGINE", requested, daemonEngine)
+	}
+	return nil
+}
+
+// compatibleEngineProfile 校验 local-hybrid 的 provider 配置指纹一致
+// （Stage 3 暗坑 K29）：用户改 provider env 后不得静默复用旧配置 daemon。
+// 旧 daemon（Stage 2，无 engine_profile 广播）按纯词法档对待——与
+// semantic/rerank 全关的期望兼容，与任何 provider 配置不兼容（D11）。
+func compatibleEngineProfile(requestedEngine string, expected string, daemonProfile string) error {
+	if requestedEngine != engine.EngineLocalHybrid {
+		return nil
+	}
+	if daemonProfile == "" {
+		daemonProfile = localengine.Options{}.Fingerprint()
+	}
+	if expected != daemonProfile {
+		return fmt.Errorf("wrapper engine profile %s != daemon engine profile %s (provider/degrade env changed); restart the daemon to apply the new configuration", expected, daemonProfile)
 	}
 	return nil
 }

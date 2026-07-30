@@ -55,12 +55,14 @@ type Profile struct {
 	DocWindowLines int
 }
 
-// DefaultProfile 是 Stage 2 唯一启用的 profile。
+// DefaultProfile 是当前唯一启用的 profile。
 // 参数依据 docs/references/2026-07-29-chunking-provider-benchmark-expansion.md §A5。
+// Version 2（Stage 3）：字节窗口改为 rune 边界切分并修正尾换行 EndLine
+// （review S16）——切分行为变化必须升版本以保证 chunk ID 跨版本不混用（K5）。
 func DefaultProfile() Profile {
 	return Profile{
 		ID:             "default",
-		Version:        "1",
+		Version:        "2",
 		MaxChunkBytes:  2048,
 		WindowLines:    60,
 		OverlapLines:   10,

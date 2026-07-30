@@ -254,23 +254,36 @@ profile 文件包含 token/session，必须当作本地 secret 管理，不要�
 
 `auto` 只会复用暴露运行时身份能力且 build revision 兼容的 daemon。若本机 `127.0.0.1:8765` 上已有旧 daemon、缺少 `runtime_identity` capability，或能确认与当前 MCP wrapper revision 不一致，MCP shim 会明确失败并要求重启/升级，而不是静默复用一个未知版本的长驻进程。daemon 返回的 sync、retrieve、workspace status 和 task 响应也会带 `served_by`，用于排查 WSL/Windows、多 IDE、多 cache namespace 混用时到底是哪一个 daemon 在响应。
 
-## 实验性能力：本地词法引擎（local-hybrid）
+## 实验性能力：本地引擎（local-hybrid）
 
-设置 `OPENACE_ENGINE=local-hybrid` 后，openACE 使用自有的本地检索引擎：本机扫描、按 AST/行窗口切分、构建 BM25 词法索引并在本地完成检索，全程**不需要任何凭据或网络**。
+设置 `OPENACE_ENGINE=local-hybrid` 后，openACE 使用自有的本地检索引擎：本机扫描、按 AST/行窗口切分、构建 BM25 词法索引并在本地完成检索。**词法路径不需要任何凭据或网络**；配置 embedding provider 后自动升级为词法 + 语义的混合检索（RRF 融合，可选 rerank 精排）。
 
 ```jsonc
+// 纯词法（零配置、零出网）
 "env": {
   "OPENACE_ENGINE": "local-hybrid"
 }
+
+// 混合语义检索（自带 provider key）
+"env": {
+  "OPENACE_ENGINE": "local-hybrid",
+  "VOYAGE_API_KEY": "<your key>"          // 或自部署端点，见下方环境变量
+}
 ```
 
-当前边界（如实声明）：
+行为与边界（如实声明）：
 
-- 本阶段只提供关键词/词法检索（BM25），语义检索在后续阶段加入；词法结果是该模式的完整能力，不是降级。
-- Go 文件按 AST 声明切分，其余语言按确定性行窗口切分；`workspace_status` 会如实上报每种语言是 `ast` 还是 `fallback`。
-- 索引以不可变 revision 形式保存在 cache 目录（`engines/local-hybrid/` 子树），发布原子切换，损坏时自动回退上一 revision。
+- **词法路径永远可用**：无 key、断网、provider 故障时 BM25 检索继续完整工作；未配置任何 provider 时行为与纯词法模式完全一致，不出现降级标记。
+- **语义混合检索**：配置 `VOYAGE_API_KEY`（默认 preset：`voyage-code-3`）或自部署 OpenAI-compatible 端点（vLLM/TEI/Infinity/Ollama，允许无 key）后，查询同时走 BM25 与本地向量召回并按 RRF 融合；配置 rerank provider（默认 `rerank-2.5`，可 `off`）后对头部候选精排。
+- **降级完全显式，由你支配**：语义路/精排失败或索引覆盖不完整时，结果首行出现 `[DEGRADED] <原因>; mode=...; semantic_coverage=...` 横幅，结构化字段同步携带 `retrieval_mode`/`degraded_reason`/`semantic_coverage`；`OPENACE_RETRIEVAL_DEGRADE=deny`/`OPENACE_RERANK_DEGRADE=deny` 可改为直接返回可行动错误（默认 `allow` 放行词法结果）。不存在静默降级。
+- **成本边界**：embedding/rerank 使用你自己的 API key。索引期按变更内容计费——未变更 chunk 按纯内容 hash 跨 revision 复用向量，不重复付费；查询期每次消耗一次 query embedding（启用 rerank 时另加一次精排调用）。openACE 默认不做客户端预算限制，预算护栏建议设在 provider dashboard（如 Voyage project rate limit / budget）。
+- **数据边界**：索引会在本机 cache 目录保存被索引文件的明文片段副本（`engines/local-hybrid/` 子树，权限仅当前用户）；启用 embedding 时 chunk 内容会发送到你配置的 provider。使用 Voyage 前请在其 dashboard 确认组织已切换 **Opted Out**（默认 Opted In，数据可用于训练；绑卡只是获得 opt-out 资格）。`.augmentignore` 与内置敏感文件 denylist 先于一切生效。
+- **向量身份隔离**：模型/维度/端点任一变化会创建平行索引子树并全量重建，禁止混用不同模型的向量；换 key 不触发重建。
+- Go 文件按 AST 声明切分，其余语言按确定性行窗口切分；`workspace_status` 如实上报每语言 `ast|fallback`、语义覆盖率、provider 健康状态（healthy/backoff/candidate）与恢复时间。
+- 索引以不可变 revision 形式保存，发布原子切换；词法/向量数据损坏时自动回退上一 revision 并在下次 sync 自愈。
 - `provider_profile_id` 仅适用于默认 ACE 引擎；local-hybrid 收到该参数会明确报错。
-- 引擎按进程选择：切换 `OPENACE_ENGINE` 需重启 daemon；`auto` 模式只会复用引擎一致的 daemon。
+- 引擎与 provider 配置按进程生效：修改 `OPENACE_ENGINE` 或任何 provider/降级 env 后需重启 daemon；`auto` 模式只复用引擎与 provider 配置指纹一致的 daemon，不一致会明确报错而非静默复用。
+- 大仓库首次语义 sync 是分钟级操作（实测约 2400 chunks 在 Voyage 上耗时 1–5 分钟，取决于批参数与网络），可能超过默认 `OPENACE_TOOL_TIMEOUT=110s`；首次索引建议临时调大该值（如 `600s`）。批处理端点较慢时调大 `OPENACE_PROVIDER_TIMEOUT` 或调小 `OPENACE_EMBEDDING_BATCH_SIZE`。已发布 revision 的向量按内容 hash 跨次复用（后续 sync 只补缺口）；但一次被超时/取消中断的构建会整体丢弃，其间已完成的嵌入调用不落盘——首次索引请预留足够超时。
 
 ## 索引范围与安全边界
 
@@ -310,7 +323,13 @@ openACE 默认尊重 `.gitignore` / `.ignore`，并跳过 `.env*`、session、cr
 | `AUGMENT_SESSION_AUTH` | 完整 session JSON，优先级最高 |
 | `OPENACE_SESSION_FILE` | 显式 session 文件路径 |
 | `OPENACE_PROFILES_FILE` | 实验性多 profile JSON；设置后替代单账号凭据链 |
-| `OPENACE_ENGINE` | `ace`（默认）/ `local-hybrid`（实验性本地词法引擎，无需凭据） |
+| `OPENACE_ENGINE` | `ace`（默认）/ `local-hybrid`（实验性本地引擎；词法无需凭据，可选语义混合） |
+| `OPENACE_EMBEDDING_PROVIDER` | local-hybrid 语义路：`voyage`（默认）/ `openai`（自部署 OpenAI-compatible）/ `off`；voyage 缺 key 时语义路自动关闭、词法照常 |
+| `OPENACE_EMBEDDING_BASE_URL` `_API_KEY` `_MODEL` `_DIMENSION` | provider 身份四项；默认 Voyage `voyage-code-3` @1024 维；key 为空时回退读 `VOYAGE_API_KEY`；任一身份变化触发平行索引全量重建 |
+| `OPENACE_EMBEDDING_BATCH_SIZE` `_MAX_CONCURRENCY` `_RPM_BUDGET` `_TPM_BUDGET` | 索引期调用参数（默认 128 / 4 / 不限 / 不限） |
+| `OPENACE_RERANK_PROVIDER` | 可选精排：`voyage`（默认，缺 key 即关闭）/ `tei`（自部署）/ `off`；`OPENACE_RERANK_BASE_URL`/`_API_KEY`/`_MODEL`/`_MAX_TOKENS` 语义同上（默认 `rerank-2.5`，单请求 200K token 上限） |
+| `OPENACE_PROVIDER_TIMEOUT` / `OPENACE_PROVIDER_MAX_RETRIES` | provider HTTP 超时（默认 `60s`）与单批重试上限（默认 `5`） |
+| `OPENACE_RETRIEVAL_DEGRADE` / `OPENACE_RERANK_DEGRADE` | 语义路/精排失败策略：`allow`（默认，放行并标记 `[DEGRADED]`）/ `deny`（返回可行动错误） |
 | `OPENACE_MODE` | `auto` / `direct` / `manual-daemon`，默认 `auto` |
 | `OPENACE_CACHE_NAMESPACE` | cache 命名空间，用于隔离账号、tenant 或测试批次 |
 | `OPENACE_DAEMON_ADDR` | MCP shim 连接 daemon 的地址 |

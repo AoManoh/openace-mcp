@@ -22,23 +22,46 @@ func TestChunkIDDeterministic(t *testing.T) {
 			t.Fatalf("chunk ID 不可复现: %s vs %s", first[i].ID, second[i].ID)
 		}
 	}
-	changed := Profile{ID: "default", Version: "2", MaxChunkBytes: profile.MaxChunkBytes, WindowLines: profile.WindowLines, OverlapLines: profile.OverlapLines, DocWindowLines: profile.DocWindowLines}
+	changed := Profile{ID: "default", Version: "test-bump", MaxChunkBytes: profile.MaxChunkBytes, WindowLines: profile.WindowLines, OverlapLines: profile.OverlapLines, DocWindowLines: profile.DocWindowLines}
 	third, _ := changed.Split(file)
 	if third[0].ID == first[0].ID {
 		t.Fatal("profile 版本变化后 chunk ID 应变化")
 	}
 }
 
+// TestContentHashExcludesLineRange 是 D4/K5 的直接断言（review S18 补全）：
+// 同一声明内容在不同文件位置时 chunk ID 变化（含行号）而 ContentHash
+// 不变（Stage 3 embedding 缓存复用的键控依据）。
 func TestContentHashExcludesLineRange(t *testing.T) {
 	profile := DefaultProfile()
-	// 同一内容出现在不同文件位置：ID 不同（含行号），ContentHash 相同（供缓存复用）。
-	a, _ := profile.Split(File{RelPath: "a.py", Content: "def f():\n    return 1\n"})
-	b, _ := profile.Split(File{RelPath: "a.py", Content: "# header\ndef f():\n    return 1\n"})
-	if len(a) == 0 || len(b) == 0 {
-		t.Fatal("切分结果为空")
+	// Go AST 切分：同一函数在文件头部注释平移后内容逐字节相同、行号不同。
+	a, _ := profile.Split(File{RelPath: "a.go", Content: "package a\n\nfunc F() int {\n\treturn 1\n}\n"})
+	b, _ := profile.Split(File{RelPath: "a.go", Content: "package a\n\n// shifted by an extra comment block\n\nfunc F() int {\n\treturn 1\n}\n"})
+	var chunkA, chunkB *Chunk
+	for i := range a {
+		if a[i].SymbolHint == "F" {
+			chunkA = &a[i]
+		}
 	}
-	if a[0].ID == b[0].ID {
+	for i := range b {
+		if b[i].SymbolHint == "F" {
+			chunkB = &b[i]
+		}
+	}
+	if chunkA == nil || chunkB == nil {
+		t.Fatalf("应各切出函数 F: a=%v b=%v", chunkA, chunkB)
+	}
+	if chunkA.Content != chunkB.Content {
+		t.Fatalf("函数内容应逐字节一致:\n%q\n%q", chunkA.Content, chunkB.Content)
+	}
+	if chunkA.StartLine == chunkB.StartLine {
+		t.Fatal("行号应因平移不同")
+	}
+	if chunkA.ID == chunkB.ID {
 		t.Fatal("行号平移后 chunk ID 应变化")
+	}
+	if chunkA.ContentHash != chunkB.ContentHash {
+		t.Fatalf("ContentHash 必须只依赖内容（K5）: %s vs %s", chunkA.ContentHash, chunkB.ContentHash)
 	}
 }
 

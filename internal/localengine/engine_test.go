@@ -68,12 +68,21 @@ func writeFixture(t *testing.T, root string, rel string, content string) {
 	}
 }
 
-// newTestEngine 隔离 cache 目录并返回引擎。
+// newTestEngine 隔离 cache 目录并返回纯词法引擎（Stage 2 行为）。
 func newTestEngine(t *testing.T) *Engine {
+	t.Helper()
+	return newTestEngineWith(t, Options{})
+}
+
+// newTestEngineWith 隔离 cache 目录并按 opts 构造引擎。
+func newTestEngineWith(t *testing.T, opts Options) *Engine {
 	t.Helper()
 	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
 	t.Setenv("OPENACE_CACHE_NAMESPACE", "test")
-	e := New()
+	e, err := New(opts)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 	t.Cleanup(func() { _ = e.Close(context.Background()) })
 	return e
 }

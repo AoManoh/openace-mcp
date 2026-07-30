@@ -87,7 +87,10 @@ func TestBleveCorruptionSelfHealsOnSync(t *testing.T) {
 	_ = e.Close(context.Background())
 
 	// 重新创建引擎（清空句柄缓存），破坏唯一 revision 的 Bleve 目录。
-	e2 := New()
+	e2, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = e2.Close(context.Background()) })
 	_, workspaceKey, _ := e2.resolveRoot(root)
 	store, err := e2.storeFor(workspaceKey)
@@ -256,7 +259,10 @@ func TestCacheIsolationFromACEState(t *testing.T) {
 	if err := os.WriteFile(fakeState, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	e := New()
+	e, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = e.Close(context.Background()) })
 	root := newFixtureWorkspace(t)
 	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {

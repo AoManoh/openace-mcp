@@ -7,26 +7,59 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/AoManoh/openace-mcp/internal/engine"
+	"github.com/AoManoh/openace-mcp/internal/fusion"
 	"github.com/AoManoh/openace-mcp/internal/index"
 	"github.com/AoManoh/openace-mcp/internal/lexical"
+	"github.com/AoManoh/openace-mcp/internal/reliability"
+	"github.com/AoManoh/openace-mcp/internal/rerank"
+	"github.com/AoManoh/openace-mcp/internal/vector"
 )
 
 // noHitsText 与既有 MCP 文案保持一致。
 const noHitsText = "No relevant code sections were found."
 
 // revisionHandle 是一个已打开 revision 的只读句柄（refcount 管理，暗坑 K3/K11）。
+// 向量索引按需懒加载并随句柄常驻（revision 不可变，加载一次即定格）。
 type revisionHandle struct {
 	workspaceKey string
 	manifest     *index.Manifest
 	lex          *lexical.Index
 	chunks       map[string]chunkRecord
+	segmentDir   string
 	refs         int
 	retired      bool
+
+	vecOnce sync.Once
+	vecIx   *vector.Index
+	vecErr  error
 }
 
-// Search 实现 engine.Service：按需同步后在 active revision 上执行词法检索。
+// vectorIndex 懒加载本 revision 的向量索引；校验失败只降级语义路，
+// 不影响词法可用性（暗坑 K25）。
+func (h *revisionHandle) vectorIndex(dimension int) (*vector.Index, error) {
+	h.vecOnce.Do(func() {
+		if !h.manifest.HasVectors() {
+			h.vecErr = errors.New("revision 无向量数据")
+			return
+		}
+		h.vecIx, h.vecErr = vector.Load(h.segmentDir, dimension,
+			h.manifest.VectorsChecksum, h.manifest.VectorsIndexChecksum, 0)
+	})
+	return h.vecIx, h.vecErr
+}
+
+// rankedHit 是进入渲染的最终排序候选；score 仅用于同文件合并后的
+// 跨块排序（"越大越靠前"），Stage 2 纯词法路径沿用真实 BM25 分数。
+type rankedHit struct {
+	id    string
+	score float64
+}
+
+// Search 实现 engine.Service：按需同步后执行 lexical（+dense RRF）
+// （+optional rerank）检索；降级行为受 D8 支配，禁止静默。
 func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
 	if err := rejectProfileID(req.Workspace); err != nil {
 		return engine.Result{}, err
@@ -36,30 +69,259 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 		return engine.Result{}, errors.New("查询内容为空")
 	}
 	// 检索前确保索引就绪（与 legacy Syncer 的 retrieval 语义一致）。
-	syncResult, err := e.syncWorkspace(ctx, req.Workspace)
-	if err != nil {
-		return engine.Result{}, err
+	syncResult, syncErr := e.syncWorkspace(ctx, req.Workspace)
+	if syncErr != nil && ctx.Err() != nil {
+		return engine.Result{}, ctx.Err()
 	}
 	_, workspaceKey, err := e.resolveRoot(req.Workspace.DirectoryPath)
 	if err != nil {
 		return engine.Result{}, err
 	}
-	handle, err := e.acquireHandle(workspaceKey)
-	if err != nil {
-		return engine.Result{}, err
+	handle, handleErr := e.acquireHandle(workspaceKey)
+	var reasons []string
+	if syncErr != nil {
+		// D8(d)/review S23：索引刷新失败但存在可用 revision 时，
+		// allow 以旧索引服务并显式标记 stale，deny 报错。
+		if handleErr != nil {
+			return engine.Result{}, syncErr
+		}
+		if e.retrievalDegrade == DegradeDeny {
+			e.releaseHandle(handle)
+			return engine.Result{}, degradeDeniedError("index refresh failed", syncErr, EnvRetrievalDegrade)
+		}
+		reasons = append(reasons, "stale-index")
+		syncResult = engine.Result{Engine: EngineID, FileCount: handle.manifest.Counts.Files}
+	} else if handleErr != nil {
+		return engine.Result{}, handleErr
 	}
 	defer e.releaseHandle(handle)
 
-	hits, err := handle.lex.Search(ctx, query, defaultTopK)
+	mode := "lexical"
+	lexTopK := defaultTopK
+	if e.semanticEnabled() {
+		lexTopK = hybridRouteTopK
+	}
+	lexHits, err := handle.lex.Search(ctx, query, lexTopK)
 	if err != nil {
 		return engine.Result{}, fmt.Errorf("词法检索: %w", err)
 	}
-	text := renderHits(handle, hits, req.MaxOutputLen)
+
+	var ordered []rankedHit
+	coverage := ""
+	if e.semanticEnabled() {
+		denseIDs, denseReasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query)
+		if denseErr != nil {
+			return engine.Result{}, denseErr
+		}
+		reasons = append(reasons, denseReasons...)
+		lexIDs := make([]string, 0, len(lexHits))
+		for _, hit := range lexHits {
+			lexIDs = append(lexIDs, hit.ID)
+		}
+		if denseIDs != nil {
+			mode = "hybrid"
+			fused := fusion.RRF(lexIDs, denseIDs)
+			ids := make([]string, 0, len(fused))
+			for _, f := range fused {
+				ids = append(ids, f.ID)
+			}
+			ordered = rankByPosition(ids)
+		} else {
+			ordered = rankByPosition(lexIDs)
+		}
+		coverage = coveragePercent(handle.manifest)
+		if !handle.manifest.SemanticComplete() {
+			reasons = append(reasons, "semantic-coverage-partial")
+		}
+	} else {
+		// 纯词法：沿用真实 BM25 分数，渲染行为与 Stage 2 逐字节一致（K32）。
+		ordered = make([]rankedHit, 0, len(lexHits))
+		for _, hit := range lexHits {
+			ordered = append(ordered, rankedHit{id: hit.ID, score: hit.Score})
+		}
+	}
+
+	// 可选精排：只重排已召回候选头部，失败绝不丢候选（D7/D8(b)）。
+	if e.rerankClient != nil && len(ordered) > 0 {
+		reordered, applied, rerankReason, rerankErr := e.rerankOrder(ctx, handle, query, ordered)
+		if rerankErr != nil {
+			return engine.Result{}, rerankErr
+		}
+		if applied {
+			mode += "+rerank"
+			ordered = reordered
+		}
+		if rerankReason != "" {
+			reasons = append(reasons, rerankReason)
+		}
+	}
+
+	text := renderHits(handle, ordered, req.MaxOutputLen)
+	degradedReason := strings.Join(reasons, ",")
+	if degradedReason != "" {
+		text = degradedBanner(degradedReason, mode, coverage) + text
+	}
 	result := syncResult
 	result.Text = text
 	result.Engine = EngineID
 	result.IndexRevision = handle.manifest.Revision
+	// 透明性字段：provider 已配置或发生降级时填充；纯词法正常路径
+	// 保持空（Stage 2 wire 不变，K32/K34）。
+	if e.semanticEnabled() || e.rerankClient != nil || degradedReason != "" {
+		result.RetrievalMode = mode
+		result.DegradedReason = degradedReason
+		result.SemanticCoverage = coverage
+	}
 	return result, nil
+}
+
+// denseRoute 执行语义召回：返回 dense 候选 ID（nil 表示语义路未执行）、
+// 降级原因与致命错误（ctx 取消或 deny 拒绝）。
+func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string) ([]string, []string, error) {
+	ix, loadErr := handle.vectorIndex(e.embedCfg.Dimension)
+	if loadErr != nil {
+		if errors.Is(loadErr, vector.ErrEnvelopeExceeded) {
+			// 超出已验证 envelope：重建无济于事，不标记 repair（§18）。
+			if e.retrievalDegrade == DegradeDeny {
+				return nil, nil, degradeDeniedError("semantic path unavailable", loadErr, EnvRetrievalDegrade)
+			}
+			return nil, []string{"vector-envelope-exceeded"}, nil
+		}
+		// 向量数据损坏/缺失：登记自愈并降级（暗坑 K25）。
+		e.markVectorRepair(workspaceKey)
+		if e.retrievalDegrade == DegradeDeny {
+			return nil, nil, degradeDeniedError("semantic path unavailable", loadErr, EnvRetrievalDegrade)
+		}
+		return nil, []string{"vector-data-unavailable"}, nil
+	}
+	if ix.Count() == 0 {
+		// 覆盖为空（如 provider 长期故障后的零覆盖 revision）：
+		// 语义路无候选可召回，覆盖缺口由调用方按 manifest 如实上报。
+		return nil, nil, nil
+	}
+	queryVector, embedErr := e.embedClient.EmbedQuery(ctx, query)
+	if embedErr != nil {
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+		if e.retrievalDegrade == DegradeDeny {
+			return nil, nil, degradeDeniedError("query embedding failed", embedErr, EnvRetrievalDegrade)
+		}
+		return nil, []string{"query-embedding-failed(" + failureClass(embedErr) + ")"}, nil
+	}
+	vectorHits, searchErr := ix.Search(ctx, queryVector, hybridRouteTopK)
+	if searchErr != nil {
+		return nil, nil, searchErr
+	}
+	ids := make([]string, 0, len(vectorHits))
+	for _, hit := range vectorHits {
+		ids = append(ids, hit.ID)
+	}
+	return ids, nil, nil
+}
+
+// rerankOrder 精排 ordered 头部（≤rerankHeadLimit，再受 token 预算截断），
+// 未送审部分按原序跟随（暗坑 K28）。送审集与 ordered 显式对齐：chunks
+// 表缺失的头部候选（防御性路径）保持原位跟随，禁止因 docs/ordered
+// 错位造成条目重复或丢失（Stage 3 自审修复）。
+func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query string, ordered []rankedHit) ([]rankedHit, bool, string, error) {
+	head := rerankHeadLimit
+	if head > len(ordered) {
+		head = len(ordered)
+	}
+	docs := make([]rerank.Document, 0, head)
+	included := make([]rankedHit, 0, head)
+	skippedHead := make([]rankedHit, 0)
+	for _, hit := range ordered[:head] {
+		record, ok := handle.chunks[hit.id]
+		if !ok {
+			skippedHead = append(skippedHead, hit)
+			continue
+		}
+		docs = append(docs, rerank.Document{ID: hit.id, Text: rerankDocText(record)})
+		included = append(included, hit)
+	}
+	hits, sent, err := e.rerankClient.Rerank(ctx, query, docs)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, false, "", ctx.Err()
+		}
+		if e.rerankDegrade == DegradeDeny {
+			return nil, false, "", degradeDeniedError("rerank failed", err, EnvRerankDegrade)
+		}
+		return nil, false, "rerank-skipped(" + failureClass(err) + ")", nil
+	}
+	if sent == 0 {
+		return nil, false, "rerank-skipped(token-budget)", nil
+	}
+	ids := make([]string, 0, len(ordered))
+	for _, hit := range hits {
+		ids = append(ids, hit.ID)
+	}
+	// 顺序：重排头部 → 因 token 预算未送审的头部（原序）→ chunks 缺失的
+	// 头部（原序）→ 头部之外的尾部（原序）。
+	for _, hit := range included[sent:] {
+		ids = append(ids, hit.id)
+	}
+	for _, hit := range skippedHead {
+		ids = append(ids, hit.id)
+	}
+	for _, hit := range ordered[head:] {
+		ids = append(ids, hit.id)
+	}
+	return rankByPosition(ids), true, "", nil
+}
+
+// rerankDocText 构造送审文本：path:start-end symbol 头 + 内容（D6，
+// rerank 无缓存语义，头信息帮助精排理解上下文）。
+func rerankDocText(record chunkRecord) string {
+	header := fmt.Sprintf("%s:%d-%d", record.RelPath, record.StartLine, record.EndLine)
+	if record.Symbol != "" {
+		header += " " + record.Symbol
+	}
+	return header + "\n" + record.Content
+}
+
+// rankByPosition 把最终 ID 序转换为合成序分（1/(pos+1)），保证渲染合并
+// 后的跨块排序与最终排名一致（暗坑 K27 确定性）。
+func rankByPosition(ids []string) []rankedHit {
+	ordered := make([]rankedHit, 0, len(ids))
+	for i, id := range ids {
+		ordered = append(ordered, rankedHit{id: id, score: 1.0 / float64(i+1)})
+	}
+	return ordered
+}
+
+// coveragePercent 计算语义覆盖率（向下取整；空仓库按 100%，暗坑 K31）。
+func coveragePercent(manifest *index.Manifest) string {
+	if manifest.Counts.Chunks == 0 {
+		return "100%"
+	}
+	return fmt.Sprintf("%d%%", manifest.VectorCount*100/manifest.Counts.Chunks)
+}
+
+// degradedBanner 构造 [DEGRADED] 首行横幅（D8 定稿格式）。
+func degradedBanner(reason string, mode string, coverage string) string {
+	banner := "[DEGRADED] " + reason + "; mode=" + mode
+	if coverage != "" {
+		banner += "; semantic_coverage=" + coverage
+	}
+	return banner + "\n\n"
+}
+
+// degradeDeniedError 构造 deny 模式的可行动错误（暗坑 K33）：
+// 保留分类诊断并附恢复路径提示。
+func degradeDeniedError(stage string, cause error, envName string) error {
+	return fmt.Errorf("%s: %v (degrade mode is deny; set %s=allow to accept degraded results)", stage, cause, envName)
+}
+
+// failureClass 提取失败类别 token（进入 degraded_reason）。
+func failureClass(err error) string {
+	callErr := &reliability.CallError{}
+	if errors.As(err, &callErr) {
+		return string(callErr.Class)
+	}
+	return "error"
 }
 
 // handleKey 是句柄表键：workspaceKey + revision 复合，避免跨工作区
@@ -81,7 +343,9 @@ func (e *Engine) acquireHandle(workspaceKey string) (*revisionHandle, error) {
 		return nil, err
 	}
 	var lastErr error
-	for manifest != nil {
+	visited := make(map[string]bool)
+	for manifest != nil && !visited[manifest.Revision] && len(visited) < index.MaxRevisionChain {
+		visited[manifest.Revision] = true
 		handle, openErr := e.openOrReuseHandle(store, workspaceKey, manifest)
 		if openErr == nil {
 			if len(skipped) > 0 {
@@ -138,7 +402,10 @@ func (e *Engine) openOrReuseHandle(store *index.Store, workspaceKey string, mani
 	for _, record := range records {
 		chunks[record.ID] = record
 	}
-	handle := &revisionHandle{workspaceKey: workspaceKey, manifest: manifest, lex: lex, chunks: chunks, refs: 1}
+	handle := &revisionHandle{
+		workspaceKey: workspaceKey, manifest: manifest, lex: lex, chunks: chunks,
+		segmentDir: store.SegmentPath(manifest), refs: 1,
+	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -206,17 +473,17 @@ type renderBlock struct {
 
 // renderHits 把命中渲染为稳定文本格式（golden 锁定，暗坑 K13）：
 // 同文件重叠/相邻 chunk 合并，按最高分排序，MaxOutputLen 预算截断。
-func renderHits(handle *revisionHandle, hits []lexical.Hit, maxOutputLen int) string {
+func renderHits(handle *revisionHandle, hits []rankedHit, maxOutputLen int) string {
 	if len(hits) == 0 {
 		return noHitsText
 	}
 	blocks := make([]renderBlock, 0, len(hits))
 	for _, hit := range hits {
-		record, ok := handle.chunks[hit.ID]
+		record, ok := handle.chunks[hit.id]
 		if !ok {
 			continue
 		}
-		blocks = append(blocks, renderBlock{record: record, score: hit.Score})
+		blocks = append(blocks, renderBlock{record: record, score: hit.score})
 	}
 	if len(blocks) == 0 {
 		return noHitsText
