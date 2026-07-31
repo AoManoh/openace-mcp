@@ -2,6 +2,7 @@ package index
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -141,8 +142,12 @@ func holderProcessAlive(identity string) bool {
 
 // takeoverLock 原子抢占 stale 锁：temp+rename 后回读裁决（K45/K46）。
 func takeoverLock(path string, identity string) error {
-	temp := path + ".takeover-" + hex.EncodeToString([]byte(identity))[:8]
-	tempFile := fmt.Sprintf("%s.%d", temp, os.Getpid())
+	// 临时文件名必须对"每个接管者"唯一：identity 含随机分量，整体哈希
+	// 后取前缀。旧命名（identity 前 4 字节 + pid）在同进程并发接管时
+	// 全体撞名——竞争者互相覆盖临时文件再抢 rename，可能出现 0 胜者
+	// （ext4 上高概率复现，9p 因串行慢写从未暴露）。
+	digest := sha256.Sum256([]byte(identity))
+	tempFile := path + ".takeover-" + hex.EncodeToString(digest[:8])
 	if err := os.WriteFile(tempFile, []byte(identity+"\n"), filePerm); err != nil {
 		return err
 	}
