@@ -5,21 +5,26 @@ package fusion
 
 import "sort"
 
-// K 是 RRF 常数（§12 冻结为 60；记录在案的受测常数，非针对测试集校准）。
+// K 是 RRF 常数回落值（迁移方案 §12 原冻结 60；T10b-3 定值后默认参数
+// 见 DefaultParams，本常数仅作 Params.K<=0 时的防御回落）。
 const K = 60
 
-// Params 是 RRF 融合参数（P5B-T10b 加权定值扫描用；默认值 = 现状行为）。
-// 权重只影响两路贡献的相对比例：score(id) = LexWeight/(K+r_lex) +
-// DenseWeight/(K+r_dense)。等权 (1,1) 与历史无权重公式逐位一致。
+// Params 是 RRF 融合参数（P5B-T10b 加权定值扫描用）。权重只影响两路
+// 贡献的相对比例：score(id) = LexWeight/(K+r_lex) + DenseWeight/(K+r_dense)。
+// 等权 (1,1) 与历史无权重公式逐位一致。
 type Params struct {
 	K           int
 	LexWeight   float64
 	DenseWeight float64
 }
 
-// DefaultParams 返回当前默认融合参数（未配置 = 现状行为，Stage 5 计划 §4）。
+// DefaultParams 返回默认融合参数。T10b-3 四语料 minimax 定值
+// {K:20, Lex:0.15, Dense:0.85}（2026-07-31 用户批准，对迁移方案 §12
+// k=60 等权冻结的 amendment）：vs 等权 k=60 十二个语料×指标格全升，
+// 最差语料退化 -1.46%（等权为 -25.2%）；证据与 run 记录见
+// stage5b-tuning §2.6 与决策台账。
 func DefaultParams() Params {
-	return Params{K: K, LexWeight: 1, DenseWeight: 1}
+	return Params{K: 20, LexWeight: 0.15, DenseWeight: 0.85}
 }
 
 // 结果来源标记（set 级 retrieval_mode 之下的 per-hit 调试信息）。
