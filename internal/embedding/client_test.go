@@ -504,3 +504,29 @@ func TestNewClientRequiresEnabled(t *testing.T) {
 		t.Fatalf("未启用配置应报错")
 	}
 }
+
+// TestQueryTimeoutIndependent RS3:查询期独立超时生效——文档批仍用
+// 长 Timeout,query 批用短 QueryTimeout;未配置(0)回落 Timeout。
+func TestQueryTimeoutIndependent(t *testing.T) {
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		<-release
+	}))
+	defer func() { close(release); ts.Close() }()
+
+	cfg := testConfig(ts.URL, 2)
+	cfg.Timeout = 10 * time.Second
+	cfg.QueryTimeout = 60 * time.Millisecond
+	cfg.MaxRetries = 0
+	client, _ := NewClient(cfg)
+	start := time.Now()
+	_, err := client.EmbedBatch(context.Background(), []string{"q"}, InputQuery)
+	elapsed := time.Since(start)
+	callErr := &reliability.CallError{}
+	if !errors.As(err, &callErr) || callErr.Class != reliability.ClassTransient {
+		t.Fatalf("查询期应按 QueryTimeout 超时(transient): %v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("查询期超时未独立生效,等待了 %v", elapsed)
+	}
+}

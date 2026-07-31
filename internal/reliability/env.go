@@ -18,6 +18,10 @@ const (
 	EnvProviderTimeout = "OPENACE_PROVIDER_TIMEOUT"
 	// EnvProviderMaxRetries 是单批可重试错误的重试上限。
 	EnvProviderMaxRetries = "OPENACE_PROVIDER_MAX_RETRIES"
+	// EnvQueryTimeout 是查询期 provider 调用(query embedding/rerank)的
+	// 独立超时(RS3):未设置时回落 EnvProviderTimeout(现状行为)。
+	// 构建期大批调优(如 120s+)不再放大查询期最坏等待。
+	EnvQueryTimeout = "OPENACE_QUERY_PROVIDER_TIMEOUT"
 
 	defaultTimeout    = 60 * time.Second
 	defaultMaxRetries = 5
@@ -26,6 +30,12 @@ const (
 // TimeoutFromEnv 解析 OPENACE_PROVIDER_TIMEOUT（默认 60s）。
 func TimeoutFromEnv() (time.Duration, error) {
 	return DurationEnv(EnvProviderTimeout, defaultTimeout)
+}
+
+// QueryTimeoutFromEnv 解析 OPENACE_QUERY_PROVIDER_TIMEOUT;零值表示
+// 未配置,调用方回落 TimeoutFromEnv(RS3 冻结:未配置=现状)。
+func QueryTimeoutFromEnv() (time.Duration, error) {
+	return DurationEnv(EnvQueryTimeout, 0)
 }
 
 // MaxRetriesFromEnv 解析 OPENACE_PROVIDER_MAX_RETRIES（默认 5，0 表示不重试）。

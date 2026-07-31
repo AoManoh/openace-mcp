@@ -81,6 +81,12 @@ func ConfigFromEnv() (Config, error) {
 	if cfg.Timeout, err = reliability.TimeoutFromEnv(); err != nil {
 		return Config{}, err
 	}
+	// rerank 只发生在查询期:配置了查询期独立超时(RS3)即覆盖。
+	if queryTimeout, qerr := reliability.QueryTimeoutFromEnv(); qerr != nil {
+		return Config{}, qerr
+	} else if queryTimeout > 0 {
+		cfg.Timeout = queryTimeout
+	}
 	if cfg.MaxRetries, err = reliability.MaxRetriesFromEnv(); err != nil {
 		return Config{}, err
 	}
