@@ -6,18 +6,18 @@ import (
 	"testing"
 )
 
-// TestRRFGolden 手工计算的融合 golden：
+// TestRRFGolden 手工计算的默认融合 golden（T10b-3 定值 K=20/0.15/0.85）：
 // lexical=[a,b,c]，dense=[b,d]：
 //
-//	b = 1/62 + 1/61 ≈ 0.032524（both）
-//	a = 1/61 ≈ 0.016393（lexical）
-//	d = 1/62 ≈ 0.016129（dense）
-//	c = 1/63 ≈ 0.015873（lexical）
+//	b = 0.15/22 + 0.85/21 ≈ 0.047294（both）
+//	d = 0.85/22 ≈ 0.038636（dense）
+//	a = 0.15/21 ≈ 0.007143（lexical）
+//	c = 0.15/23 ≈ 0.006522（lexical）
 func TestRRFGolden(t *testing.T) {
 	fused := RRF([]string{"a", "b", "c"}, []string{"b", "d"})
-	wantIDs := []string{"b", "a", "d", "c"}
-	wantSources := []string{SourceBoth, SourceLexical, SourceDense, SourceLexical}
-	wantScores := []float64{1.0/62 + 1.0/61, 1.0 / 61, 1.0 / 62, 1.0 / 63}
+	wantIDs := []string{"b", "d", "a", "c"}
+	wantSources := []string{SourceBoth, SourceDense, SourceLexical, SourceLexical}
+	wantScores := []float64{0.15/22 + 0.85/21, 0.85 / 22, 0.15 / 21, 0.15 / 23}
 	if len(fused) != 4 {
 		t.Fatalf("应有 4 个候选: %d", len(fused))
 	}
@@ -69,15 +69,18 @@ func TestDuplicateWithinRouteCountsFirstRank(t *testing.T) {
 	if len(fused) != 2 {
 		t.Fatalf("应去重: %v", fused)
 	}
-	if math.Abs(fused[0].Score-1.0/61) > 1e-12 {
+	if math.Abs(fused[0].Score-0.15/21) > 1e-12 {
 		t.Fatalf("重复 ID 应只计首个 rank: %v", fused[0].Score)
 	}
 }
 
-// TestLexicalTopHitStaysInHead 是 P3-T05 业务验收的单元级形态：
-// 词法强命中（exact identifier 定义处）融合后仍在头部（≤2 位，
-// 完整端到端验收见 P3-T07/T11）。
-func TestLexicalTopHitStaysInHead(t *testing.T) {
+// TestLexicalTopHitStaysInTopFive 是 P3-T05 验收在 T10b-3 定值后的
+// 修订形态：加权默认（0.15/0.85）下两路完全不相交时，词法第一命中
+// 沉到全部 dense 深度之后是数学必然；修订后的契约是词法强命中保持
+// 在 top-5 窗口内（doc 级 R@5 口径），头部排序保护由 rerank 精排
+// （head=50 全指标最优，tuning §2.7）与 dense 路自身召回承担。
+// exact-symbol 端到端保护的 symprobe 复验登记于 tuning §2.8。
+func TestLexicalTopHitStaysInTopFive(t *testing.T) {
 	lexical := []string{"target-def", "l2", "l3", "l4"}
 	dense := []string{"d1", "d2", "d3", "d4"}
 	fused := RRF(lexical, dense)
@@ -88,20 +91,32 @@ func TestLexicalTopHitStaysInHead(t *testing.T) {
 			break
 		}
 	}
-	if pos < 0 || pos > 1 {
-		t.Fatalf("词法第一命中融合后应在头部: pos=%d %+v", pos, fused[:3])
+	if pos < 0 || pos > 4 {
+		t.Fatalf("词法第一命中融合后应留在 top-5: pos=%d %+v", pos, fused)
 	}
 }
 
-// TestWeightedEqualMatchesLegacy 等权 (1,1) 必须与无权重 RRF 逐位一致
-// （T10b：加权能力不得改变现状默认行为）。
-func TestWeightedEqualMatchesLegacy(t *testing.T) {
+// TestRRFMatchesDefaultParams RRF() 必须与 RRFWeighted(DefaultParams)
+// 逐位一致（引擎默认路径与便捷入口同语义）。
+func TestRRFMatchesDefaultParams(t *testing.T) {
 	lex := []string{"a", "b", "c", "e"}
 	dense := []string{"b", "d", "a"}
-	legacy := RRF(lex, dense)
-	weighted := RRFWeighted(lex, dense, DefaultParams())
-	if !reflect.DeepEqual(legacy, weighted) {
-		t.Fatalf("等权应与历史公式逐位一致:\nlegacy=%+v\nweighted=%+v", legacy, weighted)
+	if !reflect.DeepEqual(RRF(lex, dense), RRFWeighted(lex, dense, DefaultParams())) {
+		t.Fatal("RRF 应与 DefaultParams 加权逐位一致")
+	}
+}
+
+// TestWeightedEqualMatchesHistoricalFormula 等权 {60,1,1} 必须复现历史
+// 无权重公式的 golden（迁移方案 §12 原冻结行为可按参数复现，用于
+// 回归对照与旧 run 复算）。
+func TestWeightedEqualMatchesHistoricalFormula(t *testing.T) {
+	fused := RRFWeighted([]string{"a", "b", "c"}, []string{"b", "d"}, Params{K: 60, LexWeight: 1, DenseWeight: 1})
+	wantIDs := []string{"b", "a", "d", "c"}
+	wantScores := []float64{1.0/62 + 1.0/61, 1.0 / 61, 1.0 / 62, 1.0 / 63}
+	for i := range wantIDs {
+		if fused[i].ID != wantIDs[i] || math.Abs(fused[i].Score-wantScores[i]) > 1e-12 {
+			t.Fatalf("位置 %d: got=%+v want id=%s score=%v", i, fused[i], wantIDs[i], wantScores[i])
+		}
 	}
 }
 
