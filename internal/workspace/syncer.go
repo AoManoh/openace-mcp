@@ -681,9 +681,18 @@ func (s *Syncer) syncRoot(ctx context.Context, key stateKey) (engine.Result, err
 }
 
 func scan(ctx context.Context, root string) ([]fileBlob, error) {
+	return scanWithCache(ctx, root, nil)
+}
+
+// scanWithCache 带 stat 短路缓存的扫描(T11):size+mtime 命中即复用
+// blobName,跳过读内容与哈希;racy 窗口与删除清理见 StatCache。
+// cache 为 nil 时行为与历史 scan 逐字节一致。
+func scanWithCache(ctx context.Context, root string, cache *StatCache) ([]fileBlob, error) {
 	maxBytes := int64(maxFileBytes())
 	rules := loadIgnoreRules(root)
 	var files []fileBlob
+	scanStart := time.Now()
+	seen := make(map[string]bool)
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
@@ -723,6 +732,27 @@ func scan(ctx context.Context, root string) ([]fileBlob, error) {
 		if d.Type()&fs.ModeType != 0 {
 			return nil
 		}
+		if cache != nil {
+			if info, infoErr := d.Info(); infoErr == nil {
+				if hit, ok := cache.lookup(rel, info.Size(), info.ModTime(), scanStart); ok {
+					seen[rel] = true
+					files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: hit})
+					return nil
+				}
+				content, ok, err := readIndexableContent(ctx, path, maxBytes)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return nil
+				}
+				name := blobName(rel, content)
+				cache.store(rel, info.Size(), info.ModTime(), name)
+				seen[rel] = true
+				files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: name})
+				return nil
+			}
+		}
 		content, ok, err := readIndexableContent(ctx, path, maxBytes)
 		if err != nil {
 			return err
@@ -737,6 +767,9 @@ func scan(ctx context.Context, root string) ([]fileBlob, error) {
 		})
 		return nil
 	})
+	if cache != nil && err == nil {
+		cache.prune(seen)
+	}
 	if err != nil {
 		return nil, err
 	}
