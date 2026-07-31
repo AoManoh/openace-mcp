@@ -191,6 +191,63 @@ func TestTimeoutClassifiedTransient(t *testing.T) {
 	}
 }
 
+// TestMidBodyTimeoutClassifiedTransient 复现 F3：provider 返回 200 并开始
+// 输出响应体后停滞，attempt 超时在流式解码中触发——必须分类为 transient
+// 超时（可重试），不得误判为 permanent malformed（会计入 circuit 并把
+// 整场构建的语义路熄火）。
+func TestMidBodyTimeoutClassifiedTransient(t *testing.T) {
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":[{"embedding":[0.1,`))
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer func() { close(release); ts.Close() }()
+
+	cfg := testConfig(ts.URL, 2)
+	cfg.Timeout = 100 * time.Millisecond
+	cfg.MaxRetries = 0
+	client, _ := NewClient(cfg)
+	_, err := client.EmbedBatch(context.Background(), []string{"a"}, InputDocument)
+	callErr := &reliability.CallError{}
+	if !errors.As(err, &callErr) || callErr.Class != reliability.ClassTransient || !strings.Contains(callErr.Message, "timed out") {
+		t.Fatalf("响应体中途超时应为 transient 超时: %v", err)
+	}
+}
+
+// TestMidBodyCancelReturnsCallerError 调用方取消发生在响应体读取期间时，
+// 错误必须原样返回 context.Canceled（不计 provider 失败，暗坑 K26）。
+func TestMidBodyCancelReturnsCallerError(t *testing.T) {
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":[{"embedding":[0.1,`))
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer func() { close(release); ts.Close() }()
+
+	client, _ := NewClient(testConfig(ts.URL, 2))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.EmbedBatch(ctx, []string{"a"}, InputDocument)
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	err := <-done
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("调用方取消应原样返回: %v", err)
+	}
+	if s := client.CircuitSnapshot(); s.State == "backoff" {
+		t.Fatalf("取消不得毒化 circuit: %+v", s)
+	}
+}
+
 func TestCancelDoesNotPoisonCircuit(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})

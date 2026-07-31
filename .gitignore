@@ -44,6 +44,7 @@ coverage/
 # Compiled openACE binaries (built locally via `go build ./cmd/...`)
 /openace-mcp
 /openace-daemon
+/openace-bench
 
 # Cross-language test caches and coverage artifacts.
 # Go test caches live under the toolchain cache, not the repo; these cover
