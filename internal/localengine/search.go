@@ -284,6 +284,34 @@ func (e *Engine) SearchCandidates(ctx context.Context, req engine.SearchRequest)
 	return candidates, nil
 }
 
+// ChunkDocTexts 按 chunk ID 取回 rerank 送审文本（T10b-4 head 定值
+// harness 专用 hook，不进入 MCP 工具面）：与 shipped rerank 路径共用
+// rerankDocText 构造，保证离线打分与在线送审逐字节同文本。未知 ID
+// 静默跳过（调用方按返回 map 对齐）。
+func (e *Engine) ChunkDocTexts(ctx context.Context, ref engine.WorkspaceRef, ids []string) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
+	if err != nil {
+		return nil, err
+	}
+	handle, err := e.acquireHandle(workspaceKey)
+	if err != nil {
+		return nil, err
+	}
+	defer e.releaseHandle(handle)
+	texts := make(map[string]string, len(ids))
+	for _, id := range ids {
+		record, err := handle.record(id)
+		if err != nil {
+			continue
+		}
+		texts[id] = rerankDocText(record)
+	}
+	return texts, nil
+}
+
 // RouteCandidates 是融合前的双路召回镜像（Stage 5 T10b 专用 hook，
 // 不进入 MCP 工具面）：词法与语义候选各按原始路内序返回，供离线融合
 // 参数扫描（RRF k、召回深度、子句权重交互）复用已付费的 query

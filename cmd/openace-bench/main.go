@@ -22,6 +22,7 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/fusion"
 	"github.com/AoManoh/openace-mcp/internal/lexical"
 	"github.com/AoManoh/openace-mcp/internal/localengine"
+	"github.com/AoManoh/openace-mcp/internal/rerank"
 )
 
 func main() {
@@ -77,6 +78,10 @@ func run() error {
 		// 候选到 routes.jsonl，供离线融合参数扫描（零新增嵌入费用）。
 		dumpRoutes = flag.Bool("dump-routes", false, "导出融合前双路候选而非评分")
 		routeDepth = flag.Int("route-depth", 200, "dump-routes 每路候选深度")
+		// rerank head 定值（T10b-4）：融合序头部 pool 送 rerank 打分并
+		// 导出原始分，head≤pool 的配置全部离线派生（送审一次付费一次）。
+		dumpRerank = flag.Bool("dump-rerank-scores", false, "导出融合头部的 rerank 原始分")
+		rerankPool = flag.Int("rerank-pool", 100, "dump-rerank-scores 送审池大小")
 		// 融合参数覆盖（T10b 定值验证）：负值 = 引擎默认（k=60 等权）。
 		fusionK      = flag.Int("fusion-k", -1, "RRF k（<0=默认）")
 		fusionLexW   = flag.Float64("fusion-lex-weight", -1, "词法路权重（<0=默认）")
@@ -198,6 +203,24 @@ func run() error {
 		fmt.Printf("routes dumped: %d queries depth=%d → %s\n", len(evaluable), *routeDepth, *out)
 		return nil
 	}
+	if *dumpRerank {
+		if !opts.Rerank.Enabled {
+			return fmt.Errorf("-dump-rerank-scores 需要 rerank provider 配置（当前未启用）")
+		}
+		rr, err := rerank.NewClient(opts.Rerank)
+		if err != nil {
+			return err
+		}
+		params := fusion.DefaultParams()
+		if opts.FusionParams != nil {
+			params = *opts.FusionParams
+		}
+		if err := dumpRerankScores(ctx, eng, rr, ref, evaluable, pathToDoc, *out, *rerankPool, *routeDepth, params, manifest); err != nil {
+			return err
+		}
+		fmt.Printf("rerank scores dumped: %d queries pool=%d → %s\n", len(evaluable), *rerankPool, *out)
+		return nil
+	}
 	resultsFile, err := os.Create(filepath.Join(*out, "results.jsonl"))
 	if err != nil {
 		return err
@@ -314,6 +337,97 @@ func dumpRouteCandidates(ctx context.Context, eng *localengine.Engine, ref engin
 		writer.WriteByte('\n')
 		if (i+1)%100 == 0 {
 			fmt.Fprintf(os.Stderr, "routes: %d/%d\n", i+1, len(evaluable))
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		return err
+	}
+	manifest.FinishedAt = time.Now().UTC()
+	manifest.QueryCount = len(evaluable)
+	manifestJSON, _ := json.MarshalIndent(manifest, "", "  ")
+	return os.WriteFile(filepath.Join(out, "manifest.json"), manifestJSON, 0o644)
+}
+
+// rerankScoreLine 是 -dump-rerank-scores 的单查询记录：pool 为融合序
+// 头部候选（chunk,doc 对），Scores 为 rerank 对每个送审 chunk 的原始
+// 分——head≤pool 的任意配置可离线派生（送审一次，全部 head 复用）。
+type rerankScoreLine struct {
+	QueryID string             `json:"qid"`
+	Group   string             `json:"group,omitempty"`
+	Pool    [][2]string        `json:"pool"`
+	Scores  map[string]float64 `json:"scores"`
+	Sent    int                `json:"sent"`
+	Elapsed int64              `json:"elapsed_ms"`
+}
+
+// dumpRerankScores 对每查询取融合序头部 pool 送 rerank 打分并原样导出
+// （T10b-4 head 定值）。融合参数沿引擎生效配置（-fusion-* flag 支配）。
+func dumpRerankScores(ctx context.Context, eng *localengine.Engine, rr *rerank.Client, ref engine.WorkspaceRef, evaluable []bench.Query, pathToDoc map[string]string, out string, pool int, routeDepth int, params fusion.Params, manifest runManifest) error {
+	scoresFile, err := os.Create(filepath.Join(out, "rerank-scores.jsonl"))
+	if err != nil {
+		return err
+	}
+	defer scoresFile.Close()
+	writer := bufio.NewWriter(scoresFile)
+	toDoc := func(relPath string) string {
+		if docID := pathToDoc[relPath]; docID != "" {
+			return docID
+		}
+		return relPath
+	}
+	for i, query := range evaluable {
+		start := time.Now()
+		routes, err := eng.SearchRoutes(ctx, engine.SearchRequest{Workspace: ref, Query: query.Text}, routeDepth)
+		if err != nil {
+			return fmt.Errorf("query %s: %w", query.ID, err)
+		}
+		lexIDs := make([]string, 0, len(routes.Lex))
+		relByID := make(map[string]string, len(routes.Lex)+len(routes.Dense))
+		for _, ref := range routes.Lex {
+			lexIDs = append(lexIDs, ref.ID)
+			relByID[ref.ID] = ref.RelPath
+		}
+		denseIDs := make([]string, 0, len(routes.Dense))
+		for _, ref := range routes.Dense {
+			denseIDs = append(denseIDs, ref.ID)
+			relByID[ref.ID] = ref.RelPath
+		}
+		fused := fusion.RRFWeighted(lexIDs, denseIDs, params)
+		if len(fused) > pool {
+			fused = fused[:pool]
+		}
+		ids := make([]string, 0, len(fused))
+		poolPairs := make([][2]string, 0, len(fused))
+		for _, f := range fused {
+			ids = append(ids, f.ID)
+			poolPairs = append(poolPairs, [2]string{f.ID, toDoc(relByID[f.ID])})
+		}
+		texts, err := eng.ChunkDocTexts(ctx, ref, ids)
+		if err != nil {
+			return fmt.Errorf("query %s 取文: %w", query.ID, err)
+		}
+		docs := make([]rerank.Document, 0, len(ids))
+		for _, id := range ids {
+			if text, ok := texts[id]; ok {
+				docs = append(docs, rerank.Document{ID: id, Text: text})
+			}
+		}
+		hits, sent, err := rr.Rerank(ctx, query.Text, docs)
+		if err != nil {
+			return fmt.Errorf("query %s rerank: %w", query.ID, err)
+		}
+		scores := make(map[string]float64, len(hits))
+		for _, hit := range hits {
+			scores[hit.ID] = hit.Score
+		}
+		line, _ := json.Marshal(rerankScoreLine{
+			QueryID: query.ID, Group: query.Group, Pool: poolPairs,
+			Scores: scores, Sent: sent, Elapsed: time.Since(start).Milliseconds(),
+		})
+		writer.Write(line)
+		writer.WriteByte('\n')
+		if (i+1)%50 == 0 {
+			fmt.Fprintf(os.Stderr, "rerank-scores: %d/%d\n", i+1, len(evaluable))
 		}
 	}
 	if err := writer.Flush(); err != nil {
