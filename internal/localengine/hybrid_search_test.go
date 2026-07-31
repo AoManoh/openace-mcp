@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AoManoh/openace-mcp/internal/fusion"
 	"github.com/AoManoh/openace-mcp/internal/rerank"
 	"github.com/AoManoh/openace-mcp/internal/vector"
 )
@@ -499,5 +500,39 @@ func TestLexicalOnlyFieldsStayEmpty(t *testing.T) {
 	}
 	if strings.Contains(result.Text, "[DEGRADED]") {
 		t.Fatalf("不得出现横幅: %q", result.Text)
+	}
+}
+
+// TestFusionParamsSteerHybridOrder 验证 Options.FusionParams 真实接入
+// 融合路径：同一双路候选下，等权默认与"语义压倒性加权"给出不同头名。
+// 词法路首位与 dense 路首位不同（词法命中 token 文件、dense 命中语义
+// 文件），LexWeight=0 时头名必须是 dense 首位。
+func TestFusionParamsSteerHybridOrder(t *testing.T) {
+	const dim = 8
+	server := newMagicEmbedServer(t, dim, func(text string) bool {
+		return strings.Contains(text, "establishSession") || strings.Contains(text, "qqxx")
+	})
+	base := embedOptions(server.ts.URL, dim, 16, "fake-model")
+	weighted := base
+	weighted.FusionParams = &fusion.Params{K: 20, LexWeight: 0, DenseWeight: 1}
+	e := newTestEngineWith(t, weighted)
+	root := newFixtureWorkspace(t)
+
+	// 查询同时含词法可命中 token 与语义 magic 词:两路首位不同。
+	result, err := e.Search(context.Background(), searchRequest(root, "renderGreeting qqxx"))
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if result.RetrievalMode != "hybrid" {
+		t.Fatalf("mode 应为 hybrid: %q", result.RetrievalMode)
+	}
+	// LexWeight=0:词法唯一命中不得占据首位,语义目标必须领先。
+	semIdx := strings.Index(result.Text, "establishSession")
+	lexIdx := strings.Index(result.Text, "renderGreeting")
+	if semIdx == -1 {
+		t.Fatalf("语义目标应在结果中: %q", result.Text)
+	}
+	if lexIdx != -1 && lexIdx < semIdx {
+		t.Fatalf("LexWeight=0 时语义首位应领先词法命中: lex@%d sem@%d\n%s", lexIdx, semIdx, result.Text)
 	}
 }

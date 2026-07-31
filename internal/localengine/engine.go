@@ -16,6 +16,7 @@ import (
 
 	"github.com/AoManoh/openace-mcp/internal/chunk"
 	"github.com/AoManoh/openace-mcp/internal/embedding"
+	"github.com/AoManoh/openace-mcp/internal/fusion"
 	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/index"
 	"github.com/AoManoh/openace-mcp/internal/lexical"
@@ -59,6 +60,9 @@ type Engine struct {
 	// lexWeights 是词法子句权重（T10a 受测常数；默认 DefaultWeights，
 	// 评测 harness 可经 Options 覆盖做权重扫描）。
 	lexWeights lexical.Weights
+	// fusion 是 RRF 融合参数（T10b 受测常数；默认 DefaultParams=现状
+	// 等权 k=60，评测 harness 可经 Options 覆盖做融合扫描）。
+	fusion fusion.Params
 
 	mu       sync.Mutex
 	inflight map[string]*buildCall
@@ -105,6 +109,10 @@ func New(opts Options) (*Engine, error) {
 	if opts.LexicalWeights != nil {
 		e.lexWeights = *opts.LexicalWeights
 	}
+	e.fusion = fusion.DefaultParams()
+	if opts.FusionParams != nil {
+		e.fusion = *opts.FusionParams
+	}
 	e.storeProfile = e.profile.ID + "-v" + e.profile.Version
 	e.embedCfg = opts.Embedding
 	if opts.Embedding.Enabled {
@@ -137,6 +145,11 @@ func (e *Engine) EngineProfileFingerprint() string {
 // semanticEnabled 报告语义路是否已配置。
 func (e *Engine) semanticEnabled() bool {
 	return e.embedClient != nil
+}
+
+// fusionParams 返回本引擎实例的 RRF 融合参数。
+func (e *Engine) fusionParams() fusion.Params {
+	return e.fusion
 }
 
 // markVectorRepair 登记查询期发现的向量损坏，触发下次 sync 自愈（K25）。

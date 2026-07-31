@@ -19,6 +19,7 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/bench"
 	"github.com/AoManoh/openace-mcp/internal/buildinfo"
 	"github.com/AoManoh/openace-mcp/internal/engine"
+	"github.com/AoManoh/openace-mcp/internal/fusion"
 	"github.com/AoManoh/openace-mcp/internal/lexical"
 	"github.com/AoManoh/openace-mcp/internal/localengine"
 )
@@ -45,6 +46,8 @@ type runManifest struct {
 	// LexWeights 记录本 run 生效的词法子句权重（run 可复现的 config
 	// 指纹组成部分；nil 字段缺省 = 引擎默认）。
 	LexWeights map[string]float64 `json:"lex_weights,omitempty"`
+	// FusionParams 记录本 run 生效的 RRF 融合参数（同上；nil = 默认）。
+	FusionParams map[string]float64 `json:"fusion_params,omitempty"`
 }
 
 type resultLine struct {
@@ -74,6 +77,10 @@ func run() error {
 		// 候选到 routes.jsonl，供离线融合参数扫描（零新增嵌入费用）。
 		dumpRoutes = flag.Bool("dump-routes", false, "导出融合前双路候选而非评分")
 		routeDepth = flag.Int("route-depth", 200, "dump-routes 每路候选深度")
+		// 融合参数覆盖（T10b 定值验证）：负值 = 引擎默认（k=60 等权）。
+		fusionK      = flag.Int("fusion-k", -1, "RRF k（<0=默认）")
+		fusionLexW   = flag.Float64("fusion-lex-weight", -1, "词法路权重（<0=默认）")
+		fusionDenseW = flag.Float64("fusion-dense-weight", -1, "dense 路权重（<0=默认）")
 	)
 	flag.Parse()
 	if *workspace == "" || *queries == "" || *qrels == "" || *out == "" {
@@ -100,6 +107,23 @@ func run() error {
 		lexWeights = map[string]float64{
 			"content": weights.Content, "path": weights.Path,
 			"symbol": weights.Symbol, "symbol_exact": weights.SymbolExact,
+		}
+	}
+	var fusionParams map[string]float64
+	if *fusionK >= 0 || *fusionLexW >= 0 || *fusionDenseW >= 0 {
+		params := fusion.DefaultParams()
+		if *fusionK >= 0 {
+			params.K = *fusionK
+		}
+		if *fusionLexW >= 0 {
+			params.LexWeight = *fusionLexW
+		}
+		if *fusionDenseW >= 0 {
+			params.DenseWeight = *fusionDenseW
+		}
+		opts.FusionParams = &params
+		fusionParams = map[string]float64{
+			"k": float64(params.K), "lex_weight": params.LexWeight, "dense_weight": params.DenseWeight,
 		}
 	}
 	eng, err := localengine.New(opts)
@@ -145,7 +169,8 @@ func run() error {
 		InputSHA: map[string]string{
 			"queries": fileSHA(*queries), "qrels": fileSHA(*qrels),
 		},
-		LexWeights: lexWeights,
+		LexWeights:   lexWeights,
+		FusionParams: fusionParams,
 	}
 
 	ctx := context.Background()

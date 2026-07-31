@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/AoManoh/openace-mcp/internal/embedding"
+	"github.com/AoManoh/openace-mcp/internal/fusion"
 	"github.com/AoManoh/openace-mcp/internal/lexical"
 	"github.com/AoManoh/openace-mcp/internal/rerank"
 )
@@ -40,6 +41,9 @@ type Options struct {
 	// 仅评测 harness（openace-bench 权重扫描）使用，无对应环境变量；
 	// 定值结果冻结进 DefaultWeights 而不是长期依赖本覆盖。
 	LexicalWeights *lexical.Weights
+	// FusionParams 覆盖 RRF 融合参数；nil = fusion.DefaultParams()。
+	// 同上仅评测 harness 使用；T10b 定值经呈批后冻结进 DefaultParams。
+	FusionParams *fusion.Params
 }
 
 // OptionsFromEnv 解析 local-hybrid 的 provider 与降级配置；
