@@ -43,8 +43,9 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 	return &Client{
 		cfg: cfg,
-		// 超时由每次尝试的 context 控制（取消需即时关闭请求，暗坑 K26）。
-		httpClient: &http.Client{},
+		// 超时由每次尝试的 context 控制（取消需即时关闭请求，暗坑 K26）；
+		// 传输层禁 h2 走 HTTP/1.1 连接池（F3：单连接复用会挤兑超时）。
+		httpClient: reliability.NewHTTPClient(),
 		circuit:    reliability.NewCircuit(),
 		limiter:    reliability.NewRateLimiter(cfg.RPMBudget, cfg.TPMBudget),
 		sem:        make(chan struct{}, cfg.MaxConcurrency),
@@ -187,6 +188,11 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&decoded); err != nil {
+		// 响应体读取期间的取消/超时不是 malformed（F3）：误判为 permanent
+		// 会计入 circuit 并在大批量构建中把语义路整场熄火。
+		if ctx.Err() != nil || attemptCtx.Err() != nil {
+			return nil, reliability.ClassifyTransportError(ctx, attemptCtx, c.cfg.Timeout, err)
+		}
 		return nil, &reliability.CallError{Class: reliability.ClassPermanent, Message: reliability.SanitizeMessage("malformed embeddings response: " + err.Error())}
 	}
 	// 结构校验（暗坑 K22）：数量精确、index 唯一且在界、维度与配置一致。

@@ -45,8 +45,9 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("rerank provider is not enabled: %s", cfg.DisabledReason)
 	}
 	return &Client{
-		cfg:        cfg,
-		httpClient: &http.Client{},
+		cfg: cfg,
+		// 传输层禁 h2 走 HTTP/1.1 连接池（F3，与 embedding 客户端一致）。
+		httpClient: reliability.NewHTTPClient(),
 		circuit:    reliability.NewCircuit(),
 		retry:      reliability.DefaultRetryPolicy(cfg.MaxRetries),
 	}, nil

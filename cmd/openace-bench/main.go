@@ -159,10 +159,11 @@ func run() error {
 	// 覆盖 + circuit 退避会让整个 run 的语义路静默瘫痪，必须前置可见）。
 	if opts.Embedding.Enabled {
 		if status, err := eng.WorkspaceStatus(ctx, ref); err == nil && status.Semantic != nil {
-			fmt.Fprintf(os.Stderr, "workspace: files=%d coverage=%s (%d/%d) rejected=%d provider=%s last_error=%q\n",
-				status.FileCount, status.Semantic.Coverage, status.Semantic.CoveredChunks,
-				status.Semantic.TotalChunks, status.Semantic.RejectedChunks,
-				status.ProviderState, status.LastError)
+			sem := status.Semantic
+			fmt.Fprintf(os.Stderr, "workspace: files=%d coverage=%s (%d/%d) rejected=%d journal=%d provider=%s last_error=%q\n",
+				status.FileCount, sem.Coverage, sem.CoveredChunks,
+				sem.TotalChunks, sem.RejectedChunks, sem.JournalEntries,
+				sem.ProviderState, sem.LastError)
 		}
 	}
 	if *dumpRoutes {
