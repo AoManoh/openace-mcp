@@ -84,7 +84,7 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 
 	// 阶段 1：发现（复用 workspace 扫描与 AssetPolicy，暗坑 K4）。
 	status.setStage(engine.IndexStageScanning)
-	assets, err := workspace.FileAssetSource{}.Load(ctx, root.CanonicalPath)
+	assets, err := workspace.FileAssetSource{Cache: e.statCacheFor(workspaceKey)}.Load(ctx, root.CanonicalPath)
 	if err != nil {
 		return engine.Result{}, fmt.Errorf("扫描工作区: %w", err)
 	}

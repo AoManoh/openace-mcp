@@ -76,6 +76,9 @@ type Engine struct {
 	// 拒绝集（Stage 4 D4：取消/kill 不丢已付费批次；K35 拒绝史跨重启
 	// 生效）。仅 semanticEnabled 时创建。
 	journals map[string]*index.Journal
+	// statCaches 每 workspace 一个扫描 stat 短路缓存(T11;构建持写锁
+	// 串行,缓存自身另有锁自卫)。
+	statCaches map[string]*workspace.StatCache
 	// locks 是 per-workspace 的跨进程写锁（Stage 4 D6：daemon 是唯一
 	// index owner 从假设变为机制），首次构建时获取、Close 时释放。
 	locks  map[string]*index.ProcessLock
@@ -104,6 +107,7 @@ func New(opts Options) (*Engine, error) {
 		handles:          make(map[string]*revisionHandle),
 		repair:           make(map[string]bool),
 		journals:         make(map[string]*index.Journal),
+		statCaches:       make(map[string]*workspace.StatCache),
 		locks:            make(map[string]*index.ProcessLock),
 	}
 	if opts.LexicalWeights != nil {
@@ -145,6 +149,18 @@ func (e *Engine) EngineProfileFingerprint() string {
 // semanticEnabled 报告语义路是否已配置。
 func (e *Engine) semanticEnabled() bool {
 	return e.embedClient != nil
+}
+
+// statCacheFor 返回(必要时创建)workspace 的扫描 stat 缓存。
+func (e *Engine) statCacheFor(workspaceKey string) *workspace.StatCache {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cache, ok := e.statCaches[workspaceKey]
+	if !ok {
+		cache = workspace.NewStatCache()
+		e.statCaches[workspaceKey] = cache
+	}
+	return cache
 }
 
 // fusionParams 返回本引擎实例的 RRF 融合参数。

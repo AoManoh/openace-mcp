@@ -21,12 +21,17 @@ type AssetSource interface {
 	Load(ctx context.Context, root string) (AssetSet, error)
 }
 
-type FileAssetSource struct{}
+// FileAssetSource 扫描 workspace 产出资产集;Cache 非 nil 时按
+// (size,mtime) 短路复用 blobName(T11 定值,长驻进程每 workspace
+// 一个实例),nil 时行为与历史逐字节一致。
+type FileAssetSource struct {
+	Cache *StatCache
+}
 
 var _ AssetSource = FileAssetSource{}
 
-func (FileAssetSource) Load(ctx context.Context, root string) (AssetSet, error) {
-	files, err := scan(ctx, root)
+func (s FileAssetSource) Load(ctx context.Context, root string) (AssetSet, error) {
+	files, err := scanWithCache(ctx, root, s.Cache)
 	if err != nil {
 		return nil, err
 	}
