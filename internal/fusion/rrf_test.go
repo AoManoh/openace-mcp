@@ -92,3 +92,50 @@ func TestLexicalTopHitStaysInHead(t *testing.T) {
 		t.Fatalf("词法第一命中融合后应在头部: pos=%d %+v", pos, fused[:3])
 	}
 }
+
+// TestWeightedEqualMatchesLegacy 等权 (1,1) 必须与无权重 RRF 逐位一致
+// （T10b：加权能力不得改变现状默认行为）。
+func TestWeightedEqualMatchesLegacy(t *testing.T) {
+	lex := []string{"a", "b", "c", "e"}
+	dense := []string{"b", "d", "a"}
+	legacy := RRF(lex, dense)
+	weighted := RRFWeighted(lex, dense, DefaultParams())
+	if !reflect.DeepEqual(legacy, weighted) {
+		t.Fatalf("等权应与历史公式逐位一致:\nlegacy=%+v\nweighted=%+v", legacy, weighted)
+	}
+}
+
+// TestWeightedFavorsDense 加权 golden：LexWeight=0.15/DenseWeight=0.85 时，
+// dense 首位应压过 lexical 首位（手工计算：a=0.15/21≈0.00714，
+// d=0.85/21≈0.04048，b=0.15/22+0.85/22≈0.04545 仍以双路居首）。
+func TestWeightedFavorsDense(t *testing.T) {
+	params := Params{K: 20, LexWeight: 0.15, DenseWeight: 0.85}
+	fused := RRFWeighted([]string{"a", "b"}, []string{"d", "b"}, params)
+	wantIDs := []string{"b", "d", "a"}
+	for i, want := range wantIDs {
+		if fused[i].ID != want {
+			t.Fatalf("位置 %d: got=%s want=%s (全部=%+v)", i, fused[i].ID, want, fused)
+		}
+	}
+	wantScores := []float64{0.15/22 + 0.85/22, 0.85 / 21, 0.15 / 21}
+	for i := range wantScores {
+		if math.Abs(fused[i].Score-wantScores[i]) > 1e-12 {
+			t.Fatalf("位置 %d 分数: got=%v want=%v", i, fused[i].Score, wantScores[i])
+		}
+	}
+}
+
+// TestWeightedParamClamps 非法参数收敛：负权重按 0、K<=0 回落默认。
+func TestWeightedParamClamps(t *testing.T) {
+	fused := RRFWeighted([]string{"a"}, []string{"d"}, Params{K: -1, LexWeight: -5, DenseWeight: 1})
+	if fused[0].ID != "d" {
+		t.Fatalf("负词法权重应按 0 处理，dense 应居首: %+v", fused)
+	}
+	if math.Abs(fused[0].Score-1.0/61) > 1e-12 {
+		t.Fatalf("K<=0 应回落默认 60: %v", fused[0].Score)
+	}
+	// 权重归零的一路仍参与来源标记与去重，只是不贡献分数。
+	if fused[1].ID != "a" || fused[1].Score != 0 {
+		t.Fatalf("零权重路候选应保留但零分: %+v", fused[1])
+	}
+}

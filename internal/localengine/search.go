@@ -425,7 +425,7 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		}
 		if denseIDs != nil {
 			mode = "hybrid"
-			fused := fusion.RRF(lexIDs, denseIDs)
+			fused := fusion.RRFWeighted(lexIDs, denseIDs, e.fusionParams())
 			ids := make([]string, 0, len(fused))
 			for _, f := range fused {
 				ids = append(ids, f.ID)
