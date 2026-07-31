@@ -284,6 +284,80 @@ func (e *Engine) SearchCandidates(ctx context.Context, req engine.SearchRequest)
 	return candidates, nil
 }
 
+// RouteCandidates 是融合前的双路召回镜像（Stage 5 T10b 专用 hook，
+// 不进入 MCP 工具面）：词法与语义候选各按原始路内序返回，供离线融合
+// 参数扫描（RRF k、召回深度、子句权重交互）复用已付费的 query
+// embedding 结果——参数扫描零新增嵌入费用（裁决 A1 的执行机制）。
+type RouteCandidates struct {
+	Lex   []CandidateRef
+	Dense []CandidateRef
+	// Reasons 是语义路降级原因（如有）；Dense 为 nil 且 Reasons 为空
+	// 表示语义未配置或覆盖为空。
+	Reasons []string
+}
+
+// SearchRoutes 返回融合前双路候选（每路深度 depth，不融合、不精排、
+// 不渲染）。与 retrieve 共享同步、句柄与存活过滤语义。
+func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, depth int) (RouteCandidates, error) {
+	if err := rejectProfileID(req.Workspace); err != nil {
+		return RouteCandidates{}, err
+	}
+	query := strings.TrimSpace(req.Query)
+	if query == "" {
+		return RouteCandidates{}, errors.New("查询内容为空")
+	}
+	if depth <= 0 {
+		depth = hybridRouteTopK
+	}
+	if _, syncErr := e.syncWorkspace(ctx, req.Workspace); syncErr != nil {
+		return RouteCandidates{}, syncErr
+	}
+	_, workspaceKey, err := e.resolveRoot(req.Workspace.DirectoryPath)
+	if err != nil {
+		return RouteCandidates{}, err
+	}
+	handle, err := e.acquireHandle(workspaceKey)
+	if err != nil {
+		return RouteCandidates{}, err
+	}
+	defer e.releaseHandle(handle)
+
+	lexHits, err := handle.lex.SearchWeighted(ctx, query, depth, e.lexWeights)
+	if err != nil {
+		return RouteCandidates{}, fmt.Errorf("词法检索: %w", err)
+	}
+	lexHits = filterLiveHits(handle, lexHits)
+	out := RouteCandidates{Lex: make([]CandidateRef, 0, len(lexHits))}
+	toRef := func(id string) (CandidateRef, bool) {
+		meta, ok := handle.chunks[id]
+		if !ok {
+			return CandidateRef{}, false
+		}
+		return CandidateRef{ID: id, RelPath: meta.RelPath, StartLine: meta.StartLine, EndLine: meta.EndLine}, true
+	}
+	for _, hit := range lexHits {
+		if ref, ok := toRef(hit.ID); ok {
+			out.Lex = append(out.Lex, ref)
+		}
+	}
+	if e.semanticEnabled() {
+		denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, depth)
+		if denseErr != nil {
+			return RouteCandidates{}, denseErr
+		}
+		out.Reasons = reasons
+		if denseIDs != nil {
+			out.Dense = make([]CandidateRef, 0, len(denseIDs))
+			for _, id := range denseIDs {
+				if ref, ok := toRef(id); ok {
+					out.Dense = append(out.Dense, ref)
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
 // retrieve 执行检索核心（同步→句柄→双路召回→融合→精排），返回渲染前
 // 候选；错误路径不返回句柄。
 func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrieval, error) {
@@ -339,7 +413,7 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	var ordered []rankedHit
 	coverage := ""
 	if e.semanticEnabled() {
-		denseIDs, denseReasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query)
+		denseIDs, denseReasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, hybridRouteTopK)
 		if denseErr != nil {
 			e.releaseHandle(handle)
 			return retrieval{}, denseErr
@@ -405,11 +479,11 @@ func filterLiveHits(handle *revisionHandle, hits []lexical.Hit) []lexical.Hit {
 	return live
 }
 
-// denseRoute 执行语义召回：返回 dense 候选 ID（nil 表示语义路未执行）、
-// 降级原因与致命错误（ctx 取消或 deny 拒绝）。多 segment 逐段 exact
-// 检索后确定性归并（score desc, ID asc，暗坑 K27），死 chunk 在归并后
-// 过滤（暗坑 K39）。
-func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string) ([]string, []string, error) {
+// denseRoute 执行语义召回：返回 depth 深度的 dense 候选 ID（nil 表示
+// 语义路未执行）、降级原因与致命错误（ctx 取消或 deny 拒绝）。多
+// segment 逐段 exact 检索后确定性归并（score desc, ID asc，暗坑 K27），
+// 死 chunk 在归并后过滤（暗坑 K39）。
+func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, depth int) ([]string, []string, error) {
 	ixs, loadErr := handle.vectorIndexes(e.embedCfg.Dimension)
 	if loadErr != nil {
 		if errors.Is(loadErr, vector.ErrEnvelopeExceeded) {
@@ -449,7 +523,7 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 	for _, ix := range ixs {
 		queryCopy := make([]float32, len(queryVector))
 		copy(queryCopy, queryVector)
-		segmentHits, searchErr := ix.Search(ctx, queryCopy, hybridRouteTopK)
+		segmentHits, searchErr := ix.Search(ctx, queryCopy, depth)
 		if searchErr != nil {
 			return nil, nil, searchErr
 		}
@@ -461,13 +535,13 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 		}
 		return merged[a].ID < merged[b].ID
 	})
-	ids := make([]string, 0, hybridRouteTopK)
+	ids := make([]string, 0, depth)
 	for _, hit := range merged {
 		if _, live := handle.chunks[hit.ID]; !live {
 			continue
 		}
 		ids = append(ids, hit.ID)
-		if len(ids) >= hybridRouteTopK {
+		if len(ids) >= depth {
 			break
 		}
 	}

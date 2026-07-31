@@ -70,6 +70,10 @@ func run() error {
 		symbolWeight = flag.Float64("lex-symbol-weight", -1, "symbol 分词子句权重（<0=默认）")
 		exactBoost   = flag.Float64("lex-symbol-exact-boost", -1, "symbol_raw 精确子句 boost（<0=默认）")
 		pathWeight   = flag.Float64("lex-path-weight", -1, "path 子句权重（<0=默认）")
+		// 双路候选导出（T10b）：dump 融合前 lex/dense 各 route-depth 条
+		// 候选到 routes.jsonl，供离线融合参数扫描（零新增嵌入费用）。
+		dumpRoutes = flag.Bool("dump-routes", false, "导出融合前双路候选而非评分")
+		routeDepth = flag.Int("route-depth", 200, "dump-routes 每路候选深度")
 	)
 	flag.Parse()
 	if *workspace == "" || *queries == "" || *qrels == "" || *out == "" {
@@ -133,13 +137,6 @@ func run() error {
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		return err
 	}
-	resultsFile, err := os.Create(filepath.Join(*out, "results.jsonl"))
-	if err != nil {
-		return err
-	}
-	defer resultsFile.Close()
-	writer := bufio.NewWriter(resultsFile)
-
 	manifest := runManifest{
 		Label: *label, StartedAt: time.Now().UTC(),
 		GitRevision: buildinfo.Current().VCSRevision, Workspace: *workspace,
@@ -158,6 +155,29 @@ func run() error {
 	if _, err := eng.Sync(ctx, engine.SyncRequest{Workspace: ref}); err != nil {
 		return fmt.Errorf("workspace 首建: %w", err)
 	}
+	// 语义配置下如实上报构建期覆盖与 provider 健康（T10b 教训：部分
+	// 覆盖 + circuit 退避会让整个 run 的语义路静默瘫痪，必须前置可见）。
+	if opts.Embedding.Enabled {
+		if status, err := eng.WorkspaceStatus(ctx, ref); err == nil && status.Semantic != nil {
+			fmt.Fprintf(os.Stderr, "workspace: files=%d coverage=%s (%d/%d) rejected=%d provider=%s last_error=%q\n",
+				status.FileCount, status.Semantic.Coverage, status.Semantic.CoveredChunks,
+				status.Semantic.TotalChunks, status.Semantic.RejectedChunks,
+				status.ProviderState, status.LastError)
+		}
+	}
+	if *dumpRoutes {
+		if err := dumpRouteCandidates(ctx, eng, ref, evaluable, pathToDoc, *out, *routeDepth, manifest); err != nil {
+			return err
+		}
+		fmt.Printf("routes dumped: %d queries depth=%d → %s\n", len(evaluable), *routeDepth, *out)
+		return nil
+	}
+	resultsFile, err := os.Create(filepath.Join(*out, "results.jsonl"))
+	if err != nil {
+		return err
+	}
+	defer resultsFile.Close()
+	writer := bufio.NewWriter(resultsFile)
 	for i, query := range evaluable {
 		start := time.Now()
 		candidates, err := eng.SearchCandidates(ctx, engine.SearchRequest{Workspace: ref, Query: query.Text})
@@ -221,11 +241,74 @@ func run() error {
 	return nil
 }
 
-func engineFlavor(opts localengine.Options) string {
-	if opts.Embedding.Enabled {
-		return "hybrid"
+// routeLine 是 routes.jsonl 的一行：候选以 [chunkID, docID] 对表示，
+// 路内序即召回序（RRF rank 的事实源）。
+type routeLine struct {
+	QueryID string      `json:"qid"`
+	Group   string      `json:"group,omitempty"`
+	Lex     [][2]string `json:"lex"`
+	Dense   [][2]string `json:"dense,omitempty"`
+	Reasons []string    `json:"reasons,omitempty"`
+	Elapsed int64       `json:"elapsed_ms"`
+}
+
+// dumpRouteCandidates 逐查询导出融合前双路候选（T10b 离线扫描原料）。
+func dumpRouteCandidates(ctx context.Context, eng *localengine.Engine, ref engine.WorkspaceRef, evaluable []bench.Query, pathToDoc map[string]string, out string, depth int, manifest runManifest) error {
+	routesFile, err := os.Create(filepath.Join(out, "routes.jsonl"))
+	if err != nil {
+		return err
 	}
-	return "lexical-only"
+	defer routesFile.Close()
+	writer := bufio.NewWriter(routesFile)
+	toDoc := func(relPath string) string {
+		if docID := pathToDoc[relPath]; docID != "" {
+			return docID
+		}
+		return relPath
+	}
+	pairs := func(refs []localengine.CandidateRef) [][2]string {
+		out := make([][2]string, 0, len(refs))
+		for _, ref := range refs {
+			out = append(out, [2]string{ref.ID, toDoc(ref.RelPath)})
+		}
+		return out
+	}
+	for i, query := range evaluable {
+		start := time.Now()
+		routes, err := eng.SearchRoutes(ctx, engine.SearchRequest{Workspace: ref, Query: query.Text}, depth)
+		if err != nil {
+			return fmt.Errorf("query %s: %w", query.ID, err)
+		}
+		line, _ := json.Marshal(routeLine{
+			QueryID: query.ID, Group: query.Group,
+			Lex: pairs(routes.Lex), Dense: pairs(routes.Dense),
+			Reasons: routes.Reasons, Elapsed: time.Since(start).Milliseconds(),
+		})
+		writer.Write(line)
+		writer.WriteByte('\n')
+		if (i+1)%100 == 0 {
+			fmt.Fprintf(os.Stderr, "routes: %d/%d\n", i+1, len(evaluable))
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		return err
+	}
+	manifest.FinishedAt = time.Now().UTC()
+	manifest.QueryCount = len(evaluable)
+	manifestJSON, _ := json.MarshalIndent(manifest, "", "  ")
+	return os.WriteFile(filepath.Join(out, "manifest.json"), manifestJSON, 0o644)
+}
+
+func engineFlavor(opts localengine.Options) string {
+	if !opts.Embedding.Enabled {
+		return "lexical-only"
+	}
+	// rerank 由 key 存在性缺省开启（Stage 3 语义），run 记录必须区分
+	// 纯融合与精排后结果（T10b 排障教训：二者指标差一个档位）。
+	if opts.Rerank.Enabled {
+		return "hybrid+rerank"
+	}
+	return "hybrid"
 }
 
 func loadDocmap(path string, out map[string]string) error {

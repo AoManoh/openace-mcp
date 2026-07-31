@@ -86,6 +86,69 @@ func TestHybridHitsSemanticOnlyTarget(t *testing.T) {
 	}
 }
 
+// TestSearchRoutesExposesBothRoutes 是 T10b hook 契约：融合前双路候选
+// 按路内原序返回、深度受 depth 支配、语义命中出现在 dense 路；
+// 纯词法引擎 Dense 为 nil。
+func TestSearchRoutesExposesBothRoutes(t *testing.T) {
+	const dim = 8
+	server := newMagicEmbedServer(t, dim, func(text string) bool {
+		return strings.Contains(text, "establishSession") || strings.Contains(text, "qqxx")
+	})
+	e := newTestEngineWith(t, embedOptions(server.ts.URL, dim, 16, "fake-model"))
+	root := newFixtureWorkspace(t)
+
+	// depth 不低于 hybridRouteTopK,保证融合子集断言对完整候选面成立。
+	routes, err := e.SearchRoutes(context.Background(), searchRequest(root, lexicalMissQuery), hybridRouteTopK)
+	if err != nil {
+		t.Fatalf("routes: %v", err)
+	}
+	if len(routes.Dense) == 0 {
+		t.Fatalf("语义已配置且覆盖完整,dense 路应有候选: %+v", routes)
+	}
+	if routes.Dense[0].RelPath != "main.go" {
+		t.Fatalf("dense 首位应命中语义目标 main.go: %+v", routes.Dense[0])
+	}
+	if len(routes.Reasons) != 0 {
+		t.Fatalf("完整链路不应降级: %v", routes.Reasons)
+	}
+	for _, ref := range append(append([]CandidateRef{}, routes.Lex...), routes.Dense...) {
+		if ref.ID == "" || ref.RelPath == "" || ref.StartLine < 1 || ref.EndLine < ref.StartLine {
+			t.Fatalf("候选引用字段非法: %+v", ref)
+		}
+	}
+	// 与 Search 语义一致性:同查询的最终候选是双路的融合子集。
+	candidates, err := e.SearchCandidates(context.Background(), searchRequest(root, lexicalMissQuery))
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeIDs := map[string]bool{}
+	for _, ref := range routes.Lex {
+		routeIDs[ref.ID] = true
+	}
+	for _, ref := range routes.Dense {
+		routeIDs[ref.ID] = true
+	}
+	for _, c := range candidates {
+		if !routeIDs[c.ID] {
+			t.Fatalf("融合候选 %s 不在双路并集内", c.ID)
+		}
+	}
+
+	// 纯词法引擎:Dense nil、Reasons 空,lex 深度受 depth 支配。
+	lexEngine := newTestEngine(t)
+	lexRoot := newFixtureWorkspace(t)
+	lexRoutes, err := lexEngine.SearchRoutes(context.Background(), searchRequest(lexRoot, "HandleLogin"), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lexRoutes.Dense != nil || len(lexRoutes.Reasons) != 0 {
+		t.Fatalf("纯词法引擎不应有 dense 路: %+v", lexRoutes)
+	}
+	if len(lexRoutes.Lex) == 0 || len(lexRoutes.Lex) > 3 {
+		t.Fatalf("lex 深度应受 depth=3 支配: %d", len(lexRoutes.Lex))
+	}
+}
+
 // TestQueryEmbeddingFailureAllowDegradesToLexical 是 D8(a) allow 路径。
 func TestQueryEmbeddingFailureAllowDegradesToLexical(t *testing.T) {
 	const dim = 8
