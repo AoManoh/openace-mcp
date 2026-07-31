@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/AoManoh/openace-mcp/internal/embedding"
 	"github.com/AoManoh/openace-mcp/internal/engine"
@@ -154,54 +155,129 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 
 	// 3) 分批嵌入：单批失败记录并继续（部分成功入盘，D10）；circuit
 	// 退避即停（后续批必然拒绝，K30）；取消中止整次构建。进度按批
-	// 写入状态（D8：构建期 workspace_status 可见嵌入进展）。
+	// 写入状态（D8：构建期 workspace_status 可见嵌入进展）。批间按
+	// MaxConcurrency 并行（T10b：provider 单请求延迟秒级且波动大，
+	// 串行会把构建吞吐钉死在单请求延迟上）；每批 all-or-nothing 与
+	// journal 落盘语义不变，journal 自身持锁。
 	status.setEmbedProgress(len(missingHashes), 0)
-	embedded := 0
 	batchSize := e.embedCfg.BatchSize
+	type batchSpan struct{ start, end int }
+	var batches []batchSpan
 	for start := 0; start < len(missingHashes); start += batchSize {
 		end := start + batchSize
 		if end > len(missingHashes) {
 			end = len(missingHashes)
 		}
-		vectors, err := e.embedClient.EmbedBatch(ctx, missingTexts[start:end], embedding.InputDocument)
-		if err != nil {
-			if ctx.Err() != nil {
-				return out, ctx.Err()
+		batches = append(batches, batchSpan{start: start, end: end})
+	}
+	workers := e.embedCfg.MaxConcurrency
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(batches) {
+		workers = len(batches)
+	}
+	var (
+		embedMu   sync.Mutex
+		embedded  int
+		fatalErr  error
+		workQueue = make(chan batchSpan)
+		wg        sync.WaitGroup
+	)
+	workCtx, cancelWork := context.WithCancel(ctx)
+	defer cancelWork()
+	recordFatal := func(err error) {
+		embedMu.Lock()
+		if fatalErr == nil {
+			fatalErr = err
+		}
+		embedMu.Unlock()
+		cancelWork()
+	}
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for span := range workQueue {
+				if workCtx.Err() != nil {
+					return
+				}
+				vectors, err := e.embedClient.EmbedBatch(workCtx, missingTexts[span.start:span.end], embedding.InputDocument)
+				if err != nil {
+					if ctx.Err() != nil {
+						recordFatal(ctx.Err())
+						return
+					}
+					if workCtx.Err() != nil {
+						// 同伴 worker 已触发停止（退避/致命错误），本批的
+						// 取消回声不覆盖真实原因。
+						return
+					}
+					embedMu.Lock()
+					out.lastError = sanitizeError(err)
+					embedMu.Unlock()
+					callErr := &reliability.CallError{}
+					if errors.As(err, &callErr) && callErr.Class == reliability.ClassBackoff {
+						// circuit 退避：停止投放后续批（K30），已入队
+						// 批次经 workCtx 取消快速退出。
+						embedMu.Lock()
+						out.backedOff = true
+						embedMu.Unlock()
+						cancelWork()
+					}
+					continue
+				}
+				batchGood := make(map[string][]float32, len(vectors))
+				var batchRejected []string
+				rejectedCount := 0
+				for i, vec := range vectors {
+					if err := vector.Normalize(vec); err != nil {
+						// 零向量/NaN：该内容记为未覆盖并计数（K35），持久化
+						// 拒绝史跨重启防重复付费。
+						rejectedCount++
+						batchRejected = append(batchRejected, missingHashes[span.start+i])
+						continue
+					}
+					batchGood[missingHashes[span.start+i]] = vec
+				}
+				// 批成功即落 journal（D4/G2）：随后即使构建被取消/kill，
+				// 这批付费向量也可被下次构建复用。
+				if err := journal.Append(batchGood); err != nil {
+					recordFatal(fmt.Errorf("journal 落盘: %w", err))
+					return
+				}
+				if err := journal.MarkRejected(batchRejected); err != nil {
+					recordFatal(fmt.Errorf("journal 拒绝集落盘: %w", err))
+					return
+				}
+				embedMu.Lock()
+				out.rejected += rejectedCount
+				for hash, vec := range batchGood {
+					reuse[hash] = vec
+					out.newlyEmbedded++
+				}
+				embedded += span.end - span.start
+				status.setEmbedProgress(len(missingHashes)-embedded, embedded)
+				embedMu.Unlock()
 			}
-			out.lastError = sanitizeError(err)
-			callErr := &reliability.CallError{}
-			if errors.As(err, &callErr) && callErr.Class == reliability.ClassBackoff {
-				out.backedOff = true
-				break
-			}
-			continue
+		}()
+	}
+	for _, span := range batches {
+		if workCtx.Err() != nil {
+			break
 		}
-		batchGood := make(map[string][]float32, len(vectors))
-		var batchRejected []string
-		for i, vec := range vectors {
-			if err := vector.Normalize(vec); err != nil {
-				// 零向量/NaN：该内容记为未覆盖并计数（K35），持久化
-				// 拒绝史跨重启防重复付费。
-				out.rejected++
-				batchRejected = append(batchRejected, missingHashes[start+i])
-				continue
-			}
-			batchGood[missingHashes[start+i]] = vec
+		select {
+		case workQueue <- span:
+		case <-workCtx.Done():
 		}
-		// 批成功即落 journal（D4/G2）：随后即使构建被取消/kill，
-		// 这批付费向量也可被下次构建复用。
-		if err := journal.Append(batchGood); err != nil {
-			return out, fmt.Errorf("journal 落盘: %w", err)
-		}
-		if err := journal.MarkRejected(batchRejected); err != nil {
-			return out, fmt.Errorf("journal 拒绝集落盘: %w", err)
-		}
-		for hash, vec := range batchGood {
-			reuse[hash] = vec
-			out.newlyEmbedded++
-		}
-		embedded = end
-		status.setEmbedProgress(len(missingHashes)-embedded, embedded)
+	}
+	close(workQueue)
+	wg.Wait()
+	if fatalErr != nil {
+		return out, fatalErr
+	}
+	if err := ctx.Err(); err != nil {
+		return out, err
 	}
 
 	// 4) 对齐 records 组装行集（同内容多行共享同一向量值）。
