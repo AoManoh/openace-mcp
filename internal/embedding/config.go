@@ -76,8 +76,11 @@ type Config struct {
 	RPMBudget int
 	TPMBudget int
 
-	Timeout    time.Duration
-	MaxRetries int
+	Timeout time.Duration
+	// QueryTimeout 是查询期(InputQuery)单次尝试超时;0=回落 Timeout
+	// (RS3:未配置=现状行为)。
+	QueryTimeout time.Duration
+	MaxRetries   int
 }
 
 // ConfigFromEnv 解析 embedding 配置；配置错误在启动即报（fail-fast），
@@ -116,6 +119,9 @@ func ConfigFromEnv() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.Timeout, err = reliability.TimeoutFromEnv(); err != nil {
+		return Config{}, err
+	}
+	if cfg.QueryTimeout, err = reliability.QueryTimeoutFromEnv(); err != nil {
 		return Config{}, err
 	}
 	if cfg.MaxRetries, err = reliability.MaxRetriesFromEnv(); err != nil {

@@ -150,7 +150,12 @@ func (c *Client) embedOnce(ctx context.Context, texts []string, inputType InputT
 
 // doRequest 发送单次 HTTP 请求并解析、校验响应。
 func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputType) ([][]float32, error) {
-	attemptCtx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
+	timeout := c.cfg.Timeout
+	if inputType == InputQuery && c.cfg.QueryTimeout > 0 {
+		// RS3:查询期独立超时,构建期大批调优不放大交互最坏等待。
+		timeout = c.cfg.QueryTimeout
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	body := map[string]any{"input": texts, "model": c.cfg.Model}
@@ -174,7 +179,7 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, reliability.ClassifyTransportError(ctx, attemptCtx, c.cfg.Timeout, err)
+		return nil, reliability.ClassifyTransportError(ctx, attemptCtx, timeout, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -191,7 +196,7 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 		// 响应体读取期间的取消/超时不是 malformed（F3）：误判为 permanent
 		// 会计入 circuit 并在大批量构建中把语义路整场熄火。
 		if ctx.Err() != nil || attemptCtx.Err() != nil {
-			return nil, reliability.ClassifyTransportError(ctx, attemptCtx, c.cfg.Timeout, err)
+			return nil, reliability.ClassifyTransportError(ctx, attemptCtx, timeout, err)
 		}
 		return nil, &reliability.CallError{Class: reliability.ClassPermanent, Message: reliability.SanitizeMessage("malformed embeddings response: " + err.Error())}
 	}
