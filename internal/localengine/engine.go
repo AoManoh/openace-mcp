@@ -455,7 +455,7 @@ func (e *Engine) WorkspaceChanged(ctx context.Context, ref engine.WorkspaceRef) 
 		}
 		return false, err
 	}
-	assets, err := workspace.FileAssetSource{}.Load(ctx, root.CanonicalPath)
+	assets, err := workspace.FileAssetSource{Cache: e.statCacheFor(workspaceKey)}.Load(ctx, root.CanonicalPath)
 	if err != nil {
 		return false, err
 	}

@@ -519,20 +519,61 @@ func TestFusionParamsSteerHybridOrder(t *testing.T) {
 	root := newFixtureWorkspace(t)
 
 	// 查询同时含词法可命中 token 与语义 magic 词:两路首位不同。
-	result, err := e.Search(context.Background(), searchRequest(root, "renderGreeting qqxx"))
+	result, err := e.Search(context.Background(), searchRequest(root, "parse_config qqxx"))
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
 	if result.RetrievalMode != "hybrid" {
 		t.Fatalf("mode 应为 hybrid: %q", result.RetrievalMode)
 	}
-	// LexWeight=0:词法唯一命中不得占据首位,语义目标必须领先。
+	// LexWeight=0:语义目标必须领先词法命中(两者都必须在结果中,
+	// 防 vacuous 断言)。
 	semIdx := strings.Index(result.Text, "establishSession")
-	lexIdx := strings.Index(result.Text, "renderGreeting")
-	if semIdx == -1 {
-		t.Fatalf("语义目标应在结果中: %q", result.Text)
+	lexIdx := strings.Index(result.Text, "parse_config")
+	if semIdx == -1 || lexIdx == -1 {
+		t.Fatalf("语义与词法目标都应在结果中: sem@%d lex@%d %q", semIdx, lexIdx, result.Text)
 	}
-	if lexIdx != -1 && lexIdx < semIdx {
+	if lexIdx < semIdx {
 		t.Fatalf("LexWeight=0 时语义首位应领先词法命中: lex@%d sem@%d\n%s", lexIdx, semIdx, result.Text)
+	}
+}
+
+// TestLexicalAnchorRescuedByRerank 是词法锚的业务验收:dense 路存活但
+// 语义失真(magic 向量指向无关文件)时,词法唯一强命中被锚入 rerank
+// 窗口,精排按真实相关性把它救回头部——最终 top-1 必须是词法目标。
+func TestLexicalAnchorRescuedByRerank(t *testing.T) {
+	const dim = 8
+	// dense 全部失真:查询与无关文件共向,与词法目标不共向。
+	server := newMagicEmbedServer(t, dim, func(text string) bool {
+		return strings.Contains(text, "establishSession") || strings.Contains(text, "qqxx")
+	})
+	failFlag := false
+	rerankServer := newRerankServer(t, func(doc string) float64 {
+		if strings.Contains(doc, "parse_config") {
+			return 0.99
+		}
+		return 0.01
+	}, &failFlag)
+	opts := embedOptions(server.ts.URL, dim, 16, "fake-model")
+	opts.Rerank = rerank.Config{
+		Enabled: true, ProviderType: rerank.ProviderVoyage, BaseURL: rerankServer.URL,
+		APIKey: "fake", Model: "fake-rerank", MaxTokens: 100000,
+		Timeout: 2 * time.Second, MaxRetries: 0,
+	}
+	e := newTestEngineWith(t, opts)
+	root := newFixtureWorkspace(t)
+	// 查询含词法可命中 token(parse_config)+ magic 词(qqxx 使 dense
+	// 指向 establishSession)。dense 失真场景下 rerank 应救回词法目标。
+	result, err := e.Search(context.Background(), searchRequest(root, "parse_config qqxx"))
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	lexIdx := strings.Index(result.Text, "parse_config")
+	semIdx := strings.Index(result.Text, "establishSession")
+	if lexIdx == -1 {
+		t.Fatalf("词法目标应在结果中: %q", result.Text)
+	}
+	if semIdx != -1 && semIdx < lexIdx {
+		t.Fatalf("精排后词法目标应领先失真 dense 命中: lex@%d sem@%d\n%s", lexIdx, semIdx, result.Text)
 	}
 }

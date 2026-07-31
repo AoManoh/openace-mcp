@@ -458,6 +458,14 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 			for _, f := range fused {
 				ids = append(ids, f.ID)
 			}
+			// 词法锚(T11 业务冒烟发现的边界):dense 路存活但语义失真
+			// (弱模型/错配)时,加权融合会把词法唯一强命中压出精排窗口。
+			// 保证词法首位进入 rerank head 窗口——四语料 12,497 查询离线
+			// 复算证明零质量代价(R@5/R@10 逐位不变),而精排从此必然
+			// "看得见"最强词法信号;窗口 5 的激进版被证伪(cosqa -3.6pp)。
+			if len(lexIDs) > 0 {
+				ids = anchorWithinWindow(ids, lexIDs[0], rerankHeadLimit)
+			}
 			ordered = rankByPosition(ids)
 		} else {
 			ordered = rankByPosition(lexIDs)
@@ -639,6 +647,28 @@ func rerankDocText(record chunkRecord) string {
 		header += " " + record.Symbol
 	}
 	return header + "\n" + record.Content
+}
+
+// anchorWithinWindow 把 anchor 提升到窗口内末位(若在窗口外);
+// 窗口内命中保持原位,确定性重排不引入分数语义。
+func anchorWithinWindow(ids []string, anchor string, window int) []string {
+	if window <= 0 || len(ids) <= window {
+		return ids
+	}
+	idx := -1
+	for i, id := range ids {
+		if id == anchor {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 || idx < window {
+		return ids
+	}
+	item := ids[idx]
+	copy(ids[window:idx+1], ids[window-1:idx])
+	ids[window-1] = item
+	return ids
 }
 
 // rankByPosition 把最终 ID 序转换为合成序分（1/(pos+1)），保证渲染合并
