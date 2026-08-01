@@ -40,9 +40,11 @@ const (
 	journalFileName  = "vectors.journal"
 	rejectedFileName = "rejected.list"
 	// journalMaxEntries/journalMaxBytes 是孤儿条目双上限（受测常数，K40）：
-	// 打开与发布后压实时执行，保留最新条目。
-	journalMaxEntries = 100_000
-	journalMaxBytes   = 512 << 20
+	// 打开与发布后压实时执行，保留最新条目。随 envelope 上调至 250K
+	// （2026-07-31）同步放大——首建 250K chunk 工作区的断点保护需容纳
+	// 全量未发布向量（250K × ~4.3KB ≈ 1.1GB,字节上限同步 1.25GB）。
+	journalMaxEntries = 250_000
+	journalMaxBytes   = 1280 << 20
 	// rejectedMaxEntries 限制拒绝集规模（病理内容计数级别）。
 	rejectedMaxEntries = 10_000
 )
