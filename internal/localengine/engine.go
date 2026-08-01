@@ -13,11 +13,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/chunk"
 	"github.com/AoManoh/openace-mcp/internal/embedding"
-	"github.com/AoManoh/openace-mcp/internal/fusion"
 	"github.com/AoManoh/openace-mcp/internal/engine"
+	"github.com/AoManoh/openace-mcp/internal/fusion"
 	"github.com/AoManoh/openace-mcp/internal/index"
 	"github.com/AoManoh/openace-mcp/internal/lexical"
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
@@ -63,6 +64,9 @@ type Engine struct {
 	// fusion 是 RRF 融合参数（T10b 受测常数；默认 DefaultParams=现状
 	// 等权 k=60，评测 harness 可经 Options 覆盖做融合扫描）。
 	fusion fusion.Params
+	// freshnessWindow>0 时,上次成功同步距今小于窗口的查询跳过内联
+	// 扫描(Stage 6 前置;新鲜度上界=窗口)。
+	freshnessWindow time.Duration
 
 	mu       sync.Mutex
 	inflight map[string]*buildCall
@@ -79,6 +83,9 @@ type Engine struct {
 	// statCaches 每 workspace 一个扫描 stat 短路缓存(T11;构建持写锁
 	// 串行,缓存自身另有锁自卫)。
 	statCaches map[string]*workspace.StatCache
+	// lastSyncOK 是每 workspace 最近一次成功同步完成时刻(freshness
+	// 窗口判据;仅成功路径刷新)。
+	lastSyncOK map[string]time.Time
 	// locks 是 per-workspace 的跨进程写锁（Stage 4 D6：daemon 是唯一
 	// index owner 从假设变为机制），首次构建时获取、Close 时释放。
 	locks  map[string]*index.ProcessLock
@@ -108,6 +115,7 @@ func New(opts Options) (*Engine, error) {
 		repair:           make(map[string]bool),
 		journals:         make(map[string]*index.Journal),
 		statCaches:       make(map[string]*workspace.StatCache),
+		lastSyncOK:       make(map[string]time.Time),
 		locks:            make(map[string]*index.ProcessLock),
 	}
 	if opts.LexicalWeights != nil {
@@ -117,6 +125,7 @@ func New(opts Options) (*Engine, error) {
 	if opts.FusionParams != nil {
 		e.fusion = *opts.FusionParams
 	}
+	e.freshnessWindow = opts.FreshnessWindow
 	e.storeProfile = e.profile.ID + "-v" + e.profile.Version
 	e.embedCfg = opts.Embedding
 	if opts.Embedding.Enabled {
@@ -360,6 +369,25 @@ func (e *Engine) syncWorkspace(ctx context.Context, ref engine.WorkspaceRef) (en
 	if err != nil {
 		return engine.Result{}, err
 	}
+	// freshness 窗口短路(Stage 6 前置):窗口内且已有成功同步 → 直接
+	// 用现役 revision 应答;显式 Sync(bench 首建/用户触发)不走本入口
+	// 之外的路径,窗口只作用于查询期内联同步。失败过的 workspace 不
+	// 短路(lastSyncOK 仅成功刷新),保证故障不被窗口掩盖。
+	if e.freshnessWindow > 0 {
+		e.mu.Lock()
+		last, ok := e.lastSyncOK[workspaceKey]
+		e.mu.Unlock()
+		if ok && time.Since(last) < e.freshnessWindow {
+			if handle, herr := e.acquireHandle(workspaceKey); herr == nil {
+				manifest := handle.manifest
+				e.releaseHandle(handle)
+				return engine.Result{
+					Engine: EngineID, IndexRevision: manifest.Revision,
+					FileCount: manifest.Counts.Files,
+				}, nil
+			}
+		}
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return engine.Result{}, err
@@ -391,6 +419,11 @@ func (e *Engine) syncWorkspace(ctx context.Context, ref engine.WorkspaceRef) (en
 
 		go func() {
 			result, err := e.runBuild(runCtx, root, workspaceKey)
+			if err == nil {
+				e.mu.Lock()
+				e.lastSyncOK[workspaceKey] = time.Now()
+				e.mu.Unlock()
+			}
 			call.result, call.err = result, err
 			// 对齐 legacy 语义（review S9）：先在锁内摘除表项（带身份
 			// 校验）再 close(done)，消除"看到 done 但表内仍是本 call"

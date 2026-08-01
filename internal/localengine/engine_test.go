@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"sync"
 	"testing"
 
@@ -485,5 +486,42 @@ func TestNoUsableRevisionSurfaced(t *testing.T) {
 	_, err := e.acquireHandle("nonexistent-ws")
 	if !errors.Is(err, index.ErrNoUsableRevision) {
 		t.Fatalf("无 revision 应返回 ErrNoUsableRevision，got %v", err)
+	}
+}
+
+// TestFreshnessWindowSkipsInlineScan 新鲜度窗口业务语义:窗口内查询
+// 不感知磁盘变更(跳过内联扫描),窗口过期后第一次查询恢复同步并
+// 看到新内容;窗口=0(默认)保持每查询即时可见。
+func TestFreshnessWindowSkipsInlineScan(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\nfunc OldToken() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{FreshnessWindow: 300 * time.Millisecond}
+	e := newTestEngineWith(t, opts)
+	ctx := context.Background()
+	ref := engine.WorkspaceRef{DirectoryPath: root}
+	if _, err := e.Sync(ctx, engine.SyncRequest{Workspace: ref}); err != nil {
+		t.Fatal(err)
+	}
+	// 磁盘变更(窗口内):查询不应看到新 token。
+	if err := os.WriteFile(filepath.Join(root, "b.go"), []byte("package a\nfunc FreshToken() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.Search(ctx, searchRequest(root, "FreshToken"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result.Text, "FreshToken") {
+		t.Fatalf("窗口内不应看到未同步内容: %q", result.Text)
+	}
+	// 窗口过期:恢复内联同步,新内容可检索。
+	time.Sleep(350 * time.Millisecond)
+	result, err = e.Search(ctx, searchRequest(root, "FreshToken"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Text, "FreshToken") {
+		t.Fatalf("窗口过期后应看到新内容: %q", result.Text)
 	}
 }
