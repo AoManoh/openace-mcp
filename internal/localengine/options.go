@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/embedding"
 	"github.com/AoManoh/openace-mcp/internal/fusion"
 	"github.com/AoManoh/openace-mcp/internal/lexical"
+	"github.com/AoManoh/openace-mcp/internal/reliability"
 	"github.com/AoManoh/openace-mcp/internal/rerank"
 )
 
@@ -28,6 +30,11 @@ const (
 const (
 	EnvRetrievalDegrade = "OPENACE_RETRIEVAL_DEGRADE"
 	EnvRerankDegrade    = "OPENACE_RERANK_DEGRADE"
+	// EnvFreshnessWindow 是查询期新鲜度窗口（Stage 6 前置，T11 证据：
+	// 查询延迟由 no-op sync 全量扫描支配）：上次成功同步距今小于窗口
+	// 时跳过内联扫描，新鲜度上界=窗口时长；空/0=每查询扫描（现状）。
+	// 后台 reconciler/显式 sync 不受窗口约束。
+	EnvFreshnessWindow = "OPENACE_FRESHNESS_WINDOW"
 )
 
 // Options 是 local-hybrid 引擎的完整构造配置；零值 = Stage 2 行为
@@ -44,6 +51,8 @@ type Options struct {
 	// FusionParams 覆盖 RRF 融合参数；nil = fusion.DefaultParams()。
 	// 同上仅评测 harness 使用；T10b 定值经呈批后冻结进 DefaultParams。
 	FusionParams *fusion.Params
+	// FreshnessWindow 是查询期新鲜度窗口；0 = 每查询内联扫描（现状）。
+	FreshnessWindow time.Duration
 }
 
 // OptionsFromEnv 解析 local-hybrid 的 provider 与降级配置；
@@ -65,11 +74,16 @@ func OptionsFromEnv() (Options, error) {
 	if err != nil {
 		return Options{}, err
 	}
+	freshness, err := reliability.DurationEnv(EnvFreshnessWindow, 0)
+	if err != nil {
+		return Options{}, err
+	}
 	return Options{
 		Embedding:        embedCfg,
 		Rerank:           rerankCfg,
 		RetrievalDegrade: retrievalDegrade,
 		RerankDegrade:    rerankDegrade,
+		FreshnessWindow:  freshness,
 	}, nil
 }
 
