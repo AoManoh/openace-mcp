@@ -33,8 +33,11 @@ const (
 	indexSchemaVersion = 1
 	// DefaultMaxResidentVectors 是 exact 路径常驻内存的已验证 envelope
 	// （§18：超出必须显式降级词法，禁止靠 OOM/超时兜底）。
-	// 100K × 1024 维 × 4B ≈ 400MB；Stage 5 benchmark 后复审。
-	DefaultMaxResidentVectors = 100_000
+	// Stage 5 复审定值 250K（2026-07-31，T09b/T11 证据 + 用户批准）：
+	// 270,373 条真实 1024 维向量实测 exact p50=86ms/p95=94ms
+	// （annbench，ANN 六门后裁决不引入）；250K × 1024 维 × 4B ≈ 1.0GB
+	// 常驻为已知代价，超出仍显式降级。
+	DefaultMaxResidentVectors = 250_000
 	// cancelCheckRows 是并行扫描的取消检查粒度。
 	cancelCheckRows = 2048
 )
