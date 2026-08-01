@@ -198,6 +198,12 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 		if ctx.Err() != nil || attemptCtx.Err() != nil {
 			return nil, reliability.ClassifyTransportError(ctx, attemptCtx, timeout, err)
 		}
+		// 连接中断类解码错误同理（F6，sealed 实跑发现：redis 首建遭
+		// "unexpected EOF" 被判 permanent → circuit 退避 → 11% 覆盖入库）：
+		// 半途断流是传输故障不是 JSON 垃圾，必须 transient 走重试。
+		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+			return nil, &reliability.CallError{Class: reliability.ClassTransient, Message: reliability.SanitizeMessage("response stream interrupted: " + err.Error())}
+		}
 		return nil, &reliability.CallError{Class: reliability.ClassPermanent, Message: reliability.SanitizeMessage("malformed embeddings response: " + err.Error())}
 	}
 	// 结构校验（暗坑 K22）：数量精确、index 唯一且在界、维度与配置一致。

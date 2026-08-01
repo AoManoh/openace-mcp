@@ -530,3 +530,30 @@ func TestQueryTimeoutIndependent(t *testing.T) {
 		t.Fatalf("查询期超时未独立生效,等待了 %v", elapsed)
 	}
 }
+
+// TestTruncatedBodyClassifiedTransient F6:响应体半途断流(unexpected
+// EOF)是传输故障,必须 transient 重试,不得判 permanent 毒化 circuit。
+func TestTruncatedBodyClassifiedTransient(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "999999")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":[{"embedding":[0.1`))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		if hj, ok := w.(http.Hijacker); ok {
+			conn, _, _ := hj.Hijack()
+			conn.Close()
+		}
+	}))
+	defer ts.Close()
+
+	cfg := testConfig(ts.URL, 2)
+	cfg.MaxRetries = 0
+	client, _ := NewClient(cfg)
+	_, err := client.EmbedBatch(context.Background(), []string{"a"}, InputDocument)
+	callErr := &reliability.CallError{}
+	if !errors.As(err, &callErr) || callErr.Class != reliability.ClassTransient {
+		t.Fatalf("断流应为 transient: %v", err)
+	}
+}
