@@ -33,11 +33,12 @@ const (
 	indexSchemaVersion = 1
 	// DefaultMaxResidentVectors 是 exact 路径常驻内存的已验证 envelope
 	// （§18：超出必须显式降级词法，禁止靠 OOM/超时兜底）。
-	// Stage 5 复审定值 250K（2026-07-31，T09b/T11 证据 + 用户批准）：
-	// 270,373 条真实 1024 维向量实测 exact p50=86ms/p95=94ms
-	// （annbench，ANN 六门后裁决不引入）；250K × 1024 维 × 4B ≈ 1.0GB
-	// 常驻为已知代价，超出仍显式降级。
-	DefaultMaxResidentVectors = 250_000
+	// Stage 5 复审定值：250K（2026-07-31,270,373 条真实向量 p50=86ms）→
+	// 400K（2026-08-01 用户批准选项 B,kubernetes 全量语料需求）：
+	// 线性外推 p50≈128ms(0.32ms/K 实测斜率),常驻 400K×1024×4B≈1.6GB;
+	// 定值以 k8s 全量嵌入后 annbench 实测复核(sealed 报告记录),
+	// 超出仍显式降级。
+	DefaultMaxResidentVectors = 400_000
 	// cancelCheckRows 是并行扫描的取消检查粒度。
 	cancelCheckRows = 2048
 )
