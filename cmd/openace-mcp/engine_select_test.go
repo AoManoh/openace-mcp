@@ -63,19 +63,34 @@ func TestLocalHybridInvalidProviderEnvRejected(t *testing.T) {
 	}
 }
 
-// TestDefaultEngineUnchanged 是 P2-T10 业务验收 (a)：
-// 未设 OPENACE_ENGINE 时仍走 legacy ACE 路径（含凭据时返回 workspace.Syncer）。
-func TestDefaultEngineUnchanged(t *testing.T) {
+// TestDefaultEngineIsLocalHybrid 是 Stage 6 切默认验收：未设
+// OPENACE_ENGINE 时走 local-hybrid(§18 全过后 2026-08-02 批准);
+// 显式 OPENACE_ENGINE=ace 保持 legacy 可用(单变量回退)。
+func TestDefaultEngineIsLocalHybrid(t *testing.T) {
 	clearAugmentEnv(t)
 	t.Setenv("OPENACE_ENGINE", "")
-	t.Setenv("AUGMENT_TOKEN", "test-token")
-	t.Setenv("AUGMENT_TENANT", "https://example.test/")
 	service, err := buildLocalService(context.Background())
 	if err != nil {
 		t.Fatalf("默认路径构建失败: %v", err)
 	}
+	if _, ok := service.(*workspace.Syncer); ok {
+		t.Fatalf("默认不应再是 legacy Syncer，got %T", service)
+	}
+}
+
+// TestExplicitACEStillAvailable 单变量回退:OPENACE_ENGINE=ace 仍走
+// legacy(Stage 7 删除前不移除)。
+func TestExplicitACEStillAvailable(t *testing.T) {
+	clearAugmentEnv(t)
+	t.Setenv("OPENACE_ENGINE", "ace")
+	t.Setenv("AUGMENT_TOKEN", "test-token")
+	t.Setenv("AUGMENT_TENANT", "https://example.test/")
+	service, err := buildLocalService(context.Background())
+	if err != nil {
+		t.Fatalf("legacy 路径构建失败: %v", err)
+	}
 	if _, ok := service.(*workspace.Syncer); !ok {
-		t.Fatalf("默认应返回 workspace.Syncer，got %T", service)
+		t.Fatalf("显式 ace 应返回 workspace.Syncer，got %T", service)
 	}
 }
 
