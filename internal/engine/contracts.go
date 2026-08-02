@@ -21,14 +21,16 @@ const (
 	EngineLocalHybrid = "local-hybrid"
 )
 
-// NormalizeEngineID 规范化引擎选择：空值与 "ace" 归一为 legacy ACE，
-// 其余非法值显式报错（不静默回退）。
+// NormalizeEngineID 规范化引擎选择：空值默认 local-hybrid（Stage 6 切
+// 默认，2026-08-02 批准；门票=§18 判定报告七条全过）；显式 "ace" 保持
+// legacy 可用（单变量回退，Stage 7 删除前不移除）；其余非法值显式
+// 报错（不静默回退）。
 func NormalizeEngineID(value string) (string, error) {
 	switch strings.TrimSpace(strings.ToLower(value)) {
-	case "", EngineACE:
-		return EngineACE, nil
-	case EngineLocalHybrid:
+	case "", EngineLocalHybrid:
 		return EngineLocalHybrid, nil
+	case EngineACE:
+		return EngineACE, nil
 	default:
 		return "", fmt.Errorf("invalid OPENACE_ENGINE %q; use %q or %q", value, EngineACE, EngineLocalHybrid)
 	}

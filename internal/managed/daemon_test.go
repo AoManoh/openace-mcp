@@ -68,6 +68,10 @@ func TestConnectFallsBackToPlainHTTPForManagedDaemonURL(t *testing.T) {
 	}))
 	defer server.Close()
 
+	// 本测试只验 URL scheme 回退,与引擎选择无关:fake daemon 状态未带
+	// engine 字段(按 legacy ace 解释),wrapper 侧钉 ace 对齐(切默认后
+	// 默认为 local-hybrid,不钉会命中兼容性拒绝)。
+	t.Setenv("OPENACE_ENGINE", "ace")
 	t.Setenv("OPENACE_DAEMON_ADDR", "https://"+strings.TrimPrefix(server.URL, "http://"))
 	t.Setenv("OPENACE_DAEMON_START_TIMEOUT", "200ms")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

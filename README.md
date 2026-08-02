@@ -257,22 +257,19 @@ profile 文件包含 token/session，必须当作本地 secret 管理，不要�
 
 `auto` 只会复用暴露运行时身份能力且 build revision 兼容的 daemon。若本机 `127.0.0.1:8765` 上已有旧 daemon、缺少 `runtime_identity` capability，或能确认与当前 MCP wrapper revision 不一致，MCP shim 会明确失败并要求重启/升级，而不是静默复用一个未知版本的长驻进程。daemon 返回的 sync、retrieve、workspace status 和 task 响应也会带 `served_by`，用于排查 WSL/Windows、多 IDE、多 cache namespace 混用时到底是哪一个 daemon 在响应。
 
-## 实验性能力：本地引擎（local-hybrid）
+## 默认引擎：本地引擎（local-hybrid）
 
-设置 `OPENACE_ENGINE=local-hybrid` 后，openACE 使用自有的本地检索引擎：本机扫描、按 AST/行窗口切分、构建 BM25 词法索引并在本地完成检索。**词法路径不需要任何凭据或网络**。
+openACE 默认使用自有的本地检索引擎（无需设置任何变量；`OPENACE_ENGINE=ace` 可切回迁移期的 legacy 上游适配）：本机扫描、按 AST 声明/行窗口切分、构建 BM25 词法索引并在本地完成检索。**词法路径不需要任何凭据或网络**。
 
 要提升语义检索召回质量，需要你**自行提供一个性能可靠的 embedding 模型服务**（可选再加一个 rerank 模型服务）：openACE 只做检索编排（本地向量索引、RRF 融合、精排调度、降级），模型能力完全来自你配置的端点。接入后检索自动升级为词法 + 语义混合。
 
 ```jsonc
-// 纯词法（零配置、零出网）
-"env": {
-  "OPENACE_ENGINE": "local-hybrid"
-}
+// 纯词法（零配置、零出网）——默认即是，无需任何 env
+"env": {}
 
 // 混合语义检索：接入你自己的 embedding 服务（OpenAI-compatible 端点，
 // 自部署或托管均可；亦支持 voyage 类型端点，见下方环境变量表）
 "env": {
-  "OPENACE_ENGINE": "local-hybrid",
   "OPENACE_EMBEDDING_PROVIDER": "openai",
   "OPENACE_EMBEDDING_BASE_URL": "http://127.0.0.1:8080/v1",
   "OPENACE_EMBEDDING_MODEL": "<your-embedding-model>",
@@ -336,7 +333,7 @@ openACE 默认尊重 `.gitignore` / `.ignore`，并跳过 `.env*`、session、cr
 | `AUGMENT_SESSION_AUTH` | 完整 session JSON，优先级最高 |
 | `OPENACE_SESSION_FILE` | 显式 session 文件路径 |
 | `OPENACE_PROFILES_FILE` | 实验性多 profile JSON；设置后替代单账号凭据链 |
-| `OPENACE_ENGINE` | `ace`（默认）/ `local-hybrid`（实验性本地引擎；词法无需凭据，可接入自备模型开启语义混合） |
+| `OPENACE_ENGINE` | `local-hybrid`（默认；本地引擎，词法无需凭据，可接入自备模型开启语义混合）/ `ace`（迁移期 legacy 上游适配，单变量回退） |
 | `OPENACE_EMBEDDING_PROVIDER` | local-hybrid 语义路端点类型：`openai`（OpenAI-compatible，自部署或托管）/ `voyage`（Voyage 形状端点）/ `off`。默认值为 `voyage` 且未提供 key 时语义路保持关闭、词法照常——即不配置就是纯词法 |
 | `OPENACE_EMBEDDING_BASE_URL` `_API_KEY` `_MODEL` `_DIMENSION` | 模型服务身份四项，由你按所选服务填写（`openai` 类型必填 base_url 与 model）；`voyage` 类型内置端点与模型预设，key 为空时回退读 `VOYAGE_API_KEY`；任一身份变化触发平行索引全量重建 |
 | `OPENACE_EMBEDDING_BATCH_SIZE` `_MAX_CONCURRENCY` `_RPM_BUDGET` `_TPM_BUDGET` | 索引期调用参数（默认 128 / 4 / 不限 / 不限） |
