@@ -688,6 +688,65 @@ func scan(ctx context.Context, root string) ([]fileBlob, error) {
 // blobName,跳过读内容与哈希;racy 窗口与删除清理见 StatCache。
 // cache 为 nil 时行为与历史 scan 逐字节一致。
 func scanWithCache(ctx context.Context, root string, cache *StatCache) ([]fileBlob, error) {
+	files, _, err := scanWithCacheStats(ctx, root, cache)
+	return files, err
+}
+
+// scanStats 是扫描期的跳过统计(K6 口径:跳过必须如实计数,不静默吞)。
+// 目前在包内产出并被测试锁定;上抛到 FileAssetSource.Load / localengine
+// wsStatus.skippedFiles 需要改 assets.go 与 localengine 状态面,归属
+// 后续跨包任务。
+type scanStats struct {
+	// PermissionSkippedFiles 是因 fs.ErrPermission 被跳过的文件条目数。
+	PermissionSkippedFiles int
+}
+
+// scanFileSkipDisposition 分类扫描期"单文件条目"的读取/stat 错误(M1):
+//   - fs.ErrNotExist:ReadDir 与 stat/read 之间文件消失(TOCTOU——
+//     构建产物、编辑器临时文件),跳过该文件,留待下次 sync 收敛;
+//   - fs.ErrPermission:无读权限文件,跳过并计入 skipped 统计;
+//   - 其余(IO 故障、ctx 取消等)保持致命。
+//
+// 根路径本身与目录级错误不经此函数分类,始终致命(根不可用意味着
+// 结果集不可信,目录级错误意味着子树整体缺失,静默继续会产出
+// 系统性残缺的索引)。
+func scanFileSkipDisposition(err error) (skip bool, permission bool) {
+	switch {
+	case err == nil:
+		return false, false
+	case errors.Is(err, fs.ErrNotExist):
+		return true, false
+	case errors.Is(err, fs.ErrPermission):
+		return true, true
+	default:
+		return false, false
+	}
+}
+
+func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]fileBlob, scanStats, error) {
+	var stats scanStats
+	// H2 第二层防御(第一层是 pathutil.ResolveWorkspaceRoot 的
+	// EvalSymlinks;此处兜住旧 state 文件里的 canonical_path、直接
+	// 调用 scan 的路径):根必须解析为一个存在的目录,否则显式报错
+	// ——与"根不存在时 WalkDir 报错"的行为对齐,禁止把根当单文件
+	// 收录或静默返回空集。
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return nil, stats, fmt.Errorf("workspace root is not accessible: %w", err)
+	}
+	if !rootInfo.IsDir() {
+		return nil, stats, fmt.Errorf("workspace root is not a directory: %s", root)
+	}
+	// 根的叶组件为 symlink→目录时,WalkDir 对根用 Lstat 会把它当
+	// "非常规文件"跳过并成功返回空集(H2 机理);解析到真实目录再走。
+	// 中间组件的 symlink 由内核路径解析处理,不受影响。
+	if lst, lerr := os.Lstat(root); lerr == nil && lst.Mode()&fs.ModeSymlink != 0 {
+		resolved, rerr := filepath.EvalSymlinks(root)
+		if rerr != nil {
+			return nil, stats, fmt.Errorf("resolve workspace root symlink: %w", rerr)
+		}
+		root = resolved
+	}
 	maxBytes := int64(maxFileBytes())
 	// F6 扫描器债修复:ignore 规则按目录栈管理,而非在整个 walk 期单调
 	// 累积——旧实现里已完成兄弟子树的规则(经 base 检查必然空转)仍被
@@ -699,11 +758,13 @@ func scanWithCache(ctx context.Context, root string, cache *StatCache) ([]fileBl
 	var files []fileBlob
 	scanStart := time.Now()
 	seen := make(map[string]bool)
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
 		if err != nil {
+			// 此处的 err 只来自根的 Lstat 与目录的 ReadDir(WalkDir 契约,
+			// 文件条目的 stat 是惰性的),按 M1 裁决保持致命。
 			return err
 		}
 		name := d.Name()
@@ -749,6 +810,13 @@ func scanWithCache(ctx context.Context, root string, cache *StatCache) ([]fileBl
 				}
 				content, ok, err := readIndexableContent(ctx, path, maxBytes)
 				if err != nil {
+					// M1:单文件 TOCTOU/权限错误只跳过该文件,不中止整次扫描。
+					if skip, denied := scanFileSkipDisposition(err); skip {
+						if denied {
+							stats.PermissionSkippedFiles++
+						}
+						return nil
+					}
 					return err
 				}
 				if !ok {
@@ -763,6 +831,13 @@ func scanWithCache(ctx context.Context, root string, cache *StatCache) ([]fileBl
 		}
 		content, ok, err := readIndexableContent(ctx, path, maxBytes)
 		if err != nil {
+			// M1:单文件 TOCTOU/权限错误只跳过该文件,不中止整次扫描。
+			if skip, denied := scanFileSkipDisposition(err); skip {
+				if denied {
+					stats.PermissionSkippedFiles++
+				}
+				return nil
+			}
 			return err
 		}
 		if !ok {
@@ -779,10 +854,10 @@ func scanWithCache(ctx context.Context, root string, cache *StatCache) ([]fileBl
 		cache.prune(seen)
 	}
 	if err != nil {
-		return nil, err
+		return nil, stats, err
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].RelPath < files[j].RelPath })
-	return files, nil
+	return files, stats, nil
 }
 
 func findMissingBatched(ctx context.Context, client ACEClient, blobNames []string, batchSize int) ([]string, []string, error) {
