@@ -65,6 +65,7 @@ func (c *Client) CircuitSnapshot() reliability.CircuitSnapshot {
 
 // Rerank 精排 docs 头部（受 MaxTokens 估算截断，暗坑 K28）并返回按
 // 相关性降序的命中与实际送审数 sent；docs[sent:] 由调用方按原序跟随。
+// 成功时 hits 与送审集一一对应（条数不足按 malformed 整体拒绝，H1）；
 // circuit 退避期返回 ClassBackoff；任何失败下调用方候选集不受影响
 // （P3-T04 业务验收：rerank 失败绝不丢候选）。
 func (c *Client) Rerank(ctx context.Context, query string, docs []Document) (hits []Hit, sent int, err error) {
@@ -166,7 +167,7 @@ func (c *Client) doRequest(ctx context.Context, query string, docs []Document) (
 	if err != nil {
 		return nil, err
 	}
-	// 响应校验（暗坑 K28）：index 在界且唯一；允许 provider 只返回头部。
+	// 响应校验（暗坑 K28）：index 在界且唯一。
 	seen := make(map[int]bool, len(scored))
 	hits := make([]Hit, 0, len(scored))
 	for _, item := range scored {
@@ -178,6 +179,17 @@ func (c *Client) doRequest(ctx context.Context, query string, docs []Document) (
 		}
 		seen[item.Index] = true
 		hits = append(hits, Hit{ID: docs[item.Index].ID, Score: item.Score})
+	}
+	// 结构校验（H1）：条数与送审集精确一致，all-or-nothing——与 embedding
+	// 客户端 K22 同语义。空 data、部分返回（网关兜底页、忽略非标准 top_k
+	// 且自带默认截断的端点）都按 malformed 整体拒绝，调用方走
+	// rerank-skipped 显式降级路，绝不静默丢弃已送审候选（P3-T04 / 决策 11）。
+	// 多于送审数的响应必含越界/重复 index，已被上面的检查拒绝。
+	if len(scored) != len(docs) {
+		return nil, &reliability.CallError{
+			Class:   reliability.ClassPermanent,
+			Message: fmt.Sprintf("rerank count mismatch: sent %d, got %d (response rejected)", len(docs), len(scored)),
+		}
 	}
 	// 按分数降序稳定排序；同分保持送审（RRF）顺序，保证确定性（暗坑 K27）。
 	sort.SliceStable(hits, func(a, b int) bool { return hits[a].Score > hits[b].Score })
