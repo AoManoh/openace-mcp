@@ -64,6 +64,9 @@ type Engine struct {
 	// fusion 是 RRF 融合参数（T10b 受测常数；默认 DefaultParams=现状
 	// 等权 k=60，评测 harness 可经 Options 覆盖做融合扫描）。
 	fusion fusion.Params
+	// localePenalty 是 locale 类词法负先验系数(方案②机制 B 受测常数;
+	// 默认冻结常量,评测 harness 可经 Options 覆盖做网格扫描)。
+	localePenalty float64
 	// freshnessWindow>0 时,上次成功同步距今小于窗口的查询跳过内联
 	// 扫描(Stage 6 前置;新鲜度上界=窗口)。
 	freshnessWindow time.Duration
@@ -124,6 +127,10 @@ func New(opts Options) (*Engine, error) {
 	e.fusion = fusion.DefaultParams()
 	if opts.FusionParams != nil {
 		e.fusion = *opts.FusionParams
+	}
+	e.localePenalty = localePriorPenalty
+	if opts.LocalePriorPenalty != nil {
+		e.localePenalty = *opts.LocalePriorPenalty
 	}
 	e.freshnessWindow = opts.FreshnessWindow
 	e.storeProfile = e.profile.ID + "-v" + e.profile.Version

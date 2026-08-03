@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"unicode"
 
 	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/keyword"
@@ -45,6 +47,14 @@ type Weights struct {
 	Path        float64
 	Symbol      float64
 	SymbolExact float64
+	// LatinContent/LatinPath 是 CJK 守卫子句(方案②机制 A)的权重:
+	// 查询同时含 ≥2 个 Han 字符与 ≥1 个高区分度 Latin token 时,对
+	// latin-only 子串追加 content/path match 子句——CJK 内容仓里包装
+	// 措辞的 Han 单字子句会淹没唯一 key/标识符子句(WP-4 实测 nacos
+	// zh 包装 R@5 0.800→0.017),追加子句把区分度信号权重拉回。
+	// 触发条件外(纯中文/纯英文查询)子句集合与历史逐字节一致。
+	LatinContent float64
+	LatinPath    float64
 }
 
 // DefaultWeights 返回默认子句权重。Symbol=0.1 是 Stage 5 T10a 定值
@@ -55,7 +65,52 @@ type Weights struct {
 // content 命中已足）。SymbolExact=4 对多词查询惰性、对全串精确查询
 // 提供 +0.33pp MRR，保留。证据：docs/refactor/2026-07-30-stage5b-tuning.md。
 func DefaultWeights() Weights {
-	return Weights{Content: 1, Path: 1, Symbol: 0.1, SymbolExact: 4}
+	// LatinContent=4/LatinPath=1 是方案② T4 零费用网格的初值(中值),
+	// 定值证据落 docs/benchmarks/work/wp4/ 后按证据冻结。
+	return Weights{Content: 1, Path: 1, Symbol: 0.1, SymbolExact: 4, LatinContent: 4, LatinPath: 1}
+}
+
+// latinGuardTokens 提取查询里的高区分度 Latin token(len≥4,含字母开头,
+// 保留内部 . _ -,剔除首尾标点);与 hanRuneCount 一起构成机制 A 触发判定。
+func latinGuardTokens(query string) []string {
+	var tokens []string
+	start := -1
+	isLatin := func(r byte) bool {
+		return r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '.' || r == '-'
+	}
+	flush := func(end int) {
+		if start < 0 {
+			return
+		}
+		tok := query[start:end]
+		start = -1
+		tok = strings.Trim(tok, "._-")
+		if len(tok) >= 4 && (tok[0] >= 'A' && tok[0] <= 'Z' || tok[0] >= 'a' && tok[0] <= 'z') {
+			tokens = append(tokens, tok)
+		}
+	}
+	for i := 0; i < len(query); i++ {
+		if isLatin(query[i]) {
+			if start < 0 {
+				start = i
+			}
+		} else {
+			flush(i)
+		}
+	}
+	flush(len(query))
+	return tokens
+}
+
+// hanRuneCount 统计 Han(中日汉字区)rune 数。
+func hanRuneCount(query string) int {
+	n := 0
+	for _, r := range query {
+		if unicode.Is(unicode.Han, r) {
+			n++
+		}
+	}
+	return n
 }
 
 // blevemapping 构建索引 mapping：
@@ -232,6 +287,25 @@ func (i *Index) SearchWeighted(ctx context.Context, queryText string, topK int, 
 		exact.SetField("symbol_raw")
 		exact.SetBoost(w.SymbolExact)
 		clauses = append(clauses, exact)
+	}
+	// CJK 守卫(方案②机制 A):混排查询追加 latin-only 子句,详见 Weights 注释。
+	// 触发条件不满足时不追加任何子句——纯中文/纯英文查询行为与历史逐字节一致。
+	if (w.LatinContent > 0 || w.LatinPath > 0) && hanRuneCount(queryText) >= 2 {
+		if tokens := latinGuardTokens(queryText); len(tokens) > 0 {
+			latinOnly := strings.Join(tokens, " ")
+			if w.LatinContent > 0 {
+				guard := bleve.NewMatchQuery(latinOnly)
+				guard.SetField("content")
+				guard.SetBoost(w.LatinContent)
+				clauses = append(clauses, guard)
+			}
+			if w.LatinPath > 0 {
+				guardPath := bleve.NewMatchQuery(latinOnly)
+				guardPath.SetField("path")
+				guardPath.SetBoost(w.LatinPath)
+				clauses = append(clauses, guardPath)
+			}
+		}
 	}
 	if len(clauses) == 0 {
 		return nil, nil
