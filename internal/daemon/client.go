@@ -44,8 +44,30 @@ func NewClient(addr string) *Client {
 		http: &http.Client{
 			Timeout: 30 * time.Minute,
 		},
-		token: strings.TrimSpace(os.Getenv("OPENACE_DAEMON_TOKEN")),
+		token: clientToken(addr),
 	}
+}
+
+// clientToken 解析客户端凭据(M5,与服务端 resolveAuthToken 对偶):
+// env=off → 空;env 非空 → 显式值;env 未设 → 读 token 状态文件
+// (不存在则空——连接 off 档或历史 daemon 时无害)。
+func clientToken(addr string) string {
+	env := strings.TrimSpace(os.Getenv("OPENACE_DAEMON_TOKEN"))
+	if strings.EqualFold(env, tokenModeOff) {
+		return ""
+	}
+	if env != "" {
+		return env
+	}
+	path := TokenFilePath(addr)
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func (c *Client) Health(ctx context.Context) error {

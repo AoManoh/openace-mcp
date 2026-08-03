@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,13 +21,15 @@ import (
 const DefaultAddr = "127.0.0.1:8765"
 
 type Server struct {
-	service    engine.Service
-	tasks      *TaskStore
-	reconciler *workspaceReconciler
-	authToken  string
-	startedAt  time.Time
-	statusMu   sync.Mutex
-	listenAddr string
+	service      engine.Service
+	tasks        *TaskStore
+	reconciler   *workspaceReconciler
+	authToken    string
+	authErr      error
+	reconcileErr error
+	startedAt    time.Time
+	statusMu     sync.Mutex
+	listenAddr   string
 }
 
 type syncRequest struct {
@@ -47,17 +50,32 @@ type retrieveRequest struct {
 }
 
 func NewServer(service engine.Service) *Server {
+	// M5:默认档自动生成随机 token(0600 状态文件);=off 显式关闭;
+	// 文件不可用 fail-closed(此处保守起见退回显式报错的哨兵空 token
+	// 会打开零认证,故失败即 panic 边界改为:构造期记录错误,
+	// ListenAndServe 前置校验拒绝启动)。
+	token, tokenErr := resolveAuthToken()
 	server := &Server{
 		service:   service,
-		authToken: strings.TrimSpace(os.Getenv("OPENACE_DAEMON_TOKEN")),
+		authToken: token,
+		authErr:   tokenErr,
 		startedAt: time.Now().UTC(),
 	}
 	server.tasks = NewTaskStore(server.runTask, 0)
-	server.reconciler = newWorkspaceReconciler(service)
+	server.reconciler, server.reconcileErr = newWorkspaceReconciler(service)
 	return server
 }
 
 func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
+	if s.authErr != nil {
+		// fail-closed(M5):默认 token 档不可用时拒绝启动,不静默
+		// 退回零认证。
+		return s.authErr
+	}
+	if s.reconcileErr != nil {
+		// fail-fast(M10):监测并发配置非法拒绝启动。
+		return s.reconcileErr
+	}
 	if strings.TrimSpace(addr) == "" {
 		addr = DefaultAddr
 	}
@@ -153,13 +171,20 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/v1/tasks", s.tasksCollection)
 	mux.HandleFunc("/v1/tasks/", s.taskItem)
 	if s.authToken == "" {
-		return mux
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+			mux.ServeHTTP(w, r)
+		})
 	}
+	expected := []byte("Bearer " + s.authToken)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("authorization") != "Bearer "+s.authToken {
+		// 常数时间比较(M5 附带):防 token 逐字节计时侧信道。
+		got := []byte(r.Header.Get("authorization"))
+		if len(got) != len(expected) || subtle.ConstantTimeCompare(got, expected) != 1 {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		mux.ServeHTTP(w, r)
 	})
 }
