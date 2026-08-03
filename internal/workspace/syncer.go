@@ -689,7 +689,13 @@ func scan(ctx context.Context, root string) ([]fileBlob, error) {
 // cache 为 nil 时行为与历史 scan 逐字节一致。
 func scanWithCache(ctx context.Context, root string, cache *StatCache) ([]fileBlob, error) {
 	maxBytes := int64(maxFileBytes())
-	rules := loadIgnoreRules(root)
+	// F6 扫描器债修复:ignore 规则按目录栈管理,而非在整个 walk 期单调
+	// 累积——旧实现里已完成兄弟子树的规则(经 base 检查必然空转)仍被
+	// 每个后续文件逐条求值,大仓深处一次 Match 扫上千条规则(sealed
+	// openace 活树 1,088 规则的 SIGQUIT 栈证据)。栈语义与累积语义逐位
+	// 等价:base 约束保证非祖先目录的规则永不匹配当前路径,弹出它们
+	// 不改变任何判定;规则求值序(外层先、同层后到者胜)保持不变。
+	stack := ruleStack{{dirRel: "", rules: loadIgnoreRules(root)}}
 	var files []fileBlob
 	scanStart := time.Now()
 	seen := make(map[string]bool)
@@ -715,9 +721,10 @@ func scanWithCache(ctx context.Context, root string, cache *StatCache) ([]fileBl
 				if shouldAlwaysSkipDir(name) {
 					return filepath.SkipDir
 				}
+				stack.unwindTo(rel)
 				localRules := loadIgnoreRulesForDir(path, rel)
-				rules = append(rules, localRules...)
-				if rules.Match(rel, true) && !localRules.hasAugmentInclude() && !rules.hasAugmentDescendantInclude(rel) {
+				stack.push(rel, localRules)
+				if stack.Match(rel, true) && !localRules.hasAugmentInclude() && !stack.hasAugmentDescendantInclude(rel) {
 					return filepath.SkipDir
 				}
 			}
@@ -726,7 +733,8 @@ func scanWithCache(ctx context.Context, root string, cache *StatCache) ([]fileBl
 		if rel == "" {
 			rel = name
 		}
-		if shouldAlwaysSkipFile(rel, name) || rules.Match(rel, false) {
+		stack.unwindTo(rel)
+		if shouldAlwaysSkipFile(rel, name) || stack.Match(rel, false) {
 			return nil
 		}
 		if d.Type()&fs.ModeType != 0 {
@@ -1092,6 +1100,70 @@ func parseIgnoreRulesWithBase(data string, base string, layer ignoreLayer) ignor
 		})
 	}
 	return rules
+}
+
+// ruleFrame 是目录栈上的一层规则(dirRel="" 为根帧:内置默认 + 根级
+// ignore 文件,永不弹出)。
+type ruleFrame struct {
+	dirRel string
+	rules  ignoreRules
+}
+
+// ruleStack 按祖先链维护活动规则(F6 修复):Match/hasAugmentDescendantInclude
+// 只遍历当前路径祖先目录贡献的规则,与历史"全量累积"判定逐位等价
+// (非祖先规则受 base 约束必然不匹配),复杂度从 O(仓内全部规则) 降到
+// O(祖先链规则)。
+type ruleStack []ruleFrame
+
+// push 压入新目录帧(空规则也压,保证 unwind 语义均匀)。
+func (s *ruleStack) push(dirRel string, rules ignoreRules) {
+	*s = append(*s, ruleFrame{dirRel: dirRel, rules: rules})
+}
+
+// unwindTo 弹出所有不是 rel 祖先的帧(WalkDir 为 DFS 字典序,离开子树
+// 后首个非子树条目触发弹出)。根帧永驻。
+func (s *ruleStack) unwindTo(rel string) {
+	for len(*s) > 1 {
+		top := (*s)[len(*s)-1]
+		if rel == top.dirRel || strings.HasPrefix(rel, top.dirRel+"/") {
+			return
+		}
+		*s = (*s)[:len(*s)-1]
+	}
+}
+
+// Match 语义与 ignoreRules.Match 一致:先非 augment 层后 augment 层,
+// 同层内后加载(更深目录)者胜;帧序即加载序。
+func (s ruleStack) Match(rel string, isDir bool) bool {
+	rel = pathpkg.Clean(filepath.ToSlash(rel))
+	if rel == "." || rel == "" {
+		return false
+	}
+	ignored := false
+	for _, frame := range s {
+		for _, rule := range frame.rules {
+			if rule.layer != ignoreLayerAugment && rule.matches(rel, isDir) {
+				ignored = !rule.negated
+			}
+		}
+	}
+	for _, frame := range s {
+		for _, rule := range frame.rules {
+			if rule.layer == ignoreLayerAugment && rule.matches(rel, isDir) {
+				ignored = !rule.negated
+			}
+		}
+	}
+	return ignored
+}
+
+func (s ruleStack) hasAugmentDescendantInclude(rel string) bool {
+	for _, frame := range s {
+		if frame.rules.hasAugmentDescendantInclude(rel) {
+			return true
+		}
+	}
+	return false
 }
 
 func (rules ignoreRules) Match(rel string, isDir bool) bool {
