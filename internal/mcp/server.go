@@ -147,6 +147,9 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
 				"name":    "openace-codebase",
 				"version": "0.1.0",
 			},
+			// instructions 是 caller LLM 的检索使用引导(方案③,E4 变体
+			// V2 冻结稿):仅增强字段,旧客户端忽略,零 wire 变更。
+			"instructions": serverInstructions,
 		})
 	case "tools/list":
 		tools := []any{retrievalTool(), multiRetrievalTool(), syncTool()}
@@ -596,16 +599,25 @@ func formatMultiRetrievalResults(results []multiRetrievalResult, status engine.M
 	return out.String()
 }
 
+// serverInstructions/工具与参数描述是方案③(2026-08-02 批准)的冻结文案,
+// 来源 E4 变体 V2(docs/benchmarks/work/e4/variant-v2.json);provider 中立、
+// 引擎中立,≤1024 字符约束由单测钉住。
+const serverInstructions = "openACE serves code retrieval for this workspace. For vague user asks, decompose into focused retrieval intents and call codebase_retrieval once per intent before answering. Keep the user's distinctive terminology in requests; add known identifiers and file-type hints. If results look degraded (a [DEGRADED] banner appears), tell the user retrieval quality is reduced and why."
+
+const retrievalDescription = "Search the local codebase index (hybrid lexical + semantic retrieval with reranking). Use this tool FIRST whenever you need to find code, configuration, tests, or documentation in the workspace before answering or editing. One focused intent per call; issue multiple calls for multi-part tasks."
+
+const informationRequestDescription = "A complete, specific description of what to find. Include: (1) the purpose or behavior you seek, in a full sentence; (2) exact identifiers if known (function/class/config key names, keep original casing); (3) artifact type hints when relevant (config file, test, docs). Preserve distinctive terms from the user's request verbatim; do not translate identifiers. Good: \"where is the retry backoff policy for embedding provider requests implemented\". Bad: \"retry\"."
+
 func retrievalTool() map[string]any {
 	return map[string]any{
 		"name":        "codebase_retrieval",
-		"description": "Query the current codebase through the Augment ACE retrieval flow.",
+		"description": retrievalDescription,
 		"inputSchema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"information_request": map[string]any{"type": "string"},
-				"directory_path":      map[string]any{"type": "string"},
-				"provider_profile_id": map[string]any{"type": "string", "description": "Optional ACE provider profile ID. Omit to use the daemon default provider state."},
+				"information_request": map[string]any{"type": "string", "description": informationRequestDescription},
+				"directory_path":      map[string]any{"type": "string", "description": "Absolute path of the workspace root to search."},
+				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"max_output_length":   map[string]any{"type": "integer"},
 			},
 			"required": []string{"information_request", "directory_path"},
@@ -616,16 +628,16 @@ func retrievalTool() map[string]any {
 func multiRetrievalTool() map[string]any {
 	return map[string]any{
 		"name":        "multi_codebase_retrieval",
-		"description": "Query multiple explicit workspaces independently through ACE and return per-workspace results.",
+		"description": "Search multiple explicit workspaces independently with the same request and return per-workspace results. Use codebase_retrieval instead when only one workspace is involved.",
 		"inputSchema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"information_request": map[string]any{"type": "string"},
+				"information_request": map[string]any{"type": "string", "description": informationRequestDescription},
 				"directory_paths": map[string]any{
 					"type":  "array",
 					"items": map[string]any{"type": "string"},
 				},
-				"provider_profile_id": map[string]any{"type": "string", "description": "Optional ACE provider profile ID. Omit to use the daemon default provider state."},
+				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"max_output_length":   map[string]any{"type": "integer"},
 			},
 			"required": []string{"information_request", "directory_paths"},
@@ -636,12 +648,12 @@ func multiRetrievalTool() map[string]any {
 func syncTool() map[string]any {
 	return map[string]any{
 		"name":        "sync_workspace",
-		"description": "Scan, upload missing blobs, and checkpoint a workspace before retrieval.",
+		"description": "Scan and index a workspace so retrieval reflects the latest file state. Retrieval tools sync automatically; call this only to warm up a workspace ahead of time.",
 		"inputSchema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"directory_path":      map[string]any{"type": "string"},
-				"provider_profile_id": map[string]any{"type": "string", "description": "Optional ACE provider profile ID. Omit to use the daemon default provider state."},
+				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 			},
 			"required": []string{"directory_path"},
 		},
@@ -651,13 +663,13 @@ func syncTool() map[string]any {
 func startRetrievalTool() map[string]any {
 	return map[string]any{
 		"name":        "start_codebase_retrieval",
-		"description": "Submit an asynchronous ACE codebase retrieval task to the local openACE daemon.",
+		"description": "Submit an asynchronous codebase retrieval task to the local openACE daemon.",
 		"inputSchema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"information_request": map[string]any{"type": "string"},
+				"information_request": map[string]any{"type": "string", "description": informationRequestDescription},
 				"directory_path":      map[string]any{"type": "string"},
-				"provider_profile_id": map[string]any{"type": "string", "description": "Optional ACE provider profile ID. Omit to use the daemon default provider state."},
+				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"max_output_length":   map[string]any{"type": "integer"},
 			},
 			"required": []string{"information_request", "directory_path"},
@@ -672,12 +684,12 @@ func startMultiRetrievalTool() map[string]any {
 		"inputSchema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"information_request": map[string]any{"type": "string"},
+				"information_request": map[string]any{"type": "string", "description": informationRequestDescription},
 				"directory_paths": map[string]any{
 					"type":  "array",
 					"items": map[string]any{"type": "string"},
 				},
-				"provider_profile_id": map[string]any{"type": "string", "description": "Optional ACE provider profile ID. Omit to use the daemon default provider state."},
+				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"max_output_length":   map[string]any{"type": "integer"},
 			},
 			"required": []string{"information_request", "directory_paths"},
@@ -693,7 +705,7 @@ func startSyncTool() map[string]any {
 			"type": "object",
 			"properties": map[string]any{
 				"directory_path":      map[string]any{"type": "string"},
-				"provider_profile_id": map[string]any{"type": "string", "description": "Optional ACE provider profile ID. Omit to use the daemon default provider state."},
+				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 			},
 			"required": []string{"directory_path"},
 		},
@@ -771,7 +783,7 @@ func workspaceStatusTool() map[string]any {
 			"type": "object",
 			"properties": map[string]any{
 				"directory_path":      map[string]any{"type": "string"},
-				"provider_profile_id": map[string]any{"type": "string", "description": "Optional ACE provider profile ID. Omit to use the daemon default provider state."},
+				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 			},
 			"required": []string{"directory_path"},
 		},
