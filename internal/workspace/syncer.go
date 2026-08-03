@@ -1030,8 +1030,18 @@ func loadIgnoreRulesForDir(dir string, base string) ignoreRules {
 	}{
 		{name: ".gitignore", layer: ignoreLayerGit},
 		{name: ".ignore", layer: ignoreLayerGit},
+		// .openaceignore 是 canonical(方案⑤,2026-08-02,B 语义):
+		// 同目录存在时 .augmentignore 规则整体被遮蔽(逐目录粒度,
+		// 迁移=改名可渐进);仅 alias 时兼容语义与历史一致。层级同
+		// augment 层(可 ! re-include gitignored,hard deny 不可覆盖)。
+		{name: ".openaceignore", layer: ignoreLayerAugment},
 		{name: ".augmentignore", layer: ignoreLayerAugment},
 	} {
+		if spec.name == ".augmentignore" {
+			if _, err := os.Stat(filepath.Join(dir, ".openaceignore")); err == nil {
+				continue
+			}
+		}
 		data, err := os.ReadFile(filepath.Join(dir, spec.name))
 		if err != nil {
 			continue
