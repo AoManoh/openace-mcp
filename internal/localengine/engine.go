@@ -67,6 +67,8 @@ type Engine struct {
 	// localePenalty 是 locale 类词法负先验系数(方案②机制 B 受测常数;
 	// 默认冻结常量,评测 harness 可经 Options 覆盖做网格扫描)。
 	localePenalty float64
+	// qualityStrict 开启质量严格档(方案④):语义链路任一缺口显式报错。
+	qualityStrict bool
 	// freshnessWindow>0 时,上次成功同步距今小于窗口的查询跳过内联
 	// 扫描(Stage 6 前置;新鲜度上界=窗口)。
 	freshnessWindow time.Duration
@@ -132,6 +134,12 @@ func New(opts Options) (*Engine, error) {
 	if opts.LocalePriorPenalty != nil {
 		e.localePenalty = *opts.LocalePriorPenalty
 	}
+	// 方案④:strict 是「完整语义质量」契约,无 embedding provider 时
+	// 每查询必失败——按配置错误在构造期显式拒绝,防呆。
+	if opts.QualityStrict && !opts.Embedding.Enabled {
+		return nil, fmt.Errorf("%s=on 需要已配置的 embedding provider(语义质量契约无从谈起)", EnvQualityStrict)
+	}
+	e.qualityStrict = opts.QualityStrict
 	e.freshnessWindow = opts.FreshnessWindow
 	e.storeProfile = e.profile.ID + "-v" + e.profile.Version
 	e.embedCfg = opts.Embedding

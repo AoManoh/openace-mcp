@@ -35,6 +35,11 @@ const (
 	// 时跳过内联扫描，新鲜度上界=窗口时长；空/0=每查询扫描（现状）。
 	// 后台 reconciler/显式 sync 不受窗口约束。
 	EnvFreshnessWindow = "OPENACE_FRESHNESS_WINDOW"
+	// EnvQualityStrict 是质量严格档（方案④,2026-08-02）:on 时语义链路
+	// 任一缺口（覆盖<100%/查询嵌入失败/配置了 rerank 但未生效/任何
+	// 降级 reason）都显式报错而非降级放行;默认 off=现状。要求 embedding
+	// provider 已配置,否则构造期报错。
+	EnvQualityStrict = "OPENACE_QUALITY_STRICT"
 )
 
 // Options 是 local-hybrid 引擎的完整构造配置；零值 = Stage 2 行为
@@ -56,6 +61,8 @@ type Options struct {
 	LocalePriorPenalty *float64
 	// FreshnessWindow 是查询期新鲜度窗口；0 = 每查询内联扫描（现状）。
 	FreshnessWindow time.Duration
+	// QualityStrict 开启质量严格档(方案④);要求 Embedding.Enabled。
+	QualityStrict bool
 }
 
 // OptionsFromEnv 解析 local-hybrid 的 provider 与降级配置；
@@ -81,13 +88,29 @@ func OptionsFromEnv() (Options, error) {
 	if err != nil {
 		return Options{}, err
 	}
+	strict, err := parseQualityStrict()
+	if err != nil {
+		return Options{}, err
+	}
 	return Options{
 		Embedding:        embedCfg,
 		Rerank:           rerankCfg,
 		RetrievalDegrade: retrievalDegrade,
 		RerankDegrade:    rerankDegrade,
 		FreshnessWindow:  freshness,
+		QualityStrict:    strict,
 	}, nil
+}
+
+func parseQualityStrict() (bool, error) {
+	switch strings.TrimSpace(strings.ToLower(os.Getenv(EnvQualityStrict))) {
+	case "", "off", "0", "false":
+		return false, nil
+	case "on", "1", "true":
+		return true, nil
+	default:
+		return false, fmt.Errorf("invalid %s %q; use \"on\" or \"off\"", EnvQualityStrict, os.Getenv(EnvQualityStrict))
+	}
 }
 
 func parseDegrade(name string) (DegradeMode, error) {
