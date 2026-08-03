@@ -441,13 +441,14 @@ func TestStaleIndexServedOnSyncFailure(t *testing.T) {
 	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
 		t.Fatal(err)
 	}
-	// 修改文件内容并去掉读权限：扫描 hash 读取失败 → sync 失败。
-	target := filepath.Join(root, "util.py")
-	writeFixture(t, root, "util.py", fixtureUtilPy+"\n# changed\n")
+	// 注入扫描失败:目录级 ReadDir 权限错误(M1 修复后单文件权限错误
+	// 改为跳过,目录级错误按裁决保持致命——注入口径随之升级)。
+	writeFixture(t, root, "blocked/extra.py", "def extra():\n    return 1\n")
+	target := filepath.Join(root, "blocked")
 	if err := os.Chmod(target, 0o000); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(target, 0o600) })
+	t.Cleanup(func() { _ = os.Chmod(target, 0o700) })
 
 	result, err := e.Search(context.Background(), searchRequest(root, "HandleLogin"))
 	if err != nil {
@@ -474,12 +475,13 @@ func TestStaleIndexDeniedWhenConfigured(t *testing.T) {
 	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
 		t.Fatal(err)
 	}
-	target := filepath.Join(root, "util.py")
-	writeFixture(t, root, "util.py", fixtureUtilPy+"\n# changed\n")
+	// 目录级权限错误注入(同上,M1 后单文件错误不再致命)。
+	writeFixture(t, root, "blocked/extra.py", "def extra():\n    return 1\n")
+	target := filepath.Join(root, "blocked")
 	if err := os.Chmod(target, 0o000); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(target, 0o600) })
+	t.Cleanup(func() { _ = os.Chmod(target, 0o700) })
 	_, err := e.Search(context.Background(), searchRequest(root, "HandleLogin"))
 	if err == nil || !strings.Contains(err.Error(), "OPENACE_RETRIEVAL_DEGRADE") {
 		t.Fatalf("deny 应报错并指明恢复路径: %v", err)

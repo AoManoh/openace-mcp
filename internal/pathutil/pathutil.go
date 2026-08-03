@@ -115,8 +115,36 @@ func ResolveWorkspaceRootForOS(input string, goos string) (WorkspaceRoot, error)
 	if err != nil {
 		return WorkspaceRoot{}, err
 	}
-	root.CanonicalPath = abs
+	root.CanonicalPath = canonicalizeExistingPath(abs, hostOS)
 	return root, nil
+}
+
+// canonicalizeExistingPath 对当前主机上真实存在的路径解析符号链接
+// （H2：根为 symlink 时 filepath.WalkDir 对根用 Lstat，会把它当
+// "非常规文件"跳过，扫描成功返回空集——local-hybrid 发布空 manifest、
+// legacy 路径把远端索引当作全量删除。EvalSymlinks 让 CanonicalPath
+// 落到真实目录，顺带消解同一物理目录多重身份的 state key 分裂，L11）。
+//
+// 契约边界：
+//   - 路径不存在（或解析失败）时原样返回 filepath.Abs 结果——
+//     ResolveWorkspaceRoot 必须继续支持不存在路径的纯词法规范化
+//     （现有测试以不存在的 /mnt/d/... 断言 lexical 结果；daemon 对
+//     已删除 workspace 查询状态也依赖该行为）；
+//   - hostOS 与运行主机不一致时（跨 OS 单测传入 goos 参数的场景）
+//     不做文件系统探测，保持纯词法语义，避免测试结果依赖宿主机文件布局。
+//
+// 副作用（已在诊断报告 §4-H2 声明）：symlink 用户的 CanonicalPath 由
+// 链接路径变为真实路径 → workspaceKey 变化 → 旧索引子树成为孤儿，
+// 属一次性重建成本。
+func canonicalizeExistingPath(abs string, hostOS string) string {
+	if hostOS != runtime.GOOS {
+		return abs
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return abs
+	}
+	return resolved
 }
 
 func wslMountToWindowsPath(input string) (string, bool) {
