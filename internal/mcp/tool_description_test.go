@@ -1,0 +1,50 @@
+package mcp
+
+import (
+	"strings"
+	"testing"
+)
+
+// 方案③(2026-08-02 批准)文案契约:工具描述引擎中立、参数描述齐备、
+// 长度守 1024 上限(部分客户端截断阈值)。
+func TestToolDescriptionsContract(t *testing.T) {
+	tools := []map[string]any{
+		retrievalTool(), multiRetrievalTool(), syncTool(),
+		startRetrievalTool(), startMultiRetrievalTool(), startSyncTool(),
+		taskStatusTool(), listTasksTool(), cancelTaskTool(),
+		daemonStatusTool(), listWorkspacesTool(), workspaceStatusTool(),
+	}
+	for _, tool := range tools {
+		name, _ := tool["name"].(string)
+		desc, _ := tool["description"].(string)
+		if desc == "" {
+			t.Fatalf("%s: description 不得为空", name)
+		}
+		if len(desc) > 1024 {
+			t.Fatalf("%s: description 超 1024 字符(%d)", name, len(desc))
+		}
+		// 引擎中立:默认引擎已是 local-hybrid,工具面不得再写上游品牌
+		// 或 "ACE 检索流" 叙事("openACE" 产品名除外)。
+		neutral := strings.ReplaceAll(desc, "openACE", "")
+		if strings.Contains(neutral, "Augment") || strings.Contains(neutral, "ACE") {
+			t.Fatalf("%s: description 残留上游品牌叙事: %q", name, desc)
+		}
+		schema, _ := tool["inputSchema"].(map[string]any)
+		props, _ := schema["properties"].(map[string]any)
+		if p, ok := props["information_request"].(map[string]any); ok {
+			d, _ := p["description"].(string)
+			if !strings.Contains(d, "identifiers") {
+				t.Fatalf("%s: information_request 参数描述缺失或未含措辞引导: %q", name, d)
+			}
+			if len(d) > 1024 {
+				t.Fatalf("%s: information_request 描述超长(%d)", name, len(d))
+			}
+		}
+	}
+	if len(serverInstructions) > 1024 {
+		t.Fatalf("instructions 超 1024 字符(%d)", len(serverInstructions))
+	}
+	if !strings.Contains(serverInstructions, "codebase_retrieval") {
+		t.Fatal("instructions 应指名检索工具")
+	}
+}
