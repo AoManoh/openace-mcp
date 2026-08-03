@@ -753,7 +753,8 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 // rerankOrder 精排 ordered 头部（≤rerankHeadLimit，再受 token 预算截断），
 // 未送审部分按原序跟随（暗坑 K28）。送审集与 ordered 显式对齐：chunks
 // 表缺失的头部候选（防御性路径）保持原位跟随，禁止因 docs/ordered
-// 错位造成条目重复或丢失（Stage 3 自审修复）。
+// 错位造成条目重复或丢失（Stage 3 自审修复）；已送审但 provider 未返回
+// 的条目按原序补回并显式上报（H1 兜底，见 rerankAssembleOrder）。
 func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query string, ordered []rankedHit) ([]rankedHit, bool, int, string, error) {
 	head := rerankHeadLimit
 	if head > len(ordered) {
@@ -787,22 +788,48 @@ func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query 
 	if sent == 0 {
 		return nil, false, 0, "rerank-skipped(token-budget)", nil
 	}
-	ids := make([]string, 0, len(ordered))
+	ids, missing := rerankAssembleOrder(hits, included, sent, skippedHead, ordered[head:])
+	reason := ""
+	if missing > 0 {
+		// 防御纵深（H1）：client 层 all-or-nothing 校验保证正常路径
+		// missing==0，此分支仅在该校验被绕过的形状下兜底——候选已按原
+		// 序补回，但精排只覆盖了部分送审集，必须显式上报（决策 11），
+		// 不得静默冒充完整精排。
+		reason = "rerank-partial-response"
+	}
+	return rankByPosition(ids), true, sent, reason, nil
+}
+
+// rerankAssembleOrder 组装精排最终序：重排命中 → 已送审但 provider 未
+// 返回的条目（原序补回，H1 兜底；正常路径为空——client 端对条数不足
+// 已按 malformed 整体拒绝）→ 因 token 预算未送审的头部（原序，K28）→
+// chunks 缺失的头部（原序）→ 头部之外的尾部（原序）。返回最终 ID 序与
+// 兜底补回条数；任何响应形状下已召回候选不重复、不丢失（P3-T04）。
+func rerankAssembleOrder(hits []rerank.Hit, included []rankedHit, sent int, skippedHead []rankedHit, tail []rankedHit) ([]string, int) {
+	ids := make([]string, 0, len(hits)+len(included)+len(skippedHead)+len(tail))
+	returned := make(map[string]bool, len(hits))
 	for _, hit := range hits {
+		returned[hit.ID] = true
 		ids = append(ids, hit.ID)
 	}
-	// 顺序：重排头部 → 因 token 预算未送审的头部（原序）→ chunks 缺失的
-	// 头部（原序）→ 头部之外的尾部（原序）。
+	missing := 0
+	for _, hit := range included[:sent] {
+		if returned[hit.id] {
+			continue
+		}
+		missing++
+		ids = append(ids, hit.id)
+	}
 	for _, hit := range included[sent:] {
 		ids = append(ids, hit.id)
 	}
 	for _, hit := range skippedHead {
 		ids = append(ids, hit.id)
 	}
-	for _, hit := range ordered[head:] {
+	for _, hit := range tail {
 		ids = append(ids, hit.id)
 	}
-	return rankByPosition(ids), true, sent, "", nil
+	return ids, missing
 }
 
 // rerankDocText 构造送审文本：path:start-end symbol 头 + 内容（D6，
