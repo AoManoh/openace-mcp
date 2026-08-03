@@ -284,7 +284,7 @@ openACE 默认使用自有的本地检索引擎（无需设置任何变量；`OP
 - **语义混合检索（模型自备）**：embedding 走 OpenAI-compatible 事实标准（vLLM/TEI/Infinity/Ollama 等自部署端点或任何兼容托管服务，允许无 key），另支持 `voyage` 类型端点；接入后查询同时走 BM25 与本地向量召回并按 RRF 融合。rerank 可选，支持 `tei`（自部署 TEI 形状）与 `voyage`（兼容 Cohere/Jina 式响应）两类端点，对头部候选精排。召回质量取决于你所选模型——请选用面向代码检索、性能可靠的 embedding/rerank 模型。
 - **降级完全显式，由你支配**：语义路/精排失败或索引覆盖不完整时，结果首行出现 `[DEGRADED] <原因>; mode=...; semantic_coverage=...` 横幅，结构化字段同步携带 `retrieval_mode`/`degraded_reason`/`semantic_coverage`；`OPENACE_RETRIEVAL_DEGRADE=deny`/`OPENACE_RERANK_DEGRADE=deny` 可改为直接返回可行动错误（默认 `allow` 放行词法结果）。不存在静默降级。
 - **成本边界**：embedding/rerank 的调用与计费发生在你自己的模型服务上。索引期按变更内容付费——未变更 chunk 按纯内容 hash 跨 revision 复用向量，不重复付费；查询期每次消耗一次 query embedding（启用 rerank 时另加一次精排调用）。openACE 默认不做客户端预算限制，预算护栏建议设在你的服务/账户侧（托管服务的 rate limit 或 budget 配置）。
-- **数据边界**：索引会在本机 cache 目录保存被索引文件的明文片段副本（`engines/local-hybrid/` 子树，权限仅当前用户）；启用 embedding 时 chunk 内容会发送到你配置的模型服务。使用任何**托管** embedding/rerank 服务前，请自行核实其数据保留与训练条款（多数托管服务默认可将数据用于训练，需显式退出）；自部署端点无此顾虑。`.augmentignore` 与内置敏感文件 denylist 先于一切生效。
+- **数据边界**：索引会在本机 cache 目录保存被索引文件的明文片段副本（`engines/local-hybrid/` 子树，权限仅当前用户）；启用 embedding 时 chunk 内容会发送到你配置的模型服务。使用任何**托管** embedding/rerank 服务前，请自行核实其数据保留与训练条款（多数托管服务默认可将数据用于训练，需显式退出）；自部署端点无此顾虑。`.openaceignore`（及迁移别名 `.augmentignore`）与内置敏感文件 denylist 先于一切生效。
 - **向量身份隔离**：模型/维度/端点任一变化会创建平行索引子树并全量重建，禁止混用不同模型的向量；换 key 不触发重建。
 - Go（标准库 parser）与 Python/TypeScript/TSX/JavaScript（内嵌 Tree-sitter，纯 Go 运行时，无 CGO）按 AST 声明切分——函数/类/方法独立成块并携带符号；其余语言按确定性行窗口切分。单文件解析失败（语法错误、超时、超长单行）自动回退行窗口；`workspace_status` 如实上报每语言 `ast|fallback|mixed`、语义覆盖率、provider 健康状态（healthy/backoff/candidate）与恢复时间。
 - **增量索引（变更量成本）**：首建之后，编辑只重建变更文件（delta segment），删除/重命名立即从检索结果消失；重命名且内容未变时向量零重付。delta 链达到阈值后自动本地合并（compaction），合并不产生任何模型服务调用。磁盘与内存占用有界：索引只保留最近两个 revision，检索内容按需读取不常驻内存。
@@ -299,7 +299,9 @@ openACE 默认使用自有的本地检索引擎（无需设置任何变量；`OP
 
 openACE 默认尊重 `.gitignore` / `.ignore`，并跳过 `.env*`、session、credentials、私钥、证书和 keystore 等敏感文件。
 
-如果你的项目把本地知识资产放在 Git ignore 里，但希望 AI 检索时能看到，可以用 `.augmentignore` 显式纳入。`.augmentignore` 只影响 openACE 本地扫描和 ACE 同步，不改变 Git 跟踪状态，也不能绕过 hard safety denylist。
+如果你的项目把本地知识资产放在 Git ignore 里，但希望 AI 检索时能看到，可以用 `.openaceignore` 显式纳入（gitignore 语法，支持 `!` re-include）。`.openaceignore` 只影响 openACE 本地扫描，不改变 Git 跟踪状态，也不能绕过 hard safety denylist。
+
+兼容说明：`.augmentignore` 作为迁移别名继续被读取；同目录同时存在两个文件时，`.openaceignore` 生效、`.augmentignore` 的规则整体被忽略（逐目录判定）。迁移 = 直接改名。
 
 示例：
 
@@ -322,7 +324,7 @@ openACE 默认尊重 `.gitignore` / `.ignore`，并跳过 `.env*`、session、cr
 !skills/**/SPEC.md
 ```
 
-真实 `.augmentignore` 推荐作为本地配置管理，不要误提交私有索引策略。
+真实 `.openaceignore` 推荐作为本地配置管理，不要误提交私有索引策略。
 
 ## 常用环境变量
 
@@ -340,6 +342,7 @@ openACE 默认尊重 `.gitignore` / `.ignore`，并跳过 `.env*`、session、cr
 | `OPENACE_RERANK_PROVIDER` | 可选精排端点类型：`tei`（自部署 TEI 形状）/ `voyage`（Cohere/Jina 兼容形状）/ `off`。默认值为 `voyage` 且缺 key 即关闭；`OPENACE_RERANK_BASE_URL`/`_API_KEY`/`_MODEL`/`_MAX_TOKENS` 语义同上（单请求默认 200K token 上限） |
 | `OPENACE_PROVIDER_TIMEOUT` / `OPENACE_PROVIDER_MAX_RETRIES` | provider HTTP 超时（默认 `60s`）与单批重试上限（默认 `5`） |
 | `OPENACE_RETRIEVAL_DEGRADE` / `OPENACE_RERANK_DEGRADE` | 语义路/精排失败策略：`allow`（默认，放行并标记 `[DEGRADED]`）/ `deny`（返回可行动错误） |
+| `OPENACE_QUALITY_STRICT` | `on` 时启用质量严格档：语义链路任一缺口（覆盖 <100%、查询嵌入失败、已配置的 rerank 未生效等）直接报错而非降级放行，错误信息标明缺口；要求已配置 embedding 服务。默认 `off`（上表 allow/deny 语义不变）。结构化结果另携带 `rerank_sent`/`query_embed_failed`/`embedding_profile` 质量字段 |
 | `OPENACE_MODE` | `auto` / `direct` / `manual-daemon`，默认 `auto` |
 | `OPENACE_CACHE_NAMESPACE` | cache 命名空间，用于隔离账号、tenant 或测试批次 |
 | `OPENACE_DAEMON_ADDR` | MCP shim 连接 daemon 的地址 |
