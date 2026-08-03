@@ -1,6 +1,7 @@
 package reliability
 
 import (
+	"errors"
 	"context"
 	"fmt"
 	"math/rand"
@@ -252,8 +253,10 @@ func (p RetryPolicy) Do(ctx context.Context, attempt func(context.Context) error
 			// 取消优先：不把取消误判为 provider 失败（暗坑 K26）。
 			return ctx.Err()
 		}
-		callErr, ok := lastErr.(*CallError)
-		if !ok || !callErr.Retryable() || try >= p.MaxRetries {
+		// errors.As 与包内其余判定一致(L9):调用方未来以 %w 包装时
+		// 裸断言会静默关闭重试。
+		callErr := &CallError{}
+		if !errors.As(lastErr, &callErr) || !callErr.Retryable() || try >= p.MaxRetries {
 			return lastErr
 		}
 		wait := callErr.RetryAfter

@@ -14,7 +14,7 @@ func writeCycleManifests(t *testing.T, store *Store) {
 	now := time.Now().UTC()
 	for _, pair := range [][2]string{{"rev-a", "rev-b"}, {"rev-b", "rev-a"}} {
 		manifest := &Manifest{
-			SchemaVersion: ManifestSchemaVersion,
+			SchemaVersion: ManifestSchemaV1, // v1 形状夹具:显式声明,验证读取端 v1 归一容忍
 			EngineID:      "local-hybrid", EngineVersion: "test",
 			Revision: pair[0], PreviousRevision: pair[1],
 			ChunkerID: "default", ChunkerVersion: "2",
@@ -86,7 +86,7 @@ func TestCleanupOrphanSegments(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	manifest := &Manifest{
-		SchemaVersion: ManifestSchemaVersion,
+		SchemaVersion: ManifestSchemaV1, // v1 形状夹具:显式声明,验证读取端 v1 归一容忍
 		EngineID:      "local-hybrid", EngineVersion: "test",
 		Revision: "rev-live", ChunkerID: "default", ChunkerVersion: "2",
 		LexicalEngine: "bleve", LexicalVersion: "test",

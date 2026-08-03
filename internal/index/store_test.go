@@ -39,7 +39,7 @@ func stageBuild(t *testing.T, store *Store, buildID string, chunksContent string
 
 func testManifest(buildID string, previous string, checksum string) *Manifest {
 	return &Manifest{
-		SchemaVersion:    ManifestSchemaVersion,
+		SchemaVersion:    ManifestSchemaV1, // v1 形状夹具(单段顶层字段),读取端归一化路径
 		Workspace:        WorkspaceIdentity{CanonicalPath: "/tmp/project"},
 		EngineID:         "local-hybrid",
 		EngineVersion:    "stage2",

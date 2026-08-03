@@ -95,6 +95,7 @@ func (j *Journal) loadVectors() error {
 	reader := bufio.NewReaderSize(file, 1<<20)
 	var goodOffset int64
 	order := make([]string, 0, 1024)
+	sizes := make(map[string]int64, 1024)
 	for {
 		hash, vector, recordLen, err := readJournalRecord(reader, j.dimension)
 		if err != nil {
@@ -104,6 +105,7 @@ func (j *Journal) loadVectors() error {
 			order = append(order, hash)
 		}
 		j.entries[hash] = vector
+		sizes[hash] = recordLen
 		goodOffset += recordLen
 	}
 	info, err := os.Stat(j.vectorsPath())
@@ -118,10 +120,7 @@ func (j *Journal) loadVectors() error {
 	}
 	j.bytes = goodOffset
 	if len(j.entries) > journalMaxEntries || j.bytes > journalMaxBytes {
-		keep := map[string]bool{}
-		for i := len(order) - 1; i >= 0 && len(keep) < journalMaxEntries; i-- {
-			keep[order[i]] = true
-		}
+		keep := journalRetention(order, sizes, journalMaxEntries, journalMaxBytes)
 		for hash := range j.entries {
 			if !keep[hash] {
 				delete(j.entries, hash)
@@ -130,6 +129,23 @@ func (j *Journal) loadVectors() error {
 		return j.rewriteLocked()
 	}
 	return nil
+}
+
+// journalRetention 计算压实保留集:从最新往旧保留,条数与字节双上限
+// 同时生效。历史缺陷(M8,诊断报告 2026-08-03):保留环只按条数截断,
+// 高维向量场景字节条件恒成立→每次打开全量重写 GB 级文件。
+func journalRetention(order []string, sizes map[string]int64, maxEntries int, maxBytes int64) map[string]bool {
+	keep := make(map[string]bool, maxEntries)
+	var keptBytes int64
+	for i := len(order) - 1; i >= 0 && len(keep) < maxEntries; i-- {
+		hash := order[i]
+		if keptBytes+sizes[hash] > maxBytes {
+			break
+		}
+		keep[hash] = true
+		keptBytes += sizes[hash]
+	}
+	return keep
 }
 
 // readJournalRecord 读取单条记录；任何不一致返回错误（调用方截断）。

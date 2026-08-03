@@ -22,8 +22,9 @@ const (
 	ManifestSchemaV2 = 2
 )
 
-// ManifestSchemaVersion 是当前构建路径写出的版本（P4-T03 切换为 v2）。
-const ManifestSchemaVersion = ManifestSchemaV1
+// ManifestSchemaVersion 是当前构建路径写出的版本(P4-T03 起为 v2;
+// L12:常量此前滞留 V1 与事实脱节,仅测试引用,现对齐)。
+const ManifestSchemaVersion = ManifestSchemaV2
 
 // WorkspaceIdentity 是被索引工作区的规范身份。
 type WorkspaceIdentity struct {

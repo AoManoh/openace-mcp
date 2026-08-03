@@ -145,6 +145,10 @@ func New(opts Options) (*Engine, error) {
 	e.queryBuildWait = opts.QueryBuildWait
 	e.freshnessWindow = opts.FreshnessWindow
 	e.storeProfile = e.profile.ID + "-v" + e.profile.Version
+	// 模板版本注入(M9② 单一事实源):ProfileHash 与子树后缀取同一常量。
+	// 注入使既有 ProfileHash 变化——随 A2'(23aab91)同一 BREAKING 窗口
+	// 落地,升级用户本就经历一次平行重建,无额外迁移成本。
+	opts.Embedding.TemplateVersion = embedTemplateVersion
 	e.embedCfg = opts.Embedding
 	if opts.Embedding.Enabled {
 		client, err := embedding.NewClient(opts.Embedding)

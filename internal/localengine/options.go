@@ -103,6 +103,9 @@ func OptionsFromEnv() (Options, error) {
 	if err != nil {
 		return Options{}, err
 	}
+	// 模板版本注入(M9②):env 路径与引擎构造双点注入同一常量,保证
+	// wrapper/daemon 的 Fingerprint 与引擎侧 ProfileHash 同源。
+	embedCfg.TemplateVersion = embedTemplateVersion
 	return Options{
 		Embedding:        embedCfg,
 		Rerank:           rerankCfg,
@@ -157,12 +160,21 @@ func (o Options) Fingerprint() string {
 	if o.Rerank.Enabled {
 		rerankComponent = o.Rerank.Identity()
 	}
+	// M9①(诊断报告 2026-08-03):QualityStrict 改变检索语义(缺口报错
+	// vs 降级放行),与 degrade 开关同类,必须入指纹——否则两个 wrapper
+	// 以 strict=on/off 连接同一 daemon 会静默复用,语义由先启动者决定。
+	// 指纹版本升 v2(与 M9② 模板注入共用同一次失配重启窗)。
+	strictComponent := "strict-off"
+	if o.QualityStrict {
+		strictComponent = "strict-on"
+	}
 	sum := sha256.Sum256([]byte(strings.Join([]string{
-		"engine-profile-v1",
+		"engine-profile-v2",
 		embedComponent,
 		rerankComponent,
 		string(normalizeDegrade(o.RetrievalDegrade)),
 		string(normalizeDegrade(o.RerankDegrade)),
+		strictComponent,
 	}, "\x00")))
 	return hex.EncodeToString(sum[:])[:12]
 }

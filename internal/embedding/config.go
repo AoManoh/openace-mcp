@@ -53,9 +53,9 @@ const (
 // Dtype 是向量元素类型；Stage 3 固定 float32（量化属 Stage 5）。
 const Dtype = "float32"
 
-// EmbedTemplateVersion 标识 embedding 输入模板：纯 chunk 内容、不拼
-// path/symbol 头（阶段计划 D6）。模板变更必须升版本并触发平行 profile。
-const EmbedTemplateVersion = "none-v1"
+// 模板版本的唯一事实源在 localengine.embedTemplateVersion(嵌入输入的
+// 构造者);本包 ProfileHash 经 TemplateVersion 字段注入,禁止再设第二
+// 常量(M9②,诊断报告 2026-08-03:双常量在模板升级时必改漏一处)。
 
 // Config 是 embedding provider 的完整配置。
 type Config struct {
@@ -81,6 +81,11 @@ type Config struct {
 	// (RS3:未配置=现状行为)。
 	QueryTimeout time.Duration
 	MaxRetries   int
+
+	// TemplateVersion 是 embedding 输入模板版本,唯一事实源在
+	// localengine.embedTemplateVersion,由引擎构造期注入(参与
+	// ProfileHash;M9② 单一化,禁止本包再设常量)。
+	TemplateVersion string
 }
 
 // ConfigFromEnv 解析 embedding 配置；配置错误在启动即报（fail-fast），
@@ -191,7 +196,7 @@ func (c Config) ProfileHash() string {
 		return ""
 	}
 	sum := sha256.Sum256([]byte(strings.Join([]string{
-		c.ProviderType, c.BaseURL, c.Model, fmt.Sprintf("%d", c.Dimension), Dtype, EmbedTemplateVersion,
+		c.ProviderType, c.BaseURL, c.Model, fmt.Sprintf("%d", c.Dimension), Dtype, c.TemplateVersion,
 	}, "\x00")))
 	return hex.EncodeToString(sum[:])[:12]
 }
