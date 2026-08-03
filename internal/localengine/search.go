@@ -312,6 +312,55 @@ func (e *Engine) ChunkDocTexts(ctx context.Context, ref engine.WorkspaceRef, ids
 	return texts, nil
 }
 
+// ChunkDumpRecord 是评测 harness 导出的 chunk 全量记录(E3 嵌入模板
+// A/B 专用 hook,不进入 MCP 工具面):字段与索引内 chunkRecord 对齐,
+// 供离线按模板重组文本、直连 provider 重嵌与召回对比。
+type ChunkDumpRecord struct {
+	ID        string `json:"id"`
+	RelPath   string `json:"path"`
+	Language  string `json:"language"`
+	StartLine int    `json:"start"`
+	EndLine   int    `json:"end"`
+	Symbol    string `json:"symbol,omitempty"`
+	Content   string `json:"content"`
+}
+
+// DumpChunkRecords 按 chunk ID 升序遍历当前 revision 存活集并逐条回调
+// (E3 专用 hook)。与查询路径共享句柄与存活过滤语义;emit 返回错误即中止。
+func (e *Engine) DumpChunkRecords(ctx context.Context, ref engine.WorkspaceRef, emit func(ChunkDumpRecord) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
+	if err != nil {
+		return err
+	}
+	handle, err := e.acquireHandle(workspaceKey)
+	if err != nil {
+		return err
+	}
+	defer e.releaseHandle(handle)
+	ids := make([]string, 0, len(handle.chunks))
+	for id := range handle.chunks {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		record, err := handle.record(id)
+		if err != nil {
+			continue
+		}
+		if err := emit(ChunkDumpRecord{
+			ID: record.ID, RelPath: record.RelPath, Language: record.Language,
+			StartLine: record.StartLine, EndLine: record.EndLine,
+			Symbol: record.Symbol, Content: record.Content,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // RouteCandidates 是融合前的双路召回镜像（Stage 5 T10b 专用 hook，
 // 不进入 MCP 工具面）：词法与语义候选各按原始路内序返回，供离线融合
 // 参数扫描（RRF k、召回深度、子句权重交互）复用已付费的 query
