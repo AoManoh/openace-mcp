@@ -359,7 +359,10 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 			if err != nil {
 				return engine.Result{}, err
 			}
-			if skipped {
+			// 0 chunk 文件与门禁拒绝同路(H3 口径):全量单段路径无
+			// 复活风险,但 Files{ChunkCount:0} 属脏数据且会被后续
+			// delta/compaction 的 ContentHash 复用条件误命中。
+			if skipped || len(fileRecords) == 0 {
 				skippedFiles++
 				continue
 			}
@@ -470,7 +473,11 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 		if err != nil {
 			return engine.Result{}, err
 		}
-		if skipped {
+		// 0 chunk 的变更文件(纯空白/仅注释等)按删除语义处理,与内容
+		// 门禁拒绝同路:从 Files 摘除 + 入 tombstone。否则旧段 chunk
+		// 无人覆盖继续可检索,且 compaction 按 ContentHash 复用将污染
+		// 固化(H3,诊断报告 2026-08-03;K39/K44 口径)。
+		if skipped || len(fileRecords) == 0 {
 			skippedFiles++
 			skippedPaths[asset.RelPath] = true
 			continue
