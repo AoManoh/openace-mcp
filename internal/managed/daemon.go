@@ -279,6 +279,9 @@ func startDaemon(addr string) (string, error) {
 	cmd.Env = upsertEnv(os.Environ(), "OPENACE_DAEMON_LISTEN_ADDR", listenAddr(addr))
 	cmd.Stdin = nil
 	cmd.Stdout = io.Discard
+	// M6(诊断报告 2026-08-03,已批准):脱离 wrapper 进程组——daemon 是
+	// 跨会话共享资源,wrapper 前台 Ctrl+C 不得连坐清杀(平台文件注入)。
+	applyDaemonSysProcAttr(cmd)
 	logFile, logPath := daemonLogFile()
 	if logFile != nil {
 		defer logFile.Close()
@@ -289,9 +292,9 @@ func startDaemon(addr string) (string, error) {
 	if err := cmd.Start(); err != nil {
 		return logPath, fmt.Errorf("start managed daemon: %w", err)
 	}
-	if err := cmd.Process.Release(); err != nil {
-		return logPath, fmt.Errorf("release managed daemon: %w", err)
-	}
+	// M6:goroutine 收尸替代 Release——daemon 先于 wrapper 退出(崩溃/
+	// bind 失败)时不留僵尸;wrapper 先退则由 init 接管,两态皆无残留。
+	go func() { _ = cmd.Wait() }()
 	return logPath, nil
 }
 
