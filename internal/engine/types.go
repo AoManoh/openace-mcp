@@ -65,6 +65,16 @@ type Result struct {
 	DegradedReason string `json:"degraded_reason,omitempty"`
 	// SemanticCoverage 是语义索引覆盖率（如 "87%"；语义路未配置时为空）。
 	SemanticCoverage string `json:"semantic_coverage,omitempty"`
+
+	// —— 方案④ quality-strict 可机读质量字段（2026-08-02;omitempty,
+	// legacy 与纯词法路径不填充,wire 不变）——
+
+	// RerankSent 是实际送审精排的候选数（rerank 未配置或未生效时为 0）。
+	RerankSent int `json:"rerank_sent,omitempty"`
+	// QueryEmbedFailed 表示本次查询嵌入失败（语义路仅缺查询侧）。
+	QueryEmbedFailed bool `json:"query_embed_failed,omitempty"`
+	// EmbeddingProfile 是语义路身份短指纹（provider/model/dimension）。
+	EmbeddingProfile string `json:"embedding_profile,omitempty"`
 }
 
 // Summary 输出一行人类可读的结果摘要，供 MCP 工具文本渲染使用。

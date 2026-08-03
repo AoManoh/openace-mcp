@@ -220,6 +220,10 @@ type retrieval struct {
 	reasons    []string
 	coverage   string
 	syncResult engine.Result
+	// 方案④ 质量字段素材:实际送审精排数 / 精排是否生效 / 查询嵌入失败。
+	rerankSent       int
+	rerankApplied    bool
+	queryEmbedFailed bool
 }
 
 // Search 实现 engine.Service：按需同步后执行 lexical（+dense RRF）
@@ -250,6 +254,13 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 		result.RetrievalMode = out.mode
 		result.DegradedReason = degradedReason
 		result.SemanticCoverage = out.coverage
+		// 方案④ 质量字段:rerank 实际送审数 / 查询嵌入失败 / 语义身份。
+		result.RerankSent = out.rerankSent
+		result.QueryEmbedFailed = out.queryEmbedFailed
+		if e.semanticEnabled() {
+			result.EmbeddingProfile = fmt.Sprintf("%s/%s/%d",
+				e.embedCfg.ProviderType, e.embedCfg.Model, e.embedCfg.Dimension)
+		}
 	}
 	return result, nil
 }
@@ -532,8 +543,10 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	}
 
 	// 可选精排：只重排已召回候选头部，失败绝不丢候选（D7/D8(b)）。
+	rerankApplied := false
+	rerankSent := 0
 	if e.rerankClient != nil && len(ordered) > 0 {
-		reordered, applied, rerankReason, rerankErr := e.rerankOrder(ctx, handle, query, ordered)
+		reordered, applied, sent, rerankReason, rerankErr := e.rerankOrder(ctx, handle, query, ordered)
 		if rerankErr != nil {
 			e.releaseHandle(handle)
 			return retrieval{}, rerankErr
@@ -541,16 +554,56 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		if applied {
 			mode += "+rerank"
 			ordered = reordered
+			rerankApplied = true
+			rerankSent = sent
 		}
 		if rerankReason != "" {
 			reasons = append(reasons, rerankReason)
 		}
 	}
 
-	return retrieval{
+	out := retrieval{
 		handle: handle, ordered: ordered, mode: mode,
 		reasons: reasons, coverage: coverage, syncResult: syncResult,
-	}, nil
+		rerankSent: rerankSent, rerankApplied: rerankApplied,
+		queryEmbedFailed: hasQueryEmbedFailure(reasons),
+	}
+	// 方案④ strict 闸:语义链路任一缺口显式报错而非降级放行。触发面 =
+	// 任何降级 reason(覆盖缺口/查询嵌入失败/rerank 跳过/stale/向量不可用)
+	// ∪ 配置了 rerank 但未生效。错误指名 env 与缺口 token,供调用方定位。
+	if e.qualityStrict {
+		violations := append([]string(nil), reasons...)
+		if e.rerankClient != nil && !rerankApplied && len(ordered) > 0 && !containsRerankReason(reasons) {
+			violations = append(violations, "rerank-not-applied")
+		}
+		if len(violations) > 0 {
+			e.releaseHandle(handle)
+			return retrieval{}, fmt.Errorf("%s=on: 语义质量缺口 [%s],拒绝返回不完整结果(改用 %s=off 可降级放行)",
+				EnvQualityStrict, strings.Join(violations, ","), EnvQualityStrict)
+		}
+	}
+	return out, nil
+}
+
+// hasQueryEmbedFailure 判定降级原因中是否含查询嵌入失败(方案④字段)。
+func hasQueryEmbedFailure(reasons []string) bool {
+	for _, r := range reasons {
+		if strings.HasPrefix(r, "query-embedding-failed") {
+			return true
+		}
+	}
+	return false
+}
+
+// containsRerankReason 判定 reasons 是否已含 rerank 缺口 token(避免
+// strict 违规清单重复)。
+func containsRerankReason(reasons []string) bool {
+	for _, r := range reasons {
+		if strings.HasPrefix(r, "rerank-skipped") {
+			return true
+		}
+	}
+	return false
 }
 
 // categoryLocale 是文件类别负先验(方案②机制 B)当前唯一收编类别:
@@ -696,7 +749,7 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 // 未送审部分按原序跟随（暗坑 K28）。送审集与 ordered 显式对齐：chunks
 // 表缺失的头部候选（防御性路径）保持原位跟随，禁止因 docs/ordered
 // 错位造成条目重复或丢失（Stage 3 自审修复）。
-func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query string, ordered []rankedHit) ([]rankedHit, bool, string, error) {
+func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query string, ordered []rankedHit) ([]rankedHit, bool, int, string, error) {
 	head := rerankHeadLimit
 	if head > len(ordered) {
 		head = len(ordered)
@@ -711,7 +764,7 @@ func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query 
 		}
 		record, err := handle.record(hit.id)
 		if err != nil {
-			return nil, false, "", err
+			return nil, false, 0, "", err
 		}
 		docs = append(docs, rerank.Document{ID: hit.id, Text: rerankDocText(record)})
 		included = append(included, hit)
@@ -719,15 +772,15 @@ func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query 
 	hits, sent, err := e.rerankClient.Rerank(ctx, query, docs)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, false, "", ctx.Err()
+			return nil, false, 0, "", ctx.Err()
 		}
 		if e.rerankDegrade == DegradeDeny {
-			return nil, false, "", degradeDeniedError("rerank failed", err, EnvRerankDegrade)
+			return nil, false, 0, "", degradeDeniedError("rerank failed", err, EnvRerankDegrade)
 		}
-		return nil, false, "rerank-skipped(" + failureClass(err) + ")", nil
+		return nil, false, 0, "rerank-skipped(" + failureClass(err) + ")", nil
 	}
 	if sent == 0 {
-		return nil, false, "rerank-skipped(token-budget)", nil
+		return nil, false, 0, "rerank-skipped(token-budget)", nil
 	}
 	ids := make([]string, 0, len(ordered))
 	for _, hit := range hits {
@@ -744,7 +797,7 @@ func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query 
 	for _, hit := range ordered[head:] {
 		ids = append(ids, hit.id)
 	}
-	return rankByPosition(ids), true, "", nil
+	return rankByPosition(ids), true, sent, "", nil
 }
 
 // rerankDocText 构造送审文本：path:start-end symbol 头 + 内容（D6，
