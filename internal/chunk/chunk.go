@@ -62,10 +62,14 @@ type Profile struct {
 // Version 3（Stage 5，决策 25/D10 首批）：Python、TypeScript/TSX、JavaScript
 // 由行窗口升级为 Tree-sitter AST 声明级切分（treesitter.go），解析失败
 // 语言级回退行窗口；未变语言按纯内容 hash 复用向量零重嵌（K61）。
+// Version 4（健壮性批次 M2/M3）：splitGo 增加超长单行守卫（整文件降级
+// 字节窗口）、splitOversized 单行超预算按字节窗口细分（MaxChunkBytes
+// 成为硬上限）、//line 指令改取物理行号——受影响文件的切分产出变化，
+// 依 K5 升版本；未受影响 chunk 内容不变，向量按 ContentHash 复用（K61）。
 func DefaultProfile() Profile {
 	return Profile{
 		ID:             "default",
-		Version:        "3",
+		Version:        "4",
 		MaxChunkBytes:  2048,
 		WindowLines:    60,
 		OverlapLines:   10,
