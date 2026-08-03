@@ -82,13 +82,20 @@ func run() error {
 		// 导出原始分，head≤pool 的配置全部离线派生（送审一次付费一次）。
 		dumpRerank = flag.Bool("dump-rerank-scores", false, "导出融合头部的 rerank 原始分")
 		rerankPool = flag.Int("rerank-pool", 100, "dump-rerank-scores 送审池大小")
+		// chunk 全量导出（E3）：存活集逐条记录到 chunks.jsonl，供离线
+		// 模板重组与直连 provider 重嵌（不经引擎嵌入路径）。
+		dumpChunks = flag.Bool("dump-chunks", false, "导出存活 chunk 全量记录而非评分")
 		// 融合参数覆盖（T10b 定值验证）：负值 = 引擎默认（k=60 等权）。
 		fusionK      = flag.Int("fusion-k", -1, "RRF k（<0=默认）")
 		fusionLexW   = flag.Float64("fusion-lex-weight", -1, "词法路权重（<0=默认）")
 		fusionDenseW = flag.Float64("fusion-dense-weight", -1, "dense 路权重（<0=默认）")
 	)
 	flag.Parse()
-	if *workspace == "" || *queries == "" || *qrels == "" || *out == "" {
+	if *dumpChunks {
+		if *workspace == "" || *out == "" {
+			return fmt.Errorf("-dump-chunks 必填参数: -workspace -out")
+		}
+	} else if *workspace == "" || *queries == "" || *qrels == "" || *out == "" {
 		return fmt.Errorf("必填参数: -workspace -queries -qrels -out")
 	}
 
@@ -137,30 +144,34 @@ func run() error {
 	}
 	defer eng.Close(context.Background())
 
-	queryList, err := bench.LoadQueries(*queries)
-	if err != nil {
-		return err
-	}
-	qrelSet, err := bench.LoadQrels(*qrels)
-	if err != nil {
-		return err
-	}
+	var evaluable []bench.Query
+	var qrelSet bench.Qrels
 	pathToDoc := map[string]string{}
-	if *docmap != "" {
-		if err := loadDocmap(*docmap, pathToDoc); err != nil {
+	if !*dumpChunks {
+		queryList, err := bench.LoadQueries(*queries)
+		if err != nil {
 			return err
 		}
-	}
-	// 只评有 qrels 的查询（协议 §3：缺判定剔除并计数）。
-	evaluable := make([]bench.Query, 0, len(queryList))
-	for _, query := range queryList {
-		if len(qrelSet[query.ID]) > 0 {
-			evaluable = append(evaluable, query)
+		qrelSet, err = bench.LoadQrels(*qrels)
+		if err != nil {
+			return err
 		}
-	}
-	sort.Slice(evaluable, func(i, j int) bool { return evaluable[i].ID < evaluable[j].ID })
-	if *limit > 0 && len(evaluable) > *limit {
-		evaluable = evaluable[:*limit]
+		if *docmap != "" {
+			if err := loadDocmap(*docmap, pathToDoc); err != nil {
+				return err
+			}
+		}
+		// 只评有 qrels 的查询（协议 §3：缺判定剔除并计数）。
+		evaluable = make([]bench.Query, 0, len(queryList))
+		for _, query := range queryList {
+			if len(qrelSet[query.ID]) > 0 {
+				evaluable = append(evaluable, query)
+			}
+		}
+		sort.Slice(evaluable, func(i, j int) bool { return evaluable[i].ID < evaluable[j].ID })
+		if *limit > 0 && len(evaluable) > *limit {
+			evaluable = evaluable[:*limit]
+		}
 	}
 
 	if err := os.MkdirAll(*out, 0o755); err != nil {
@@ -195,6 +206,14 @@ func run() error {
 				sem.TotalChunks, sem.RejectedChunks, sem.JournalEntries,
 				sem.ProviderState, sem.LastError)
 		}
+	}
+	if *dumpChunks {
+		count, err := dumpChunkRecords(ctx, eng, ref, *out, manifest)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("chunks dumped: %d → %s\n", count, *out)
+		return nil
 	}
 	if *dumpRoutes {
 		if err := dumpRouteCandidates(ctx, eng, ref, evaluable, pathToDoc, *out, *routeDepth, manifest); err != nil {
@@ -346,6 +365,37 @@ func dumpRouteCandidates(ctx context.Context, eng *localengine.Engine, ref engin
 	manifest.QueryCount = len(evaluable)
 	manifestJSON, _ := json.MarshalIndent(manifest, "", "  ")
 	return os.WriteFile(filepath.Join(out, "manifest.json"), manifestJSON, 0o644)
+}
+
+// dumpChunkRecords 导出存活 chunk 全量记录到 chunks.jsonl（E3 嵌入模板
+// A/B）：字段来自引擎 hook，离线侧按模板重组文本后直连 provider 重嵌。
+func dumpChunkRecords(ctx context.Context, eng *localengine.Engine, ref engine.WorkspaceRef, out string, manifest runManifest) (int, error) {
+	chunksFile, err := os.Create(filepath.Join(out, "chunks.jsonl"))
+	if err != nil {
+		return 0, err
+	}
+	defer chunksFile.Close()
+	writer := bufio.NewWriter(chunksFile)
+	count := 0
+	if err := eng.DumpChunkRecords(ctx, ref, func(rec localengine.ChunkDumpRecord) error {
+		line, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		writer.Write(line)
+		writer.WriteByte('\n')
+		count++
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	if err := writer.Flush(); err != nil {
+		return 0, err
+	}
+	manifest.FinishedAt = time.Now().UTC()
+	manifest.QueryCount = count
+	manifestJSON, _ := json.MarshalIndent(manifest, "", "  ")
+	return count, os.WriteFile(filepath.Join(out, "manifest.json"), manifestJSON, 0o644)
 }
 
 // rerankScoreLine 是 -dump-rerank-scores 的单查询记录：pool 为融合序
