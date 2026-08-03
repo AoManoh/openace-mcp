@@ -69,6 +69,8 @@ type Engine struct {
 	localePenalty float64
 	// qualityStrict 开启质量严格档(方案④):语义链路任一缺口显式报错。
 	qualityStrict bool
+	// queryBuildWait>0 时查询等待在建索引有上界(P1 有界化);0=无界。
+	queryBuildWait time.Duration
 	// freshnessWindow>0 时,上次成功同步距今小于窗口的查询跳过内联
 	// 扫描(Stage 6 前置;新鲜度上界=窗口)。
 	freshnessWindow time.Duration
@@ -140,6 +142,7 @@ func New(opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("%s=on 需要已配置的 embedding provider(语义质量契约无从谈起)", EnvQualityStrict)
 	}
 	e.qualityStrict = opts.QualityStrict
+	e.queryBuildWait = opts.QueryBuildWait
 	e.freshnessWindow = opts.FreshnessWindow
 	e.storeProfile = e.profile.ID + "-v" + e.profile.Version
 	e.embedCfg = opts.Embedding
@@ -377,8 +380,53 @@ type buildCall struct {
 	err       error
 }
 
-// syncWorkspace 以 singleflight 语义执行一次索引构建。
+// errQueryBuildWait 标记查询等待在建索引超界(P1 有界化);构建继续
+// 后台推进,调用方按 revision 有无决定降级或报错。
+var errQueryBuildWait = errors.New("query wait for index build exceeded")
+
+// syncWorkspaceForQuery 是查询路径的同步入口:配置了 QueryBuildWait 时
+// 以其为上界等待在建构建;超界即脱离等待(不取消构建,phantom waiter
+// 保证后续 leave 也不会取消),错误带构建进度与 env 名(可行动)。
+func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.WorkspaceRef) (engine.Result, error) {
+	if e.queryBuildWait <= 0 {
+		return e.syncWorkspace(ctx, ref)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, e.queryBuildWait)
+	defer cancel()
+	res, err := e.syncWorkspaceDetachable(waitCtx, ref, false)
+	if err != nil && waitCtx.Err() != nil && ctx.Err() == nil {
+		_, workspaceKey, kerr := e.resolveRoot(ref.DirectoryPath)
+		progress := ""
+		if kerr == nil {
+			progress = e.buildProgressLabel(workspaceKey)
+		}
+		return res, fmt.Errorf("%w: index still building (%s); %s=%s 超界,构建继续后台推进",
+			errQueryBuildWait, progress, EnvQueryBuildWait, e.queryBuildWait)
+	}
+	return res, err
+}
+
+// buildProgressLabel 读取构建期进度快照(D8 可见性字段的错误文案投影)。
+func (e *Engine) buildProgressLabel(workspaceKey string) string {
+	e.mu.Lock()
+	tracker := e.statuses[workspaceKey]
+	e.mu.Unlock()
+	if tracker == nil {
+		return "stage=unknown"
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	return fmt.Sprintf("stage=%s embedded=%d pending=%d", tracker.stage, tracker.embedDone, tracker.embedPending)
+}
+
 func (e *Engine) syncWorkspace(ctx context.Context, ref engine.WorkspaceRef) (engine.Result, error) {
+	return e.syncWorkspaceDetachable(ctx, ref, true)
+}
+
+// syncWorkspaceDetachable 的 cancelOnLeave=false 供有界查询等待使用:
+// 等待者超时脱离时不递减 waiters(留 phantom waiter),构建不因此被
+// 取消——有界化的全部意义就是"查询先走,构建继续"。
+func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.WorkspaceRef, cancelOnLeave bool) (engine.Result, error) {
 	if err := rejectProfileID(ref); err != nil {
 		return engine.Result{}, err
 	}
@@ -427,7 +475,7 @@ func (e *Engine) syncWorkspace(ctx context.Context, ref engine.WorkspaceRef) (en
 			}
 			call.waiters++
 			e.mu.Unlock()
-			return e.waitBuild(ctx, workspaceKey, call)
+			return e.waitBuild(ctx, workspaceKey, call, cancelOnLeave)
 		}
 		runCtx, cancel := context.WithCancel(context.Background())
 		call := &buildCall{done: make(chan struct{}), cancel: cancel, waiters: 1}
@@ -452,12 +500,14 @@ func (e *Engine) syncWorkspace(ctx context.Context, ref engine.WorkspaceRef) (en
 			e.mu.Unlock()
 			close(call.done)
 		}()
-		return e.waitBuild(ctx, workspaceKey, call)
+		return e.waitBuild(ctx, workspaceKey, call, cancelOnLeave)
 	}
 }
 
-// waitBuild 等待共享构建完成；最后一个等待者取消时中止构建。
-func (e *Engine) waitBuild(ctx context.Context, workspaceKey string, call *buildCall) (engine.Result, error) {
+// waitBuild 等待共享构建完成；cancelOnLeave 时最后一个等待者取消即中止
+// 构建(K12 原语义);有界查询等待用 cancelOnLeave=false——脱离不记账
+// (phantom waiter),构建永不因查询超时被取消,Close 仍兜底强停。
+func (e *Engine) waitBuild(ctx context.Context, workspaceKey string, call *buildCall, cancelOnLeave bool) (engine.Result, error) {
 	select {
 	case <-call.done:
 		return call.result, call.err
@@ -469,6 +519,9 @@ func (e *Engine) waitBuild(ctx context.Context, workspaceKey string, call *build
 	case <-call.done:
 		return call.result, call.err
 	default:
+	}
+	if !cancelOnLeave {
+		return engine.Result{}, ctx.Err()
 	}
 	e.mu.Lock()
 	// 递减前校验身份（review S9）：本 call 已被摘除时不再记账，
