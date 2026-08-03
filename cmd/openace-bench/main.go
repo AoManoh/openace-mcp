@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -74,6 +75,10 @@ func run() error {
 		symbolWeight = flag.Float64("lex-symbol-weight", -1, "symbol 分词子句权重（<0=默认）")
 		exactBoost   = flag.Float64("lex-symbol-exact-boost", -1, "symbol_raw 精确子句 boost（<0=默认）")
 		pathWeight   = flag.Float64("lex-path-weight", -1, "path 子句权重（<0=默认）")
+		// CJK 守卫与类别负先验网格（方案② T4）：负值 = 引擎默认。
+		latinContentW = flag.Float64("lex-latin-content", -1, "CJK 守卫 latin content 子句权重（<0=默认）")
+		latinPathW    = flag.Float64("lex-latin-path", -1, "CJK 守卫 latin path 子句权重（<0=默认）")
+		localePenalty = flag.Float64("locale-penalty", -1, "locale 类词法负先验系数（<0=默认；1=关闭）")
 		// 双路候选导出（T10b）：dump 融合前 lex/dense 各 route-depth 条
 		// 候选到 routes.jsonl，供离线融合参数扫描（零新增嵌入费用）。
 		dumpRoutes = flag.Bool("dump-routes", false, "导出融合前双路候选而非评分")
@@ -82,6 +87,10 @@ func run() error {
 		// 导出原始分，head≤pool 的配置全部离线派生（送审一次付费一次）。
 		dumpRerank = flag.Bool("dump-rerank-scores", false, "导出融合头部的 rerank 原始分")
 		rerankPool = flag.Int("rerank-pool", 100, "dump-rerank-scores 送审池大小")
+		// 增量打分（方案① 端到端）：按 {qid, ids[]} 清单对指定 chunk 打分
+		// （送审文本经 ChunkDocTexts 与 shipped 逐字节一致；B1 已证打分
+		// 逐点确定，跨调用合并合法）。
+		scoreList = flag.String("score-list", "", "增量 rerank 打分清单 jsonl（{qid, ids[]}）")
 		// chunk 全量导出（E3）：存活集逐条记录到 chunks.jsonl，供离线
 		// 模板重组与直连 provider 重嵌（不经引擎嵌入路径）。
 		dumpChunks = flag.Bool("dump-chunks", false, "导出存活 chunk 全量记录而非评分")
@@ -104,7 +113,7 @@ func run() error {
 		return err
 	}
 	var lexWeights map[string]float64
-	if *symbolWeight >= 0 || *exactBoost >= 0 || *pathWeight >= 0 {
+	if *symbolWeight >= 0 || *exactBoost >= 0 || *pathWeight >= 0 || *latinContentW >= 0 || *latinPathW >= 0 {
 		weights := lexical.DefaultWeights()
 		if *symbolWeight >= 0 {
 			weights.Symbol = *symbolWeight
@@ -115,11 +124,25 @@ func run() error {
 		if *pathWeight >= 0 {
 			weights.Path = *pathWeight
 		}
+		if *latinContentW >= 0 {
+			weights.LatinContent = *latinContentW
+		}
+		if *latinPathW >= 0 {
+			weights.LatinPath = *latinPathW
+		}
 		opts.LexicalWeights = &weights
 		lexWeights = map[string]float64{
 			"content": weights.Content, "path": weights.Path,
 			"symbol": weights.Symbol, "symbol_exact": weights.SymbolExact,
+			"latin_content": weights.LatinContent, "latin_path": weights.LatinPath,
 		}
+	}
+	if *localePenalty >= 0 {
+		opts.LocalePriorPenalty = localePenalty
+		if lexWeights == nil {
+			lexWeights = map[string]float64{}
+		}
+		lexWeights["locale_penalty"] = *localePenalty
 	}
 	var fusionParams map[string]float64
 	if *fusionK >= 0 || *fusionLexW >= 0 || *fusionDenseW >= 0 {
@@ -220,6 +243,21 @@ func run() error {
 			return err
 		}
 		fmt.Printf("routes dumped: %d queries depth=%d → %s\n", len(evaluable), *routeDepth, *out)
+		return nil
+	}
+	if *scoreList != "" {
+		if !opts.Rerank.Enabled {
+			return fmt.Errorf("-score-list 需要 rerank provider 配置（当前未启用）")
+		}
+		rr, err := rerank.NewClient(opts.Rerank)
+		if err != nil {
+			return err
+		}
+		count, err := scoreListedChunks(ctx, eng, rr, ref, evaluable, *scoreList, *out, manifest)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("score-list done: %d queries → %s\n", count, *out)
 		return nil
 	}
 	if *dumpRerank {
@@ -365,6 +403,100 @@ func dumpRouteCandidates(ctx context.Context, eng *localengine.Engine, ref engin
 	manifest.QueryCount = len(evaluable)
 	manifestJSON, _ := json.MarshalIndent(manifest, "", "  ")
 	return os.WriteFile(filepath.Join(out, "manifest.json"), manifestJSON, 0o644)
+}
+
+// scoreListedChunks 按清单对指定 (qid, chunk) 打分并导出 rerank-scores.jsonl
+// （方案① 端到端增量;送审文本与 shipped 逐字节一致,断点=已存在行跳过）。
+func scoreListedChunks(ctx context.Context, eng *localengine.Engine, rr *rerank.Client, ref engine.WorkspaceRef, evaluable []bench.Query, listPath, out string, manifest runManifest) (int, error) {
+	queryText := map[string]string{}
+	for _, q := range evaluable {
+		queryText[q.ID] = q.Text
+	}
+	type listLine struct {
+		QID string   `json:"qid"`
+		IDs []string `json:"ids"`
+	}
+	listFile, err := os.Open(listPath)
+	if err != nil {
+		return 0, err
+	}
+	defer listFile.Close()
+	var lines []listLine
+	dec := json.NewDecoder(listFile)
+	for {
+		var l listLine
+		if err := dec.Decode(&l); err == io.EOF {
+			break
+		} else if err != nil {
+			return 0, err
+		}
+		lines = append(lines, l)
+	}
+	outPath := filepath.Join(out, "rerank-scores.jsonl")
+	done := map[string]bool{}
+	if raw, err := os.ReadFile(outPath); err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if line == "" {
+				continue
+			}
+			var row rerankScoreLine
+			if json.Unmarshal([]byte(line), &row) == nil {
+				done[row.QueryID] = true
+			}
+		}
+	}
+	scoresFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	defer scoresFile.Close()
+	writer := bufio.NewWriter(scoresFile)
+	count := 0
+	for i, l := range lines {
+		if done[l.QID] {
+			continue
+		}
+		text, ok := queryText[l.QID]
+		if !ok {
+			return 0, fmt.Errorf("清单 qid %s 不在 queries 文件", l.QID)
+		}
+		texts, err := eng.ChunkDocTexts(ctx, ref, l.IDs)
+		if err != nil {
+			return 0, fmt.Errorf("qid %s 取文: %w", l.QID, err)
+		}
+		docs := make([]rerank.Document, 0, len(l.IDs))
+		pool := make([][2]string, 0, len(l.IDs))
+		for _, id := range l.IDs {
+			t, ok := texts[id]
+			if !ok {
+				return 0, fmt.Errorf("qid %s chunk %s 不在存活集", l.QID, id)
+			}
+			docs = append(docs, rerank.Document{ID: id, Text: t})
+			pool = append(pool, [2]string{id, ""})
+		}
+		hits, sent, err := rr.Rerank(ctx, text, docs)
+		if err != nil {
+			return 0, fmt.Errorf("qid %s rerank: %w", l.QID, err)
+		}
+		scores := make(map[string]float64, len(hits))
+		for _, hit := range hits {
+			scores[hit.ID] = hit.Score
+		}
+		line, _ := json.Marshal(rerankScoreLine{QueryID: l.QID, Pool: pool, Scores: scores, Sent: sent})
+		writer.Write(line)
+		writer.WriteByte('\n')
+		if err := writer.Flush(); err != nil {
+			return 0, err
+		}
+		count++
+		if (i+1)%50 == 0 {
+			fmt.Fprintf(os.Stderr, "score-list: %d/%d\n", i+1, len(lines))
+		}
+	}
+	manifest.FinishedAt = time.Now().UTC()
+	manifest.QueryCount = count
+	manifestJSON, _ := json.MarshalIndent(manifest, "", "  ")
+	return count, os.WriteFile(filepath.Join(out, "manifest.json"), manifestJSON, 0o644)
 }
 
 // dumpChunkRecords 导出存活 chunk 全量记录到 chunks.jsonl（E3 嵌入模板
