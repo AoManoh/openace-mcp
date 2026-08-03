@@ -166,7 +166,7 @@ func newCheckpointFallbackFixture(t *testing.T) (string, *workspace.Syncer, *int
 
 func TestServerTaskLifecycle(t *testing.T) {
 	useTempTaskStore(t)
-	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
 	server := newDaemonHTTPTestServer(t, fakeSyncer{})
 
 	task := postTask(t, server.URL, TaskRequest{
@@ -189,7 +189,7 @@ func TestServerTaskLifecycle(t *testing.T) {
 
 func TestServerRetrieveTaskCompletesAfterCheckpointHTTP400Fallback(t *testing.T) {
 	useTempTaskStore(t)
-	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
 	root, syncer, checkpointCalls := newCheckpointFallbackFixture(t)
 	server := newDaemonHTTPTestServer(t, syncer)
 
@@ -212,7 +212,7 @@ func TestServerRetrieveTaskCompletesAfterCheckpointHTTP400Fallback(t *testing.T)
 
 func TestServerRetrieveCompletesAfterCheckpointHTTP400Fallback(t *testing.T) {
 	useTempTaskStore(t)
-	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
 	root, syncer, checkpointCalls := newCheckpointFallbackFixture(t)
 	server := newDaemonHTTPTestServer(t, syncer)
 
@@ -230,7 +230,7 @@ func TestServerRetrieveCompletesAfterCheckpointHTTP400Fallback(t *testing.T) {
 
 func TestServerListsTasks(t *testing.T) {
 	useTempTaskStore(t)
-	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
 	server := newDaemonHTTPTestServer(t, fakeSyncer{})
 
 	first := postTask(t, server.URL, TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/one"})
@@ -313,7 +313,7 @@ func TestValidateListenAddrCanAllowRemoteExplicitly(t *testing.T) {
 
 func TestServerAllowsConcurrentSyncRequests(t *testing.T) {
 	useTempTaskStore(t)
-	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
 	syncer := newConcurrentSyncer()
 	server := newDaemonHTTPTestServer(t, syncer)
 
@@ -340,7 +340,7 @@ func TestServerAllowsConcurrentSyncRequests(t *testing.T) {
 
 func TestServerWorkspaceStatus(t *testing.T) {
 	useTempTaskStore(t)
-	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
 	server := newDaemonHTTPTestServer(t, fakeWorkspaceSyncer{})
 
 	resp, err := http.Get(server.URL + "/v1/workspaces")
@@ -390,7 +390,7 @@ func TestServerWorkspaceStatus(t *testing.T) {
 
 func TestServerDaemonStatus(t *testing.T) {
 	useTempTaskStore(t)
-	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
 	t.Setenv("OPENACE_CACHE_NAMESPACE", "status-test")
 	server := newDaemonHTTPTestServer(t, fakeWorkspaceSyncer{})
 
@@ -414,7 +414,7 @@ func TestServerDaemonStatus(t *testing.T) {
 
 func TestServerRoutesProviderProfileRequests(t *testing.T) {
 	useTempTaskStore(t)
-	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
 	server := newDaemonHTTPTestServer(t, fakeProviderWorkspaceSyncer{})
 
 	retrievePayload, err := json.Marshal(retrieveRequest{
@@ -470,7 +470,7 @@ func TestServerRoutesProviderProfileRequests(t *testing.T) {
 
 func TestServerWorkspaceStatusIncludesWatchDiagnosticsForSeenWorkspace(t *testing.T) {
 	useTempTaskStore(t)
-	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
 	t.Setenv("OPENACE_WATCH_MODE", "seen")
 	t.Setenv("OPENACE_WATCH_DEBOUNCE", "1h")
 	syncer := fakeWatchWorkspaceSyncer{}
@@ -502,7 +502,7 @@ func TestServerWorkspaceStatusIncludesWatchDiagnosticsForSeenWorkspace(t *testin
 
 func TestServerMultiRetrieveRegistersWatchDiagnostics(t *testing.T) {
 	useTempTaskStore(t)
-	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
 	t.Setenv("OPENACE_WATCH_MODE", "seen")
 	t.Setenv("OPENACE_WATCH_DEBOUNCE", "1h")
 	server := newDaemonHTTPTestServer(t, fakeWatchWorkspaceSyncer{})
@@ -537,7 +537,7 @@ func TestServerMultiRetrieveRegistersWatchDiagnostics(t *testing.T) {
 
 func TestServerCompletesMultiRetrieveTask(t *testing.T) {
 	useTempTaskStore(t)
-	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
 	server := newDaemonHTTPTestServer(t, fakeSyncer{})
 
 	task := postTask(t, server.URL, TaskRequest{
@@ -568,7 +568,7 @@ func TestServerCompletesMultiRetrieveTask(t *testing.T) {
 
 func TestServerFailsMultiRetrieveTaskWhenAllWorkspacesFail(t *testing.T) {
 	useTempTaskStore(t)
-	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
 	server := newDaemonHTTPTestServer(t, fakeSyncer{})
 
 	task := postTask(t, server.URL, TaskRequest{
@@ -749,7 +749,7 @@ func (e testRateLimitError) RateLimitRetryAfter() (time.Duration, bool) {
 
 func TestRetrieveRateLimitReturns429(t *testing.T) {
 	useTempTaskStore(t)
-	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
 	server := newDaemonHTTPTestServer(t, rateLimitedSyncer{})
 
 	payload, err := json.Marshal(retrieveRequest{DirectoryPath: "/tmp/project", InformationRequest: "q"})

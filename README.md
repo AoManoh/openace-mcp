@@ -348,6 +348,8 @@ openACE 默认尊重 `.gitignore` / `.ignore`，并跳过 `.env*`、session、cr
 | `OPENACE_CACHE_NAMESPACE` | cache 命名空间，用于隔离账号、tenant 或测试批次 |
 | `OPENACE_DAEMON_ADDR` | MCP shim 连接 daemon 的地址 |
 | `OPENACE_DAEMON_LISTEN_ADDR` | daemon 监听地址，默认 `127.0.0.1:8765` |
+| `OPENACE_DAEMON_TOKEN` | daemon HTTP 面凭据。**默认(未设)自动生成随机 token** 存于用户缓存目录 0600 文件并由 wrapper 自动读取——零配置即封死多用户机上其他本地用户经回环端口读取你的索引；设 `off` 显式关闭认证(自担风险);设其他值为显式 token(与历史行为一致) |
+| `OPENACE_RECONCILE_CONCURRENCY` | daemon 后台 workspace 监测的并发度(默认 `2`;`1`=串行)。单个大仓构建不再阻塞其余 workspace 的变更监测 |
 | `OPENACE_TASK_WORKERS` | daemon 异步任务 worker 数，默认 `4` |
 | `OPENACE_TOOL_TIMEOUT` | 同步 MCP 工具调用超时，默认 `110s` |
 | `OPENACE_RETRIEVAL_TIMEOUT` | 单次上游 ACE retrieval 超时，默认 `90s` |
