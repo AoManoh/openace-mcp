@@ -150,8 +150,10 @@ func New(opts Options) (*Engine, error) {
 		}
 		e.embedClient = client
 		// 平行 profile 子树：向量身份变化即全量重建，semantic off 路径
-		// 与 Stage 2 逐字节一致（阶段计划 D4/K24）。
-		e.storeProfile += "+emb-" + opts.Embedding.ProfileHash()
+		// 与 Stage 2 逐字节一致（阶段计划 D4/K24）。模板版本进子树名
+		// (方案①):模板变化 = 嵌入输入语义变化 = 新身份,旧子树保留
+		// 供回退。
+		e.storeProfile += "+emb-" + opts.Embedding.ProfileHash() + "-" + embedTemplateVersion
 	}
 	e.rerankCfg = opts.Rerank
 	if opts.Rerank.Enabled {

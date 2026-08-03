@@ -301,11 +301,12 @@ func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKe
 	}, nil
 }
 
-// coveredPerFile 统计每文件被向量覆盖的 chunk 数（覆盖口径 K31/K51）。
+// coveredPerFile 统计每文件被向量覆盖的 chunk 数（覆盖口径 K31/K51;
+// 键 = embedKey,与 seman.entries 的键语义一致,方案① R1）。
 func coveredPerFile(fileRecords []chunkRecord, coveredHash map[string]bool) int {
 	covered := 0
 	for _, record := range fileRecords {
-		if coveredHash[record.ContentHash] {
+		if coveredHash[embedKey(record)] {
 			covered++
 		}
 	}
