@@ -194,6 +194,11 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	// journal 落盘语义不变，journal 自身持锁。
 	status.setEmbedProgress(len(missingHashes), 0)
 	batchSize := e.embedCfg.BatchSize
+	if batchSize < 1 {
+		// 程序化构造 Options 传 0 的防呆(L5):env 路径有下限校验,
+		// 此处钳位防批次切分死循环;与下方 workers 钳位同一口径。
+		batchSize = 1
+	}
 	type batchSpan struct{ start, end int }
 	var batches []batchSpan
 	for start := 0; start < len(missingHashes); start += batchSize {

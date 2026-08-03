@@ -41,10 +41,15 @@ func NewClient(cfg Config) (*Client, error) {
 	if !cfg.Enabled {
 		return nil, fmt.Errorf("embedding provider is not enabled: %s", cfg.DisabledReason)
 	}
+	if cfg.MaxConcurrency < 1 {
+		cfg.MaxConcurrency = 1
+	}
 	return &Client{
 		cfg: cfg,
 		// 超时由每次尝试的 context 控制（取消需即时关闭请求，暗坑 K26）；
 		// 传输层禁 h2 走 HTTP/1.1 连接池（F3：单连接复用会挤兑超时）。
+		// MaxConcurrency 已在上方钳位:0 会使 sem 退化为无缓冲 channel,
+		// 全部调用悬挂到超时(L6)。
 		httpClient: reliability.NewHTTPClient(),
 		circuit:    reliability.NewCircuit(),
 		limiter:    reliability.NewRateLimiter(cfg.RPMBudget, cfg.TPMBudget),
