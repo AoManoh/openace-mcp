@@ -2,6 +2,8 @@ package localengine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
@@ -38,6 +40,35 @@ type semanticOutcome struct {
 // improved 报告语义覆盖相对 active revision 是否有实质改善。
 func (s semanticOutcome) improved() bool {
 	return s.enabled && s.covered > s.coveredByActive
+}
+
+// embedTemplateVersion 是 document 嵌入模板版本(方案①,2026-08-02 批准):
+// 进 storeProfile(版本变化 = 平行子树全量重建)与 embedKey。
+const embedTemplateVersion = "a2p-v1"
+
+// embedDocText 构造 document 嵌入输入(A2' 模板,冻结):NL 化 path/
+// language/symbol 头 + 内容。证据:E3 spike +14.1pp dense R@5(零反向)、
+// 放大实验 n=498 dense +9.6pp、端到端 fusion+rerank +3.0pp(CI 排零)、
+// exact 探针零退化、voyage-context-3 对照臂 -7.7pp 被否——手工模板胜出。
+// R2:行号显式不进模板(行号进键会使任意编辑级联失效下方全部 chunk 的
+// 嵌入复用,摧毁增量经济性;行号信息由 rerank 头与渲染层承担)。
+func embedDocText(record chunkRecord) string {
+	head := "This chunk is from " + record.RelPath + ", " + record.Language
+	if record.Symbol != "" {
+		head += ", defining " + record.Symbol
+	}
+	return head + ".\n" + record.Content
+}
+
+// embedKey 是嵌入复用/journal 的键(R1):模板使嵌入输入 = f(path, symbol,
+// language, content),键随之升级——纯 content hash 键会让同内容异路径
+// chunk 静默复用首个文件的带头向量(路径串味)。代价如实声明:重命名
+// (含目录移动)后同内容 chunk 需重嵌(D2 "rename 零重付" 条款经方案①
+// 批准修订);行号漂移不改键(R2)。
+func embedKey(record chunkRecord) string {
+	h := sha256.Sum256([]byte(embedTemplateVersion + "\x00" + record.RelPath + "\x00" +
+		record.Symbol + "\x00" + record.Language + "\x00" + record.ContentHash))
+	return hex.EncodeToString(h[:])
 }
 
 // priorVectors 是构建前装载的既有向量视图（D2 复用源 + 覆盖口径基线）。
@@ -130,27 +161,29 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		}
 	}
 
-	// 2) 缺失清单：唯一 content hash，按 records 首次出现序（确定性批次；
-	// 同内容多处出现只嵌入一次——嵌入输入为纯 chunk 内容，D6）。
+	// 2) 缺失清单：唯一 embedKey，按 records 首次出现序（确定性批次；
+	// R1:键 = f(模板版本, path, symbol, language, contentHash)——嵌入
+	// 输入带路径头后,同内容异路径必须各自成键,防止带头向量串路径）。
 	// 持久化拒绝集（K35 修订）内的零向量内容不再送 provider，跨重启
 	// 防止 watcher 周期对病理内容反复付费。
 	var missingHashes []string
 	var missingTexts []string
 	seen := make(map[string]bool, len(records))
 	for _, record := range records {
-		if seen[record.ContentHash] {
+		key := embedKey(record)
+		if seen[key] {
 			continue
 		}
-		seen[record.ContentHash] = true
-		if _, ok := reuse[record.ContentHash]; ok {
+		seen[key] = true
+		if _, ok := reuse[key]; ok {
 			continue
 		}
-		if journal.Rejected(record.ContentHash) {
+		if journal.Rejected(key) {
 			out.rejected++
 			continue
 		}
-		missingHashes = append(missingHashes, record.ContentHash)
-		missingTexts = append(missingTexts, record.Content)
+		missingHashes = append(missingHashes, key)
+		missingTexts = append(missingTexts, embedDocText(record))
 	}
 
 	// 3) 分批嵌入：单批失败记录并继续（部分成功入盘，D10）；circuit
@@ -280,16 +313,19 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		return out, err
 	}
 
-	// 4) 对齐 records 组装行集（同内容多行共享同一向量值）。
+	// 4) 对齐 records 组装行集（同 embedKey 多行共享同一向量值;Entry
+	// 的 ContentHash 字段自本版本起承载 embedKey——子树按模板版本平行
+	// 隔离,单一子树内键语义恒一致）。
 	for _, record := range records {
-		vec, ok := reuse[record.ContentHash]
+		key := embedKey(record)
+		vec, ok := reuse[key]
 		if !ok {
 			continue
 		}
-		out.entries = append(out.entries, vector.Entry{ID: record.ID, ContentHash: record.ContentHash})
+		out.entries = append(out.entries, vector.Entry{ID: record.ID, ContentHash: key})
 		out.vectors = append(out.vectors, vec)
 		out.covered++
-		if activeUsable[record.ContentHash] {
+		if activeUsable[key] {
 			out.coveredByActive++
 		}
 	}

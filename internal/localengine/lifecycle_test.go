@@ -73,7 +73,9 @@ func TestLifecycleDeleteDirectory(t *testing.T) {
 }
 
 // TestLifecycleRenameSameContent 重命名（同内容）：旧路径零引用、新路径
-// 可检索，且向量按纯 content hash 复用零重付（G3 + D2）。
+// 可检索,覆盖保持完整。D2 "rename 零重付" 条款经方案①(2026-08-02 批准)
+// 修订:嵌入输入带路径头后键含路径(R1,防同内容串路径),rename 触发
+// 该文件 chunk 重嵌——断言从"零调用"改为"重嵌上界 = 该文件 chunk 数"。
 func TestLifecycleRenameSameContent(t *testing.T) {
 	const dim = 8
 	server := newEmbedServer(t, dim)
@@ -89,8 +91,8 @@ func TestLifecycleRenameSameContent(t *testing.T) {
 	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
 		t.Fatal(err)
 	}
-	if server.callCount() != callsBefore {
-		t.Fatalf("同内容 rename 不得重付 embedding（D2）: %d → %d", callsBefore, server.callCount())
+	if server.callCount() != callsBefore+1 {
+		t.Fatalf("同内容 rename 应恰好重嵌该文件一批(R1 键含路径): %d → %d", callsBefore, server.callCount())
 	}
 	result, err := e.Search(context.Background(), searchRequest(root, "parse_config"))
 	if err != nil {

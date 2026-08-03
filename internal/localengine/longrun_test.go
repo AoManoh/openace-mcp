@@ -89,7 +89,7 @@ func TestLongRunResourceBounds(t *testing.T) {
 			} else {
 				writeSynthetic(pick)
 			}
-		default: // 重命名（同内容，费用应为零）
+		default: // 重命名（同内容;R1 后重嵌该文件,费用有界于变更文件量）
 			renamed := strings.TrimSuffix(pick, ".py") + "_moved.py"
 			if err := os.Rename(filepath.Join(root, pick), filepath.Join(root, renamed)); err != nil {
 				t.Fatal(err)
