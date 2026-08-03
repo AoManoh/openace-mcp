@@ -40,6 +40,11 @@ const (
 	// 降级 reason）都显式报错而非降级放行;默认 off=现状。要求 embedding
 	// provider 已配置,否则构造期报错。
 	EnvQualityStrict = "OPENACE_QUALITY_STRICT"
+	// EnvQueryBuildWait 是查询等待在建索引的时长上界(P1 有界化):
+	// 超时后构建继续后台推进,查询按「有旧 revision → allow/deny 降级
+	// (原因 index-building)、无 revision → 可行动错误(带构建进度)」
+	// 返回;空/0 = 现状(等到构建完成)。显式 sync 与后台任务不受约束。
+	EnvQueryBuildWait = "OPENACE_QUERY_BUILD_WAIT"
 )
 
 // Options 是 local-hybrid 引擎的完整构造配置；零值 = Stage 2 行为
@@ -63,6 +68,8 @@ type Options struct {
 	FreshnessWindow time.Duration
 	// QualityStrict 开启质量严格档(方案④);要求 Embedding.Enabled。
 	QualityStrict bool
+	// QueryBuildWait 是查询等待在建索引的上界;0 = 无界(现状)。
+	QueryBuildWait time.Duration
 }
 
 // OptionsFromEnv 解析 local-hybrid 的 provider 与降级配置；
@@ -92,6 +99,10 @@ func OptionsFromEnv() (Options, error) {
 	if err != nil {
 		return Options{}, err
 	}
+	buildWait, err := reliability.DurationEnv(EnvQueryBuildWait, 0)
+	if err != nil {
+		return Options{}, err
+	}
 	return Options{
 		Embedding:        embedCfg,
 		Rerank:           rerankCfg,
@@ -99,6 +110,7 @@ func OptionsFromEnv() (Options, error) {
 		RerankDegrade:    rerankDegrade,
 		FreshnessWindow:  freshness,
 		QualityStrict:    strict,
+		QueryBuildWait:   buildWait,
 	}, nil
 }
 

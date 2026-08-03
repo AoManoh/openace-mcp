@@ -457,7 +457,7 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		return retrieval{}, errors.New("查询内容为空")
 	}
 	// 检索前确保索引就绪（与 legacy Syncer 的 retrieval 语义一致）。
-	syncResult, syncErr := e.syncWorkspace(ctx, req.Workspace)
+	syncResult, syncErr := e.syncWorkspaceForQuery(ctx, req.Workspace)
 	if syncErr != nil && ctx.Err() != nil {
 		return retrieval{}, ctx.Err()
 	}
@@ -469,15 +469,20 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	var reasons []string
 	if syncErr != nil {
 		// D8(d)/review S23：索引刷新失败但存在可用 revision 时，
-		// allow 以旧索引服务并显式标记 stale，deny 报错。
+		// allow 以旧索引服务并显式标记 stale，deny 报错。查询等待在建
+		// 索引超界(P1 有界化)同构处理,原因区分为 index-building。
 		if handleErr != nil {
 			return retrieval{}, syncErr
 		}
+		reason, label := "stale-index", "index refresh failed"
+		if errors.Is(syncErr, errQueryBuildWait) {
+			reason, label = "index-building", "index still building"
+		}
 		if e.retrievalDegrade == DegradeDeny {
 			e.releaseHandle(handle)
-			return retrieval{}, degradeDeniedError("index refresh failed", syncErr, EnvRetrievalDegrade)
+			return retrieval{}, degradeDeniedError(label, syncErr, EnvRetrievalDegrade)
 		}
-		reasons = append(reasons, "stale-index")
+		reasons = append(reasons, reason)
 		syncResult = engine.Result{Engine: EngineID, FileCount: handle.manifest.Counts.Files}
 	} else if handleErr != nil {
 		return retrieval{}, handleErr

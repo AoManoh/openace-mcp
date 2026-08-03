@@ -342,6 +342,7 @@ openACE 默认尊重 `.gitignore` / `.ignore`，并跳过 `.env*`、session、cr
 | `OPENACE_RERANK_PROVIDER` | 可选精排端点类型：`tei`（自部署 TEI 形状）/ `voyage`（Cohere/Jina 兼容形状）/ `off`。默认值为 `voyage` 且缺 key 即关闭；`OPENACE_RERANK_BASE_URL`/`_API_KEY`/`_MODEL`/`_MAX_TOKENS` 语义同上（单请求默认 200K token 上限） |
 | `OPENACE_PROVIDER_TIMEOUT` / `OPENACE_PROVIDER_MAX_RETRIES` | provider HTTP 超时（默认 `60s`）与单批重试上限（默认 `5`） |
 | `OPENACE_RETRIEVAL_DEGRADE` / `OPENACE_RERANK_DEGRADE` | 语义路/精排失败策略：`allow`（默认，放行并标记 `[DEGRADED]`）/ `deny`（返回可行动错误） |
+| `OPENACE_QUERY_BUILD_WAIT` | 查询等待在建索引的时长上界（如 `30s`）：超时后构建继续后台推进，已有旧索引时按 allow/deny 降级放行（原因 `index-building`），无旧索引时返回带构建进度的可行动错误。空/0 = 等到构建完成（默认） |
 | `OPENACE_QUALITY_STRICT` | `on` 时启用质量严格档：语义链路任一缺口（覆盖 <100%、查询嵌入失败、已配置的 rerank 未生效等）直接报错而非降级放行，错误信息标明缺口；要求已配置 embedding 服务。默认 `off`（上表 allow/deny 语义不变）。结构化结果另携带 `rerank_sent`/`query_embed_failed`/`embedding_profile` 质量字段 |
 | `OPENACE_MODE` | `auto` / `direct` / `manual-daemon`，默认 `auto` |
 | `OPENACE_CACHE_NAMESPACE` | cache 命名空间，用于隔离账号、tenant 或测试批次 |
