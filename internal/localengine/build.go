@@ -75,6 +75,9 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 			status.fail(err)
 		}
 	}()
+	// 构建收尾排空 tree-sitter arena 池(M4c):池内 arena 是强引用,
+	// GC 不回收;批量切分结束后排水,查询路径不涉及。
+	defer chunk.DrainParserPools()
 
 	// 跨进程写锁（D6/K45）：构建/GC/journal 是写路径，必须独占；
 	// 查询只读不经此处。锁在 Engine 生命周期内持有并跨构建复用。

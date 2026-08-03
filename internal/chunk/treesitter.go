@@ -19,6 +19,15 @@ import (
 // 超时经 ParseStrict 显式报错，整文件回退行窗口。
 const parseTimeoutMicros = 2_000_000
 
+// DrainParserPools 释放 tree-sitter 运行时的包级 arena 池（M4）。池内
+// arena 是强 Go 引用，GC 不会自行回收；上游要求批量扫描结束后排水。
+// 调用点归属批量构建的收尾（如 localengine 构建循环结束处），本包只
+// 提供封装避免调用方直接依赖 gotreesitter。幂等；与并发中的 Split
+// 互不破坏（在途 arena 已检出、不在空闲池内，下次解析重新分配）。
+func DrainParserPools() {
+	gotreesitter.DrainArenaPools()
+}
+
 // treesitterGrammar 返回语言在首批批次内对应的 grammar 名；不在批次
 // 内返回空串。.tsx 是 TypeScript 的语法超集（JSX），上游以独立 grammar
 // 发布，须按扩展名细分；.jsx 由 javascript grammar 原生覆盖。
@@ -87,6 +96,11 @@ func (p Profile) splitTreeSitter(file File, language string, grammarName string)
 	// ParseStrict 把超时/预算等提前停止当作错误返回，避免拿到静默的
 	// 部分树（Parse 在超时时返回 tree + nil error）。
 	tree, err := parser.ParseStrict([]byte(content))
+	// 成功与全部早退路径统一释放（M4）：ParseStrict 超时/预算中止时仍
+	// 可能返回非 nil 部分树（err!=nil），弃置即放弃 arena 池化。Release
+	// 对 nil 与重复调用安全；chunk 产物只持有 content 的字符串切片，
+	// 不引用 arena 内节点，函数退出后释放无悬垂面。
+	defer tree.Release()
 	if err != nil || tree == nil {
 		return nil, false
 	}
@@ -96,8 +110,8 @@ func (p Profile) splitTreeSitter(file File, language string, grammarName string)
 	}
 	// 该 runtime 的错误标记不上传到根（实测顶层子节点 err=true 时根
 	// 仍为 false），逐个核查顶层子节点：任一子树带错即整文件回退。
-	for i, count := 0, root.NamedChildCount(); i < count; i++ {
-		if child := root.NamedChild(i); child != nil && (child.HasError() || child.IsError() || child.IsMissing()) {
+	for _, child := range namedChildren(root) {
+		if child.HasError() || child.IsError() || child.IsMissing() {
 			return nil, false
 		}
 	}
@@ -118,6 +132,26 @@ func (p Profile) splitTreeSitter(file File, language string, grammarName string)
 		return nil, false
 	}
 	return chunks, true
+}
+
+// namedChildren 一次性物化全部子节点并顺序过滤出命名节点。禁止用
+// NamedChild(i) 循环遍历兄弟：该 runtime 的 NamedChild 每次都从下标 0
+// 起线性扫描（v0.47.0 tree.go:1581），循环整体 O(n²)，数万顶层语句的
+// 扁平生成文件会耗秒到分钟级且不可取消（M4）；Children 单次物化为
+// O(n)，命名判定与 NamedChild 同一 flag，序列语义等价。返回的切片是
+// 节点内部存储，只读遍历、不得修改。
+func namedChildren(node *gotreesitter.Node) []*gotreesitter.Node {
+	if node == nil {
+		return nil
+	}
+	all := node.Children()
+	named := make([]*gotreesitter.Node, 0, len(all))
+	for _, child := range all {
+		if child != nil && child.IsNamed() {
+			named = append(named, child)
+		}
+	}
+	return named
 }
 
 // tsNodeKind 是兄弟序列游走时的节点分类。
@@ -147,12 +181,7 @@ func (p Profile) walkSiblings(parent *gotreesitter.Node, lang *gotreesitter.Lang
 		spans = append(spans, commentRun...)
 		commentRun = commentRun[:0]
 	}
-	count := parent.NamedChildCount()
-	for i := 0; i < count; i++ {
-		node := parent.NamedChild(i)
-		if node == nil {
-			continue
-		}
+	for _, node := range namedChildren(parent) {
 		start, end, valid := nodeLines(node, maxLine)
 		if !valid {
 			continue
@@ -246,10 +275,8 @@ var declTypes = map[string]bool{
 
 // firstDeclChild 返回节点的首个声明类命名子节点。
 func firstDeclChild(node *gotreesitter.Node, lang *gotreesitter.Language) *gotreesitter.Node {
-	count := node.NamedChildCount()
-	for i := 0; i < count; i++ {
-		child := node.NamedChild(i)
-		if child != nil && declTypes[child.Type(lang)] {
+	for _, child := range namedChildren(node) {
+		if declTypes[child.Type(lang)] {
 			return child
 		}
 	}
@@ -345,10 +372,8 @@ var funcValueTypes = map[string]bool{
 // declaratorInfo 提取 lexical/variable declaration 的首个声明名，并判断
 // 其值是否为函数（决定 isFunc 与合并策略）。
 func declaratorInfo(node *gotreesitter.Node, lang *gotreesitter.Language, src string) (string, bool) {
-	count := node.NamedChildCount()
-	for i := 0; i < count; i++ {
-		child := node.NamedChild(i)
-		if child == nil || child.Type(lang) != "variable_declarator" {
+	for _, child := range namedChildren(node) {
+		if child.Type(lang) != "variable_declarator" {
 			continue
 		}
 		name := tsNodeName(child, lang, src)
@@ -374,12 +399,7 @@ func tsNodeName(node *gotreesitter.Node, lang *gotreesitter.Language, src string
 
 // firstChildOfType 返回首个匹配类型的命名子节点。
 func firstChildOfType(node *gotreesitter.Node, lang *gotreesitter.Language, types ...string) *gotreesitter.Node {
-	count := node.NamedChildCount()
-	for i := 0; i < count; i++ {
-		child := node.NamedChild(i)
-		if child == nil {
-			continue
-		}
+	for _, child := range namedChildren(node) {
 		childType := child.Type(lang)
 		for _, t := range types {
 			if childType == t {
