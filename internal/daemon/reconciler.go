@@ -10,6 +10,7 @@ import (
 
 	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
+	"github.com/AoManoh/openace-mcp/internal/reliability"
 )
 
 const (
@@ -19,6 +20,10 @@ const (
 	defaultWatchBackoffMin = 5 * time.Second
 	defaultWatchBackoffMax = 2 * time.Minute
 	defaultWatchMaxRoots   = 64
+	// defaultReconcileConcurrency 是 reconcile worker 数（M10，2026-08-03
+	// 批准）：嵌入构建自身已有 provider 侧并发，daemon 级并发 2 的目的是
+	// 防单个大仓分钟级构建队头阻塞其余 workspace 的变更监测，而非提吞吐。
+	defaultReconcileConcurrency = 2
 )
 
 type workspaceReconciler struct {
@@ -31,22 +36,33 @@ type workspaceReconciler struct {
 	cancel context.CancelFunc
 	wake   chan struct{}
 	done   chan struct{}
+	// workCh/workers 是有界并发 worker 池（M10）：run 只做调度分发，
+	// reconcile（含同步构建，最长 watchTimeout）由 worker 执行，慢仓
+	// 不再队头阻塞其余 workspace 的变更监测。
+	workCh  chan watchTarget
+	workers sync.WaitGroup
 
-	interval   time.Duration
-	debounce   time.Duration
-	timeout    time.Duration
-	backoffMin time.Duration
-	backoffMax time.Duration
-	maxRoots   int
+	interval    time.Duration
+	debounce    time.Duration
+	timeout     time.Duration
+	backoffMin  time.Duration
+	backoffMax  time.Duration
+	maxRoots    int
+	concurrency int
 
 	mu     sync.Mutex
 	states map[string]*watchState
 }
 
 type watchState struct {
-	directoryPath        string
-	providerProfileID    string
-	pending              bool
+	directoryPath     string
+	providerProfileID string
+	pending           bool
+	// queued/running 二段置位（M10）：dueWorkspaces 分发时置 queued，
+	// worker 领取时才置 running，处理完成清 running——不再批量预置
+	// running 造成未处理者状态失真；且 queued||running 期间不会被再次
+	// 领取（reconciler 侧去重，与引擎侧 singleflight 双保险）。
+	queued               bool
 	running              bool
 	lastWatchAt          *time.Time
 	nextWatchAt          *time.Time
@@ -55,29 +71,39 @@ type watchState struct {
 	backoff              time.Duration
 }
 
-func newWorkspaceReconciler(service engine.Service) *workspaceReconciler {
+func newWorkspaceReconciler(service engine.Service) (*workspaceReconciler, error) {
+	// 非法并发值启动期 fail-fast（M10 批准语义）：静默回退默认值属静默
+	// 降级，禁止；watch off 也先校验，配置错误不因功能关闭而漏检。
+	// 错误经 Server.reconcileErr 在 ListenAndServe 前置校验拒绝启动
+	// (与 M5 authErr 同一 fail-closed 模式)。
+	concurrency, err := reconcileConcurrency()
+	if err != nil {
+		return nil, err
+	}
 	if watchMode() == "off" {
-		return nil
+		return nil, nil
 	}
 	detector, ok := service.(engine.ChangeDetector)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	reconciler := &workspaceReconciler{
-		service:    service,
-		detector:   detector,
-		ctx:        ctx,
-		cancel:     cancel,
-		wake:       make(chan struct{}, 1),
-		done:       make(chan struct{}),
-		interval:   watchInterval(),
-		debounce:   watchDebounce(),
-		timeout:    watchTimeout(),
-		backoffMin: watchBackoffMin(),
-		backoffMax: watchBackoffMax(),
-		maxRoots:   watchMaxRoots(),
-		states:     make(map[string]*watchState),
+		service:     service,
+		detector:    detector,
+		ctx:         ctx,
+		cancel:      cancel,
+		wake:        make(chan struct{}, 1),
+		done:        make(chan struct{}),
+		workCh:      make(chan watchTarget),
+		interval:    watchInterval(),
+		debounce:    watchDebounce(),
+		timeout:     watchTimeout(),
+		backoffMin:  watchBackoffMin(),
+		backoffMax:  watchBackoffMax(),
+		maxRoots:    watchMaxRoots(),
+		concurrency: concurrency,
+		states:      make(map[string]*watchState),
 	}
 	if bgSyncer, ok := service.(engine.BackgroundSyncer); ok {
 		reconciler.bgSyncer = bgSyncer
@@ -85,8 +111,12 @@ func newWorkspaceReconciler(service engine.Service) *workspaceReconciler {
 	if inspector, ok := service.(engine.WorkspaceInspector); ok {
 		reconciler.inspector = inspector
 	}
+	for i := 0; i < reconciler.concurrency; i++ {
+		reconciler.workers.Add(1)
+		go reconciler.worker()
+	}
 	go reconciler.run()
-	return reconciler
+	return reconciler, nil
 }
 
 type watchTarget struct {
@@ -183,8 +213,14 @@ func (r *workspaceReconciler) Shutdown(ctx context.Context) error {
 	}
 }
 
+// run 是调度循环：只负责计时与把到期 workspace 分发给 worker 池，自身
+// 不执行 reconcile。关停时按 LIFO defer 先关 workCh、等 worker 全部退出
+// （in-flight reconcile 的 ctx 已被 cancel，会快速返回），最后 close(done)
+// ——保持 Shutdown 「取消 in-flight 并等其收尾」的既有契约。
 func (r *workspaceReconciler) run() {
 	defer close(r.done)
+	defer r.workers.Wait()
+	defer close(r.workCh)
 	for {
 		timer := time.NewTimer(r.nextWait(time.Now().UTC()))
 		select {
@@ -196,8 +232,21 @@ func (r *workspaceReconciler) run() {
 		case <-timer.C:
 		}
 		for _, target := range r.dueWorkspaces(time.Now().UTC()) {
-			r.reconcile(target)
+			select {
+			case r.workCh <- target:
+			case <-r.ctx.Done():
+				// 进程正在关停，未送达目标随内存状态一并废弃。
+				return
+			}
 		}
+	}
+}
+
+// worker 逐个领取到期 workspace 并执行 reconcile；workCh 关闭后退出。
+func (r *workspaceReconciler) worker() {
+	defer r.workers.Done()
+	for target := range r.workCh {
+		r.reconcile(target)
 	}
 }
 
@@ -206,7 +255,9 @@ func (r *workspaceReconciler) nextWait(now time.Time) time.Duration {
 	defer r.mu.Unlock()
 	wait := r.interval
 	for _, state := range r.states {
-		if state.running || !state.pending || state.nextWatchAt == nil {
+		// queued 也要跳过：已在分发管道里的目标 nextWatchAt 停留在过去，
+		// 不跳过会让调度循环 0 等待空转。
+		if state.queued || state.running || !state.pending || state.nextWatchAt == nil {
 			continue
 		}
 		until := state.nextWatchAt.Sub(now)
@@ -237,16 +288,35 @@ func (r *workspaceReconciler) dueWorkspaces(now time.Time) []watchTarget {
 	defer r.mu.Unlock()
 	var targets []watchTarget
 	for _, state := range r.states {
-		if state.running || !state.pending || state.nextWatchAt == nil || now.Before(*state.nextWatchAt) {
+		// queued||running 期间不重复分发：同一 workspace 从分发到处理完成
+		// 的全程恰有一段标志为真（转换都在 r.mu 内），杜绝同轮重复领取。
+		if state.queued || state.running || !state.pending || state.nextWatchAt == nil || now.Before(*state.nextWatchAt) {
 			continue
 		}
-		state.running = true
+		state.queued = true
 		targets = append(targets, watchTarget{root: state.directoryPath, providerProfileID: state.providerProfileID})
 	}
 	return targets
 }
 
+// claim 由 worker 在领取目标时调用：queued→running 原子转换，running
+// 只在实际处理期间为真（Decorate 的 WatchRunning 不再虚报排队中的目标）。
+func (r *workspaceReconciler) claim(target watchTarget) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.states[target.key()]
+	if state == nil {
+		return false
+	}
+	state.queued = false
+	state.running = true
+	return true
+}
+
 func (r *workspaceReconciler) reconcile(target watchTarget) {
+	if !r.claim(target) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel()
 
@@ -399,6 +469,13 @@ func watchMaxRoots() int {
 		return defaultWatchMaxRoots
 	}
 	return parsed
+}
+
+// reconcileConcurrency 解析 OPENACE_RECONCILE_CONCURRENCY（M10）：默认 2，
+// ≥1，1 = 旧串行行为。与其余 watch env 的宽容回退不同，非法值显式报错
+// （localengine options 先例：配置错误 fail-fast，不静默吞掉用户意图）。
+func reconcileConcurrency() (int, error) {
+	return reliability.IntEnv("OPENACE_RECONCILE_CONCURRENCY", defaultReconcileConcurrency, 1)
 }
 
 func durationEnv(name string, fallback time.Duration) time.Duration {
