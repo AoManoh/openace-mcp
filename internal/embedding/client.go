@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"syscall"
 
 	"github.com/AoManoh/openace-mcp/internal/reliability"
 )
@@ -208,9 +210,14 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 			return nil, reliability.ClassifyTransportError(ctx, attemptCtx, timeout, err)
 		}
 		// 连接中断类解码错误同理（F6，sealed 实跑发现：redis 首建遭
-		// "unexpected EOF" 被判 permanent → circuit 退避 → 11% 覆盖入库）：
-		// 半途断流是传输故障不是 JSON 垃圾，必须 transient 走重试。
-		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		// "unexpected EOF" 被判 permanent → circuit 退避 → 11% 覆盖入库;
+		// sealed v2 k8s 再遭 TCP connection reset 同样误判 → 94% 覆盖,
+		// 2026-08-04 补齐 net 层错误家族）：半途断流是传输故障不是 JSON
+		// 垃圾，必须 transient 走重试。
+		var netErr net.Error
+		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) ||
+			errors.As(err, &netErr) || errors.Is(err, net.ErrClosed) ||
+			errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
 			return nil, &reliability.CallError{Class: reliability.ClassTransient, Message: reliability.SanitizeMessage("response stream interrupted: " + err.Error())}
 		}
 		return nil, &reliability.CallError{Class: reliability.ClassPermanent, Message: reliability.SanitizeMessage("malformed embeddings response: " + err.Error())}
