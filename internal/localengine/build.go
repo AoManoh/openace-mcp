@@ -87,10 +87,12 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 
 	// 阶段 1：发现（复用 workspace 扫描与 AssetPolicy，暗坑 K4）。
 	status.setStage(engine.IndexStageScanning)
-	assets, err := workspace.FileAssetSource{Cache: e.statCacheFor(workspaceKey)}.Load(ctx, root.CanonicalPath)
+	assets, scanStats, err := workspace.FileAssetSource{Cache: e.statCacheFor(workspaceKey)}.LoadWithStats(ctx, root.CanonicalPath)
 	if err != nil {
 		return engine.Result{}, fmt.Errorf("扫描工作区: %w", err)
 	}
+	// 权限跳过如实上报(M1 配套状态面,K6 上抛口径)。
+	status.setPermissionSkipped(scanStats.PermissionSkippedFiles)
 
 	previous, _, resolveErr := store.ResolveUsable()
 	if resolveErr != nil && !isNoRevision(resolveErr) {

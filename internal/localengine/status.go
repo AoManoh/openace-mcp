@@ -23,19 +23,21 @@ type wsStatus struct {
 	root         pathutil.WorkspaceRoot
 	workspaceKey string
 
-	inFlight         bool
-	stage            engine.IndexStage
-	revision         string
-	fileCount        int
-	chunkCount       int
-	revisionCount    int
-	skippedFiles     int
-	capabilities     map[string]string
-	lastError        string
-	skippedRevisions []string
-	startedAt        *time.Time
-	finishedAt       *time.Time
-	updatedAt        time.Time
+	inFlight      bool
+	stage         engine.IndexStage
+	revision      string
+	fileCount     int
+	chunkCount    int
+	revisionCount int
+	skippedFiles  int
+	// permissionSkipped 是扫描期因权限被跳过的文件数(M1 配套,K6)。
+	permissionSkipped int
+	capabilities      map[string]string
+	lastError         string
+	skippedRevisions  []string
+	startedAt         *time.Time
+	finishedAt        *time.Time
+	updatedAt         time.Time
 
 	// 语义路状态（Stage 3）：covered 来自 active manifest（暗坑 K31），
 	// rejected/embedError 来自最近一次构建的 provider 交互。
@@ -70,6 +72,13 @@ func (s *wsStatus) setSemanticOutcome(rejected int, lastError string) {
 func (s *wsStatus) setSkippedFiles(count int) {
 	s.mu.Lock()
 	s.skippedFiles = count
+	s.mu.Unlock()
+}
+
+// setPermissionSkipped 记录扫描期因权限被跳过的文件数(M1 配套,K6)。
+func (s *wsStatus) setPermissionSkipped(count int) {
+	s.mu.Lock()
+	s.permissionSkipped = count
 	s.mu.Unlock()
 }
 
@@ -186,8 +195,8 @@ func (s *wsStatus) snapshot() engine.WorkspaceStatus {
 		updated := s.updatedAt
 		status.UpdatedAt = &updated
 	}
-	if len(s.capabilities) > 0 || s.revisionCount > 0 || len(s.skippedRevisions) > 0 || s.skippedFiles > 0 {
-		status.UpstreamStatus = capabilitySummary(s.capabilities, s.revisionCount, s.skippedFiles, s.skippedRevisions)
+	if len(s.capabilities) > 0 || s.revisionCount > 0 || len(s.skippedRevisions) > 0 || s.skippedFiles > 0 || s.permissionSkipped > 0 {
+		status.UpstreamStatus = capabilitySummary(s.capabilities, s.revisionCount, s.skippedFiles, s.permissionSkipped, s.skippedRevisions)
 	}
 	return status
 }
@@ -195,7 +204,7 @@ func (s *wsStatus) snapshot() engine.WorkspaceStatus {
 // capabilitySummary 把 chunker 能力、revision 保留数、内容门禁跳过数
 // 与损坏回退信息压缩为一行可读文本（Stage 2 复用现有 UpstreamStatus
 // 字段承载本地引擎详情，避免提前扩表；Stage 3 状态扩展时再字段化）。
-func capabilitySummary(capabilities map[string]string, revisions int, skippedFiles int, skippedRevisions []string) string {
+func capabilitySummary(capabilities map[string]string, revisions int, skippedFiles int, permissionSkipped int, skippedRevisions []string) string {
 	parts := make([]string, 0, len(capabilities)+3)
 	languages := make([]string, 0, len(capabilities))
 	for language := range capabilities {
@@ -210,6 +219,9 @@ func capabilitySummary(capabilities map[string]string, revisions int, skippedFil
 	}
 	if skippedFiles > 0 {
 		parts = append(parts, "skipped_files="+strconv.Itoa(skippedFiles))
+	}
+	if permissionSkipped > 0 {
+		parts = append(parts, "permission_skipped="+strconv.Itoa(permissionSkipped))
 	}
 	if len(skippedRevisions) > 0 {
 		parts = append(parts, "skipped="+strings.Join(skippedRevisions, ","))
