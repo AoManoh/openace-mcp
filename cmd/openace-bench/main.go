@@ -78,6 +78,7 @@ func run() error {
 		// CJK 守卫与类别负先验网格（方案② T4）：负值 = 引擎默认。
 		latinContentW = flag.Float64("lex-latin-content", -1, "CJK 守卫 latin content 子句权重（<0=默认）")
 		latinPathW    = flag.Float64("lex-latin-path", -1, "CJK 守卫 latin path 子句权重（<0=默认）")
+		compoundKeyW  = flag.Float64("lex-compound-key", -1, "复合 key 查询扩展子句权重（a' 机制;<0=默认;0=关闭）")
 		localePenalty = flag.Float64("locale-penalty", -1, "locale 类词法负先验系数（<0=默认；1=关闭）")
 		// 双路候选导出（T10b）：dump 融合前 lex/dense 各 route-depth 条
 		// 候选到 routes.jsonl，供离线融合参数扫描（零新增嵌入费用）。
@@ -113,7 +114,7 @@ func run() error {
 		return err
 	}
 	var lexWeights map[string]float64
-	if *symbolWeight >= 0 || *exactBoost >= 0 || *pathWeight >= 0 || *latinContentW >= 0 || *latinPathW >= 0 {
+	if *symbolWeight >= 0 || *exactBoost >= 0 || *pathWeight >= 0 || *latinContentW >= 0 || *latinPathW >= 0 || *compoundKeyW >= 0 {
 		weights := lexical.DefaultWeights()
 		if *symbolWeight >= 0 {
 			weights.Symbol = *symbolWeight
@@ -127,6 +128,9 @@ func run() error {
 		if *latinContentW >= 0 {
 			weights.LatinContent = *latinContentW
 		}
+		if *compoundKeyW >= 0 {
+			weights.CompoundKey = *compoundKeyW
+		}
 		if *latinPathW >= 0 {
 			weights.LatinPath = *latinPathW
 		}
@@ -135,6 +139,7 @@ func run() error {
 			"content": weights.Content, "path": weights.Path,
 			"symbol": weights.Symbol, "symbol_exact": weights.SymbolExact,
 			"latin_content": weights.LatinContent, "latin_path": weights.LatinPath,
+			"compound_key": weights.CompoundKey,
 		}
 	}
 	if *localePenalty >= 0 {

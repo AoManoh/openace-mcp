@@ -55,6 +55,14 @@ type Weights struct {
 	// 触发条件外(纯中文/纯英文查询)子句集合与历史逐字节一致。
 	LatinContent float64
 	LatinPath    float64
+	// CompoundKey 是复合 key 查询扩展子句(a' 机制,G-config 诊断
+	// 2026-08-04 批准)的权重:查询含 kebab/dot/snake 复合 token
+	// (order-by-type / blake3.workspace)时,标准分词把它拆成泛词且
+	// by/and 等停用段被删,gold 配置文件被单泛词高频文件淹没。对每个
+	// 复合 token 追加 content 字段 AND-match 子句(经索引同款分析器,
+	// 停用段两侧一致丢弃),把"同文档共现全部区分段"的信号拉回。
+	// 无复合 token 的查询子句集合不变。
+	CompoundKey float64
 }
 
 // DefaultWeights 返回默认子句权重。Symbol=0.1 是 Stage 5 T10a 定值
@@ -67,7 +75,10 @@ type Weights struct {
 func DefaultWeights() Weights {
 	// LatinContent=4/LatinPath=1 是方案② T4 零费用网格的初值(中值),
 	// 定值证据落 docs/benchmarks/work/wp4/ 后按证据冻结。
-	return Weights{Content: 1, Path: 1, Symbol: 0.1, SymbolExact: 4, LatinContent: 4, LatinPath: 1}
+	// CompoundKey=2 是 a' 机制网格定值(work/gconfig/grid-verdict.txt):
+	// wd2 在 cargo raw/zh +1.3/+6.0pp、nacos-zh +3.4pp;wd4/6 反伤
+	// cargo-raw;触发面同轮收紧为仅 kebab(dot 复合反伤 nacos-raw -5pp)。
+	return Weights{Content: 1, Path: 1, Symbol: 0.1, SymbolExact: 4, LatinContent: 4, LatinPath: 1, CompoundKey: 2}
 }
 
 // latinGuardTokens 提取查询里的高区分度 Latin token(len≥4,含字母开头,
@@ -100,6 +111,65 @@ func latinGuardTokens(query string) []string {
 	}
 	flush(len(query))
 	return tokens
+}
+
+// compoundKeyTokens 提取查询中的复合 key token(a' 机制触发面):
+// 仅 kebab 形状(≥2 个以 - 连接的字母数字段,总长 ≥6)。网格证据
+// (work/gconfig/grid-verdict.txt):dot 复合(nacos.core.auth 类)的
+// AND 扩展会把同时含全部命名空间段的代码/import 文件抬过配置 gold
+// (nacos config-raw -5pp),而 kebab 键(order-by-type/--kube-api-*)
+// 的段共现天然指向配置位。dot/snake 不触发。上限 3 个防子句爆炸。
+func compoundKeyTokens(query string) []string {
+	var out []string
+	for _, token := range strings.Fields(query) {
+		token = strings.Trim(token, "\"'`()[]{}<>,;:!?")
+		if len(token) < 6 || len(out) >= 3 {
+			continue
+		}
+		if !strings.Contains(token, "-") {
+			continue
+		}
+		segs := strings.FieldsFunc(token, func(r rune) bool { return r == '-' })
+		if len(segs) < 2 {
+			continue
+		}
+		valid, hasAlphaSeg := true, false
+		for _, seg := range segs {
+			if seg == "" {
+				valid = false
+				break
+			}
+			segAlpha := false
+			for _, r := range seg {
+				if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' {
+					segAlpha = true
+				} else if r < '0' || r > '9' {
+					valid = false
+					break
+				}
+			}
+			if segAlpha {
+				hasAlphaSeg = true
+			}
+		}
+		// 触发口径:全部段都必须含字母(blake3 类字母数字混合段算含
+		// 字母)——纯数字段的版本号形状(v1.2.3 的 2/3 段)不触发,
+		// 防把版本串当配置 key 扩展。
+		alphaSegs := 0
+		for _, seg := range segs {
+			for _, r := range seg {
+				if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' {
+					alphaSegs++
+					break
+				}
+			}
+		}
+		if !valid || !hasAlphaSeg || alphaSegs < len(segs) {
+			continue
+		}
+		out = append(out, token)
+	}
+	return out
 }
 
 // hanRuneCount 统计 Han(中日汉字区)rune 数。
@@ -305,6 +375,17 @@ func (i *Index) SearchWeighted(ctx context.Context, queryText string, topK int, 
 				guardPath.SetBoost(w.LatinPath)
 				clauses = append(clauses, guardPath)
 			}
+		}
+	}
+	// a' 复合 key 查询扩展:AND-match 走索引同款分析器,停用段一致丢弃;
+	// 单段剩余时退化为对该区分段的加权 match(仍优于被泛词淹没)。
+	if w.CompoundKey > 0 {
+		for _, key := range compoundKeyTokens(queryText) {
+			expanded := bleve.NewMatchQuery(strings.ReplaceAll(key, "-", " "))
+			expanded.SetField("content")
+			expanded.SetOperator(query.MatchQueryOperatorAnd)
+			expanded.SetBoost(w.CompoundKey)
+			clauses = append(clauses, expanded)
 		}
 	}
 	if len(clauses) == 0 {
