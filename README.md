@@ -1,12 +1,10 @@
 # openACE MCP
 
-`openACE` 是 **Open Adapter for Context Engine**。
+`openACE` 是 **Open Agent Context Engine**——纯 Go、单二进制、无 CGO、无 sidecar 的本地代码检索引擎,经 MCP 工具接入 AI IDE / agent。
 
-它把你自己的 Augment / ACE codebase retrieval 能力接到 AI IDE 的 MCP 工具里，让 AI agent 可以检索本地仓库，而不是为每个会话、每个 subagent 反复启动重型进程、重复扫描 workspace。
+引擎自有:AST 声明级切分(Go/Python/TS/TSX/JS 内嵌 Tree-sitter)、BM25 词法索引、本地向量索引、加权 RRF 融合、可选精排编排、immutable 增量索引、显式降级。embedding/rerank 模型不自研也不默认推介任何厂商:由你自备模型服务经可替换 provider 接入(OpenAI-compatible 自部署/托管端点,或 voyage/tei 形状端点);**不配置任何模型服务时,词法检索零凭据完整可用**。
 
-openACE 做的是本地编排：扫描 workspace、过滤文件、同步 checkpoint/cache、调用上游 ACE、提供 MCP 工具、复用本机 daemon。它不是离线语义检索引擎，不提供自研 embedding / ranking，也不会绕过 Augment / ACE 的认证、quota、tenant 或 rate limit。
-
-当前日常推荐路径是 **单租户 + `OPENACE_MODE=auto`**。多 Provider Profile 已提供，但仍属于实验性/高级能力，不是自动高可用系统。
+AI agent 复用本机索引与常驻 daemon 检索本地仓库,而不是为每个会话、每个 subagent 反复启动重型进程、重复扫描 workspace。
 
 ## 快速开始：直接在 AI IDE 里配置
 
@@ -25,8 +23,6 @@ openACE 做的是本地编排：扫描 workspace、过滤文件、同步 checkpo
       "env": {
         "GOPROXY": "https://goproxy.cn,direct",
         "GOSUMDB": "sum.golang.google.cn",
-        "AUGMENT_TOKEN": "your-augment-token",
-        "AUGMENT_TENANT": "https://<your-tenant>.api.augmentcode.com/",
         "OPENACE_MODE": "auto",
         "OPENACE_CACHE_NAMESPACE": "default"
       }
@@ -48,8 +44,6 @@ openACE 做的是本地编排：扫描 workspace、过滤文件、同步 checkpo
   "env": {
     "GOPROXY": "https://goproxy.cn,direct",
     "GOSUMDB": "sum.golang.google.cn",
-    "AUGMENT_TOKEN": "your-augment-token",
-    "AUGMENT_TENANT": "https://<your-tenant>.api.augmentcode.com/",
     "OPENACE_MODE": "auto",
     "OPENACE_CACHE_NAMESPACE": "default"
   }
@@ -58,42 +52,15 @@ openACE 做的是本地编排：扫描 workspace、过滤文件、同步 checkpo
 
 `@main` 表示跟随最新代码。想要固定版本时，把 `@main` 换成 `@<release-tag-or-commit>`。
 
-如果你不想马上体验最新版本，可以先固定到上一条单租户稳定基线：
-
-```text
-github.com/AoManoh/openace-mcp/cmd/openace-mcp@14af3f1
-```
-
-`14af3f1` 是引入多 Provider Profile 前、此前远端长期可用的单租户版本。后续如果项目发布正式 tag，也可以把它替换成对应 tag。
-
 Windows 下如果 AI IDE 找不到 `go`，把 `command` 改成 `go.exe` 的绝对路径。
 
 ## 你需要准备什么
 
 - Go `>= 1.23`
-- 一个可用的 Augment / ACE 账号
 - 支持 MCP JSON 配置的 AI IDE
+- (可选)一个 embedding 模型服务端点——不配置则纯词法检索,零凭据可用;要开语义混合检索时按下文「默认引擎」一节配置 `OPENACE_EMBEDDING_*`
 
-认证方式任选一种：
-
-- `AUGMENT_TOKEN` + `AUGMENT_TENANT`
-- `AUGMENT_SESSION_AUTH`
-- `OPENACE_SESSION_FILE`
-- 已登录插件留下的 `~/.augment/session.json`
-
-最简单的是配置 `AUGMENT_TOKEN` 和 `AUGMENT_TENANT`。如果你只有一个账号或租户，不要配置 `OPENACE_PROFILES_FILE`，也不需要理解 `provider_profile_id`。
-
-## 默认推荐：单租户
-
-单租户是当前最稳定、最清晰的日常路径。
-
-在这个模式下，AI IDE 只启动一个 `openace-mcp`。`OPENACE_MODE=auto` 会让它优先复用本机已有 daemon；如果没有 daemon，就自动托管一个内部 daemon。多个 AI 会话可以共享本机状态，避免重复扫描、重复上传和重复维护 checkpoint。
-
-单租户模式下：
-
-- 不需要 profile 文件。
-- 不需要给 MCP 工具传 `provider_profile_id`。
-- 不会引入多个账号之间的 checkpoint、quota、索引状态差异。
+`OPENACE_MODE=auto` 会让 wrapper 优先复用本机已有 daemon;没有 daemon 时自动托管一个。多个 AI 会话共享本机索引与状态,避免重复扫描与重复嵌入付费。
 
 ## 可选：先安装到本机
 
@@ -127,8 +94,6 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
       "args": [],
       "disabled": false,
       "env": {
-        "AUGMENT_TOKEN": "your-augment-token",
-        "AUGMENT_TENANT": "https://<your-tenant>.api.augmentcode.com/",
         "OPENACE_MODE": "auto",
         "OPENACE_CACHE_NAMESPACE": "default"
       }
@@ -148,83 +113,6 @@ GOPROXY=https://goproxy.cn,direct GOSUMDB=sum.golang.google.cn \
 go install github.com/AoManoh/openace-mcp/cmd/openace-mcp@14af3f1
 ```
 
-## 实验性能力：多 Provider Profile
-
-多 Provider Profile 用来让同一个 daemon 识别多个 ACE 账号或租户，适合显式测试、排障、手动切换账号。它不是自动 failover，也不是自动高可用。
-
-只有在你确实需要多个账号时，才创建本地 profile 文件，例如 `/absolute/path/to/openace-profiles.json`：
-
-```json
-{
-  "default_profile_id": "primary",
-  "profiles": [
-    {
-      "id": "primary",
-      "accessToken": "your-primary-token",
-      "tenantURL": "https://<primary-tenant>.api.augmentcode.com/"
-    },
-    {
-      "id": "standby",
-      "accessToken": "your-standby-token",
-      "tenantURL": "https://<standby-tenant>.api.augmentcode.com/"
-    }
-  ]
-}
-```
-
-然后在 MCP 配置里直接指定 `OPENACE_PROFILES_FILE`：
-
-```json
-{
-  "mcpServers": {
-    "openace-mcp": {
-      "command": "go",
-      "args": [
-        "run",
-        "github.com/AoManoh/openace-mcp/cmd/openace-mcp@main"
-      ],
-      "disabled": false,
-      "env": {
-        "GOPROXY": "https://goproxy.cn,direct",
-        "GOSUMDB": "sum.golang.google.cn",
-        "OPENACE_MODE": "auto",
-        "OPENACE_CACHE_NAMESPACE": "default",
-        "OPENACE_PROFILES_FILE": "/absolute/path/to/openace-profiles.json"
-      }
-    }
-  }
-}
-```
-
-profile 文件包含 token/session，必须当作本地 secret 管理，不要提交到 Git。
-
-多 profile 的关键边界：
-
-- openACE 不会因为 `primary` 被限流、封禁、quota 用完或临时不可用，就自动切到 `standby`。
-- ACE 的代码索引跟随账号、租户和 checkpoint；另一个账号有 token，不代表它已经同步过同一个 workspace。
-- 当前实现只提供显式选择、状态隔离和状态可见性。
-- 如果要让备用账号可用，需要先用备用 profile 对同一 workspace 独立同步并确认 ready。
-
-在工具调用里显式选择 profile：
-
-```json
-{
-  "directory_path": "/absolute/path/to/workspace",
-  "information_request": "Find the daemon startup flow",
-  "provider_profile_id": "standby"
-}
-```
-
-备用 profile 还没同步过 workspace 时，先调用 `sync_workspace` 或 `start_sync_workspace`：
-
-```json
-{
-  "directory_path": "/absolute/path/to/workspace",
-  "provider_profile_id": "standby"
-}
-```
-
-修改 profile 文件后，需要重启已有 daemon，否则 MCP shim 可能仍在复用旧 daemon。
 
 ## MCP 工具
 
@@ -232,7 +120,7 @@ profile 文件包含 token/session，必须当作本地 secret 管理，不要�
 
 | 工具 | 用途 |
 |------|------|
-| `codebase_retrieval` | 同步当前 workspace，然后调用 ACE 检索代码 |
+| `codebase_retrieval` | 同步当前 workspace,然后混合检索代码(BM25 + 可选语义/精排) |
 | `multi_codebase_retrieval` | 显式传入多个 workspace，分仓检索并返回结果 |
 | `sync_workspace` | 只同步 workspace，不做检索 |
 | `start_codebase_retrieval` | daemon 模式下提交异步检索任务，适合大仓库 |
@@ -240,7 +128,7 @@ profile 文件包含 token/session，必须当作本地 secret 管理，不要�
 | `start_sync_workspace` | daemon 模式下提交异步同步任务 |
 | `task_status` | 查询异步任务状态和结果 |
 | `list_tasks` | 找回最近任务，列表不返回完整检索正文 |
-| `workspace_status` | 查看 workspace checkpoint、同步阶段、最近错误和上游退避摘要 |
+| `workspace_status` | 查看 workspace revision、同步阶段、语义覆盖、最近错误与 provider 健康摘要 |
 | `daemon_status` | 查看 MCP wrapper 与 daemon 的 build、pid、cache namespace、capability |
 
 小仓库可以直接用 `codebase_retrieval`。大仓库或跨仓问题优先用 `start_*` 提交异步任务，再用 `task_status` 查询。
@@ -291,7 +179,7 @@ openACE 默认使用自有的本地检索引擎（无需设置任何变量；`OP
 - **中断不丢付费进度**：每批嵌入成功即写入本地 journal；构建被超时/取消/进程被杀中断后，下次 sync 直接复用已付费向量，只补真正缺失的部分。构建期 embedding 进度（待嵌/已嵌/journal 条数）经 `workspace_status` 实时可见。
 - **崩溃与多进程安全**：任意时刻杀死进程，重启后自动恢复到可用索引、清理残留、无重复付费。同一索引子树的写路径跨进程互斥（构建锁），持锁进程崩溃后其他进程自动接管；只读检索不受锁影响。
 - 索引以不可变 revision 形式保存，发布原子切换；词法/向量数据损坏时自动回退上一 revision 并在下次 sync 自愈。
-- `provider_profile_id` 仅适用于默认 ACE 引擎；local-hybrid 收到该参数会明确报错。
+- `provider_profile_id` 是已退役 legacy 引擎的历史参数;传入会得到明确报错(Stage 7)。
 - 引擎与 provider 配置按进程生效：修改 `OPENACE_ENGINE` 或任何 provider/降级 env 后需重启 daemon；`auto` 模式只复用引擎与 provider 配置指纹一致的 daemon，不一致会明确报错而非静默复用。
 - 大仓库首次语义 sync 是分钟级操作（实测约 2400 chunks 在托管 embedding 服务上耗时 1–5 分钟，取决于所选服务、批参数与网络），可能超过默认 `OPENACE_TOOL_TIMEOUT=110s`；首次索引建议临时调大该值（如 `600s`）。批处理端点较慢时调大 `OPENACE_PROVIDER_TIMEOUT` 或调小 `OPENACE_EMBEDDING_BATCH_SIZE`。中断构建已付费的批次经 journal 保留，重跑只补缺口。
 
@@ -330,11 +218,6 @@ openACE 默认尊重 `.gitignore` / `.ignore`，并跳过 `.env*`、session、cr
 
 | 变量 | 说明 |
 |------|------|
-| `AUGMENT_TOKEN` | 上游 ACE access token |
-| `AUGMENT_TENANT` | 上游 ACE tenant/base URL |
-| `AUGMENT_SESSION_AUTH` | 完整 session JSON，优先级最高 |
-| `OPENACE_SESSION_FILE` | 显式 session 文件路径 |
-| `OPENACE_PROFILES_FILE` | 实验性多 profile JSON；设置后替代单账号凭据链 |
 | `OPENACE_ENGINE` | `local-hybrid`（默认；本地引擎，词法无需凭据，可接入自备模型开启语义混合）/ `ace`（迁移期 legacy 上游适配，单变量回退） |
 | `OPENACE_EMBEDDING_PROVIDER` | local-hybrid 语义路端点类型：`openai`（OpenAI-compatible，自部署或托管）/ `voyage`（Voyage 形状端点）/ `off`。默认值为 `voyage` 且未提供 key 时语义路保持关闭、词法照常——即不配置就是纯词法 |
 | `OPENACE_EMBEDDING_BASE_URL` `_API_KEY` `_MODEL` `_DIMENSION` | 模型服务身份四项，由你按所选服务填写（`openai` 类型必填 base_url 与 model）；`voyage` 类型内置端点与模型预设，key 为空时回退读 `VOYAGE_API_KEY`；任一身份变化触发平行索引全量重建 |
@@ -352,7 +235,6 @@ openACE 默认尊重 `.gitignore` / `.ignore`，并跳过 `.env*`、session、cr
 | `OPENACE_RECONCILE_CONCURRENCY` | daemon 后台 workspace 监测的并发度(默认 `2`;`1`=串行)。单个大仓构建不再阻塞其余 workspace 的变更监测 |
 | `OPENACE_TASK_WORKERS` | daemon 异步任务 worker 数，默认 `4` |
 | `OPENACE_TOOL_TIMEOUT` | 同步 MCP 工具调用超时，默认 `110s` |
-| `OPENACE_RETRIEVAL_TIMEOUT` | 单次上游 ACE retrieval 超时，默认 `90s` |
 
 daemon 默认只监听 loopback。不要把 daemon 直接暴露到公网。
 
@@ -360,9 +242,8 @@ daemon 默认只监听 loopback。不要把 daemon 直接暴露到公网。
 
 - IDE 启动 MCP 子进程时通常不会经过 shell，`$HOME`、`%USERPROFILE%` 这类占位符不一定会展开。配置路径时优先写绝对路径。
 - 使用本地安装方式后，升级需要重新 `go install` 并重启 MCP 会话；运行中的进程不会自动换成新版本。
-- 切换 `OPENACE_PROFILES_FILE` 或修改 profile 文件后，需要重启 daemon。
+- 修改 `OPENACE_EMBEDDING_*`/`OPENACE_RERANK_*` 等 provider env 后,wrapper 会按配置指纹拒绝复用旧 daemon 并自动拉起匹配的新 daemon;手工管理 daemon 时需自行重启。
 - WSL 里如果复用 Windows daemon，可以传 `D:\\project` 或 `/mnt/d/project`；Windows daemon 会把 WSL mount 路径规范化为 Windows drive path。非 WSL 的 POSIX 路径会被拒绝，避免产生 `C:\\mnt\\...` 这类无效 workspace identity。
-- 最新版本会在已有 checkpoint 的 `checkpoint-blobs` HTTP 400 上自动尝试一次 fresh checkpoint；如果旧版本仍持续失败，先确认你运行的是哪个 commit/tag，并优先升级到最新 `@main` 或固定到已验证版本复现。
 
 ## 本地开发
 

@@ -32,15 +32,6 @@ func TestServedByAdvertisesEngine(t *testing.T) {
 		t.Fatal("local-hybrid daemon 不应广播 provider_profiles 能力")
 	}
 
-	legacy := NewServer(fakeSyncer{})
-	t.Cleanup(func() { _ = legacy.Shutdown(context.Background()) })
-	legacyIdentity := legacy.servedBy()
-	if legacyIdentity.Engine != engine.EngineACE {
-		t.Fatalf("无自述能力的服务应按 ace 广播: %+v", legacyIdentity)
-	}
-	if !legacyIdentity.Capabilities["provider_profiles"] {
-		t.Fatal("ace daemon 应保留 provider_profiles 能力")
-	}
 }
 
 // profiledSyncer 模拟自述配置指纹的服务（Stage 3 暗坑 K29）。
@@ -65,9 +56,4 @@ func TestServedByAdvertisesEngineProfile(t *testing.T) {
 	}
 
 	// 无自述能力（legacy ACE / 旧实现）不广播该字段。
-	legacy := NewServer(fakeSyncer{})
-	t.Cleanup(func() { _ = legacy.Shutdown(context.Background()) })
-	if legacy.servedBy().EngineProfile != "" {
-		t.Fatal("无 ProfileIdentifier 的服务不应广播 engine_profile")
-	}
 }

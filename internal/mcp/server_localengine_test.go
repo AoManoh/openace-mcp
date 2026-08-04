@@ -19,7 +19,7 @@ func TestLocalEngineEndToEnd(t *testing.T) {
 	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
 	t.Setenv("OPENACE_CACHE_NAMESPACE", "e2e")
 	// 断言全程无凭据。
-	for _, key := range []string{"AUGMENT_SESSION_AUTH", "AUGMENT_TOKEN", "AUGMENT_TENANT", "VOYAGE_API_KEY"} {
+	for _, key := range []string{"VOYAGE_API_KEY"} {
 		t.Setenv(key, "")
 	}
 	root := t.TempDir()

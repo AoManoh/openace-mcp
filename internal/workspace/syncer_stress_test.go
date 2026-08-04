@@ -11,7 +11,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/AoManoh/openace-mcp/internal/ace"
 )
 
 func TestStressLargeWorkspaceScanAndSync(t *testing.T) {
@@ -70,23 +69,6 @@ func TestStressLargeWorkspaceScanAndSync(t *testing.T) {
 		}
 	}
 
-	client := &stressACEClient{}
-	result, err := NewSyncer(client).Sync(context.Background(), syncReq(root))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.FileCount != len(files) {
-		t.Fatalf("sync file count = %d, scan count = %d", result.FileCount, len(files))
-	}
-	if result.Uploaded != len(files) {
-		t.Fatalf("expected every stress blob uploaded once, got uploaded=%d files=%d", result.Uploaded, len(files))
-	}
-	if client.findMissingCalls != 4 {
-		t.Fatalf("expected 4 find-missing batches for %d files, got %d", len(files), client.findMissingCalls)
-	}
-	if client.uploaded != len(files) {
-		t.Fatalf("client uploaded %d files, want %d", client.uploaded, len(files))
-	}
 }
 
 func stressWriteFile(t *testing.T, root string, rel string, content string) {

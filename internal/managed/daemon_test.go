@@ -64,14 +64,13 @@ func TestConnectFallsBackToPlainHTTPForManagedDaemonURL(t *testing.T) {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
 		w.Header().Set("content-type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok","service":"openace-daemon","capabilities":{"runtime_identity":true}}`))
+		_, _ = w.Write([]byte(`{"status":"ok","service":"openace-daemon","engine":"local-hybrid","capabilities":{"runtime_identity":true}}`))
 	}))
 	defer server.Close()
 
-	// 本测试只验 URL scheme 回退,与引擎选择无关:fake daemon 状态未带
-	// engine 字段(按 legacy ace 解释),wrapper 侧钉 ace 对齐(切默认后
-	// 默认为 local-hybrid,不钉会命中兼容性拒绝)。
-	t.Setenv("OPENACE_ENGINE", "ace")
+	// 本测试只验 URL scheme 回退:fake daemon 广播 local-hybrid 与零值
+	// 配置指纹对齐 wrapper 默认档(Stage 7 后唯一引擎)。
+	t.Setenv("OPENACE_ENGINE", "local-hybrid")
 	t.Setenv("OPENACE_DAEMON_ADDR", "https://"+strings.TrimPrefix(server.URL, "http://"))
 	t.Setenv("OPENACE_DAEMON_START_TIMEOUT", "200ms")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

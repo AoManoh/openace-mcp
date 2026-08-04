@@ -8,14 +8,11 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/AoManoh/openace-mcp/internal/auth"
 	"github.com/AoManoh/openace-mcp/internal/daemon"
 	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/localengine"
 	"github.com/AoManoh/openace-mcp/internal/managed"
 	"github.com/AoManoh/openace-mcp/internal/mcp"
-	"github.com/AoManoh/openace-mcp/internal/provider"
-	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
 func main() {
@@ -85,29 +82,18 @@ func daemonAddr() string {
 }
 
 func buildLocalService(ctx context.Context) (engine.Service, error) {
-	engineID, err := engine.NormalizeEngineID(os.Getenv("OPENACE_ENGINE"))
+	_ = ctx
+	// Stage 7:legacy ACE 引擎已删除,唯一引擎 = local-hybrid;
+	// NormalizeEngineID 对 "ace" 给出可行动错误。零凭据可启动
+	// (缺 key = semantic off,词法照常,阶段计划 D1)。
+	if _, err := engine.NormalizeEngineID(os.Getenv("OPENACE_ENGINE")); err != nil {
+		return nil, err
+	}
+	opts, err := localengine.OptionsFromEnv()
 	if err != nil {
 		return nil, err
 	}
-	// local-hybrid 不依赖任何上游凭据：无 AUGMENT_* 也必须可启动
-	// （缺 key = semantic off，词法照常，阶段计划 D1）。
-	if engineID == engine.EngineLocalHybrid {
-		opts, err := localengine.OptionsFromEnv()
-		if err != nil {
-			return nil, err
-		}
-		return localengine.New(opts)
-	}
-	loader := auth.NewLoader()
-	profiles, err := loader.LoadProfiles(ctx)
-	if err != nil {
-		return nil, err
-	}
-	registry, err := provider.NewRegistry(profiles)
-	if err != nil {
-		return nil, err
-	}
-	return workspace.NewSyncerWithRouter(registry), nil
+	return localengine.New(opts)
 }
 
 func runDaemon() {

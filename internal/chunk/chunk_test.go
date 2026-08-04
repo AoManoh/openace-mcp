@@ -77,7 +77,9 @@ func TestGoChunkerRealSyncerBoundaries(t *testing.T) {
 		t.Fatalf("真实 Go 文件应走 AST，got %s", capability)
 	}
 	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
-	wantSymbols := []string{"Syncer.syncSingleflight", "Syncer.Search", "Syncer.Sync", "Syncer.WorkspaceStatus", "Syncer.WorkspaceChanged"}
+	// Stage 7 删除 legacy Syncer 后,锚点换扫描/ignore 家族的常驻方法
+	// (本测试以真实 syncer.go 为夹具,符号集随其演化)。
+	wantSymbols := []string{"ruleStack.Match", "ruleStack.unwindTo", "ignoreRules.Match", "ScanStats", "ignoreRule.matches"}
 	for _, symbol := range wantSymbols {
 		found := false
 		for _, chunk := range chunks {
@@ -88,7 +90,9 @@ func TestGoChunkerRealSyncerBoundaries(t *testing.T) {
 			method := symbol[strings.LastIndex(symbol, ".")+1:]
 			declared := false
 			for i := chunk.StartLine; i <= chunk.EndLine && i <= len(lines); i++ {
-				if strings.Contains(lines[i-1], "func (s *Syncer) "+method+"(") {
+				line := lines[i-1]
+				if strings.Contains(line, method+"(") && strings.Contains(line, "func ") ||
+					strings.Contains(line, "type "+method+" ") {
 					declared = true
 					break
 				}
