@@ -647,11 +647,23 @@ func (s *TaskStore) acceptedSidecarIDsLocked(manifest taskManifest) []string {
 	return ids
 }
 
+// pruneProtectedMaxAge 是 shutdown/abandoned 终态任务的保护时效(L13,
+// 诊断 2026-08-03):这两类此前被永久保护,跨重启在 tasks.json 缓慢累积;
+// 保护的目的是"重启后可诊断",7 天足够,过期照常剪枝。
+const pruneProtectedMaxAge = 7 * 24 * time.Hour
+
 func isPrunableTask(snapshot TaskSnapshot) bool {
 	if !isTerminal(snapshot.State) {
 		return false
 	}
-	return snapshot.Error != "shutdown" && snapshot.Error != "abandoned after daemon restart"
+	if snapshot.Error != "shutdown" && snapshot.Error != "abandoned after daemon restart" {
+		return true
+	}
+	ref := snapshot.SubmittedAt
+	if snapshot.CompletedAt != nil {
+		ref = *snapshot.CompletedAt
+	}
+	return !ref.IsZero() && time.Since(ref) > pruneProtectedMaxAge
 }
 
 func saveTaskManifest(dir string, manifest taskManifest) error {
