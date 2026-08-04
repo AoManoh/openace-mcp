@@ -76,6 +76,12 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 	if err := waitReady(ctx, managedClient, startupTimeout()); err != nil {
 		return nil, withDaemonLog(err, logPath)
 	}
+	// waitReady 后复验 reusable(L14,诊断 2026-08-03):双启动竞态下端口
+	// 可能被他人 env 的 daemon 抢占——健康 ≠ 兼容,静默连上语义不符的
+	// daemon 违反 K29。
+	if err := reusable(ctx, managedClient, requestedEngine, expectedProfile); err != nil {
+		return nil, withDaemonLog(err, logPath)
+	}
 	return managedClient, nil
 }
 
@@ -166,7 +172,14 @@ func acquireStartupLock(ctx context.Context, addr string, timeout time.Duration)
 			return nil, fmt.Errorf("create managed daemon startup lock: %w", err)
 		}
 		if info, statErr := os.Stat(dir); statErr == nil && time.Since(info.ModTime()) > staleAfter {
-			_ = os.RemoveAll(dir)
+			// rename-based 抢占(L14,诊断 2026-08-03):Stat 与删除之间
+			// 锁易主时,直接 RemoveAll 会误删新主的锁造成双启动。rename
+			// 是原子认领——抢到的才有权删除;抢不到(新主已换目录)则
+			// 重试循环。
+			claimed := fmt.Sprintf("%s.stale-%d-%d", dir, os.Getpid(), time.Now().UnixNano())
+			if renameErr := os.Rename(dir, claimed); renameErr == nil {
+				_ = os.RemoveAll(claimed)
+			}
 			continue
 		}
 		if time.Now().After(deadline) {

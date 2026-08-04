@@ -350,8 +350,13 @@ func classMemberSpans(node *gotreesitter.Node, lang *gotreesitter.Language, src 
 	case "public_field_definition", "field_definition":
 		name := tsNodeName(inner, lang, src)
 		if name == "" {
+			// 边界检查与 tsNodeName 对齐(L15):越界虽被顶层 recover 兜为
+			// 语言级 fallback,但防御应在切片处而非依赖 panic 恢复。
 			if f := inner.ChildByFieldName("property", lang); f != nil {
-				name = src[f.StartByte():f.EndByte()]
+				startByte, endByte := int(f.StartByte()), int(f.EndByte())
+				if startByte >= 0 && endByte <= len(src) && startByte < endByte {
+					name = src[startByte:endByte]
+				}
 			}
 		}
 		if value := inner.ChildByFieldName("value", lang); value != nil && funcValueTypes[value.Type(lang)] {
