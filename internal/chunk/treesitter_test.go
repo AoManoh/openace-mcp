@@ -369,13 +369,13 @@ func TestTreeSitterDeterminism(t *testing.T) {
 	}
 }
 
-// 批次外语言（rust 等）不受影响，仍走行窗口。
+// 批次外语言（kotlin 等；rust/java 已入批次 2）不受影响，仍走行窗口。
 func TestNonBatchLanguagesKeepFallback(t *testing.T) {
 	profile := DefaultProfile()
-	rust := "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"
-	_, capability := profile.Split(File{RelPath: "lib.rs", Content: rust})
+	kotlin := "fun add(a: Int, b: Int): Int = a + b\n"
+	_, capability := profile.Split(File{RelPath: "lib.kt", Content: kotlin})
 	if capability != CapabilityFallback {
-		t.Fatalf("rust 应保持行窗口: %v", capability)
+		t.Fatalf("kotlin 应保持行窗口: %v", capability)
 	}
 }
 

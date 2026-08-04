@@ -66,10 +66,14 @@ type Profile struct {
 // 字节窗口）、splitOversized 单行超预算按字节窗口细分（MaxChunkBytes
 // 成为硬上限）、//line 指令改取物理行号——受影响文件的切分产出变化，
 // 依 K5 升版本；未受影响 chunk 内容不变，向量按 ContentHash 复用（K61）。
+// Version 5（语言批次 2）：Java、Rust 由行窗口升级为 Tree-sitter AST
+// 声明级切分（treesitter_java.go / treesitter_rust.go）——与 v3 批次 1
+// 同口径：切分行为变化依 K5 升版本，未变语言按纯内容 hash 复用向量
+// 零重嵌（K61），解析失败语言级回退保留。
 func DefaultProfile() Profile {
 	return Profile{
 		ID:             "default",
-		Version:        "4",
+		Version:        "5",
 		MaxChunkBytes:  2048,
 		WindowLines:    60,
 		OverlapLines:   10,
@@ -115,8 +119,9 @@ type File struct {
 }
 
 // Split 对单个文件执行切分：Go 走标准库 AST，Python/TypeScript/TSX/
-// JavaScript 走 Tree-sitter AST（v3 批次），失败一律回退行窗口。
-// 返回的 capability 为该文件实际使用的切分方式，禁止谎报。
+// JavaScript（v3 批次 1）与 Java/Rust（v5 批次 2）走 Tree-sitter AST，
+// 失败一律回退行窗口。返回的 capability 为该文件实际使用的切分方式，
+// 禁止谎报。
 func (p Profile) Split(file File) ([]Chunk, Capability) {
 	language := DetectLanguage(file.RelPath)
 	if language == "go" {
