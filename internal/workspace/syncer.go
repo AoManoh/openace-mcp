@@ -694,11 +694,9 @@ func scanWithCache(ctx context.Context, root string, cache *StatCache) ([]fileBl
 	return files, err
 }
 
-// scanStats 是扫描期的跳过统计(K6 口径:跳过必须如实计数,不静默吞)。
-// 目前在包内产出并被测试锁定;上抛到 FileAssetSource.Load / localengine
-// wsStatus.skippedFiles 需要改 assets.go 与 localengine 状态面,归属
-// 后续跨包任务。
-type scanStats struct {
+// ScanStats 是扫描期的跳过统计(K6 口径:跳过必须如实计数,不静默吞);
+// 经 FileAssetSource.LoadWithStats 上抛,localengine 状态面如实上报。
+type ScanStats struct {
 	// PermissionSkippedFiles 是因 fs.ErrPermission 被跳过的文件条目数。
 	PermissionSkippedFiles int
 }
@@ -725,8 +723,8 @@ func scanFileSkipDisposition(err error) (skip bool, permission bool) {
 	}
 }
 
-func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]fileBlob, scanStats, error) {
-	var stats scanStats
+func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]fileBlob, ScanStats, error) {
+	var stats ScanStats
 	// H2 第二层防御(第一层是 pathutil.ResolveWorkspaceRoot 的
 	// EvalSymlinks;此处兜住旧 state 文件里的 canonical_path、直接
 	// 调用 scan 的路径):根必须解析为一个存在的目录,否则显式报错
@@ -1146,10 +1144,6 @@ func loadIgnoreRulesForDir(dir string, base string) ignoreRules {
 		rules = append(rules, parseIgnoreRulesWithBase(string(data), base, spec.layer)...)
 	}
 	return rules
-}
-
-func parseIgnoreRules(data string) ignoreRules {
-	return parseIgnoreRulesWithBase(data, "", ignoreLayerGit)
 }
 
 func parseIgnoreRulesWithBase(data string, base string, layer ignoreLayer) ignoreRules {
@@ -1639,14 +1633,6 @@ func diff(old map[string]string, current map[string]string) ([]string, []string)
 		}
 	}
 	return uniqueSorted(added), uniqueSorted(deleted)
-}
-
-func blobMap(files []fileBlob) map[string]string {
-	current := make(map[string]string, len(files))
-	for _, file := range files {
-		current[file.RelPath] = file.BlobName
-	}
-	return current
 }
 
 func sameBlobMap(left map[string]string, right map[string]string) bool {

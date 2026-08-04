@@ -31,21 +31,24 @@ type FileAssetSource struct {
 var _ AssetSource = FileAssetSource{}
 
 func (s FileAssetSource) Load(ctx context.Context, root string) (AssetSet, error) {
-	files, err := scanWithCache(ctx, root, s.Cache)
+	assets, _, err := s.LoadWithStats(ctx, root)
+	return assets, err
+}
+
+// LoadWithStats 同 Load,并回传扫描跳过统计(K6 上抛口径:调用方状态面
+// 如实上报权限跳过数,不静默吞)。
+func (s FileAssetSource) LoadWithStats(ctx context.Context, root string) (AssetSet, ScanStats, error) {
+	files, stats, err := scanWithCacheStats(ctx, root, s.Cache)
 	if err != nil {
-		return nil, err
+		return nil, stats, err
 	}
-	return assetSetFromFileBlobs(files), nil
+	return assetSetFromFileBlobs(files), stats, nil
 }
 
 func assetSetFromFileBlobs(files []fileBlob) AssetSet {
 	assets := make(AssetSet, 0, len(files))
 	for _, file := range files {
-		assets = append(assets, ContextAsset{
-			AbsPath:  file.AbsPath,
-			RelPath:  file.RelPath,
-			BlobName: file.BlobName,
-		})
+		assets = append(assets, ContextAsset(file))
 	}
 	return assets
 }
@@ -53,11 +56,7 @@ func assetSetFromFileBlobs(files []fileBlob) AssetSet {
 func (assets AssetSet) fileBlobs() []fileBlob {
 	files := make([]fileBlob, 0, len(assets))
 	for _, asset := range assets {
-		files = append(files, fileBlob{
-			AbsPath:  asset.AbsPath,
-			RelPath:  asset.RelPath,
-			BlobName: asset.BlobName,
-		})
+		files = append(files, fileBlob(asset))
 	}
 	return files
 }
