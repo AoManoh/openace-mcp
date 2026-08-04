@@ -1,12 +1,14 @@
 package workspace
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	pathpkg "path"
@@ -1046,9 +1048,21 @@ func readIndexableContent(ctx context.Context, path string, maxBytes int64) ([]b
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
-	content, err := os.ReadFile(path)
+	// L2:stat 与读取之间存在 TOCTOU 窗口——文件可能已被替换为超限
+	// 大文件,os.ReadFile 会无界整读入内存。读取按 maxBytes+1 设上界,
+	// 读满上界即证明实际内容超限,按既有 oversize 跳过口径处理
+	// (与上方 stat 期 size > maxBytes 的处置一致:ok=false, err=nil)。
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, false, err
+	}
+	defer f.Close()
+	content, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(content)) > maxBytes {
+		return nil, false, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
@@ -1282,6 +1296,11 @@ func (rules ignoreRules) hasAugmentDescendantInclude(rel string) bool {
 	return false
 }
 
+// matches 判定单条规则是否命中 rel。dirOnly 语义(诊断 L3):尾随 /
+// 的目录规则(如 build/)只匹配目录本身,同名普通文件不受影响——此前
+// 该约束只在否定分支生效,非否定的目录规则会误伤同名文件。目录被
+// 忽略后其内容仍按包含语义命中(路径模式经祖先命中/前缀包含,裸段
+// 模式经非最终段命中),不受 dirOnly 约束影响。
 func (rule ignoreRule) matches(rel string, isDir bool) bool {
 	rel, ok := rule.relForBase(rel)
 	if !ok || rel == "" {
@@ -1293,17 +1312,36 @@ func (rule ignoreRule) matches(rel string, isDir bool) bool {
 	pattern := rule.pattern
 	if strings.Contains(pattern, "/") || rule.anchored {
 		if matchPath(pattern, rel) {
-			return true
+			if !rule.dirOnly || isDir {
+				return true
+			}
+			// rel 是普通文件且规则只匹配目录:文件本身不命中;但其
+			// 某个祖先目录命中该模式时(a/** 类通配才可能),按"目录
+			// 被忽略则内容整体被忽略"的包含语义仍命中。此分支仅非
+			// 否定规则可达(否定 + dirOnly + 文件已在上方提前返回)。
+			for i := len(rel) - 1; i > 0; i-- {
+				if rel[i] == '/' && matchPath(pattern, rel[:i]) {
+					return true
+				}
+			}
+			return false
 		}
 		return !rule.negated && hasPathPrefix(rel, pattern)
 	}
 	if rule.negated {
 		return matchPath(pattern, pathpkg.Base(rel))
 	}
-	for _, segment := range strings.Split(rel, "/") {
-		if matchPath(pattern, segment) {
-			return true
+	segments := strings.Split(rel, "/")
+	for i, segment := range segments {
+		if !matchPath(pattern, segment) {
+			continue
 		}
+		// dirOnly 规则命中最终段且该条目为普通文件时不命中;非最终段
+		// 命中意味着 rel 位于同名目录之内,属包含语义,始终命中。
+		if rule.dirOnly && !isDir && i == len(segments)-1 {
+			continue
+		}
+		return true
 	}
 	return false
 }
@@ -1412,22 +1450,33 @@ func hasPathPrefix(rel string, prefix string) bool {
 	return rel == prefix || strings.HasPrefix(rel, prefix+"/")
 }
 
+// looksBinary 全量探测 NUL(诊断 L4):内容此刻已整读入内存(上限
+// maxFileBytes),全量扫描无额外 IO 成本;NUL 是合法 UTF-8(U+0000),
+// 只查前 8000 字节会让 NUL 靠后的伪文本绕过 utf8.Valid 进入索引。
 func looksBinary(data []byte) bool {
-	limit := len(data)
-	if limit > 8000 {
-		limit = 8000
-	}
-	for i := 0; i < limit; i++ {
-		if data[i] == 0 {
-			return true
-		}
-	}
-	return false
+	return bytes.IndexByte(data, 0) >= 0
 }
 
+// blobName 是文件身份哈希。摘要输入采用显式无歧义编码(诊断 L1):
+//
+//	sha256( decimal(len(rel)) "\x00" rel "\x00" content )
+//
+// 十进制长度前缀 + NUL 分隔使 (rel, content) → 输入字节串为单射:
+// 长度段只含数字、以首个 NUL 终止,rel 按长度精确取回,余下为
+// content——裸拼接 sha256(rel+content) 下 ("a","bc") 与 ("ab","c")
+// 的歧义碰撞不再可构造。
+//
+// 本编码变更使全部 blobName 变化,属破坏性变更,随 chunk profile v4 /
+// A2' 模板升级的同一未发布 BREAKING 窗口落地:全部消费方(statcache、
+// legacy state.BlobNames、manifest FileEntry.ContentHash、ACE 上传)
+// 均把 blobName 当不透明等值比较,无格式假设;升级后首次 sync 表现为
+// 一次性全量变更(重上传/重建),chunk 级向量按 embedKey 复用不受影响。
 func blobName(rel string, content []byte) string {
 	h := sha256.New()
-	h.Write([]byte(rel))
+	io.WriteString(h, strconv.Itoa(len(rel)))
+	h.Write([]byte{0})
+	io.WriteString(h, rel)
+	h.Write([]byte{0})
 	h.Write(content)
 	return hex.EncodeToString(h.Sum(nil))
 }
