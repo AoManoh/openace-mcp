@@ -15,10 +15,11 @@ func TestFallbackLineNumbersMatchContent(t *testing.T) {
 	}
 	profile := DefaultProfile()
 	content := b.String()
-	// rust 不在 v3 Tree-sitter 批次内，仍走行窗口 fallback。
-	chunks, capability := profile.Split(File{RelPath: "src/app.rs", Content: content})
+	// kotlin 不在 Tree-sitter 批次内（批次 2 后 rust/java 已走 AST），
+	// 仍走行窗口 fallback。
+	chunks, capability := profile.Split(File{RelPath: "src/app.kt", Content: content})
 	if capability != CapabilityFallback {
-		t.Fatalf("rust 文件应走行窗口，got %s", capability)
+		t.Fatalf("kotlin 文件应走行窗口，got %s", capability)
 	}
 	lines := strings.Split(content, "\n")
 	for _, chunk := range chunks {
@@ -27,7 +28,7 @@ func TestFallbackLineNumbersMatchContent(t *testing.T) {
 		if wantFirst != gotFirst {
 			t.Fatalf("chunk [%d-%d] 首行不匹配: want %q got %q", chunk.StartLine, chunk.EndLine, wantFirst, gotFirst)
 		}
-		if chunk.Language != "rust" {
+		if chunk.Language != "kotlin" {
 			t.Fatalf("语言识别错误: %s", chunk.Language)
 		}
 	}

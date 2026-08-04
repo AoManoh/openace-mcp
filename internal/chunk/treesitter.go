@@ -8,11 +8,12 @@ import (
 	"github.com/odvcencio/gotreesitter/grammars"
 )
 
-// 本文件实现 profile v3 的 Tree-sitter AST 切分批次（决策 25 / D10）：
-// Python、TypeScript/TSX、JavaScript 按顶层声明切分，语义对齐 splitGo
-// （doc 注释附着、小声明相邻合并、超预算细分、函数符号独立 chunk）。
-// Go 保留标准库 go/ast 切分器；任何解析失败都回退行窗口并如实上报
-// capability=fallback（§9.2 门禁 3/4 的失败语义）。
+// 本文件实现 Tree-sitter AST 切分（决策 25 / D10）：批次 1（profile v3，
+// Python、TypeScript/TSX、JavaScript）与批次 2（profile v5，Java、Rust，
+// 语言级细则见 treesitter_java.go / treesitter_rust.go）按顶层声明切分，
+// 语义对齐 splitGo（doc 注释附着、小声明相邻合并、超预算细分、函数符号
+// 独立 chunk）。Go 保留标准库 go/ast 切分器；任何解析失败都回退行窗口
+// 并如实上报 capability=fallback（§9.2 门禁 3/4 的失败语义）。
 
 // parseTimeoutMicros 是单文件解析超时（暗坑 K60）。workspace 内容门禁
 // 上限 1MiB，实测 500KB 合成源解析约 200ms，2s 覆盖病理输入后仍有界；
@@ -28,9 +29,11 @@ func DrainParserPools() {
 	gotreesitter.DrainArenaPools()
 }
 
-// treesitterGrammar 返回语言在首批批次内对应的 grammar 名；不在批次
+// treesitterGrammar 返回语言在已启用批次内对应的 grammar 名；不在批次
 // 内返回空串。.tsx 是 TypeScript 的语法超集（JSX），上游以独立 grammar
-// 发布，须按扩展名细分；.jsx 由 javascript grammar 原生覆盖。
+// 发布，须按扩展名细分；.jsx 由 javascript grammar 原生覆盖。批次 2
+// 加入 java/rust（grammar 均为 tree-sitter 官方仓，languages.lock pin：
+// java@e10607b45ff7、rust@77a3747266f4）。
 func treesitterGrammar(language string, relPath string) string {
 	switch language {
 	case "python":
@@ -42,6 +45,10 @@ func treesitterGrammar(language string, relPath string) string {
 		return "typescript"
 	case "javascript":
 		return "javascript"
+	case "java":
+		return "java"
+	case "rust":
+		return "rust"
 	}
 	return ""
 }
@@ -93,9 +100,21 @@ func (p Profile) splitTreeSitter(file File, language string, grammarName string)
 	}
 	parser := gotreesitter.NewParser(lang)
 	parser.SetTimeoutMicros(parseTimeoutMicros)
+	// parseBytes 默认即原文；rust 走两段等长规范化：frontmatter 掩码
+	// （cargo-script RFC 3503，pinned grammar 不识别）与 primitive! 宏名
+	// 改写（rustNormalizeMacroBangs）。变换严格保长，树的行/字节几何与
+	// 原文一一对应；span 取行区间、内容与符号一律切原文，规范化字节不
+	// 进入任何产物。被掩码的 frontmatter 行区间以匿名序言 span 补入，
+	// 保证行覆盖无缝隙（门 2）。
+	parseBytes := []byte(content)
+	frontmatterEnd := 0
+	if grammarName == "rust" {
+		parseBytes, frontmatterEnd = rustMaskFrontmatter(parseBytes)
+		parseBytes = rustNormalizeMacroBangs(parseBytes)
+	}
 	// ParseStrict 把超时/预算等提前停止当作错误返回，避免拿到静默的
 	// 部分树（Parse 在超时时返回 tree + nil error）。
-	tree, err := parser.ParseStrict([]byte(content))
+	tree, err := parser.ParseStrict(parseBytes)
 	// 成功与全部早退路径统一释放（M4）：ParseStrict 超时/预算中止时仍
 	// 可能返回非 nil 部分树（err!=nil），弃置即放弃 arena 池化。Release
 	// 对 nil 与重复调用安全；chunk 产物只持有 content 的字符串切片，
@@ -116,7 +135,12 @@ func (p Profile) splitTreeSitter(file File, language string, grammarName string)
 		}
 	}
 	lines := strings.Split(content, "\n")
-	spans := p.collectTopLevelSpans(root, lang, content, len(lines))
+	spans := p.collectTopLevelSpans(root, lang, content, len(lines), grammarName)
+	// frontmatter 掩码区对 parser 是空白、不产节点，此处以匿名 span 补
+	// 回（与 use 序言同为可合并声明前导；重叠由 coalesceOverlaps 归并）。
+	if frontmatterEnd > 0 && frontmatterEnd <= len(lines) {
+		spans = append([]declSpan{{start: 1, end: frontmatterEnd}}, spans...)
+	}
 	if len(spans) == 0 {
 		return nil, false
 	}
@@ -165,9 +189,18 @@ const (
 )
 
 // collectTopLevelSpans 游走根节点的顶层命名子节点，产出待合并 span 序列。
-func (p Profile) collectTopLevelSpans(root *gotreesitter.Node, lang *gotreesitter.Language, src string, maxLine int) []declSpan {
+// 节点分类按 grammar 分派：批次 1（python/ts/tsx/js）共享 topLevelSpans，
+// 批次 2 的 java/rust 节点类型集不同，各自持有分类器。
+func (p Profile) collectTopLevelSpans(root *gotreesitter.Node, lang *gotreesitter.Language, src string, maxLine int, grammarName string) []declSpan {
+	classify := p.topLevelSpans
+	switch grammarName {
+	case "java":
+		classify = p.javaTopLevelSpans
+	case "rust":
+		classify = p.rustTopLevelSpans
+	}
 	return p.walkSiblings(root, lang, src, maxLine, func(node *gotreesitter.Node, start, end int) ([]declSpan, tsNodeKind) {
-		return p.topLevelSpans(node, lang, src, start, end, maxLine)
+		return classify(node, lang, src, start, end, maxLine)
 	})
 }
 
@@ -299,25 +332,30 @@ func (p Profile) classSpans(outer *gotreesitter.Node, class *gotreesitter.Node, 
 	members := p.walkSiblings(body, lang, src, maxLine, func(node *gotreesitter.Node, mStart, mEnd int) ([]declSpan, tsNodeKind) {
 		return classMemberSpans(node, lang, src, className, mStart, mEnd)
 	})
+	return assembleContainer(whole, start, end, members)
+}
+
+// assembleContainer 把容器声明（类/impl/trait/mod）组装为 header + 成员
+// span 序列：header 从容器起点（含包装/附着注释由调用方走 walkSiblings
+// 补齐）到首个成员前一行，前置匿名成员（docstring、字段、关联常量）并
+// 入 header——它们是容器声明的解释性上下文，独立成块无检索价值；尾行
+// （右括号等）并入最后一个成员，避免孤立缝隙 span。成员为空或成员前无
+// 独立 header 行（同行内联 body）时退化为整容器单 span。
+func assembleContainer(whole declSpan, start int, end int, members []declSpan) []declSpan {
 	if len(members) == 0 {
 		return []declSpan{whole}
 	}
-	// header 从类声明起点（含包装）到首个成员前一行；成员前无独立行
-	// （如同行内联 body）时退化为整类单 span。
 	headerEnd := members[0].start - 1
 	if headerEnd < start {
 		return []declSpan{whole}
 	}
-	header := classStandalone(declSpan{start: start, end: headerEnd, symbol: className})
-	// 前置的匿名成员（docstring、类级字段）并入 header：它们是类声明
-	// 的解释性上下文，独立成块无检索价值。
+	header := classStandalone(declSpan{start: start, end: headerEnd, symbol: whole.symbol})
 	idx := 0
 	for idx < len(members) && members[idx].symbol == "" && !members[idx].isFunc {
 		header.end = members[idx].end
 		idx++
 	}
 	spans := append([]declSpan{header}, members[idx:]...)
-	// 尾行（右括号等）并入最后一个成员，避免产生孤立缝隙 span。
 	if last := &spans[len(spans)-1]; last.end < end {
 		last.end = end
 	}

@@ -49,6 +49,7 @@ func TestGoldenRepoCorpus(t *testing.T) {
 		language, batch := map[string]string{
 			".py": "python", ".ts": "typescript", ".tsx": "typescript",
 			".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+			".java": "java", ".rs": "rust",
 		}[ext], true
 		if language == "" {
 			batch = false
@@ -93,7 +94,7 @@ func TestGoldenRepoCorpus(t *testing.T) {
 		}
 		if capability != CapabilityAST {
 			st.fallbackFiles++
-			if len(st.fallbackList) < 40 {
+			if len(st.fallbackList) < 80 {
 				st.fallbackList = append(st.fallbackList, rel)
 			}
 			return nil
@@ -119,7 +120,15 @@ func TestGoldenRepoCorpus(t *testing.T) {
 				continue
 			}
 			if want := strings.Join(lines[c.StartLine-1:c.EndLine], "\n"); want != c.Content {
-				t.Errorf("%s:%d-%d 内容与源码行不符", rel, c.StartLine, c.EndLine)
+				// M2 语义：(MaxChunkBytes, maxLineBytes] 的单行声明按字节
+				// 窗口细分，chunk 内容是该物理行的切片（splitBytesWithin），
+				// 行区间恒为该行——此为预算硬上限的既定行为，非取文错位。
+				subLineSlice := c.StartLine == c.EndLine &&
+					len(c.Content) <= profile.MaxChunkBytes &&
+					strings.Contains(lines[c.StartLine-1], c.Content)
+				if !subLineSlice {
+					t.Errorf("%s:%d-%d 内容与源码行不符", rel, c.StartLine, c.EndLine)
+				}
 			}
 		}
 		return nil
