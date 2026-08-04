@@ -197,6 +197,10 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 			Index     int       `json:"index"`
 		} `json:"data"`
 	}
+	// 成功路径读尽剩余字节让连接归还池(L7,诊断 2026-08-03):json.Decoder
+	// 停在 JSON 值末尾,不读尽 body 时 HTTP/1.1 连接无法复用,每批重建
+	// TCP+TLS,与 F3 连接池设计意图相悖(纯性能非泄漏)。
+	defer func() { _, _ = io.Copy(io.Discard, resp.Body) }()
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&decoded); err != nil {
 		// 响应体读取期间的取消/超时不是 malformed（F3）：误判为 permanent
 		// 会计入 circuit 并在大批量构建中把语义路整场熄火。

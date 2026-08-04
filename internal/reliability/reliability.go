@@ -1,8 +1,8 @@
 package reliability
 
 import (
-	"errors"
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Class 是 provider 调用失败的类别（决策 11 可行动错误的分类基础，暗坑 K33）。
@@ -55,11 +56,17 @@ func (e *CallError) Retryable() bool {
 }
 
 // SanitizeMessage 把任意文本收敛为单行、长度封顶的错误消息。
+// 截断回退到 rune 边界(L10,诊断 2026-08-03):按字节硬切会把多字节
+// UTF-8 字符切成非法序列。
 func SanitizeMessage(text string) string {
 	text = strings.Join(strings.Fields(text), " ")
 	const maxLen = 512
 	if len(text) > maxLen {
-		text = text[:maxLen] + "…"
+		cut := maxLen
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		text = text[:cut] + "…"
 	}
 	return text
 }

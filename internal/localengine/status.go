@@ -12,6 +12,7 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/index"
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
+	"github.com/AoManoh/openace-mcp/internal/reliability"
 )
 
 // wsStatus 跟踪单个工作区的构建与索引状态。
@@ -148,17 +149,13 @@ func (e *Engine) noteSkippedRevisions(workspaceKey string, skipped []string) {
 	status.mu.Unlock()
 }
 
-// sanitizeError 收敛错误文本：去除多行与首尾空白，长度封顶。
+// sanitizeError 收敛错误文本：去除多行与首尾空白，长度封顶(复用
+// reliability 口径,L10 修复后截断安全落 rune 边界)。
 func sanitizeError(err error) string {
 	if err == nil {
 		return ""
 	}
-	text := strings.Join(strings.Fields(err.Error()), " ")
-	const maxLen = 512
-	if len(text) > maxLen {
-		text = text[:maxLen] + "…"
-	}
-	return text
+	return reliability.SanitizeMessage(err.Error())
 }
 
 // snapshot 生成对外状态。

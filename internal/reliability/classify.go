@@ -2,6 +2,8 @@ package reliability
 
 import (
 	"context"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,10 +24,28 @@ func ClassifyTransportError(callerCtx context.Context, attemptCtx context.Contex
 		}
 	}
 	message := SanitizeMessage(err.Error())
+	// 证书验证类错误重试无意义(L8,诊断 2026-08-03):判 permanent 让
+	// 调用方立刻拿到可行动错误,而非 5 次重试+退避后才浮现。类型匹配
+	// 优先,substring 兜底(经 url.Error 包装且类型信息丢失的场景)。
+	if isCertificateError(err) || strings.Contains(message, "x509:") {
+		return &CallError{Class: ClassPermanent, Message: message + " (certificate verification failed: check the endpoint TLS certificate or local trust store)"}
+	}
 	if strings.Contains(message, "connection refused") || strings.Contains(message, "no such host") {
 		message += " (endpoint unreachable: is the server running and the base URL correct?)"
 	}
 	return &CallError{Class: ClassTransient, Message: message}
+}
+
+// isCertificateError 识别 x509 验证失败家族(errors.As 穿透包装)。
+func isCertificateError(err error) bool {
+	var (
+		unknownAuthority x509.UnknownAuthorityError
+		certInvalid      x509.CertificateInvalidError
+		hostname         x509.HostnameError
+		systemRoots      x509.SystemRootsError
+	)
+	return errors.As(err, &unknownAuthority) || errors.As(err, &certInvalid) ||
+		errors.As(err, &hostname) || errors.As(err, &systemRoots)
 }
 
 // ClassifyHTTPResponse 把非 200 响应分类为可行动错误（暗坑 K33）；
