@@ -39,11 +39,11 @@ func TestOpenaceignoreShadowsAugmentignore(t *testing.T) {
 		".gitignore": "/docs/\n/skills/\n",
 		// alias 想放行 skills;canonical 只放行 docs——若 alias 生效,
 		// skills/SKILL.md 会出现在扫描集,即违反 B 语义。
-		".augmentignore": "!skills/\n!skills/**\n",
-		".openaceignore": "!docs/\n!docs/**\n",
-		"docs/note.md":   "knowledge\n",
+		".augmentignore":  "!skills/\n!skills/**\n",
+		".openaceignore":  "!docs/\n!docs/**\n",
+		"docs/note.md":    "knowledge\n",
 		"skills/SKILL.md": "skill\n",
-		"main.go":        "package main\n",
+		"main.go":         "package main\n",
 	} {
 		writeWorkspaceTestFile(t, root, rel, content)
 	}
