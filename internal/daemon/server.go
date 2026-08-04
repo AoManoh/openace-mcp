@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AoManoh/openace-mcp/internal/ace"
 	"github.com/AoManoh/openace-mcp/internal/engine"
 )
 
@@ -596,34 +595,9 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-// writeUpstreamError maps an error returned by an upstream ACE call to an HTTP
-// response. Upstream HTTP 429 (rate limit or exhausted credit budget) is surfaced as
-// 429 with a Retry-After header and an actionable message, instead of being masked as
-// a generic 502. All other upstream failures keep the 502 Bad Gateway mapping.
+// writeUpstreamError 把引擎错误映射为 502(Stage 7 简化:legacy 上游
+// 429 直通逻辑随 ACE 引擎删除;local-hybrid 的 provider 失败在引擎层
+// 已分类为可行动文本,按引擎错误原样透出)。
 func writeUpstreamError(w http.ResponseWriter, err error) {
-	if retryAfter, ok := ace.RateLimitInfo(err); ok {
-		if retryAfter > 0 {
-			seconds := int((retryAfter + time.Second - 1) / time.Second)
-			if seconds < 1 {
-				seconds = 1
-			}
-			w.Header().Set("Retry-After", strconv.Itoa(seconds))
-		}
-		writeError(w, http.StatusTooManyRequests, rateLimitMessage(err))
-		return
-	}
 	writeError(w, http.StatusBadGateway, err.Error())
-}
-
-// rateLimitMessage explains an upstream HTTP 429 in actionable terms without leaking
-// credentials (the underlying error text is already redacted upstream). Empirically the
-// upstream returns 429 on the Context Engine retrieval endpoint for several distinct
-// reasons (short rate limit, exhausted credit budget, or a plan/tier that does not
-// permit codebase retrieval at all), so the message stays deliberately broad.
-func rateLimitMessage(err error) string {
-	return "upstream returned HTTP 429 on Context Engine retrieval (rate limit, exhausted credit budget, " +
-		"or a plan/tier that does not currently permit codebase retrieval). Workspace sync/indexing can still " +
-		"succeed while retrieval stays blocked, so this is often not transient: retrying or switching to another " +
-		"same-tier account may not help. Check your plan and remaining credits at app.augmentcode.com. " +
-		"Underlying error: " + err.Error()
 }

@@ -6,13 +6,13 @@ import (
 	"testing"
 
 	"github.com/AoManoh/openace-mcp/internal/localengine"
-	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
-// clearAugmentEnv 清空全部上游凭据，验证 local-hybrid 的无凭据可用性。
+// clearAugmentEnv 清空历史上游凭据变量,验证零凭据可用性(Stage 7 后
+// 这些变量已无消费方,清空仅保证宿主 shell 残留不影响断言)。
 func clearAugmentEnv(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AUGMENT_SESSION_AUTH", "AUGMENT_TOKEN", "AUGMENT_TENANT", "OPENACE_SESSION_FILE", "OPENACE_PROFILES_FILE"} {
+	for _, key := range []string{"AUGMENT_SESSION_AUTH", "AUGMENT_TOKEN", "AUGMENT_TENANT"} {
 		t.Setenv(key, "")
 	}
 }
@@ -63,34 +63,29 @@ func TestLocalHybridInvalidProviderEnvRejected(t *testing.T) {
 	}
 }
 
-// TestDefaultEngineIsLocalHybrid 是 Stage 6 切默认验收：未设
-// OPENACE_ENGINE 时走 local-hybrid(§18 全过后 2026-08-02 批准);
-// 显式 OPENACE_ENGINE=ace 保持 legacy 可用(单变量回退)。
+// TestDefaultEngineIsLocalHybrid:未设 OPENACE_ENGINE 走 local-hybrid
+// (Stage 6,2026-08-02 批准)。
 func TestDefaultEngineIsLocalHybrid(t *testing.T) {
 	clearAugmentEnv(t)
+	clearProviderEnv(t)
 	t.Setenv("OPENACE_ENGINE", "")
 	service, err := buildLocalService(context.Background())
 	if err != nil {
 		t.Fatalf("默认路径构建失败: %v", err)
 	}
-	if _, ok := service.(*workspace.Syncer); ok {
-		t.Fatalf("默认不应再是 legacy Syncer，got %T", service)
+	if _, ok := service.(*localengine.Engine); !ok {
+		t.Fatalf("默认应为 localengine.Engine,got %T", service)
 	}
 }
 
-// TestExplicitACEStillAvailable 单变量回退:OPENACE_ENGINE=ace 仍走
-// legacy(Stage 7 删除前不移除)。
-func TestExplicitACEStillAvailable(t *testing.T) {
+// TestExplicitACERemoved:Stage 7(2026-08-04 用户裁决)后 OPENACE_ENGINE=ace
+// 显式报可行动错误,不静默回退。
+func TestExplicitACERemoved(t *testing.T) {
 	clearAugmentEnv(t)
 	t.Setenv("OPENACE_ENGINE", "ace")
-	t.Setenv("AUGMENT_TOKEN", "test-token")
-	t.Setenv("AUGMENT_TENANT", "https://example.test/")
-	service, err := buildLocalService(context.Background())
-	if err != nil {
-		t.Fatalf("legacy 路径构建失败: %v", err)
-	}
-	if _, ok := service.(*workspace.Syncer); !ok {
-		t.Fatalf("显式 ace 应返回 workspace.Syncer，got %T", service)
+	_, err := buildLocalService(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "Stage 7") {
+		t.Fatalf("ace 选项应显式报 Stage 7 移除: %v", err)
 	}
 }
 

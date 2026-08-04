@@ -108,10 +108,11 @@ func reusable(ctx context.Context, client *daemon.Client, requestedEngine string
 }
 
 // compatibleEngine 校验请求引擎与 daemon 运行引擎一致（暗坑 K8）：
-// 旧 daemon 不广播 engine 字段时按 legacy ACE 处理。
+// Stage 7 后不广播 engine 字段的 daemon 必为退役前旧构建,按不兼容
+// 处理(显式要求重启,不静默复用)。
 func compatibleEngine(requested string, daemonEngine string) error {
 	if daemonEngine == "" {
-		daemonEngine = engine.EngineACE
+		return fmt.Errorf("daemon does not advertise an engine (pre-Stage 7 build); restart the daemon with this binary")
 	}
 	if requested != daemonEngine {
 		return fmt.Errorf("wrapper engine %q != daemon engine %q; stop the daemon or align OPENACE_ENGINE", requested, daemonEngine)

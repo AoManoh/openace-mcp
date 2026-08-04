@@ -1,7 +1,7 @@
 // Package engine 定义 openACE 检索引擎的通用 contract：接口、请求与结果类型。
 //
-// 依赖方向恒定为 cmd/mcp/daemon -> engine <- 具体实现（迁移期 workspace/ace，
-// 后续 localengine）；本包不得导入 workspace、ace、mcp、daemon。
+// 依赖方向恒定为 cmd/mcp/daemon -> engine <- 具体实现（local-hybrid）；
+// 本包不得导入 workspace、mcp、daemon。
 //
 // Stage 1 决定：迁移方案 §7.2 伪代码中的 SyncResult/SearchResult 统一为共享
 // Result 载体——当前 legacy ACE 行为下二者本就共享同一结构（daemon 任务快照
@@ -17,22 +17,20 @@ import (
 
 // 引擎标识常量；OPENACE_ENGINE 环境变量取值。
 const (
-	EngineACE         = "ace"
 	EngineLocalHybrid = "local-hybrid"
 )
 
-// NormalizeEngineID 规范化引擎选择：空值默认 local-hybrid（Stage 6 切
-// 默认，2026-08-02 批准；门票=§18 判定报告七条全过）；显式 "ace" 保持
-// legacy 可用（单变量回退，Stage 7 删除前不移除）；其余非法值显式
-// 报错（不静默回退）。
+// NormalizeEngineID 规范化引擎选择：空值默认 local-hybrid(Stage 6,
+// 2026-08-02 批准);legacy "ace" 已于 Stage 7(2026-08-04 用户裁决)删除,
+// 显式给出可行动错误;其余非法值显式报错(不静默回退)。
 func NormalizeEngineID(value string) (string, error) {
 	switch strings.TrimSpace(strings.ToLower(value)) {
 	case "", EngineLocalHybrid:
 		return EngineLocalHybrid, nil
-	case EngineACE:
-		return EngineACE, nil
+	case "ace":
+		return "", fmt.Errorf("OPENACE_ENGINE=ace 已在 Stage 7 移除(legacy 上游引擎退役);删除该 env 或设为 %q", EngineLocalHybrid)
 	default:
-		return "", fmt.Errorf("invalid OPENACE_ENGINE %q; use %q or %q", value, EngineACE, EngineLocalHybrid)
+		return "", fmt.Errorf("invalid OPENACE_ENGINE %q; use %q", value, EngineLocalHybrid)
 	}
 }
 

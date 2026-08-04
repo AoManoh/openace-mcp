@@ -19,19 +19,22 @@ type Status struct {
 
 func capabilities(engineID string) map[string]bool {
 	return map[string]bool{
-		"provider_profiles":          engineID == engine.EngineACE,
+		// provider_profiles 随 legacy 引擎在 Stage 7 移除,恒 false;
+		// 保留键位是 wire 兼容(旧 wrapper 读该键判能力)。
+		"provider_profiles":          false,
 		"runtime_identity":           true,
 		"workspace_canonicalization": true,
 		"engine_local_hybrid":        engineID == engine.EngineLocalHybrid,
 	}
 }
 
-// engineID 返回当前 daemon 运行的引擎标识；无法自述时按 legacy ACE 处理。
+// engineID 返回当前 daemon 运行的引擎标识(Stage 7 后唯一实现是
+// local-hybrid;Identifier 自述保留作防御)。
 func (s *Server) engineID() string {
 	if identifier, ok := s.service.(engine.Identifier); ok {
 		return identifier.EngineID()
 	}
-	return engine.EngineACE
+	return engine.EngineLocalHybrid
 }
 
 func (s *Server) statusSnapshot(ctx context.Context) Status {

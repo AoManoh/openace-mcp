@@ -2,10 +2,6 @@ package workspace
 
 import (
 	"context"
-	"fmt"
-	"sort"
-
-	"github.com/AoManoh/openace-mcp/internal/ace"
 )
 
 // ContextAsset is the minimal file-backed asset shape used by the workspace pipeline.
@@ -61,52 +57,12 @@ func (assets AssetSet) fileBlobs() []fileBlob {
 	return files
 }
 
-func (assets AssetSet) blobMap() map[string]string {
-	current := make(map[string]string, len(assets))
-	for _, asset := range assets {
-		current[asset.RelPath] = asset.BlobName
-	}
-	return current
-}
 
-func (assets AssetSet) byBlobName() map[string]ContextAsset {
-	byName := make(map[string]ContextAsset, len(assets))
-	for _, asset := range assets {
-		byName[asset.BlobName] = asset
-	}
-	return byName
-}
 
-func (assets AssetSet) blobNames() []string {
-	names := make([]string, 0, len(assets))
-	for _, asset := range assets {
-		names = append(names, asset.BlobName)
-	}
-	sort.Strings(names)
-	return names
-}
 
 // ReadIndexableContent 以与 workspace 扫描一致的内容门禁读取文件：
 // 常规文件、大小上限、非二进制、合法 UTF-8。ok=false 表示文件不可索引。
 // local-hybrid 引擎复用该入口，禁止绕开 AssetPolicy 自建第二套判定。
 func ReadIndexableContent(ctx context.Context, absPath string) ([]byte, bool, error) {
 	return readIndexableContent(ctx, absPath, int64(maxFileBytes()))
-}
-
-func (asset ContextAsset) upload(ctx context.Context) (ace.BlobUpload, error) {
-	content, ok, err := readIndexableContent(ctx, asset.AbsPath, int64(maxFileBytes()))
-	if err != nil {
-		return ace.BlobUpload{}, err
-	}
-	if !ok {
-		return ace.BlobUpload{}, fmt.Errorf("file is no longer indexable during sync: %s", asset.RelPath)
-	}
-	if currentName := blobName(asset.RelPath, content); currentName != asset.BlobName {
-		return ace.BlobUpload{}, fmt.Errorf("file changed during sync: %s", asset.RelPath)
-	}
-	return ace.BlobUpload{
-		BlobName: asset.BlobName,
-		Path:     asset.RelPath,
-		Content:  string(content),
-	}, nil
 }
