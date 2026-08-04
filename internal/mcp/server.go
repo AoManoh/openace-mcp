@@ -194,262 +194,312 @@ func toolTimeout() time.Duration {
 	return defaultToolTimeout
 }
 
+// callTool 经 handler 表分发(L16,诊断 2026-08-03:257 行巨型 switch
+// 每加一个工具都在同一函数膨胀)。工具名统一把 '-' 归一为 '_' 后查表,
+// 行为与原 switch 逐字节一致。
 func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 	var params toolCallParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return fail(req.ID, -32602, err.Error())
 	}
-	switch params.Name {
-	case "codebase_retrieval", "codebase-retrieval":
-		var args retrievalArgs
-		if err := json.Unmarshal(params.Arguments, &args); err != nil {
-			return fail(req.ID, -32602, err.Error())
-		}
-		if err := normalizeRetrievalArgs(&args); err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		toolCtx, cancel := toolTimeoutContext(ctx)
-		defer cancel()
-		result, err := s.retrieve(toolCtx, args.DirectoryPath, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength)
-		if err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		text := strings.TrimSpace(result.Text)
-		if text == "" {
-			text = "No relevant code sections were found."
-		}
-		return ok(req.ID, toolResult(text+"\n\n"+result.Summary(), false))
-	case "multi_codebase_retrieval", "multi-codebase-retrieval":
-		var args multiRetrievalArgs
-		if err := json.Unmarshal(params.Arguments, &args); err != nil {
-			return fail(req.ID, -32602, err.Error())
-		}
-		args.InformationRequest = strings.TrimSpace(args.InformationRequest)
-		args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
-		if args.InformationRequest == "" {
-			return toolError(req.ID, "information_request is required")
-		}
-		if err := validateMaxOutputLength(args.MaxOutputLength); err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		paths, err := normalizeDirectoryPaths(args.DirectoryPaths)
-		if err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		toolCtx, cancel := toolTimeoutContext(ctx)
-		defer cancel()
-		results := s.retrieveMultiple(toolCtx, paths, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength)
-		status := summarizeMultiRetrievalResults(args.ProviderProfileID, results)
-		text := formatMultiRetrievalResults(results, status)
-		structured := map[string]any{"multi_status": status}
-		if err := toolCtx.Err(); err != nil {
-			return ok(req.ID, toolResultWithStructured(text, true, structured))
-		}
-		if status.FailureCount > 0 {
-			return ok(req.ID, toolResultWithStructured(text, true, structured))
-		}
-		return ok(req.ID, toolResultWithStructured(text, false, structured))
-	case "sync_workspace", "sync-workspace":
-		var args syncArgs
-		if err := json.Unmarshal(params.Arguments, &args); err != nil {
-			return fail(req.ID, -32602, err.Error())
-		}
-		args.DirectoryPath = strings.TrimSpace(args.DirectoryPath)
-		args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
-		if args.DirectoryPath == "" {
-			return toolError(req.ID, "directory_path is required")
-		}
-		toolCtx, cancel := toolTimeoutContext(ctx)
-		defer cancel()
-		result, err := s.syncWorkspace(toolCtx, args.DirectoryPath, args.ProviderProfileID)
-		if err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		return ok(req.ID, toolResult("Workspace synced.\n"+result.Summary(), false))
-	case "start_codebase_retrieval", "start-codebase-retrieval":
-		if s.tasker == nil {
-			return toolError(req.ID, "task tools require daemon mode")
-		}
-		var args retrievalArgs
-		if err := json.Unmarshal(params.Arguments, &args); err != nil {
-			return fail(req.ID, -32602, err.Error())
-		}
-		if err := normalizeRetrievalArgs(&args); err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		toolCtx, cancel := toolTimeoutContext(ctx)
-		defer cancel()
-		task, err := s.tasker.StartTask(toolCtx, daemon.TaskRequest{
-			Kind:               daemon.TaskKindRetrieve,
-			DirectoryPath:      args.DirectoryPath,
-			ProviderProfileID:  args.ProviderProfileID,
-			InformationRequest: args.InformationRequest,
-			MaxOutputLength:    args.MaxOutputLength,
-		})
-		if err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		return ok(req.ID, toolResult(jsonText(task), false))
-	case "start_multi_codebase_retrieval", "start-multi-codebase-retrieval":
-		if s.tasker == nil {
-			return toolError(req.ID, "task tools require daemon mode")
-		}
-		var args multiRetrievalArgs
-		if err := json.Unmarshal(params.Arguments, &args); err != nil {
-			return fail(req.ID, -32602, err.Error())
-		}
-		args.InformationRequest = strings.TrimSpace(args.InformationRequest)
-		args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
-		if args.InformationRequest == "" {
-			return toolError(req.ID, "information_request is required")
-		}
-		if err := validateMaxOutputLength(args.MaxOutputLength); err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		paths, err := normalizeDirectoryPaths(args.DirectoryPaths)
-		if err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		toolCtx, cancel := toolTimeoutContext(ctx)
-		defer cancel()
-		task, err := s.tasker.StartTask(toolCtx, daemon.TaskRequest{
-			Kind:               daemon.TaskKindMultiRetrieve,
-			DirectoryPaths:     paths,
-			ProviderProfileID:  args.ProviderProfileID,
-			InformationRequest: args.InformationRequest,
-			MaxOutputLength:    args.MaxOutputLength,
-		})
-		if err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		return ok(req.ID, toolResult(jsonText(task), false))
-	case "start_sync_workspace", "start-sync-workspace":
-		if s.tasker == nil {
-			return toolError(req.ID, "task tools require daemon mode")
-		}
-		var args syncArgs
-		if err := json.Unmarshal(params.Arguments, &args); err != nil {
-			return fail(req.ID, -32602, err.Error())
-		}
-		args.DirectoryPath = strings.TrimSpace(args.DirectoryPath)
-		args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
-		if args.DirectoryPath == "" {
-			return toolError(req.ID, "directory_path is required")
-		}
-		toolCtx, cancel := toolTimeoutContext(ctx)
-		defer cancel()
-		task, err := s.tasker.StartTask(toolCtx, daemon.TaskRequest{
-			Kind:              daemon.TaskKindSync,
-			DirectoryPath:     args.DirectoryPath,
-			ProviderProfileID: args.ProviderProfileID,
-		})
-		if err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		return ok(req.ID, toolResult(jsonText(task), false))
-	case "task_status", "task-status":
-		if s.tasker == nil {
-			return toolError(req.ID, "task tools require daemon mode")
-		}
-		var args taskIDArgs
-		if err := json.Unmarshal(params.Arguments, &args); err != nil {
-			return fail(req.ID, -32602, err.Error())
-		}
-		args.TaskID = strings.TrimSpace(args.TaskID)
-		if args.TaskID == "" {
-			return toolError(req.ID, "task_id is required")
-		}
-		toolCtx, cancel := toolTimeoutContext(ctx)
-		defer cancel()
-		task, err := s.tasker.TaskStatus(toolCtx, args.TaskID)
-		if err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		return ok(req.ID, toolResult(jsonText(task), false))
-	case "list_tasks", "list-tasks":
-		if s.tasker == nil {
-			return toolError(req.ID, "task tools require daemon mode")
-		}
-		var args listTasksArgs
-		if len(params.Arguments) > 0 {
-			if err := json.Unmarshal(params.Arguments, &args); err != nil {
-				return fail(req.ID, -32602, err.Error())
-			}
-		}
-		toolCtx, cancel := toolTimeoutContext(ctx)
-		defer cancel()
-		tasks, err := s.tasker.ListTasks(toolCtx, args.Limit)
-		if err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		return ok(req.ID, toolResult(jsonText(map[string]any{"tasks": tasks}), false))
-	case "cancel_task", "cancel-task":
-		if s.tasker == nil {
-			return toolError(req.ID, "task tools require daemon mode")
-		}
-		var args taskIDArgs
-		if err := json.Unmarshal(params.Arguments, &args); err != nil {
-			return fail(req.ID, -32602, err.Error())
-		}
-		args.TaskID = strings.TrimSpace(args.TaskID)
-		if args.TaskID == "" {
-			return toolError(req.ID, "task_id is required")
-		}
-		toolCtx, cancel := toolTimeoutContext(ctx)
-		defer cancel()
-		task, err := s.tasker.CancelTask(toolCtx, args.TaskID)
-		if err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		return ok(req.ID, toolResult(jsonText(task), false))
-	case "daemon_status", "daemon-status":
-		if s.statuser == nil {
-			return toolError(req.ID, "daemon_status requires daemon mode")
-		}
-		toolCtx, cancel := toolTimeoutContext(ctx)
-		defer cancel()
-		status, err := s.statuser.DaemonStatus(toolCtx)
-		if err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		return ok(req.ID, toolResult(jsonText(map[string]any{
-			"mcp_build": buildinfo.Current(),
-			"daemon":    status,
-		}), false))
-	case "list_workspaces", "list-workspaces":
-		if s.inspector == nil {
-			return toolError(req.ID, "workspace status tools require daemon mode")
-		}
-		toolCtx, cancel := toolTimeoutContext(ctx)
-		defer cancel()
-		statuses, err := s.inspector.ListWorkspaceStatuses(toolCtx)
-		if err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		return ok(req.ID, toolResult(jsonText(map[string]any{"workspaces": statuses}), false))
-	case "workspace_status", "workspace-status":
-		if s.inspector == nil {
-			return toolError(req.ID, "workspace status tools require daemon mode")
-		}
-		var args syncArgs
-		if err := json.Unmarshal(params.Arguments, &args); err != nil {
-			return fail(req.ID, -32602, err.Error())
-		}
-		args.DirectoryPath = strings.TrimSpace(args.DirectoryPath)
-		args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
-		if args.DirectoryPath == "" {
-			return toolError(req.ID, "directory_path is required")
-		}
-		toolCtx, cancel := toolTimeoutContext(ctx)
-		defer cancel()
-		status, err := s.workspaceStatus(toolCtx, args.DirectoryPath, args.ProviderProfileID)
-		if err != nil {
-			return toolError(req.ID, err.Error())
-		}
-		return ok(req.ID, toolResult(jsonText(status), false))
-	default:
+	name := strings.ReplaceAll(params.Name, "-", "_")
+	handler, ok := s.toolHandlers()[name]
+	if !ok {
 		return toolError(req.ID, "unknown tool: "+params.Name)
 	}
+	return handler(ctx, req.ID, params.Arguments)
+}
+
+type toolHandler func(ctx context.Context, id *json.RawMessage, args json.RawMessage) rpcResponse
+
+// toolHandlers 返回工具名 → handler 映射(可用性守卫在各 handler 内,
+// 与 tools/list 的能力暴露一致)。
+func (s *Server) toolHandlers() map[string]toolHandler {
+	return map[string]toolHandler{
+		"codebase_retrieval":             s.handleRetrieval,
+		"multi_codebase_retrieval":       s.handleMultiRetrieval,
+		"sync_workspace":                 s.handleSyncWorkspace,
+		"start_codebase_retrieval":       s.handleStartRetrieval,
+		"start_multi_codebase_retrieval": s.handleStartMultiRetrieval,
+		"start_sync_workspace":           s.handleStartSync,
+		"task_status":                    s.handleTaskStatus,
+		"list_tasks":                     s.handleListTasks,
+		"cancel_task":                    s.handleCancelTask,
+		"daemon_status":                  s.handleDaemonStatus,
+		"list_workspaces":                s.handleListWorkspaces,
+		"workspace_status":               s.handleWorkspaceStatus,
+	}
+}
+
+func (s *Server) handleRetrieval(ctx context.Context, id *json.RawMessage, rawArgs json.RawMessage) rpcResponse {
+	var args retrievalArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return fail(id, -32602, err.Error())
+	}
+	if err := normalizeRetrievalArgs(&args); err != nil {
+		return toolError(id, err.Error())
+	}
+	toolCtx, cancel := toolTimeoutContext(ctx)
+	defer cancel()
+	result, err := s.retrieve(toolCtx, args.DirectoryPath, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength)
+	if err != nil {
+		return toolError(id, err.Error())
+	}
+	text := strings.TrimSpace(result.Text)
+	if text == "" {
+		text = "No relevant code sections were found."
+	}
+	return ok(id, toolResult(text+"\n\n"+result.Summary(), false))
+}
+
+func (s *Server) handleMultiRetrieval(ctx context.Context, id *json.RawMessage, rawArgs json.RawMessage) rpcResponse {
+	var args multiRetrievalArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return fail(id, -32602, err.Error())
+	}
+	args.InformationRequest = strings.TrimSpace(args.InformationRequest)
+	args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
+	if args.InformationRequest == "" {
+		return toolError(id, "information_request is required")
+	}
+	if err := validateMaxOutputLength(args.MaxOutputLength); err != nil {
+		return toolError(id, err.Error())
+	}
+	paths, err := normalizeDirectoryPaths(args.DirectoryPaths)
+	if err != nil {
+		return toolError(id, err.Error())
+	}
+	toolCtx, cancel := toolTimeoutContext(ctx)
+	defer cancel()
+	results := s.retrieveMultiple(toolCtx, paths, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength)
+	status := summarizeMultiRetrievalResults(args.ProviderProfileID, results)
+	text := formatMultiRetrievalResults(results, status)
+	structured := map[string]any{"multi_status": status}
+	if err := toolCtx.Err(); err != nil {
+		return ok(id, toolResultWithStructured(text, true, structured))
+	}
+	if status.FailureCount > 0 {
+		return ok(id, toolResultWithStructured(text, true, structured))
+	}
+	return ok(id, toolResultWithStructured(text, false, structured))
+}
+
+func (s *Server) handleSyncWorkspace(ctx context.Context, id *json.RawMessage, rawArgs json.RawMessage) rpcResponse {
+	var args syncArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return fail(id, -32602, err.Error())
+	}
+	args.DirectoryPath = strings.TrimSpace(args.DirectoryPath)
+	args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
+	if args.DirectoryPath == "" {
+		return toolError(id, "directory_path is required")
+	}
+	toolCtx, cancel := toolTimeoutContext(ctx)
+	defer cancel()
+	result, err := s.syncWorkspace(toolCtx, args.DirectoryPath, args.ProviderProfileID)
+	if err != nil {
+		return toolError(id, err.Error())
+	}
+	return ok(id, toolResult("Workspace synced.\n"+result.Summary(), false))
+}
+
+func (s *Server) handleStartRetrieval(ctx context.Context, id *json.RawMessage, rawArgs json.RawMessage) rpcResponse {
+	if s.tasker == nil {
+		return toolError(id, "task tools require daemon mode")
+	}
+	var args retrievalArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return fail(id, -32602, err.Error())
+	}
+	if err := normalizeRetrievalArgs(&args); err != nil {
+		return toolError(id, err.Error())
+	}
+	toolCtx, cancel := toolTimeoutContext(ctx)
+	defer cancel()
+	task, err := s.tasker.StartTask(toolCtx, daemon.TaskRequest{
+		Kind:               daemon.TaskKindRetrieve,
+		DirectoryPath:      args.DirectoryPath,
+		ProviderProfileID:  args.ProviderProfileID,
+		InformationRequest: args.InformationRequest,
+		MaxOutputLength:    args.MaxOutputLength,
+	})
+	if err != nil {
+		return toolError(id, err.Error())
+	}
+	return ok(id, toolResult(jsonText(task), false))
+}
+
+func (s *Server) handleStartMultiRetrieval(ctx context.Context, id *json.RawMessage, rawArgs json.RawMessage) rpcResponse {
+	if s.tasker == nil {
+		return toolError(id, "task tools require daemon mode")
+	}
+	var args multiRetrievalArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return fail(id, -32602, err.Error())
+	}
+	args.InformationRequest = strings.TrimSpace(args.InformationRequest)
+	args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
+	if args.InformationRequest == "" {
+		return toolError(id, "information_request is required")
+	}
+	if err := validateMaxOutputLength(args.MaxOutputLength); err != nil {
+		return toolError(id, err.Error())
+	}
+	paths, err := normalizeDirectoryPaths(args.DirectoryPaths)
+	if err != nil {
+		return toolError(id, err.Error())
+	}
+	toolCtx, cancel := toolTimeoutContext(ctx)
+	defer cancel()
+	task, err := s.tasker.StartTask(toolCtx, daemon.TaskRequest{
+		Kind:               daemon.TaskKindMultiRetrieve,
+		DirectoryPaths:     paths,
+		ProviderProfileID:  args.ProviderProfileID,
+		InformationRequest: args.InformationRequest,
+		MaxOutputLength:    args.MaxOutputLength,
+	})
+	if err != nil {
+		return toolError(id, err.Error())
+	}
+	return ok(id, toolResult(jsonText(task), false))
+}
+
+func (s *Server) handleStartSync(ctx context.Context, id *json.RawMessage, rawArgs json.RawMessage) rpcResponse {
+	if s.tasker == nil {
+		return toolError(id, "task tools require daemon mode")
+	}
+	var args syncArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return fail(id, -32602, err.Error())
+	}
+	args.DirectoryPath = strings.TrimSpace(args.DirectoryPath)
+	args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
+	if args.DirectoryPath == "" {
+		return toolError(id, "directory_path is required")
+	}
+	toolCtx, cancel := toolTimeoutContext(ctx)
+	defer cancel()
+	task, err := s.tasker.StartTask(toolCtx, daemon.TaskRequest{
+		Kind:              daemon.TaskKindSync,
+		DirectoryPath:     args.DirectoryPath,
+		ProviderProfileID: args.ProviderProfileID,
+	})
+	if err != nil {
+		return toolError(id, err.Error())
+	}
+	return ok(id, toolResult(jsonText(task), false))
+}
+
+func (s *Server) handleTaskStatus(ctx context.Context, id *json.RawMessage, rawArgs json.RawMessage) rpcResponse {
+	if s.tasker == nil {
+		return toolError(id, "task tools require daemon mode")
+	}
+	var args taskIDArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return fail(id, -32602, err.Error())
+	}
+	args.TaskID = strings.TrimSpace(args.TaskID)
+	if args.TaskID == "" {
+		return toolError(id, "task_id is required")
+	}
+	toolCtx, cancel := toolTimeoutContext(ctx)
+	defer cancel()
+	task, err := s.tasker.TaskStatus(toolCtx, args.TaskID)
+	if err != nil {
+		return toolError(id, err.Error())
+	}
+	return ok(id, toolResult(jsonText(task), false))
+}
+
+func (s *Server) handleListTasks(ctx context.Context, id *json.RawMessage, rawArgs json.RawMessage) rpcResponse {
+	if s.tasker == nil {
+		return toolError(id, "task tools require daemon mode")
+	}
+	var args listTasksArgs
+	if len(rawArgs) > 0 {
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return fail(id, -32602, err.Error())
+		}
+	}
+	toolCtx, cancel := toolTimeoutContext(ctx)
+	defer cancel()
+	tasks, err := s.tasker.ListTasks(toolCtx, args.Limit)
+	if err != nil {
+		return toolError(id, err.Error())
+	}
+	return ok(id, toolResult(jsonText(map[string]any{"tasks": tasks}), false))
+}
+
+func (s *Server) handleCancelTask(ctx context.Context, id *json.RawMessage, rawArgs json.RawMessage) rpcResponse {
+	if s.tasker == nil {
+		return toolError(id, "task tools require daemon mode")
+	}
+	var args taskIDArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return fail(id, -32602, err.Error())
+	}
+	args.TaskID = strings.TrimSpace(args.TaskID)
+	if args.TaskID == "" {
+		return toolError(id, "task_id is required")
+	}
+	toolCtx, cancel := toolTimeoutContext(ctx)
+	defer cancel()
+	task, err := s.tasker.CancelTask(toolCtx, args.TaskID)
+	if err != nil {
+		return toolError(id, err.Error())
+	}
+	return ok(id, toolResult(jsonText(task), false))
+}
+
+func (s *Server) handleDaemonStatus(ctx context.Context, id *json.RawMessage, _ json.RawMessage) rpcResponse {
+	if s.statuser == nil {
+		return toolError(id, "daemon_status requires daemon mode")
+	}
+	toolCtx, cancel := toolTimeoutContext(ctx)
+	defer cancel()
+	status, err := s.statuser.DaemonStatus(toolCtx)
+	if err != nil {
+		return toolError(id, err.Error())
+	}
+	return ok(id, toolResult(jsonText(map[string]any{
+		"mcp_build": buildinfo.Current(),
+		"daemon":    status,
+	}), false))
+}
+
+func (s *Server) handleListWorkspaces(ctx context.Context, id *json.RawMessage, _ json.RawMessage) rpcResponse {
+	if s.inspector == nil {
+		return toolError(id, "workspace status tools require daemon mode")
+	}
+	toolCtx, cancel := toolTimeoutContext(ctx)
+	defer cancel()
+	statuses, err := s.inspector.ListWorkspaceStatuses(toolCtx)
+	if err != nil {
+		return toolError(id, err.Error())
+	}
+	return ok(id, toolResult(jsonText(map[string]any{"workspaces": statuses}), false))
+}
+
+func (s *Server) handleWorkspaceStatus(ctx context.Context, id *json.RawMessage, rawArgs json.RawMessage) rpcResponse {
+	if s.inspector == nil {
+		return toolError(id, "workspace status tools require daemon mode")
+	}
+	var args syncArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return fail(id, -32602, err.Error())
+	}
+	args.DirectoryPath = strings.TrimSpace(args.DirectoryPath)
+	args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
+	if args.DirectoryPath == "" {
+		return toolError(id, "directory_path is required")
+	}
+	toolCtx, cancel := toolTimeoutContext(ctx)
+	defer cancel()
+	status, err := s.workspaceStatus(toolCtx, args.DirectoryPath, args.ProviderProfileID)
+	if err != nil {
+		return toolError(id, err.Error())
+	}
+	return ok(id, toolResult(jsonText(status), false))
 }
 
 type multiRetrievalResult struct {
