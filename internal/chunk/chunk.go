@@ -70,10 +70,16 @@ type Profile struct {
 // 声明级切分（treesitter_java.go / treesitter_rust.go）——与 v3 批次 1
 // 同口径：切分行为变化依 K5 升版本，未变语言按纯内容 hash 复用向量
 // 零重嵌（K61），解析失败语言级回退保留。
+// Version 6（语言批次 3）：C、C++、C# 由行窗口升级为 Tree-sitter AST
+// 声明级切分（treesitter_c.go / treesitter_cpp.go / treesitter_csharp.go），
+// 并引入 C 族容错语义(坏顶层节点匿名兜底/预处理与 ERROR 容器展开/
+// field 映射丢失按坏标记处理/零符号整文件回退守卫,treesitter.go
+// errorTolerant)——依 K5 升版本;子树切换的向量迁移经跨子树复用工具
+// (bench -dump-vectors-from)零重付,仅真实变化 chunk 重嵌。
 func DefaultProfile() Profile {
 	return Profile{
 		ID:             "default",
-		Version:        "5",
+		Version:        "6",
 		MaxChunkBytes:  2048,
 		WindowLines:    60,
 		OverlapLines:   10,

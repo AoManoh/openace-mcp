@@ -70,7 +70,7 @@ Linux / macOS / WSL:
 
 ```bash
 GOPROXY=https://goproxy.cn,direct GOSUMDB=sum.golang.google.cn \
-go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript" \
+go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript,grammar_subset_java,grammar_subset_rust,grammar_subset_c,grammar_subset_cpp,grammar_subset_c_sharp" \
   github.com/AoManoh/openace-mcp/cmd/openace-mcp@main
 ```
 
@@ -79,7 +79,7 @@ Windows PowerShell:
 ```powershell
 $env:GOPROXY="https://goproxy.cn,direct"
 $env:GOSUMDB="sum.golang.google.cn"
-go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript" github.com/AoManoh/openace-mcp/cmd/openace-mcp@main
+go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript,grammar_subset_java,grammar_subset_rust,grammar_subset_c,grammar_subset_cpp,grammar_subset_c_sharp" github.com/AoManoh/openace-mcp/cmd/openace-mcp@main
 ```
 
 > `-tags` 控制内嵌的 Tree-sitter 语法子集（当前批次：Python/TypeScript/TSX/JavaScript，二进制约 28MB）。省略 `-tags` 也能构建出功能完全一致的二进制，但会内嵌全部 206 种语法（约 46MB）——切分行为不变，只是体积更大。
@@ -252,7 +252,7 @@ go test ./...
 go test -race ./internal/daemon ./internal/mcp ./internal/workspace
 go vet ./...
 # 发布形态构建（Tree-sitter 语法子集，体积见上文安装节说明）
-go build -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript" ./cmd/openace-mcp ./cmd/openace-daemon
+go build -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript,grammar_subset_java,grammar_subset_rust,grammar_subset_c,grammar_subset_cpp,grammar_subset_c_sharp" ./cmd/openace-mcp ./cmd/openace-daemon
 ```
 
 ## License

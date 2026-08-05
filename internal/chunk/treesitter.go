@@ -49,6 +49,12 @@ func treesitterGrammar(language string, relPath string) string {
 		return "java"
 	case "rust":
 		return "rust"
+	case "c":
+		return "c"
+	case "cpp":
+		return "cpp"
+	case "csharp":
+		return "c_sharp"
 	}
 	return ""
 }
@@ -124,18 +130,41 @@ func (p Profile) splitTreeSitter(file File, language string, grammarName string)
 		return nil, false
 	}
 	root := tree.RootNode()
-	if root == nil || root.HasError() {
+	if root == nil {
 		return nil, false
 	}
-	// 该 runtime 的错误标记不上传到根（实测顶层子节点 err=true 时根
-	// 仍为 false），逐个核查顶层子节点：任一子树带错即整文件回退。
-	for _, child := range namedChildren(root) {
-		if child.HasError() || child.IsError() || child.IsMissing() {
+	// 错误语义分派(批次 3 修订):
+	// - 严格语言(批次 1/2 与 C#):任一顶层子树带错即整文件回退——这些
+	//   grammar 对合法源解析近乎完美,带错即真语法错误,不产半坏边界;
+	// - 容错语言(C/C++):预处理宏使局部解析错误成为常态(redis 实测
+	//   sds.c 93 个顶层节点仅 2 个带错,整文件回退会把 AST 覆盖率压到
+	//   52%),带错顶层节点由分类器一律按匿名 span 兜底(内容原样保留、
+	//   不提取符号,防半坏边界),干净节点照常声明级切分;通篇皆错的
+	//   垃圾文件由"零符号产出即回退"守卫拦截(collectTopLevelSpans 后)。
+	// c_sharp 的坏因不同但同样需要容错:pinned grammar 对嵌套泛型
+	// `new List<X<T>>()` 的 `>>` 误报 ERROR(合法 C#,FluentValidation
+	// 实测 11/219 文件命中)——分类器按容器级展开隔离毒点(类名与干净
+	// 成员符号保留,坏成员匿名)。
+	errorTolerant := grammarName == "c" || grammarName == "cpp" || grammarName == "c_sharp"
+	if !errorTolerant {
+		if root.HasError() {
 			return nil, false
+		}
+		// 该 runtime 的错误标记不上传到根（实测顶层子节点 err=true 时根
+		// 仍为 false），逐个核查顶层子节点：任一子树带错即整文件回退。
+		for _, child := range namedChildren(root) {
+			if child.HasError() || child.IsError() || child.IsMissing() {
+				return nil, false
+			}
 		}
 	}
 	lines := strings.Split(content, "\n")
 	spans := p.collectTopLevelSpans(root, lang, content, len(lines), grammarName)
+	if errorTolerant && !spansHaveSymbol(spans) {
+		// 容错语言的整文件垃圾守卫:一个符号都提不出来说明解析面目全非
+		// (真语法错误/非本语言内容),回退行窗口比伪 AST 边界诚实。
+		return nil, false
+	}
 	// frontmatter 掩码区对 parser 是空白、不产节点，此处以匿名 span 补
 	// 回（与 use 序言同为可合并声明前导；重叠由 coalesceOverlaps 归并）。
 	if frontmatterEnd > 0 && frontmatterEnd <= len(lines) {
@@ -198,6 +227,12 @@ func (p Profile) collectTopLevelSpans(root *gotreesitter.Node, lang *gotreesitte
 		classify = p.javaTopLevelSpans
 	case "rust":
 		classify = p.rustTopLevelSpans
+	case "c":
+		classify = p.cTopLevelSpans
+	case "cpp":
+		classify = p.cppTopLevelSpans
+	case "c_sharp":
+		classify = p.csharpTopLevelSpans
 	}
 	return p.walkSiblings(root, lang, src, maxLine, func(node *gotreesitter.Node, start, end int) ([]declSpan, tsNodeKind) {
 		return classify(node, lang, src, start, end, maxLine)
@@ -496,4 +531,15 @@ func coalesceOverlaps(spans []declSpan) []declSpan {
 		out = append(out, next)
 	}
 	return out
+}
+
+// spansHaveSymbol 判断 span 序列是否至少提取到一个符号(容错语言的
+// 整文件垃圾守卫判据)。
+func spansHaveSymbol(spans []declSpan) bool {
+	for _, span := range spans {
+		if span.symbol != "" {
+			return true
+		}
+	}
+	return false
 }

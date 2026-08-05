@@ -50,6 +50,9 @@ func TestGoldenRepoCorpus(t *testing.T) {
 			".py": "python", ".ts": "typescript", ".tsx": "typescript",
 			".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
 			".java": "java", ".rs": "rust",
+			".c": "c", ".h": "c",
+			".cpp": "cpp", ".cc": "cpp", ".hpp": "cpp",
+			".cs": "csharp",
 		}[ext], true
 		if language == "" {
 			batch = false
