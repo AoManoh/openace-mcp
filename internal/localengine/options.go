@@ -61,9 +61,6 @@ type Options struct {
 	// FusionParams 覆盖 RRF 融合参数；nil = fusion.DefaultParams()。
 	// 同上仅评测 harness 使用；T10b 定值经呈批后冻结进 DefaultParams。
 	FusionParams *fusion.Params
-	// LocalePriorPenalty 覆盖 locale 类词法负先验系数(方案②机制 B);
-	// nil = 冻结常量 localePriorPenalty。同上仅评测 harness(T4 网格)使用。
-	LocalePriorPenalty *float64
 	// FreshnessWindow 是查询期新鲜度窗口；0 = 每查询内联扫描（现状）。
 	FreshnessWindow time.Duration
 	// QualityStrict 开启质量严格档(方案④);要求 Embedding.Enabled。

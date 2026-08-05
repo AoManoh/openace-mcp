@@ -414,7 +414,7 @@ func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, dep
 	if err != nil {
 		return RouteCandidates{}, fmt.Errorf("词法检索: %w", err)
 	}
-	lexHits = e.applyCategoryPrior(handle, filterLiveHits(handle, lexHits))
+	lexHits = filterLiveHits(handle, lexHits)
 	out := RouteCandidates{Lex: make([]CandidateRef, 0, len(lexHits))}
 	toRef := func(id string) (CandidateRef, bool) {
 		meta, ok := handle.chunks[id]
@@ -501,7 +501,7 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	// 统一过滤 choke point（暗坑 K39/K44）：两路召回都可能命中旧
 	// segment 中被 supersede/tombstone 的死 chunk，进入融合前按存活
 	// 集过滤，杜绝死内容占据候选位。
-	lexHits = e.applyCategoryPrior(handle, filterLiveHits(handle, lexHits))
+	lexHits = filterLiveHits(handle, lexHits)
 
 	var ordered []rankedHit
 	coverage := ""
@@ -611,64 +611,10 @@ func containsRerankReason(reasons []string) bool {
 	return false
 }
 
-// categoryLocale 是文件类别负先验(方案②机制 B)当前唯一收编类别:
-// locale/i18n 翻译目录。E1 实测:CJK 查询的 Han 字级匹配会让 .po 翻译
-// 目录淹没词法路 top-20(django zh 面 87%),纯词法降级用户 R@5 -70%。
-// test/vendored/generated 类别显式不做(G-test/weaksup gold 大量在测试
-// 文件,无证据支持,见方案 §2 非目标)。
-const categoryLocale = "locale"
-
-// localePriorPenalty 是 locale 类词法分惩罚系数(惩罚非过滤,仍可召回)。
-// 初值取网格 {0.2,0.35,0.5} 中值,T4 零费用扫描定值后按证据冻结。
-const localePriorPenalty = 0.35
-
-// fileCategory 按路径判类(纯函数,查询期现算,不进索引格式——旧 segment
-// 零迁移)。规则冻结:目录段 locale/locales/i18n/translations 或扩展名
-// .po/.pot/.mo。
-func fileCategory(relPath string) string {
-	lower := strings.ToLower(relPath)
-	switch {
-	case strings.HasSuffix(lower, ".po"), strings.HasSuffix(lower, ".pot"), strings.HasSuffix(lower, ".mo"):
-		return categoryLocale
-	}
-	for _, seg := range strings.Split(lower, "/") {
-		switch seg {
-		case "locale", "locales", "i18n", "translations":
-			return categoryLocale
-		}
-	}
-	return ""
-}
-
-// applyCategoryPrior 对词法命中按文件类别乘惩罚系数并重排(score desc,
-// ID asc,与段合并 tie-break 一致);dense 路不加先验(E1:dense 对
-// 翻译目录污染免疫)。
-func (e *Engine) applyCategoryPrior(handle *revisionHandle, hits []lexical.Hit) []lexical.Hit {
-	penalty := e.localePenalty
-	if penalty <= 0 || penalty >= 1 {
-		return hits
-	}
-	changed := false
-	for i := range hits {
-		meta, ok := handle.chunks[hits[i].ID]
-		if !ok {
-			continue
-		}
-		if fileCategory(meta.RelPath) == categoryLocale {
-			hits[i].Score *= penalty
-			changed = true
-		}
-	}
-	if changed {
-		sort.SliceStable(hits, func(a, b int) bool {
-			if hits[a].Score != hits[b].Score {
-				return hits[a].Score > hits[b].Score
-			}
-			return hits[a].ID < hits[b].ID
-		})
-	}
-	return hits
-}
+// 机制②-B(locale 类别负先验)已于 2026-08-05 经证据裁决移除(决策台账
+// §7 -8):门 B 复扫证明 hybrid 下惩罚在全部防护面零收益(防护由机制 A
+// latin guard 与 dense 融合承担),代价集中于 locale-gold 查询(sealed v2
+// 门 B 翻转实例;关闭后 dev 端到端 R@5 +15pp)。回归钉板:locale_gold_test.go。
 
 // filterLiveHits 过滤词法命中中的死 chunk（统一 choke point 的词法半边）。
 func filterLiveHits(handle *revisionHandle, hits []lexical.Hit) []lexical.Hit {
