@@ -39,7 +39,8 @@ func TestGenerateSymbolProbe(t *testing.T) {
 			return nil
 		}
 		switch strings.ToLower(filepath.Ext(path)) {
-		case ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go":
+		case ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go",
+			".java", ".rs", ".c", ".h", ".cpp", ".cc", ".hpp", ".cs":
 		default:
 			return nil
 		}
