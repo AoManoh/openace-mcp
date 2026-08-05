@@ -64,9 +64,6 @@ type Engine struct {
 	// fusion 是 RRF 融合参数（T10b 受测常数；默认 DefaultParams=现状
 	// 等权 k=60，评测 harness 可经 Options 覆盖做融合扫描）。
 	fusion fusion.Params
-	// localePenalty 是 locale 类词法负先验系数(方案②机制 B 受测常数;
-	// 默认冻结常量,评测 harness 可经 Options 覆盖做网格扫描)。
-	localePenalty float64
 	// qualityStrict 开启质量严格档(方案④):语义链路任一缺口显式报错。
 	qualityStrict bool
 	// queryBuildWait>0 时查询等待在建索引有上界(P1 有界化);0=无界。
@@ -131,10 +128,6 @@ func New(opts Options) (*Engine, error) {
 	e.fusion = fusion.DefaultParams()
 	if opts.FusionParams != nil {
 		e.fusion = *opts.FusionParams
-	}
-	e.localePenalty = localePriorPenalty
-	if opts.LocalePriorPenalty != nil {
-		e.localePenalty = *opts.LocalePriorPenalty
 	}
 	// 方案④:strict 是「完整语义质量」契约,无 embedding provider 时
 	// 每查询必失败——按配置错误在构造期显式拒绝,防呆。
