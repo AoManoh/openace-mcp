@@ -105,3 +105,9 @@ $RECYCLE.BIN/
 # artifacts stay private by default. Only add a precise ! exception when a
 # document must be public-read and the user explicitly approves it.
 /docs/
+
+# Local tool detritus and internal archives.
+# Browser MCP session logs and handoff tarballs bundle private docs/ content;
+# they must never ride along on a bulk `git add`.
+/.playwright-mcp/
+/openace-handoff-*.tar.gz
