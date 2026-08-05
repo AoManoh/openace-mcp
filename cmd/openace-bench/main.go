@@ -50,6 +50,10 @@ type runManifest struct {
 	LexWeights map[string]float64 `json:"lex_weights,omitempty"`
 	// FusionParams 记录本 run 生效的 RRF 融合参数（同上；nil = 默认）。
 	FusionParams map[string]float64 `json:"fusion_params,omitempty"`
+	// EmbedPlan/ImportReport 是 Batch API 两模式的产物摘要（费用预估与
+	// 回灌对账的事实源;仅对应模式写入）。
+	EmbedPlan    *localengine.EmbedPlan    `json:"embed_plan,omitempty"`
+	ImportReport *localengine.ImportReport `json:"import_report,omitempty"`
 }
 
 type resultLine struct {
@@ -95,15 +99,20 @@ func run() error {
 		// chunk 全量导出（E3）：存活集逐条记录到 chunks.jsonl，供离线
 		// 模板重组与直连 provider 重嵌（不经引擎嵌入路径）。
 		dumpChunks = flag.Bool("dump-chunks", false, "导出存活 chunk 全量记录而非评分")
+		// Batch API 驱动（2026-08-05 主线;batch verdict §2）：计划面导出
+		// 待嵌任务（custom_id=embedKey + a2p 送审文本,零 provider 调用）,
+		// 回灌面把离线批量结果写入 journal（下一次 sync 零 provider 收编）。
+		dumpEmbedJobs = flag.Bool("dump-embed-jobs", false, "导出待嵌任务清单而非评分（embed-jobs.jsonl）")
+		importVectors = flag.String("import-embeddings", "", "回灌批量嵌入结果 jsonl（{custom_id, embedding[]}）")
 		// 融合参数覆盖（T10b 定值验证）：负值 = 引擎默认（k=60 等权）。
 		fusionK      = flag.Int("fusion-k", -1, "RRF k（<0=默认）")
 		fusionLexW   = flag.Float64("fusion-lex-weight", -1, "词法路权重（<0=默认）")
 		fusionDenseW = flag.Float64("fusion-dense-weight", -1, "dense 路权重（<0=默认）")
 	)
 	flag.Parse()
-	if *dumpChunks {
+	if *dumpChunks || *dumpEmbedJobs || *importVectors != "" {
 		if *workspace == "" || *out == "" {
-			return fmt.Errorf("-dump-chunks 必填参数: -workspace -out")
+			return fmt.Errorf("-dump-chunks/-dump-embed-jobs/-import-embeddings 必填参数: -workspace -out")
 		}
 	} else if *workspace == "" || *queries == "" || *qrels == "" || *out == "" {
 		return fmt.Errorf("必填参数: -workspace -queries -qrels -out")
@@ -168,7 +177,7 @@ func run() error {
 	var evaluable []bench.Query
 	var qrelSet bench.Qrels
 	pathToDoc := map[string]string{}
-	if !*dumpChunks {
+	if !*dumpChunks && !*dumpEmbedJobs && *importVectors == "" {
 		queryList, err := bench.LoadQueries(*queries)
 		if err != nil {
 			return err
@@ -213,6 +222,14 @@ func run() error {
 	ctx := context.Background()
 	runResults := bench.Run{}
 	ref := engine.WorkspaceRef{DirectoryPath: *workspace}
+	// Batch API 两模式先于预热 sync 分派:计划面零 provider 调用是契约,
+	// 回灌面必须在(可能触发在线嵌入的)sync 之前完成。
+	if *dumpEmbedJobs {
+		return dumpEmbedJobList(ctx, eng, ref, *out, manifest)
+	}
+	if *importVectors != "" {
+		return importEmbeddingResults(ctx, eng, ref, *importVectors, *out, manifest)
+	}
 	// 预热一次 sync（首建），之后每查询的 sync 为 no-op 快路径。
 	if _, err := eng.Sync(ctx, engine.SyncRequest{Workspace: ref}); err != nil {
 		return fmt.Errorf("workspace 首建: %w", err)
@@ -654,4 +671,93 @@ func fileSHA(path string) string {
 		return "unavailable"
 	}
 	return sum
+}
+
+// embedJobLine 是 -dump-embed-jobs 的单任务记录（voyage Batch API 输入
+// 形状的上游：custom_id=embedKey，text 与在线送审逐字节一致）。
+type embedJobLine struct {
+	CustomID string `json:"custom_id"`
+	Text     string `json:"text"`
+}
+
+// dumpEmbedJobList 计划面导出：embed-jobs.jsonl + 计划摘要入 manifest
+// （零 provider 调用，PlanEmbedJobs 契约）。
+func dumpEmbedJobList(ctx context.Context, eng *localengine.Engine, ref engine.WorkspaceRef, out string, manifest runManifest) error {
+	jobsFile, err := os.Create(filepath.Join(out, "embed-jobs.jsonl"))
+	if err != nil {
+		return err
+	}
+	defer jobsFile.Close()
+	writer := bufio.NewWriter(jobsFile)
+	plan, err := eng.PlanEmbedJobs(ctx, ref, func(job localengine.EmbedJob) error {
+		line, err := json.Marshal(embedJobLine{CustomID: job.Key, Text: job.Text})
+		if err != nil {
+			return err
+		}
+		writer.Write(line)
+		writer.WriteByte('\n')
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if err := writer.Flush(); err != nil {
+		return err
+	}
+	manifest.FinishedAt = time.Now().UTC()
+	manifest.EmbedPlan = &plan
+	manifestJSON, _ := json.MarshalIndent(manifest, "", "  ")
+	if err := os.WriteFile(filepath.Join(out, "manifest.json"), manifestJSON, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("embed jobs dumped: pending=%d reusable=%d rejected=%d unique=%d (model=%s dim=%d profile=%s) → %s\n",
+		plan.Pending, plan.Reusable, plan.Rejected, plan.UniqueKeys, plan.Model, plan.Dimension, plan.StoreProfile, out)
+	return nil
+}
+
+// importResultLine 是 -import-embeddings 的输入行（voyage_batch.py fetch
+// 归一化产物;embedding 为原始向量,归一由引擎侧完成）。
+type importResultLine struct {
+	CustomID  string    `json:"custom_id"`
+	Embedding []float32 `json:"embedding"`
+}
+
+// importEmbeddingResults 回灌面：流式读结果 jsonl → 引擎 journal；报告
+// 落 manifest 与 stdout。回灌后由下一次正常 sync 零 provider 收编发布。
+func importEmbeddingResults(ctx context.Context, eng *localengine.Engine, ref engine.WorkspaceRef, path string, out string, manifest runManifest) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	lineNo := 0
+	report, err := eng.ImportEmbeddings(ctx, ref, func() (string, []float32, bool, error) {
+		for scanner.Scan() {
+			lineNo++
+			raw := scanner.Bytes()
+			if len(raw) == 0 {
+				continue
+			}
+			var line importResultLine
+			if err := json.Unmarshal(raw, &line); err != nil {
+				return "", nil, false, fmt.Errorf("%s:%d: %w", path, lineNo, err)
+			}
+			return line.CustomID, line.Embedding, true, nil
+		}
+		return "", nil, false, scanner.Err()
+	})
+	if err != nil {
+		return err
+	}
+	manifest.FinishedAt = time.Now().UTC()
+	manifest.ImportReport = &report
+	manifestJSON, _ := json.MarshalIndent(manifest, "", "  ")
+	if err := os.WriteFile(filepath.Join(out, "manifest.json"), manifestJSON, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("embeddings imported: appended=%d existing=%d bad_vector=%d wrong_dim=%d (%d 行) ← %s\n",
+		report.Appended, report.Existing, report.BadVector, report.WrongDim, lineNo, path)
+	return nil
 }
