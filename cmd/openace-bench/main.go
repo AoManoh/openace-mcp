@@ -21,9 +21,11 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/buildinfo"
 	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/fusion"
+	"github.com/AoManoh/openace-mcp/internal/index"
 	"github.com/AoManoh/openace-mcp/internal/lexical"
 	"github.com/AoManoh/openace-mcp/internal/localengine"
 	"github.com/AoManoh/openace-mcp/internal/rerank"
+	"github.com/AoManoh/openace-mcp/internal/vector"
 )
 
 func main() {
@@ -105,12 +107,23 @@ func run() error {
 		dumpEmbedJobs = flag.Bool("dump-embed-jobs", false, "导出待嵌任务清单而非评分（embed-jobs.jsonl）")
 		importVectors = flag.String("import-embeddings", "", "回灌批量嵌入结果 jsonl（{custom_id, embedding[]}）")
 		syncOnly      = flag.Bool("sync-only", false, "只执行一次 sync 并打印覆盖状态（回灌后触发零 provider 发布）")
+		// 跨子树向量复用（profile 升版零重付,2026-08-05 v5 迁移教训）：
+		// 从既有子树导出 {embedKey, vector},喂给 -import-embeddings 后
+		// 新子树 sync 只对真正变化的 chunk 付费。
+		dumpVectorsFrom = flag.String("dump-vectors-from", "", "从指定 index 子树根导出向量 jsonl（不经引擎,纯文件读取）")
 		// 融合参数覆盖（T10b 定值验证）：负值 = 引擎默认（k=60 等权）。
 		fusionK      = flag.Int("fusion-k", -1, "RRF k（<0=默认）")
 		fusionLexW   = flag.Float64("fusion-lex-weight", -1, "词法路权重（<0=默认）")
 		fusionDenseW = flag.Float64("fusion-dense-weight", -1, "dense 路权重（<0=默认）")
 	)
 	flag.Parse()
+	if *dumpVectorsFrom != "" {
+		// 纯文件模式:不构造引擎、不需要 workspace/queries。
+		if *out == "" {
+			return fmt.Errorf("-dump-vectors-from 必填参数: -out")
+		}
+		return dumpVectorsFromStore(*dumpVectorsFrom, *out)
+	}
 	if *syncOnly {
 		if *workspace == "" {
 			return fmt.Errorf("-sync-only 必填参数: -workspace")
@@ -770,5 +783,65 @@ func importEmbeddingResults(ctx context.Context, eng *localengine.Engine, ref en
 	}
 	fmt.Printf("embeddings imported: appended=%d existing=%d bad_vector=%d wrong_dim=%d (%d 行) ← %s\n",
 		report.Appended, report.Existing, report.BadVector, report.WrongDim, lineNo, path)
+	return nil
+}
+
+// dumpVectorsFromStore 跨子树向量复用的导出端：从既有 index 子树读出
+// 全部存活向量为 {custom_id: embedKey, embedding} jsonl——与
+// -import-embeddings 输入同构。纯文件读取（manifest+segments），不构造
+// 引擎、零 provider 调用。用途：chunk profile 升版时,不变 chunk 的向量
+// 零重付迁移（embedKey 与 profile 版本无关;2026-08-05 v5 迁移 ≈40M
+// 重复付费教训）。
+func dumpVectorsFromStore(root string, out string) error {
+	store, err := index.OpenExistingStore(root)
+	if err != nil {
+		return err
+	}
+	manifest, _, err := store.ResolveUsable()
+	if err != nil {
+		return fmt.Errorf("解析子树 active revision: %w", err)
+	}
+	if manifest.EmbeddingDimension <= 0 {
+		return fmt.Errorf("子树 manifest 无向量身份(EmbeddingDimension=%d),无向量可导", manifest.EmbeddingDimension)
+	}
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		return err
+	}
+	outFile, err := os.Create(filepath.Join(out, "vectors.jsonl"))
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+	writer := bufio.NewWriterSize(outFile, 4<<20)
+	seen := make(map[string]bool)
+	count := 0
+	for _, segment := range manifest.Segments {
+		if segment.VectorsChecksum == "" {
+			continue
+		}
+		ix, err := vector.Load(store.SegmentPathFor(segment.ID), manifest.EmbeddingDimension,
+			segment.VectorsChecksum, segment.VectorsIndexChecksum, 0)
+		if err != nil {
+			return fmt.Errorf("segment %s: %w", segment.ID, err)
+		}
+		for i, entry := range ix.Entries() {
+			if seen[entry.ContentHash] {
+				continue
+			}
+			seen[entry.ContentHash] = true
+			line, err := json.Marshal(importResultLine{CustomID: entry.ContentHash, Embedding: ix.Row(i)})
+			if err != nil {
+				return err
+			}
+			writer.Write(line)
+			writer.WriteByte('\n')
+			count++
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		return err
+	}
+	fmt.Printf("vectors dumped: %d 条(dim=%d, revision=%s)→ %s\n",
+		count, manifest.EmbeddingDimension, manifest.Revision, filepath.Join(out, "vectors.jsonl"))
 	return nil
 }

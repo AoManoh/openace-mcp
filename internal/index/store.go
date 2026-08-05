@@ -52,6 +52,16 @@ func NewStore(cacheDir string, namespace string, workspaceKey string, profileKey
 // Root 返回该 Store 的根目录（供状态上报）。
 func (s *Store) Root() string { return s.root }
 
+// OpenExistingStore 以既有子树根目录打开 Store(bench 跨子树向量复用工具
+// 面;不创建目录,根不存在或缺 manifests 结构即报错——防误指新建空树)。
+func OpenExistingStore(root string) (*Store, error) {
+	info, err := os.Stat(filepath.Join(root, manifestsDir))
+	if err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("目录 %s 不是 index 子树根(缺 %s/)", root, manifestsDir)
+	}
+	return &Store{root: root}, nil
+}
+
 // NewBuildID 生成一次构建的随机标识（同时用作 segment ID 与 revision 后缀）。
 func NewBuildID() string {
 	var buf [8]byte
