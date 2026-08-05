@@ -104,13 +104,18 @@ func run() error {
 		// 回灌面把离线批量结果写入 journal（下一次 sync 零 provider 收编）。
 		dumpEmbedJobs = flag.Bool("dump-embed-jobs", false, "导出待嵌任务清单而非评分（embed-jobs.jsonl）")
 		importVectors = flag.String("import-embeddings", "", "回灌批量嵌入结果 jsonl（{custom_id, embedding[]}）")
+		syncOnly      = flag.Bool("sync-only", false, "只执行一次 sync 并打印覆盖状态（回灌后触发零 provider 发布）")
 		// 融合参数覆盖（T10b 定值验证）：负值 = 引擎默认（k=60 等权）。
 		fusionK      = flag.Int("fusion-k", -1, "RRF k（<0=默认）")
 		fusionLexW   = flag.Float64("fusion-lex-weight", -1, "词法路权重（<0=默认）")
 		fusionDenseW = flag.Float64("fusion-dense-weight", -1, "dense 路权重（<0=默认）")
 	)
 	flag.Parse()
-	if *dumpChunks || *dumpEmbedJobs || *importVectors != "" {
+	if *syncOnly {
+		if *workspace == "" {
+			return fmt.Errorf("-sync-only 必填参数: -workspace")
+		}
+	} else if *dumpChunks || *dumpEmbedJobs || *importVectors != "" {
 		if *workspace == "" || *out == "" {
 			return fmt.Errorf("-dump-chunks/-dump-embed-jobs/-import-embeddings 必填参数: -workspace -out")
 		}
@@ -177,7 +182,7 @@ func run() error {
 	var evaluable []bench.Query
 	var qrelSet bench.Qrels
 	pathToDoc := map[string]string{}
-	if !*dumpChunks && !*dumpEmbedJobs && *importVectors == "" {
+	if !*dumpChunks && !*dumpEmbedJobs && *importVectors == "" && !*syncOnly {
 		queryList, err := bench.LoadQueries(*queries)
 		if err != nil {
 			return err
@@ -204,8 +209,10 @@ func run() error {
 		}
 	}
 
-	if err := os.MkdirAll(*out, 0o755); err != nil {
-		return err
+	if *out != "" {
+		if err := os.MkdirAll(*out, 0o755); err != nil {
+			return err
+		}
 	}
 	manifest := runManifest{
 		Label: *label, StartedAt: time.Now().UTC(),
@@ -244,6 +251,10 @@ func run() error {
 				sem.TotalChunks, sem.RejectedChunks, sem.JournalEntries,
 				sem.ProviderState, sem.LastError)
 		}
+	}
+	if *syncOnly {
+		fmt.Println("sync-only 完成(状态见上行)")
+		return nil
 	}
 	if *dumpChunks {
 		count, err := dumpChunkRecords(ctx, eng, ref, *out, manifest)
