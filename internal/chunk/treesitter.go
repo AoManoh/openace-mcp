@@ -55,6 +55,14 @@ func treesitterGrammar(language string, relPath string) string {
 		return "cpp"
 	case "csharp":
 		return "c_sharp"
+	// 批次 4(D5):kotlin/ruby/php(grammar 均内嵌于 gotreesitter
+	// v0.47.0,subset tags 存在;5A 报告语言清单核查收尾 2026-08-07)。
+	case "kotlin":
+		return "kotlin"
+	case "ruby":
+		return "ruby"
+	case "php":
+		return "php"
 	}
 	return ""
 }
@@ -145,7 +153,10 @@ func (p Profile) splitTreeSitter(file File, language string, grammarName string)
 	// `new List<X<T>>()` 的 `>>` 误报 ERROR(合法 C#,FluentValidation
 	// 实测 11/219 文件命中)——分类器按容器级展开隔离毒点(类名与干净
 	// 成员符号保留,坏成员匿名)。
-	errorTolerant := grammarName == "c" || grammarName == "cpp" || grammarName == "c_sharp"
+	// kotlin 同族(批次 4,okio 实测 33/313 文件):grammar 把软关键字
+	// `yield` 作参数名误报 ERROR(合法 Kotlin),坏顶层节点由分类器
+	// 匿名兜底,干净声明照常。
+	errorTolerant := grammarName == "c" || grammarName == "cpp" || grammarName == "c_sharp" || grammarName == "kotlin"
 	if !errorTolerant {
 		if root.HasError() {
 			return nil, false
@@ -233,6 +244,12 @@ func (p Profile) collectTopLevelSpans(root *gotreesitter.Node, lang *gotreesitte
 		classify = p.cppTopLevelSpans
 	case "c_sharp":
 		classify = p.csharpTopLevelSpans
+	case "kotlin":
+		classify = p.kotlinTopLevelSpans
+	case "ruby":
+		classify = p.rubyTopLevelSpans
+	case "php":
+		classify = p.phpTopLevelSpans
 	}
 	return p.walkSiblings(root, lang, src, maxLine, func(node *gotreesitter.Node, start, end int) ([]declSpan, tsNodeKind) {
 		return classify(node, lang, src, start, end, maxLine)
