@@ -74,6 +74,21 @@ type SearchRequest struct {
 	Detail string
 }
 
+// RepoMapRequest 是仓库地图请求(repo_map R1,D4):快照只读,冷仓
+// 显式 not-ready,永不隐式触发索引或 provider 调用。
+type RepoMapRequest struct {
+	Workspace    WorkspaceRef
+	MaxOutputLen int
+	// Focus 可选路径前缀,只出该子树(全仓→子树逐层导航)。
+	Focus string
+}
+
+// RepoMapper 是可选能力:按现役 revision 产出预算内仓库地图
+// (orientation 面,不进检索排序)。
+type RepoMapper interface {
+	RepoMap(context.Context, RepoMapRequest) (Result, error)
+}
+
 // Service 是检索引擎的核心行为契约：同步索引与执行检索。
 type Service interface {
 	Sync(context.Context, SyncRequest) (Result, error)

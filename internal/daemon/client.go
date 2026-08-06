@@ -162,6 +162,18 @@ func (c *Client) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	return result, err
 }
 
+// RepoMap 实现 engine.RepoMapper(经 daemon 透传;旧 daemon 无该端点
+// 时 404 原文上抛,提示升级)。
+func (c *Client) RepoMap(ctx context.Context, req engine.RepoMapRequest) (engine.Result, error) {
+	var result engine.Result
+	err := c.post(ctx, "/v1/repo-map", repoMapRequest{
+		DirectoryPath:   req.Workspace.DirectoryPath,
+		MaxOutputLength: req.MaxOutputLen,
+		Focus:           req.Focus,
+	}, &result)
+	return result, err
+}
+
 func (c *Client) ListWorkspaceStatuses(ctx context.Context) ([]engine.WorkspaceStatus, error) {
 	var result struct {
 		Workspaces []engine.WorkspaceStatus `json:"workspaces"`

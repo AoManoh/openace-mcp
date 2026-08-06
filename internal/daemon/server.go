@@ -48,6 +48,12 @@ type workspaceStatusRequest struct {
 	ProviderProfileID string `json:"provider_profile_id,omitempty"`
 }
 
+type repoMapRequest struct {
+	DirectoryPath   string `json:"directory_path"`
+	MaxOutputLength int    `json:"max_output_length,omitempty"`
+	Focus           string `json:"focus,omitempty"`
+}
+
 type retrieveRequest struct {
 	DirectoryPath      string `json:"directory_path"`
 	ProviderProfileID  string `json:"provider_profile_id,omitempty"`
@@ -180,6 +186,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/v1/daemon/status", s.daemonStatus)
 	mux.HandleFunc("/v1/sync", s.sync)
 	mux.HandleFunc("/v1/retrieve", s.retrieve)
+	mux.HandleFunc("/v1/repo-map", s.repoMap)
 	mux.HandleFunc("/v1/workspaces", s.workspaces)
 	mux.HandleFunc("/v1/workspace/status", s.workspaceStatus)
 	mux.HandleFunc("/v1/tasks", s.tasksCollection)
@@ -310,6 +317,45 @@ func (s *Server) retrieve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := s.runRetrieve(r.Context(), req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, maxOutputLength, req.Detail)
+	if err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+	s.attachResultServedBy(&result)
+	writeJSON(w, http.StatusOK, result)
+}
+
+// repoMap 是 repo_map R1 端点(D4):快照只读,冷仓显式 not-ready。
+func (s *Server) repoMap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	mapper, ok := s.service.(engine.RepoMapper)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "repo map is not supported by this engine")
+		return
+	}
+	var req repoMapRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(req.DirectoryPath) == "" {
+		writeError(w, http.StatusBadRequest, "directory_path is required")
+		return
+	}
+	maxOutputLength, err := normalizeMaxOutputLength(req.MaxOutputLength)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.observeWorkspace(req.DirectoryPath, "")
+	result, err := mapper.RepoMap(r.Context(), engine.RepoMapRequest{
+		Workspace:    engine.WorkspaceRef{DirectoryPath: req.DirectoryPath},
+		MaxOutputLen: maxOutputLength,
+		Focus:        req.Focus,
+	})
 	if err != nil {
 		writeUpstreamError(w, err)
 		return
