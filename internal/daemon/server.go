@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AoManoh/openace-mcp/internal/buildinfo"
 	"github.com/AoManoh/openace-mcp/internal/engine"
 )
 
@@ -29,6 +31,11 @@ type Server struct {
 	startedAt    time.Time
 	statusMu     sync.Mutex
 	listenAddr   string
+	// logf 是诊断日志出口(灰度反馈 2026-08-07:检索阻塞时 daemon 日志
+	// 只有启动行,无从判断请求是否到达、卡在哪、daemon 是哪个构建)。
+	// 默认带时间戳写 stderr(managed 模式经 daemonLogFile 落盘);
+	// 测试可注入。
+	logf func(format string, args ...any)
 }
 
 type syncRequest struct {
@@ -59,6 +66,7 @@ func NewServer(service engine.Service) *Server {
 		authToken: token,
 		authErr:   tokenErr,
 		startedAt: time.Now().UTC(),
+		logf:      log.New(os.Stderr, "openace-daemon: ", log.LstdFlags|log.LUTC|log.Lmsgprefix).Printf,
 	}
 	server.tasks = NewTaskStore(server.runTask, 0)
 	server.reconciler, server.reconcileErr = newWorkspaceReconciler(service)
@@ -82,6 +90,10 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		return err
 	}
 	s.setListenAddr(addr)
+	// 启动行携带构建身份与 pid:日志自身可判定 daemon 是哪个构建
+	// (灰度反馈 2026-08-07 的版本诊断卡点,此前只能另调 daemon_status)。
+	build := buildinfo.Current()
+	s.logf("serving %s build=%s(%s) pid=%d", addr, build.VCSRevision, build.Version, os.Getpid())
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -170,13 +182,13 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/v1/tasks", s.tasksCollection)
 	mux.HandleFunc("/v1/tasks/", s.taskItem)
 	if s.authToken == "" {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		return s.withRequestLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 			mux.ServeHTTP(w, r)
-		})
+		}))
 	}
 	expected := []byte("Bearer " + s.authToken)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return s.withRequestLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 常数时间比较(M5 附带):防 token 逐字节计时侧信道。
 		got := []byte(r.Header.Get("authorization"))
 		if len(got) != len(expected) || subtle.ConstantTimeCompare(got, expected) != 1 {
@@ -185,7 +197,39 @@ func (s *Server) routes() http.Handler {
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		mux.ServeHTTP(w, r)
+	}))
+}
+
+// withRequestLog 输出请求级诊断日志(灰度反馈 2026-08-07:检索阻塞时
+// daemon 日志只有启动行,无从判断请求是否到达、卡在哪)。慢端点
+// (/v1/retrieve、/v1/sync,可能等待在建索引)记 start 行——悬挂请求
+// 表现为"有 start 无完成";全部请求记完成行(方法/路径/状态/时长),
+// 401 一并可见(token 错配诊断)。/healthz、/readyz 的非错误响应不记
+// (waitReady 100ms 轮询会刷屏)。查询文本与请求体不入日志(本地隐私面)。
+func (s *Server) withRequestLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/retrieve" || r.URL.Path == "/v1/sync" {
+			s.logf("%s %s started", r.Method, r.URL.Path)
+		}
+		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(recorder, r)
+		if (r.URL.Path == "/healthz" || r.URL.Path == "/readyz") && recorder.status < 400 {
+			return
+		}
+		s.logf("%s %s -> %d (%s)", r.Method, r.URL.Path, recorder.status, time.Since(start).Round(time.Millisecond))
 	})
+}
+
+// statusRecorder 捕获响应状态码供请求日志使用。
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {

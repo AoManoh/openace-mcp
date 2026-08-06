@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -464,6 +465,103 @@ func TestServerCompletesMultiRetrieveTask(t *testing.T) {
 	}
 	if len(completed.DirectoryPaths) != 2 {
 		t.Fatalf("task should retain directory paths: %+v", completed)
+	}
+}
+
+// 灰度反馈 2026-08-07:检索阻塞时 daemon 日志只有启动行,无从判断请求
+// 是否到达、卡在哪。慢端点须记 start 行(悬挂请求由此可见),全部请求
+// 记完成行(路径/状态/时长);健康探针 2xx 不刷屏。
+func TestServerLogsRequestsForDiagnosis(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off")
+	openace := NewServer(fakeSyncer{})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = openace.Shutdown(ctx)
+	})
+	var mu sync.Mutex
+	var lines []string
+	openace.logf = func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}
+	server := httptest.NewServer(openace.routes())
+	t.Cleanup(server.Close)
+
+	post := func(dir string) {
+		payload, err := json.Marshal(retrieveRequest{DirectoryPath: dir, InformationRequest: "find code"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.Post(server.URL+"/v1/retrieve", "application/json", bytes.NewReader(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	post("/tmp/project")
+	post("/tmp/invalid-input")
+	if resp, err := http.Get(server.URL + "/healthz"); err != nil {
+		t.Fatal(err)
+	} else {
+		resp.Body.Close()
+	}
+
+	mu.Lock()
+	joined := strings.Join(lines, "\n")
+	mu.Unlock()
+	if !strings.Contains(joined, "POST /v1/retrieve started") {
+		t.Fatalf("慢端点应记 start 行: %q", joined)
+	}
+	if !strings.Contains(joined, "POST /v1/retrieve -> 200") {
+		t.Fatalf("完成行应含状态: %q", joined)
+	}
+	if !strings.Contains(joined, "POST /v1/retrieve -> 400") {
+		t.Fatalf("错误请求完成行应含 400: %q", joined)
+	}
+	if strings.Contains(joined, "/healthz") {
+		t.Fatalf("健康探针 2xx 不应刷屏: %q", joined)
+	}
+}
+
+// 启动行须携带构建身份与 pid——版本诊断此前只能靠调 daemon_status,
+// 日志本身无从判断 daemon 是哪个构建(灰度反馈 2026-08-07 的诊断卡点)。
+func TestServerLogsServingIdentityOnStart(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off")
+	openace := NewServer(fakeSyncer{})
+	var mu sync.Mutex
+	var lines []string
+	openace.logf = func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- openace.ListenAndServe(ctx, "127.0.0.1:0") }()
+	deadline := time.After(5 * time.Second)
+	for {
+		mu.Lock()
+		joined := strings.Join(lines, "\n")
+		mu.Unlock()
+		if strings.Contains(joined, "serving ") && strings.Contains(joined, "pid=") {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatalf("启动行应含 serving 与 pid: %q", joined)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ListenAndServe 未随 ctx 退出")
 	}
 }
 
