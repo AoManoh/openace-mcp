@@ -7,9 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/AoManoh/openace-mcp/internal/engine"
 )
 
 func TestScanSkipsInvalidUTF8(t *testing.T) {
@@ -248,20 +246,6 @@ func scannedRelPaths(files []fileBlob) string {
 	return strings.Join(rels, ",")
 }
 
-type checkpointCall struct {
-	previous string
-	added    []string
-	deleted  []string
-}
-
-type checkpointRequest struct {
-	Blobs struct {
-		Added        []string `json:"added_blobs"`
-		Deleted      []string `json:"deleted_blobs"`
-		CheckpointID string   `json:"checkpoint_id"`
-	} `json:"blobs"`
-}
-
 func writeWorkspaceTestFile(t *testing.T, root string, rel string, content string) {
 	t.Helper()
 	path := filepath.Join(root, filepath.FromSlash(rel))
@@ -273,13 +257,3 @@ func writeWorkspaceTestFile(t *testing.T, root string, rel string, content strin
 	}
 }
 
-func waitForResult(t *testing.T, ch <-chan engine.Result) engine.Result {
-	t.Helper()
-	select {
-	case result := <-ch:
-		return result
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for result")
-		return engine.Result{}
-	}
-}
