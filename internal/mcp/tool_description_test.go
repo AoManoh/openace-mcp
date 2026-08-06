@@ -48,3 +48,18 @@ func TestToolDescriptionsContract(t *testing.T) {
 		t.Fatal("instructions 应指名检索工具")
 	}
 }
+
+// D2 防漂移:knownToolList(工具面允许列表校验依据)必须与 handler 表
+// 键集逐一对应——新增工具漏登记会让 OPENACE_MCP_TOOLS 误报未知。
+func TestKnownToolListMatchesHandlers(t *testing.T) {
+	handlers := (&Server{}).toolHandlers()
+	known := knownToolList()
+	if len(known) != len(handlers) {
+		t.Fatalf("knownToolList(%d) 与 handler 表(%d)数量不一致", len(known), len(handlers))
+	}
+	for _, name := range known {
+		if _, ok := handlers[name]; !ok {
+			t.Fatalf("knownToolList 含 handler 表外的 %q", name)
+		}
+	}
+}

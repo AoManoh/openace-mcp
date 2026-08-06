@@ -133,9 +133,19 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 
 ## MCP 工具
 
+**默认只暴露 `codebase_retrieval` 一个工具**:多工具面会让部分 AI 客户端选错工具,且每个会话为用不到的 schema 白烧 tokens。检索会自动同步 workspace,冷仓首次检索最迟 90 秒返回带构建进度的可行动提示,通常这一个工具就够了。
+
+需要完整工具面(异步任务、状态诊断)时,在 MCP 配置的 `env` 里加:
+
+```json
+"OPENACE_MCP_TOOLS": "all"
+```
+
+也可以给逗号分隔的自定义清单(如 `"codebase_retrieval,start_sync_workspace,task_status"`);未列出的工具不再被客户端发现,但按名调用仍会被处理。完整清单:
+
 | 工具 | 用途 |
 |------|------|
-| `codebase_retrieval` | 同步当前 workspace,然后混合检索(BM25 + 可选语义/精排) |
+| `codebase_retrieval` | 同步当前 workspace,然后混合检索(BM25 + 可选语义/精排)——**默认唯一暴露** |
 | `multi_codebase_retrieval` | 显式传入多个 workspace,分仓检索 |
 | `sync_workspace` | 只同步,不检索 |
 | `start_codebase_retrieval` / `start_multi_codebase_retrieval` / `start_sync_workspace` | daemon 模式下提交异步任务,适合大仓库 |
@@ -143,7 +153,7 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 | `workspace_status` | workspace revision、同步阶段、语义覆盖、provider 健康摘要 |
 | `daemon_status` | wrapper 与 daemon 的 build、pid、cache namespace、capability |
 
-小仓库直接 `codebase_retrieval`;大仓库或跨仓问题优先 `start_*` + `task_status`。
+小仓库直接 `codebase_retrieval`;大仓库预热或跨仓问题开完整面后用 `start_*` + `task_status`。
 
 ## 运行模式
 
