@@ -65,6 +65,41 @@ func TestRenderGolden(t *testing.T) {
 	}
 }
 
+// TestRenderLineNumbersGolden 锁定 D1 Read-parity 试验面格式:开关开启时
+// 围栏内逐行携带真实文件行号(cat -n 形状,从 StartLine 起算),header
+// 与默认格式一致;默认关闭时与历史逐字节一致(上一 golden 锁定)。
+func TestRenderLineNumbersGolden(t *testing.T) {
+	t.Setenv(EnvRenderLineNumbers, "1")
+	handle := newRenderHandle(t,
+		chunkRecord{ID: "c1", RelPath: "internal/app/login.go", Language: "go", StartLine: 10, EndLine: 12, Symbol: "HandleLogin", Content: "func HandleLogin() error {\n\treturn nil\n}"},
+	)
+	got := mustRender(t, handle, []rankedHit{{id: "c1", score: 2.0}}, 0)
+	want := "## internal/app/login.go:10-12 HandleLogin\n" +
+		"```go\n" +
+		"    10\tfunc HandleLogin() error {\n" +
+		"    11\t\treturn nil\n" +
+		"    12\t}\n" +
+		"```"
+	if got != want {
+		t.Fatalf("行号渲染格式偏离 golden:\n--- want ---\n%s\n--- got ---\n%s", want, got)
+	}
+}
+
+// TestRenderLineNumbersMergedBlocksStayContinuous 相邻块合并后行号连续。
+func TestRenderLineNumbersMergedBlocksStayContinuous(t *testing.T) {
+	t.Setenv(EnvRenderLineNumbers, "on")
+	handle := newRenderHandle(t,
+		chunkRecord{ID: "a", RelPath: "m.go", Language: "go", StartLine: 1, EndLine: 3, Content: "l1\nl2\nl3"},
+		chunkRecord{ID: "b", RelPath: "m.go", Language: "go", StartLine: 4, EndLine: 5, Content: "l4\nl5"},
+	)
+	got := mustRender(t, handle, []rankedHit{{id: "a", score: 1.5}, {id: "b", score: 1.0}}, 0)
+	want := "## m.go:1-5\n```go\n" +
+		"     1\tl1\n     2\tl2\n     3\tl3\n     4\tl4\n     5\tl5\n```"
+	if got != want {
+		t.Fatalf("合并块行号错误:\n--- want ---\n%s\n--- got ---\n%s", want, got)
+	}
+}
+
 // TestRenderMergesAdjacentChunks 同文件相邻块合并且内容不重复。
 func TestRenderMergesAdjacentChunks(t *testing.T) {
 	handle := newRenderHandle(t,

@@ -1103,9 +1103,10 @@ func renderHits(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (str
 	if budget <= 0 {
 		budget = 20000
 	}
+	numbered := renderLineNumbersEnabled()
 	truncated := false
 	for i, block := range merged {
-		section := formatBlock(block.record)
+		section := formatBlock(block.record, numbered)
 		if i == 0 && len(section) > budget {
 			// F3(review 2026-08-06):首块超预算硬截断到预算并打标——
 			// 历史豁免使 MaxOutputLen=200 也可能返回数 KB,静默打爆
@@ -1180,8 +1181,26 @@ func tailLines(record chunkRecord, afterLine int) string {
 	return strings.Join(lines[skip:], "\n")
 }
 
+// EnvRenderLineNumbers 开启围栏内逐行行号前缀(D1 Read-parity 试验面,
+// 吸收清单 codegraph #4:与 Read 工具同形的输出让 agent 免二次读文件、
+// 可直接精确引用行区间)。格式同 cat -n(右对齐行号+制表符),LLM 对该
+// 形状有大量训练分布。默认关闭=历史逐字节格式;默认翻转须先经弱 caller
+// 矩阵/自食证据(record-only,决策台账 D1)。
+const EnvRenderLineNumbers = "OPENACE_RENDER_LINE_NUMBERS"
+
+func renderLineNumbersEnabled() bool {
+	switch strings.TrimSpace(strings.ToLower(os.Getenv(EnvRenderLineNumbers))) {
+	case "1", "true", "on", "yes":
+		return true
+	}
+	return false
+}
+
 // formatBlock 渲染单个块：`## path:start-end [symbol]` + 代码围栏。
-func formatBlock(record chunkRecord) string {
+// numbered 时围栏内每行携带真实文件行号(cat -n 形状),行号从
+// StartLine 起算——与 header 区间一致,agent 可直接引用行号而无需
+// 二次 Read。
+func formatBlock(record chunkRecord, numbered bool) string {
 	var b strings.Builder
 	b.WriteString("## ")
 	b.WriteString(record.RelPath)
@@ -1196,7 +1215,18 @@ func formatBlock(record chunkRecord) string {
 		b.WriteString(record.Language)
 	}
 	b.WriteString("\n")
-	b.WriteString(strings.TrimRight(record.Content, "\n"))
+	content := strings.TrimRight(record.Content, "\n")
+	if numbered {
+		lines := strings.Split(content, "\n")
+		for i, line := range lines {
+			if i > 0 {
+				b.WriteString("\n")
+			}
+			fmt.Fprintf(&b, "%6d\t%s", record.StartLine+i, line)
+		}
+	} else {
+		b.WriteString(content)
+	}
 	b.WriteString("\n```\n\n")
 	return b.String()
 }
