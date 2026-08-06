@@ -71,6 +71,10 @@ type Result struct {
 
 	// RerankSent 是实际送审精排的候选数（rerank 未配置或未生效时为 0）。
 	RerankSent int `json:"rerank_sent,omitempty"`
+	// QueryPlan 是路由分立查询规划的可审计记录(方案 -13):触发时为
+	// 词法路实际使用的结构 token 变体(零命中回退时追加 " fallback=original"),
+	// 未触发为空——原查询本身永不被改写或丢弃(调研护栏 7/8)。
+	QueryPlan string `json:"query_plan,omitempty"`
 	// QueryEmbedFailed 表示本次查询嵌入失败（语义路仅缺查询侧）。
 	QueryEmbedFailed bool `json:"query_embed_failed,omitempty"`
 	// EmbeddingProfile 是语义路身份短指纹（provider/model/dimension）。
