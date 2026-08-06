@@ -1,11 +1,11 @@
 package localengine
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
-
-	"context"
+	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/engine"
 )
@@ -31,6 +31,7 @@ type mapFile struct {
 
 // RepoMap 实现 engine.RepoMapper。
 func (e *Engine) RepoMap(ctx context.Context, req engine.RepoMapRequest) (engine.Result, error) {
+	started := time.Now()
 	if err := rejectProfileID(req.Workspace); err != nil {
 		return engine.Result{}, err
 	}
@@ -60,12 +61,18 @@ func (e *Engine) RepoMap(ctx context.Context, req engine.RepoMapRequest) (engine
 	if budget <= 0 {
 		budget = repoMapDefaultBudget
 	}
+	renderStart := time.Now()
 	text, shownFiles, truncated := renderRepoMap(handle.manifest.Revision, files, budget, focus)
+	renderMs := time.Since(renderStart).Milliseconds()
 	result := engine.Result{
 		Engine:        EngineID,
 		IndexRevision: handle.manifest.Revision,
 		FileCount:     handle.manifest.Counts.Files,
 		Text:          text,
+		Timings: &engine.RetrievalTimings{
+			RenderMs: renderMs,
+			TotalMs:  time.Since(started).Milliseconds(),
+		},
 	}
 	result.Display = &engine.DisplayStats{
 		CandidateBlocks: len(files), ShownBlocks: shownFiles, ShownFiles: shownFiles, Truncated: truncated,
