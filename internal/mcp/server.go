@@ -44,13 +44,54 @@ type Server struct {
 	// 原因与修复指引——build/profile mismatch 的可行动文案从 stderr
 	// (多数 MCP 客户端不展示)搬进调用方看得见的工具错误。
 	unavailable error
+	// reconnect 是不可用形态的惰性重探测(灰度反馈三 C.4:判定只做
+	// 一次会把会话永久锁死——坏 daemon 已清除、好 daemon 已就位,
+	// 会话仍报旧错,只能重启)。按 reconnectTTL 节流:探测可能拉起
+	// managed Connect(含 daemon spawn),不能每调用都做。
+	reconnect   func() (engine.Service, error)
+	reconnectAt time.Time
 }
+
+// reconnectTTL 是不可用形态重探测的最小间隔。
+const reconnectTTL = 10 * time.Second
 
 // NewUnavailableServer 构造启动失败降级形态的 MCP 服务(见
 // Server.unavailable)。此前 Connect 失败直接 exit(1),客户端只见裸
-// "Failed to connect",两轮灰度反馈均卡在此排障。
-func NewUnavailableServer(cause error) *Server {
-	return &Server{unavailable: cause}
+// "Failed to connect",两轮灰度反馈均卡在此排障。reconnect 可为 nil
+// (不重探测,始终返回 cause)。
+func NewUnavailableServer(cause error, reconnect func() (engine.Service, error)) *Server {
+	return &Server{unavailable: cause, reconnect: reconnect}
+}
+
+// attachService 装配服务与能力面(NewServer 与不可用形态自愈共用)。
+func (s *Server) attachService(service engine.Service) {
+	s.service = service
+	if tasker, ok := service.(Tasker); ok {
+		s.tasker = tasker
+	}
+	if inspector, ok := service.(engine.WorkspaceInspector); ok {
+		s.inspector = inspector
+	}
+	if statuser, ok := service.(DaemonStatuser); ok {
+		s.statuser = statuser
+	}
+}
+
+// tryReconnect 在不可用形态下按 TTL 重探测;成功即本会话自愈,失败则
+// 刷新失败原因(调用方看到的是最新一次探测的错误,不是启动期陈账)。
+func (s *Server) tryReconnect() bool {
+	if s.reconnect == nil || time.Since(s.reconnectAt) < reconnectTTL {
+		return s.unavailable == nil
+	}
+	s.reconnectAt = time.Now()
+	service, err := s.reconnect()
+	if err != nil {
+		s.unavailable = err
+		return false
+	}
+	s.attachService(service)
+	s.unavailable = nil
+	return true
 }
 
 type rpcRequest struct {
@@ -105,20 +146,12 @@ type listTasksArgs struct {
 }
 
 func NewServer(service engine.Service) *Server {
-	server := &Server{service: service}
-	if tasker, ok := service.(Tasker); ok {
-		server.tasker = tasker
-	}
+	server := &Server{}
 	// P9(review 2026-08-06):inspector 注册不再以 tasker 存在为前提——
 	// 该前提源于"与 legacy direct 对齐",legacy 已在 Stage 7 删除。
 	// direct 模式恢复 workspace_status/list_workspaces 只读状态面,
 	// 语义覆盖缺口在两种形态下都有处可查。
-	if inspector, ok := service.(engine.WorkspaceInspector); ok {
-		server.inspector = inspector
-	}
-	if statuser, ok := service.(DaemonStatuser); ok {
-		server.statuser = statuser
-	}
+	server.attachService(service)
 	return server
 }
 
@@ -336,8 +369,8 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return fail(req.ID, -32602, err.Error())
 	}
-	if s.unavailable != nil {
-		return toolError(req.ID, fmt.Sprintf("openACE is unavailable in this session: %v; fix the daemon or configuration, then restart the MCP session", s.unavailable))
+	if s.unavailable != nil && !s.tryReconnect() {
+		return toolError(req.ID, fmt.Sprintf("openACE is unavailable in this session: %v; fix the daemon or configuration and retry (the session re-probes automatically), or restart the MCP session", s.unavailable))
 	}
 	name := strings.ReplaceAll(params.Name, "-", "_")
 	handler, ok := s.toolHandlers()[name]

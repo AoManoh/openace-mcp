@@ -347,6 +347,7 @@ func (e *Engine) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (
 	if ok {
 		snapshot := status.snapshot()
 		e.attachSemantic(&snapshot, status)
+		e.attachTopLevelCounts(&snapshot, workspaceKey)
 		return snapshot, nil
 	}
 	// 冷启动：内存无状态时从持久化 manifest 恢复视图。
@@ -373,7 +374,32 @@ func (e *Engine) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (
 	tracker.ready(manifest, revisionCount(store, manifest))
 	snapshot := tracker.snapshot()
 	e.attachSemantic(&snapshot, tracker)
+	e.attachTopLevelCounts(&snapshot, workspaceKey)
 	return snapshot, nil
+}
+
+// attachTopLevelCounts 按现役 manifest 统计顶层目录文件数(灰度反馈三
+// C.1 残余:文件选择遵循 ignore 链,但"哪些目录被排除"对使用方完全
+// 黑盒——mailing 现场为定位 docs/ 缺失做了一整轮对照实验。计数让排除
+// 可见:预期目录计数为 0/缺失即选择面问题,无需黑盒实验)。根文件
+// 归 "."。失败静默跳过(状态查询不因可见性增强而失败)。
+func (e *Engine) attachTopLevelCounts(status *engine.WorkspaceStatus, workspaceKey string) {
+	handle, err := e.acquireHandle(workspaceKey)
+	if err != nil {
+		return
+	}
+	defer e.releaseHandle(handle)
+	counts := make(map[string]int, 16)
+	for path := range handle.manifest.Files {
+		top := "."
+		if i := strings.IndexByte(path, '/'); i > 0 {
+			top = path[:i]
+		}
+		counts[top]++
+	}
+	if len(counts) > 0 {
+		status.TopLevelFileCounts = counts
+	}
 }
 
 // ListWorkspaceStatuses 实现 engine.WorkspaceInspector。

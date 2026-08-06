@@ -68,6 +68,11 @@ type Engine struct {
 	qualityStrict bool
 	// queryBuildWait>0 时查询等待在建索引有上界(P1 有界化);0=无界。
 	queryBuildWait time.Duration
+	// buildWaitSlice 是有界等待的切片粒度:每片醒来核对构建 ETA,
+	// ETA 超出剩余预算且有旧 revision 可答时提前脱离等待(灰度反馈三
+	// C.2:大仓重建 ETA 分钟级时等满整个预算再降级是纯延迟)。测试可
+	// 拨小。
+	buildWaitSlice time.Duration
 	// freshnessWindow>0 时,上次成功同步距今小于窗口的查询跳过内联
 	// 扫描(Stage 6 前置;新鲜度上界=窗口)。
 	freshnessWindow time.Duration
@@ -136,6 +141,7 @@ func New(opts Options) (*Engine, error) {
 	}
 	e.qualityStrict = opts.QualityStrict
 	e.queryBuildWait = opts.QueryBuildWait
+	e.buildWaitSlice = 5 * time.Second
 	e.freshnessWindow = opts.FreshnessWindow
 	e.storeProfile = e.profile.ID + "-v" + e.profile.Version
 	// 模板版本注入(M9② 单一事实源):ProfileHash 与子树后缀取同一常量。
@@ -402,19 +408,76 @@ func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.Workspace
 	if e.queryBuildWait <= 0 {
 		return e.syncWorkspace(ctx, ref)
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, e.queryBuildWait)
-	defer cancel()
-	res, err := e.syncWorkspaceDetachable(waitCtx, ref, false)
-	if err != nil && waitCtx.Err() != nil && ctx.Err() == nil {
-		_, workspaceKey, kerr := e.resolveRoot(ref.DirectoryPath)
-		progress := ""
-		if kerr == nil {
-			progress = e.buildProgressLabel(workspaceKey)
+	// 切片等待(灰度反馈三 C.2):预算切成 buildWaitSlice 粒度,每片
+	// 醒来核对构建 ETA——ETA 超出剩余预算且有旧 revision 可答时提前
+	// 脱离,立即让上层以旧索引降级应答,不再等满整个预算(大仓重建
+	// ETA 分钟级时,等满 90s 再降级是纯延迟)。ETA 未知(首批未完成)
+	// 或无旧 revision 时行为与整段等待一致。
+	deadline := time.Now().Add(e.queryBuildWait)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return engine.Result{}, e.queryBuildWaitError(ref, fmt.Sprintf("%s=%s 超界,构建继续后台推进", EnvQueryBuildWait, e.queryBuildWait))
 		}
-		return res, fmt.Errorf("%w: index still building (%s); %s=%s 超界,构建继续后台推进",
-			errQueryBuildWait, progress, EnvQueryBuildWait, e.queryBuildWait)
+		slice := e.buildWaitSlice
+		if slice <= 0 || slice > remaining {
+			slice = remaining
+		}
+		waitCtx, cancel := context.WithTimeout(ctx, slice)
+		res, err := e.syncWorkspaceDetachable(waitCtx, ref, false)
+		cancel()
+		if err == nil || ctx.Err() != nil || waitCtx.Err() == nil {
+			// 真结果 / 调用方取消 / 非超时的真实构建错误:原样返回。
+			return res, err
+		}
+		if eta := e.buildETASeconds(ref); eta > 0 && time.Duration(eta)*time.Second > time.Until(deadline) && e.hasServableRevision(ref) {
+			return engine.Result{}, e.queryBuildWaitError(ref, fmt.Sprintf("构建 ETA 超出 %s=%s 预算,提前以既有索引应答,构建继续后台推进", EnvQueryBuildWait, e.queryBuildWait))
+		}
 	}
-	return res, err
+}
+
+// queryBuildWaitError 构造有界等待脱离错误(errQueryBuildWait 族,上层
+// 按 revision 有无降级或报错),携带实时进度与可行动后缀。
+func (e *Engine) queryBuildWaitError(ref engine.WorkspaceRef, suffix string) error {
+	progress := ""
+	if _, workspaceKey, err := e.resolveRoot(ref.DirectoryPath); err == nil {
+		progress = e.buildProgressLabel(workspaceKey)
+	}
+	return fmt.Errorf("%w: index still building (%s); %s", errQueryBuildWait, progress, suffix)
+}
+
+// buildETASeconds 读取在建构建的嵌入 ETA 估算(秒);无进度返回 0。
+func (e *Engine) buildETASeconds(ref engine.WorkspaceRef) int {
+	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
+	if err != nil {
+		return 0
+	}
+	e.mu.Lock()
+	tracker := e.statuses[workspaceKey]
+	e.mu.Unlock()
+	if tracker == nil {
+		return 0
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	_, eta := tracker.embedRateETALocked(time.Now().UTC())
+	return eta
+}
+
+// hasServableRevision 报告 workspace 是否已有可应答的 revision(提前
+// 脱离等待只在旧索引可答时发生;无 revision 时提前脱离只会把可行动
+// 错误提前,反而缩短小仓首建等到结果的机会)。
+func (e *Engine) hasServableRevision(ref engine.WorkspaceRef) bool {
+	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
+	if err != nil {
+		return false
+	}
+	handle, err := e.acquireHandle(workspaceKey)
+	if err != nil {
+		return false
+	}
+	e.releaseHandle(handle)
+	return true
 }
 
 // buildProgressLabel 读取构建期进度快照(D8 可见性字段的错误文案投影)。
