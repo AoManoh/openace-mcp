@@ -25,10 +25,10 @@ func TestShortResponseRejectedAsPermanent(t *testing.T) {
 		body     string
 		sent     int
 	}{
-		"voyage 空 data":          {ProviderVoyage, `{"object":"list","data":[]}`, 3},
-		"voyage 部分返回 sent-1":    {ProviderVoyage, `{"data":[{"index":0,"relevance_score":0.9},{"index":1,"relevance_score":0.5}]}`, 3},
-		"data/results 键双缺失":     {ProviderVoyage, `{"object":"list"}`, 2},
-		"TEI 空数组":               {ProviderTEI, `[]`, 2},
+		"voyage 空 data":      {ProviderVoyage, `{"object":"list","data":[]}`, 3},
+		"voyage 部分返回 sent-1": {ProviderVoyage, `{"data":[{"index":0,"relevance_score":0.9},{"index":1,"relevance_score":0.5}]}`, 3},
+		"data/results 键双缺失":  {ProviderVoyage, `{"object":"list"}`, 2},
+		"TEI 空数组":            {ProviderTEI, `[]`, 2},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

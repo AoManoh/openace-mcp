@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-
 )
 
 func TestStressLargeWorkspaceScanAndSync(t *testing.T) {

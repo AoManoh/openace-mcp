@@ -57,9 +57,6 @@ func (assets AssetSet) fileBlobs() []fileBlob {
 	return files
 }
 
-
-
-
 // ReadIndexableContent 以与 workspace 扫描一致的内容门禁读取文件：
 // 常规文件、大小上限、非二进制、合法 UTF-8。ok=false 表示文件不可索引。
 // local-hybrid 引擎复用该入口，禁止绕开 AssetPolicy 自建第二套判定。

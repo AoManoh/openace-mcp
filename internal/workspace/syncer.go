@@ -223,7 +223,6 @@ func positiveIntEnv(name string, fallback int) int {
 	return parsed
 }
 
-
 func shouldAlwaysSkipDir(name string) bool {
 	switch name {
 	case ".git", ".hg", ".svn", ".jj":
@@ -744,5 +743,3 @@ func CurrentCacheSnapshot() (CacheSnapshot, error) {
 		Namespace: cacheNamespace(),
 	}, nil
 }
-
-
