@@ -369,13 +369,19 @@ func TestTreeSitterDeterminism(t *testing.T) {
 	}
 }
 
-// 批次外语言（kotlin 等；rust/java 已入批次 2）不受影响，仍走行窗口。
+// 批次外语言(swift/scala 等;kotlin/ruby/php 已入批次 4)不受影响,
+// 仍走行窗口。
 func TestNonBatchLanguagesKeepFallback(t *testing.T) {
 	profile := DefaultProfile()
-	kotlin := "fun add(a: Int, b: Int): Int = a + b\n"
-	_, capability := profile.Split(File{RelPath: "lib.kt", Content: kotlin})
+	swift := "func add(a: Int, b: Int) -> Int { return a + b }\n"
+	_, capability := profile.Split(File{RelPath: "lib.swift", Content: swift})
 	if capability != CapabilityFallback {
-		t.Fatalf("kotlin 应保持行窗口: %v", capability)
+		t.Fatalf("swift 应保持行窗口: %v", capability)
+	}
+	scala := "object Main { def add(a: Int, b: Int): Int = a + b }\n"
+	_, capability = profile.Split(File{RelPath: "Main.scala", Content: scala})
+	if capability != CapabilityFallback {
+		t.Fatalf("scala 应保持行窗口: %v", capability)
 	}
 }
 

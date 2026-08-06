@@ -2,7 +2,7 @@
 
 `openACE` 是 **Open Agent Context Engine**——纯 Go、单二进制、无 CGO、无 sidecar 的本地代码检索引擎,经 MCP 工具接入 AI IDE / agent。
 
-- **检索内核自有**:AST 声明级切分(十语言内嵌 Tree-sitter,纯 Go 运行时)、BM25 词法索引、本地向量索引、加权 RRF 融合、可选精排编排、immutable 增量索引、显式降级。
+- **检索内核自有**:AST 声明级切分(十三语言内嵌 Tree-sitter,纯 Go 运行时)、BM25 词法索引、本地向量索引、加权 RRF 融合、可选精排编排、immutable 增量索引、显式降级。
 - **模型自备**:embedding/rerank 模型不自研也不默认推介任何厂商——由你自备模型服务经可替换 provider 接入(OpenAI-compatible 自部署/托管端点,或 voyage/tei 形状端点)。
 - **两条硬承诺**:不配置任何模型服务时,**词法检索零凭据完整可用**;任何语义链路故障都**显式标记,绝不静默降级**。
 
@@ -17,19 +17,19 @@ AI agent 复用本机索引与常驻 daemon 检索本地仓库,而不是为每�
 Linux / macOS / WSL:
 
 ```bash
-go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript,grammar_subset_java,grammar_subset_rust,grammar_subset_c,grammar_subset_cpp,grammar_subset_c_sharp" \
+go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript,grammar_subset_java,grammar_subset_rust,grammar_subset_c,grammar_subset_cpp,grammar_subset_c_sharp,grammar_subset_kotlin,grammar_subset_ruby,grammar_subset_php" \
   github.com/AoManoh/openace-mcp/cmd/openace-mcp@main
 ```
 
 Windows PowerShell:
 
 ```powershell
-go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript,grammar_subset_java,grammar_subset_rust,grammar_subset_c,grammar_subset_cpp,grammar_subset_c_sharp" github.com/AoManoh/openace-mcp/cmd/openace-mcp@main
+go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript,grammar_subset_java,grammar_subset_rust,grammar_subset_c,grammar_subset_cpp,grammar_subset_c_sharp,grammar_subset_kotlin,grammar_subset_ruby,grammar_subset_php" github.com/AoManoh/openace-mcp/cmd/openace-mcp@main
 ```
 
 网络受限时在命令前加 `GOPROXY=https://goproxy.cn,direct GOSUMDB=sum.golang.google.cn`(PowerShell 用 `$env:GOPROXY=...` 形式)。
 
-> `-tags` 选择内嵌的 Tree-sitter 语法子集(当前 AST 支持的十种语言,二进制约 31MB)。省略 `-tags` 功能完全一致,但内嵌全部 206 种语法(约 49MB)——切分行为不变,只是体积更大。
+> `-tags` 选择内嵌的 Tree-sitter 语法子集(当前 AST 支持的十三种语言,二进制约 30MB)。省略 `-tags` 功能完全一致,但内嵌全部 206 种语法(约 49MB)——切分行为不变,只是体积更大。
 > **版本优先钉精确 commit**:把 `@main` 换成 `@<commit>`。`@main` 经 Go module proxy(尤其镜像代理)可能解析到缓存的旧提交而非远端最新——装完用 `openace-mcp version` 核对实际构建。升级三步 = 重跑安装命令 → 停掉旧 daemon(`pkill -f 'openace-mcp daemon'`)→ 重启 MCP 会话(wrapper 与 daemon 有 build 等值校验,旧 daemon 不停会被明确拒绝)。
 
 ### 第 2 步:把配置贴进你的 MCP 客户端
@@ -116,7 +116,7 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 - **降级完全显式,由你支配**:语义路/精排失败或索引覆盖不完整时,结果首行出现 `[DEGRADED] <原因>; mode=...; semantic_coverage=...` 横幅,结构化字段同步携带 `retrieval_mode`/`degraded_reason`/`semantic_coverage`;`OPENACE_RETRIEVAL_DEGRADE=deny` / `OPENACE_RERANK_DEGRADE=deny` 可改为直接返回可行动错误(默认 `allow` 放行词法结果)。不存在静默降级。
 - **成本边界**:embedding/rerank 的调用与计费发生在你自己的模型服务上。索引期按变更内容付费——未变更 chunk 跨 revision 复用向量,不重复付费;查询期每次消耗一次 query embedding(启用 rerank 时另加一次精排调用)。预算护栏建议设在你的服务/账户侧。
 - **数据边界**:索引在本机 cache 目录保存被索引文件的明文片段副本(权限仅当前用户);启用 embedding 时 chunk 内容会发送到你配置的模型服务。使用任何**托管**服务前请自行核实其数据保留与训练条款(多数托管服务默认可将数据用于训练,需显式退出);自部署端点无此顾虑。`.openaceignore` 与内置敏感文件 denylist 先于一切生效。
-- **向量身份隔离**:模型/维度/端点或内置嵌入模板版本任一变化,创建平行索引子树并全量重建(一次 corpus 全量嵌入费用,旧子树保留可回退);换 key 不触发重建。
+- **向量身份隔离**:模型/维度/端点、内置嵌入模板版本或切分器版本(如新增 AST 语言批次)任一变化,创建平行索引子树并全量重建(一次 corpus 全量嵌入费用,旧子树保留可回退);换 key 不触发重建。
 - **增量索引**:首建后编辑只重建变更文件,删除/重命名立即从结果消失;嵌入费用有界于变更量。delta 链自动本地合并(compaction,零模型调用);索引只保留最近两个 revision,内容按需读取不常驻内存。
 - **中断不丢付费进度**:每批嵌入成功即写本地 journal;超时/取消/进程被杀后,下次 sync 复用已付费向量只补缺口。进度经 `workspace_status` 实时可见。
 - **崩溃与多进程安全**:任意时刻杀进程,重启自动恢复、无重复付费;同一索引子树写路径跨进程互斥,持锁进程崩溃后自动接管;只读检索无锁。索引 immutable、发布原子切换,数据损坏自动回退上一 revision 并自愈。
@@ -126,7 +126,7 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 
 | 切分方式 | 语言 |
 |---|---|
-| **AST 声明级**(函数/类/方法独立成块并携带符号) | Go(标准库 parser);Python、TypeScript、TSX、JavaScript、Java、Rust、C、C++、C#(内嵌 Tree-sitter,纯 Go 运行时,无 CGO) |
+| **AST 声明级**(函数/类/方法独立成块并携带符号) | Go(标准库 parser);Python、TypeScript、TSX、JavaScript、Java、Rust、C、C++、C#、Kotlin、Ruby、PHP(内嵌 Tree-sitter,纯 Go 运行时,无 CGO) |
 | 确定性行窗口 | 其余全部文本语言 |
 
 单文件解析失败(语法错误、超时、超长单行)自动回退行窗口;`workspace_status` 如实上报每语言 `ast|fallback|mixed`、语义覆盖率与 provider 健康状态。
@@ -223,8 +223,8 @@ daemon 只监听 loopback,不要直接暴露公网。引擎固定为 local-hybri
 go test ./...
 go vet ./...
 go test -race ./internal/daemon ./internal/mcp ./internal/workspace
-# 发布形态构建(语法子集,~31MB;省略 -tags 为全语法 ~49MB)
-go build -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript,grammar_subset_java,grammar_subset_rust,grammar_subset_c,grammar_subset_cpp,grammar_subset_c_sharp" ./cmd/openace-mcp ./cmd/openace-daemon
+# 发布形态构建(语法子集,~30MB;省略 -tags 为全语法 ~49MB)
+go build -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript,grammar_subset_java,grammar_subset_rust,grammar_subset_c,grammar_subset_cpp,grammar_subset_c_sharp,grammar_subset_kotlin,grammar_subset_ruby,grammar_subset_php" ./cmd/openace-mcp ./cmd/openace-daemon
 ```
 
 ## License

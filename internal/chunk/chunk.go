@@ -76,10 +76,16 @@ type Profile struct {
 // field 映射丢失按坏标记处理/零符号整文件回退守卫,treesitter.go
 // errorTolerant)——依 K5 升版本;子树切换的向量迁移经跨子树复用工具
 // (bench -dump-vectors-from)零重付,仅真实变化 chunk 重嵌。
+// Version 7（语言批次 4,D5）：Kotlin、Ruby、PHP 由行窗口升级为
+// Tree-sitter AST 声明级切分(treesitter_kotlin.go / treesitter_ruby.go /
+// treesitter_php.go)。kotlin 入容错族(grammar 把软关键字 yield 作参数
+// 名误报 ERROR,okio 实测 33/313 文件,坏顶层节点匿名兜底);ruby/php
+// 严格语义。门禁语料 AST 覆盖率:okio 94.2%、sinatra 100%、monolog
+// 98.6%。依 K5 升版本,未变语言按纯内容 hash 复用向量零重嵌(K61)。
 func DefaultProfile() Profile {
 	return Profile{
 		ID:             "default",
-		Version:        "6",
+		Version:        "7",
 		MaxChunkBytes:  2048,
 		WindowLines:    60,
 		OverlapLines:   10,
