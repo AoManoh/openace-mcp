@@ -44,6 +44,9 @@ func TestRepoMapBasicShape(t *testing.T) {
 	if first.IndexRevision == "" || first.FileCount != 5 {
 		t.Fatalf("结构化字段错误: revision=%q files=%d", first.IndexRevision, first.FileCount)
 	}
+	if first.Timings == nil || first.Timings.TotalMs < 0 || first.Timings.RenderMs < 0 {
+		t.Fatalf("repo_map 应携带总耗时/渲染耗时: %+v", first.Timings)
+	}
 	for i := 0; i < 2; i++ {
 		again, err := e.RepoMap(context.Background(), req)
 		if err != nil || again.Text != first.Text {

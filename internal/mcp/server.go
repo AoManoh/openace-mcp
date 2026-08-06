@@ -478,10 +478,14 @@ func (s *Server) handleRepoMap(ctx context.Context, id *json.RawMessage, rawArgs
 	if err != nil {
 		return toolError(id, err.Error())
 	}
-	if structured := retrievalStructured(result); structured != nil {
-		return ok(id, toolResultWithStructured(result.Text, false, structured))
+	text := result.Text
+	if diagnostics := retrievalDiagnosticsText(result); diagnostics != "" {
+		text += "\n" + diagnostics
 	}
-	return ok(id, toolResult(result.Text, false))
+	if structured := retrievalStructured(result); structured != nil {
+		return ok(id, toolResultWithStructured(text, false, structured))
+	}
+	return ok(id, toolResult(text, false))
 }
 
 // retrievalDiagnosticsText 把关键结构化诊断投影为一行文本兜底。
