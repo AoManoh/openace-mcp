@@ -88,6 +88,21 @@ func (s *wsStatus) embedRateETALocked(now time.Time) (int, int) {
 	return rate, eta
 }
 
+// publishedInterim 登记 lexical-first 中间发布(框架 18.1/S4):
+// revision/计数即时可见,构建保持 in_flight(嵌入随后推进),
+// stage 不回拨——状态面如实呈现"已有可服务索引 + 构建仍在进行"。
+func (s *wsStatus) publishedInterim(manifest *index.Manifest, revisions int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.revision = manifest.Revision
+	s.fileCount = manifest.Counts.Files
+	s.chunkCount = manifest.Counts.Chunks
+	s.coveredChunks = manifest.VectorCount
+	s.revisionCount = revisions
+	s.capabilities = manifest.ChunkerCapabilities
+	s.updatedAt = time.Now().UTC()
+}
+
 // setSemanticOutcome 记录最近一次构建的语义路交互结果（K35 拒绝数与
 // 脱敏错误；provider circuit 状态由 Engine 层实时提供）。
 func (s *wsStatus) setSemanticOutcome(rejected int, lastError string) {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sort"
 	"time"
 
@@ -141,6 +142,61 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	}
 	return e.buildFull(ctx, store, status, root, workspaceKey, previous, assets, contentChanged, needsLexicalRebuild,
 		fullBuildReason(previous, contentChanged, needsLexicalRebuild, repairRequested))
+}
+
+// EnvLexicalFirst 支配冷仓 lexical-first 中间发布(框架 18.1/S4);
+// 默认开启,"off" 关闭(灰度保险丝:关闭即回到"embedding 结束才可
+// 检索"的历史行为)。
+const EnvLexicalFirst = "OPENACE_LEXICAL_FIRST"
+
+func lexicalFirstEnabled() bool {
+	return strings.TrimSpace(strings.ToLower(os.Getenv(EnvLexicalFirst))) != "off"
+}
+
+// publishLexicalInterim 发布冷仓词法中间 revision:与最终发布同一
+// staging/manifest/原子发布机制,向量文件为空集(合法,K10;
+// vectorIndexes 载入 Count=0,dense 路自然"覆盖为空"短路,不触发
+// repair)。失败只记日志语义(返回 nil),不阻塞主构建。
+func (e *Engine) publishLexicalInterim(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, records []chunkRecord, files map[string]index.FileEntry, recordsByFile map[string][]chunkRecord, capabilities map[string]string, totalBytes int64) *index.Manifest {
+	if err := ctx.Err(); err != nil {
+		return nil
+	}
+	interim := semanticOutcome{enabled: true}
+	artifacts, discard, err := e.buildSegmentStaging(ctx, store, records, interim)
+	if err != nil {
+		return nil
+	}
+	manifest := e.newManifestSkeleton(root, "rev-"+artifacts.buildID, nil)
+	manifest.ChunkerCapabilities = capabilities
+	interimFiles := make(map[string]index.FileEntry, len(files))
+	for path, entry := range files {
+		entry.SegmentID = artifacts.buildID
+		interimFiles[path] = entry
+	}
+	manifest.Files = interimFiles
+	manifest.Counts = index.Counts{Files: len(interimFiles), Chunks: len(records), Bytes: totalBytes}
+	manifest.Segments = []index.SegmentRef{{
+		ID:                   artifacts.buildID,
+		ChunksChecksum:       artifacts.chunksChecksum,
+		VectorsChecksum:      artifacts.vectorsChecksum,
+		VectorsIndexChecksum: artifacts.vectorsIndexChecksum,
+		Counts:               manifest.Counts,
+	}}
+	// 发布前复验写锁(K46 同款):失锁即放弃中间发布。
+	if lock, err := e.acquireWriteLock(workspaceKey, store); err != nil {
+		discard()
+		return nil
+	} else if err := lock.Verify(); err != nil {
+		discard()
+		return nil
+	}
+	if err := store.Publish(manifest, artifacts.staging); err != nil {
+		discard()
+		return nil
+	}
+	e.retireHandles(workspaceKey, manifest.Revision, "")
+	status.publishedInterim(manifest, revisionCount(store, manifest))
+	return manifest
 }
 
 // fullBuildReason 给出全量路径的成因标签(灰度反馈四 §6.1:构建原因
@@ -424,6 +480,21 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 		}
 		recordsByFile[asset.RelPath] = fileRecords
 		records = append(records, fileRecords...)
+	}
+
+	// 阶段 2.4:lexical-first 冷仓中间发布(框架 18.1/S4,灰度最痛:
+	// 启用语义的冷仓在 embedding 结束前完全不可检索,大仓 30 分钟
+	// 不可用)。仅冷仓首建(previous==nil)触发:embedding 开始前先
+	// 发布词法 revision(空向量文件合法,K10;覆盖如实 0%,查询按
+	// 既有降级语义显式标记),嵌入完成后照常发布语义完整 revision
+	// (词法 revision 转为其 previous,GC 链一致)。中间发布失败不
+	// 阻塞主构建(词法先行是增益,不是正确性依赖);显式 Sync 语义
+	// 不变(仍阻塞到最终发布)。嵌入中途崩溃时词法 revision 保持可
+	// 服务,下次 sync 走既有 semantic-fill 收敛。
+	if previous == nil && e.semanticEnabled() && len(records) > 0 && lexicalFirstEnabled() {
+		if lexManifest := e.publishLexicalInterim(ctx, store, status, root, workspaceKey, records, files, recordsByFile, capabilities, totalBytes); lexManifest != nil {
+			previous = lexManifest
+		}
 	}
 
 	// 阶段 2.5：语义路（semantic off 时零开销直通，K32）。
