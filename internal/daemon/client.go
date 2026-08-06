@@ -157,6 +157,7 @@ func (c *Client) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 		ProviderProfileID:  providerProfileID,
 		InformationRequest: req.Query,
 		MaxOutputLength:    req.MaxOutputLen,
+		Detail:             req.Detail,
 	}, &result)
 	return result, err
 }
