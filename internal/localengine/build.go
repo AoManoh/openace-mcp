@@ -139,7 +139,32 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	if useDelta {
 		return e.buildDelta(ctx, store, status, root, workspaceKey, previous, assets)
 	}
-	return e.buildFull(ctx, store, status, root, workspaceKey, previous, assets, contentChanged, needsLexicalRebuild)
+	return e.buildFull(ctx, store, status, root, workspaceKey, previous, assets, contentChanged, needsLexicalRebuild,
+		fullBuildReason(previous, contentChanged, needsLexicalRebuild, repairRequested))
+}
+
+// fullBuildReason 给出全量路径的成因标签(灰度反馈四 §6.1:构建原因
+// 不可见时,delta 报表异常会被解读成"升级触发全量重嵌"级别的虚惊;
+// 原因随 Result.BuildMode 外显,调用方无需从进度条反猜)。判定顺序与
+// runBuild 的 useDelta 条件评估语义一致。
+func fullBuildReason(previous *index.Manifest, contentChanged bool, needsLexicalRebuild bool, repairRequested bool) string {
+	switch {
+	case previous == nil:
+		return "full:first-build"
+	case needsLexicalRebuild:
+		return "full:lexical-selfheal"
+	case repairRequested:
+		return "full:vector-repair"
+	case previous.SchemaVersion != index.ManifestSchemaV2:
+		return "full:schema-upgrade"
+	case contentChanged && len(previous.Segments) >= compactSegmentThreshold:
+		return "full:compaction-segments"
+	case contentChanged && garbageRatio(previous) >= compactGarbageRatio:
+		return "full:compaction-garbage"
+	case !contentChanged:
+		return "full:semantic-fill"
+	}
+	return "full"
 }
 
 // chunkAsset 读取并切分单个文件；skipped 表示内容门禁拒绝（暗坑 K6）
@@ -263,7 +288,7 @@ func (e *Engine) newManifestSkeleton(root pathutil.WorkspaceRoot, revision strin
 
 // finishPublish 发布 manifest 并完成句柄退役、revision GC、journal 压实
 // 与状态收敛。
-func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKey string, manifest *index.Manifest, staging string, discard func(), seman semanticOutcome, skippedFiles int) (engine.Result, error) {
+func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKey string, manifest *index.Manifest, staging string, discard func(), seman semanticOutcome, skippedFiles int, added int, buildMode string) (engine.Result, error) {
 	// 发布前复验写锁（K46）：失锁说明所有权已被接管，本次构建作废。
 	if lock, err := e.acquireWriteLock(workspaceKey, store); err != nil {
 		if discard != nil {
@@ -298,12 +323,17 @@ func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKe
 	status.setSkippedFiles(skippedFiles)
 	status.setSemanticOutcome(seman.rejected, seman.lastError)
 	status.ready(manifest, revisionCount(store, manifest))
+	// Added=本轮实际写入 segment 的 chunk 数(灰度反馈四 §6.1:此前
+	// 统一取 manifest.Counts.Chunks,delta 构建被误报成 revision 总量,
+	// 现场 1975 文件小改动显示 "Added=19028",被解读为升级触发全量
+	// 重嵌的虚惊);BuildMode 显式外显构建形态与成因。
 	result := engine.Result{
 		Engine:        EngineID,
 		IndexRevision: manifest.Revision,
 		FileCount:     manifest.Counts.Files,
 		Uploaded:      0,
-		Added:         manifest.Counts.Chunks,
+		Added:         added,
+		BuildMode:     buildMode,
 	}
 	// P8(review 2026-08-06):sync 成功面不吞语义覆盖缺口——Result 携带
 	// 覆盖率;覆盖不完整即给降级原因(与查询路径同 token),Summary 可见。
@@ -332,7 +362,7 @@ func coveredPerFile(fileRecords []chunkRecord, coveredHash map[string]bool) int 
 // buildFull 全量构建：首建、词法/向量自愈、语义补齐（fill）与
 // compaction（D3：合并后单段，chunk 与向量全部本地复用，零 provider
 // 调用于未变更内容）。
-func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, assets workspace.AssetSet, contentChanged bool, needsLexicalRebuild bool) (engine.Result, error) {
+func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, assets workspace.AssetSet, contentChanged bool, needsLexicalRebuild bool, buildMode string) (engine.Result, error) {
 	var previousChunks map[string][]chunkRecord
 	if previous != nil {
 		var err error
@@ -453,7 +483,7 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 	if seman.enabled {
 		manifest.VectorCount = seman.covered
 	}
-	return e.finishPublish(store, status, workspaceKey, manifest, artifacts.staging, discard, seman, skippedFiles)
+	return e.finishPublish(store, status, workspaceKey, manifest, artifacts.staging, discard, seman, skippedFiles, len(records), buildMode)
 }
 
 // buildDelta 增量构建（D1/G1）：只为变更文件产出 delta segment，删除/
@@ -554,7 +584,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 	if hasSegment {
 		staging = artifacts.staging
 	}
-	return e.finishPublish(store, status, workspaceKey, manifest, staging, discard, seman, delta.skippedFiles)
+	return e.finishPublish(store, status, workspaceKey, manifest, staging, discard, seman, delta.skippedFiles, len(records), "delta")
 }
 
 // diffDeltaAssets 对比 previous manifest 与当前资产集:变更文件(新增或

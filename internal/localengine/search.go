@@ -1098,36 +1098,60 @@ func renderHits(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (str
 	merged := mergeBlocks(blocks)
 	sort.SliceStable(merged, func(i, j int) bool { return merged[i].score > merged[j].score })
 
-	var out strings.Builder
 	budget := maxOutputLen
 	if budget <= 0 {
 		budget = 20000
 	}
 	numbered := renderLineNumbersEnabled()
-	truncated := false
-	shown := 0
+	sections := make([]string, len(merged))
 	for i, block := range merged {
-		section := formatBlock(block.record, numbered)
-		if i == 0 && len(section) > budget {
-			// F3(review 2026-08-06):首块超预算硬截断到预算并打标——
-			// 历史豁免使 MaxOutputLen=200 也可能返回数 KB,静默打爆
-			// 调用方的上下文预算管理。按字节截断可能落在多字节字符
-			// 中间,回退到最近的合法 UTF-8 边界。
-			cut := budget
-			for cut > 0 && !utf8.RuneStart(section[cut]) {
-				cut--
+		sections[i] = formatBlock(block.record, numbered)
+	}
+	// F3(review 2026-08-06):首块超预算硬截断到预算并打标——历史豁免
+	// 使 MaxOutputLen=200 也可能返回数 KB,静默打爆调用方的上下文预算
+	// 管理。按字节截断可能落在多字节字符中间,回退到最近的合法 UTF-8
+	// 边界。
+	if len(sections[0]) > budget {
+		cut := budget
+		for cut > 0 && !utf8.RuneStart(sections[0][cut]) {
+			cut--
+		}
+		return strings.TrimRight(sections[0][:cut]+truncationMarker(1, len(merged)), "\n"), nil
+	}
+	// 预算内选块(灰度反馈四 §6.2):先保证每个命中文件至少一个片段
+	// (按分序),再回填同文件的更多片段——此前纯分序填充会让单个
+	// 文件的多个片段吃光预算,调用方点名的其余目标文件整体消失
+	// (现场 33 块只回来 2 块且同文件)。预算充足时两轮合计=全量,
+	// 行为与历史一致;展示顺序恒为分序,与选块顺序解耦。
+	selected := make([]bool, len(merged))
+	remaining := budget
+	seenFile := make(map[string]bool, len(merged))
+	truncated := false
+	for pass := 0; pass < 2; pass++ {
+		for i := range merged {
+			if selected[i] {
+				continue
 			}
-			out.WriteString(section[:cut])
-			truncated = true
-			shown = 1
-			break
+			firstOfFile := !seenFile[merged[i].record.RelPath]
+			if (pass == 0) != firstOfFile {
+				continue
+			}
+			if len(sections[i]) > remaining {
+				truncated = true
+				continue
+			}
+			selected[i] = true
+			seenFile[merged[i].record.RelPath] = true
+			remaining -= len(sections[i])
 		}
-		if i > 0 && out.Len()+len(section) > budget {
-			truncated = true
-			break
+	}
+	var out strings.Builder
+	shown := 0
+	for i := range merged {
+		if selected[i] {
+			out.WriteString(sections[i])
+			shown++
 		}
-		out.WriteString(section)
-		shown++
 	}
 	if truncated {
 		out.WriteString(truncationMarker(shown, len(merged)))

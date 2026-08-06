@@ -279,6 +279,49 @@ func TestProviderProfileRejected(t *testing.T) {
 	}
 }
 
+// TestSyncReportsDeltaAddedAndBuildMode(灰度反馈四 §6.1):Result.Added
+// 此前对 delta 构建误报 revision 总 chunk 数(finishPublish 统一取
+// manifest.Counts.Chunks)——灰度现场 1975 文件小改动被报成
+// "Added=19028",被解读为"升级触发全量重嵌"虚惊。修复后 Added=本轮
+// 实际写入的 chunk 数;BuildMode 显式说明构建形态与原因(他们的诉求:
+// "重建时直说为什么",不再让调用方从进度条猜)。
+func TestSyncReportsDeltaAddedAndBuildMode(t *testing.T) {
+	e := newTestEngine(t)
+	root := newFixtureWorkspace(t)
+	first, err := e.Sync(context.Background(), syncRequest(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.BuildMode != "full:first-build" {
+		t.Fatalf("首建 BuildMode 应为 full:first-build: %q", first.BuildMode)
+	}
+	if first.Added <= 0 {
+		t.Fatalf("首建 Added 应为全部写入数: %+v", first.Added)
+	}
+	writeFixture(t, root, "tiny.go", "package app\n\n// Tiny 新增声明。\nfunc Tiny() {}\n")
+	second, err := e.Sync(context.Background(), syncRequest(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.BuildMode != "delta" {
+		t.Fatalf("小变更应走 delta: %q", second.BuildMode)
+	}
+	if second.Added <= 0 || second.Added >= first.Added {
+		t.Fatalf("delta Added 应为本轮写入数(远小于总量 %d): %d", first.Added, second.Added)
+	}
+	if !strings.Contains(second.Summary(), "build=delta") {
+		t.Fatalf("Summary 应携带构建形态: %q", second.Summary())
+	}
+	// 无变更 no-op:不发布、Added=0、BuildMode 空。
+	third, err := e.Sync(context.Background(), syncRequest(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Added != 0 || third.BuildMode != "" || third.IndexRevision != second.IndexRevision {
+		t.Fatalf("no-op 语义被破坏: %+v", third)
+	}
+}
+
 // TestWorkspaceStatusTopLevelFileCounts(灰度反馈三 C.1 残余):状态面
 // 按顶层目录给出现役索引文件计数,让 ignore 链的排除面可见——预期目录
 // 计数为 0/缺失即选择面问题,使用方无需黑盒对照实验。根文件归 "."。

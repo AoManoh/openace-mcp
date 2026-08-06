@@ -125,6 +125,37 @@ func TestRenderBudgetTruncation(t *testing.T) {
 	}
 }
 
+// TestRenderBudgetPrioritizesFileCoverage(灰度反馈四 §6.2):预算不足时
+// 先保证每个命中文件至少一个片段,再回填同文件更多片段——此前纯分序
+// 填充让单文件多片段吃光预算,其余点名文件整体消失(现场 33 块只回
+// 2 块且同文件)。
+func TestRenderBudgetPrioritizesFileCoverage(t *testing.T) {
+	handle := newRenderHandle(t,
+		chunkRecord{ID: "a1", RelPath: "a.go", Language: "go", StartLine: 1, EndLine: 1, Content: "alpha one"},
+		chunkRecord{ID: "a2", RelPath: "a.go", Language: "go", StartLine: 10, EndLine: 10, Content: "alpha two"},
+		chunkRecord{ID: "b1", RelPath: "b.go", Language: "go", StartLine: 1, EndLine: 1, Content: "beta one"},
+		chunkRecord{ID: "c1", RelPath: "c.go", Language: "go", StartLine: 1, EndLine: 1, Content: "gamma one"},
+	)
+	// a.go 两块分数最高;预算只够 3 块——旧行为回 a1+a2+b1(c.go 消失),
+	// 新行为回 a1+b1+c1(每文件先保一块)。
+	hits := []rankedHit{{id: "a1", score: 4}, {id: "a2", score: 3}, {id: "b1", score: 2}, {id: "c1", score: 1}}
+	got := mustRender(t, handle, hits, 100)
+	if !containsAll(got, "a.go", "b.go", "c.go") {
+		t.Fatalf("每个命中文件应至少一个片段: %q", got)
+	}
+	if contains(got, "alpha two") {
+		t.Fatalf("同文件第二片段应让位于未展示文件: %q", got)
+	}
+	if !contains(got, "[output truncated by max_output_length: 3 of 4 result blocks shown") {
+		t.Fatalf("截断标记应如实计数: %q", got)
+	}
+	// 预算充足时全量返回,行为与历史一致。
+	full := mustRender(t, handle, hits, 0)
+	if !containsAll(full, "alpha one", "alpha two", "beta one", "gamma one") || contains(full, "[output truncated") {
+		t.Fatalf("预算充足应全量: %q", full)
+	}
+}
+
 // TestContentPreadCorruptionSurfaces 是暗坑 K47：打开后段文件被篡改导致
 // 偏移错位/解码失败时，渲染显式报错而不是返回错误内容。
 func TestContentPreadCorruptionSurfaces(t *testing.T) {
