@@ -460,47 +460,12 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 // 改名进 tombstone；未触及文件的 chunk 与向量零工作量。
 func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, assets workspace.AssetSet) (engine.Result, error) {
 	status.setStage(engine.IndexStageChunking)
-	currentPaths := make(map[string]bool, len(assets))
-	var changed []workspace.ContextAsset
-	for _, asset := range assets {
-		currentPaths[asset.RelPath] = true
-		entry, ok := previous.Files[asset.RelPath]
-		if !ok || entry.ContentHash != asset.BlobName {
-			changed = append(changed, asset)
-		}
+	changed, removed, currentPaths := diffDeltaAssets(previous, assets)
+	delta, err := e.chunkChangedAssets(ctx, changed)
+	if err != nil {
+		return engine.Result{}, err
 	}
-	var removed []string
-	for path := range previous.Files {
-		if !currentPaths[path] {
-			removed = append(removed, path)
-		}
-	}
-
-	// 切分变更文件。
-	records := make([]chunkRecord, 0, len(changed)*8)
-	recordsByFile := make(map[string][]chunkRecord, len(changed))
-	skippedFiles := 0
-	skippedPaths := make(map[string]bool)
-	for _, asset := range changed {
-		if err := ctx.Err(); err != nil {
-			return engine.Result{}, err
-		}
-		fileRecords, skipped, err := e.chunkAsset(ctx, asset)
-		if err != nil {
-			return engine.Result{}, err
-		}
-		// 0 chunk 的变更文件(纯空白/仅注释等)按删除语义处理,与内容
-		// 门禁拒绝同路:从 Files 摘除 + 入 tombstone。否则旧段 chunk
-		// 无人覆盖继续可检索,且 compaction 按 ContentHash 复用将污染
-		// 固化(H3,诊断报告 2026-08-03;K39/K44 口径)。
-		if skipped || len(fileRecords) == 0 {
-			skippedFiles++
-			skippedPaths[asset.RelPath] = true
-			continue
-		}
-		recordsByFile[asset.RelPath] = fileRecords
-		records = append(records, fileRecords...)
-	}
+	records := delta.records
 
 	// 语义路：只嵌入 delta 记录（复用按纯 content hash，D2）。
 	var prior priorVectors
@@ -540,12 +505,12 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 		}
 	}
 	for _, asset := range changed {
-		if skippedPaths[asset.RelPath] {
+		if delta.skippedPaths[asset.RelPath] {
 			// 内容门禁拒绝的变更文件从 live 集移除（旧版本亦不可再检索）。
 			delete(files, asset.RelPath)
 			continue
 		}
-		fileRecords := recordsByFile[asset.RelPath]
+		fileRecords := delta.byFile[asset.RelPath]
 		var fileBytes int64
 		for _, record := range fileRecords {
 			mergeCapability(capabilities, record.Language, record.Capability)
@@ -561,7 +526,98 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 		files[asset.RelPath] = entry
 	}
 
-	// tombstones = (prev ∪ removed ∪ 被拒绝的变更文件) − 现存路径（K44）。
+	tombstones := deltaTombstones(previous, currentPaths, removed, delta.skippedPaths)
+	counts, vectorCount := sumLiveCounts(files)
+
+	status.setStage(engine.IndexStagePublishing)
+	revisionID := index.NewBuildID()
+	manifest := e.newManifestSkeleton(root, "rev-"+revisionID, previous)
+	manifest.ChunkerCapabilities = capabilities
+	manifest.Files = files
+	manifest.Tombstones = tombstones
+	manifest.Counts = counts
+	manifest.Segments = append([]index.SegmentRef{}, previous.Segments...)
+	if hasSegment {
+		manifest.Segments = append(manifest.Segments, index.SegmentRef{
+			ID:                   artifacts.buildID,
+			ChunksChecksum:       artifacts.chunksChecksum,
+			VectorsChecksum:      artifacts.vectorsChecksum,
+			VectorsIndexChecksum: artifacts.vectorsIndexChecksum,
+			Counts:               index.Counts{Files: len(delta.byFile), Chunks: len(records)},
+			VectorCount:          len(seman.entries),
+		})
+	}
+	if e.semanticEnabled() {
+		manifest.VectorCount = vectorCount
+	}
+	staging := ""
+	if hasSegment {
+		staging = artifacts.staging
+	}
+	return e.finishPublish(store, status, workspaceKey, manifest, staging, discard, seman, delta.skippedFiles)
+}
+
+// diffDeltaAssets 对比 previous manifest 与当前资产集:变更文件(新增或
+// 内容身份变化)、删除路径与现存路径集。
+func diffDeltaAssets(previous *index.Manifest, assets workspace.AssetSet) ([]workspace.ContextAsset, []string, map[string]bool) {
+	currentPaths := make(map[string]bool, len(assets))
+	var changed []workspace.ContextAsset
+	for _, asset := range assets {
+		currentPaths[asset.RelPath] = true
+		entry, ok := previous.Files[asset.RelPath]
+		if !ok || entry.ContentHash != asset.BlobName {
+			changed = append(changed, asset)
+		}
+	}
+	var removed []string
+	for path := range previous.Files {
+		if !currentPaths[path] {
+			removed = append(removed, path)
+		}
+	}
+	return changed, removed, currentPaths
+}
+
+// deltaChunks 是 buildDelta 切分阶段的产物。
+type deltaChunks struct {
+	records      []chunkRecord
+	byFile       map[string][]chunkRecord
+	skippedFiles int
+	skippedPaths map[string]bool
+}
+
+// chunkChangedAssets 切分变更文件。0 chunk 的变更文件(纯空白/仅注释等)
+// 按删除语义处理,与内容门禁拒绝同路:从 Files 摘除 + 入 tombstone。
+// 否则旧段 chunk 无人覆盖继续可检索,且 compaction 按 ContentHash 复用
+// 将污染固化(H3,诊断报告 2026-08-03;K39/K44 口径)。
+func (e *Engine) chunkChangedAssets(ctx context.Context, changed []workspace.ContextAsset) (deltaChunks, error) {
+	delta := deltaChunks{
+		records:      make([]chunkRecord, 0, len(changed)*8),
+		byFile:       make(map[string][]chunkRecord, len(changed)),
+		skippedPaths: make(map[string]bool),
+	}
+	for _, asset := range changed {
+		if err := ctx.Err(); err != nil {
+			return deltaChunks{}, err
+		}
+		fileRecords, skipped, err := e.chunkAsset(ctx, asset)
+		if err != nil {
+			return deltaChunks{}, err
+		}
+		if skipped || len(fileRecords) == 0 {
+			delta.skippedFiles++
+			delta.skippedPaths[asset.RelPath] = true
+			continue
+		}
+		delta.byFile[asset.RelPath] = fileRecords
+		delta.records = append(delta.records, fileRecords...)
+	}
+	return delta, nil
+}
+
+// deltaTombstones 计算增量后的墓碑集:(prev ∪ removed ∪ 被拒绝的变更
+// 文件) − 现存路径(K44),排序输出。
+func deltaTombstones(previous *index.Manifest, currentPaths map[string]bool, removed []string, skippedPaths map[string]bool) []string {
 	tombstoneSet := make(map[string]bool, len(previous.Tombstones)+len(removed))
 	for _, path := range previous.Tombstones {
 		if !currentPaths[path] || skippedPaths[path] {
@@ -579,8 +635,11 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 		tombstones = append(tombstones, path)
 	}
 	sort.Strings(tombstones)
+	return tombstones
+}
 
-	// 计数与覆盖口径（K31/K51）：存活文件求和。
+// sumLiveCounts 按存活文件求和计数与向量覆盖(K31/K51 口径)。
+func sumLiveCounts(files map[string]index.FileEntry) (index.Counts, int) {
 	counts := index.Counts{Files: len(files)}
 	vectorCount := 0
 	for _, entry := range files {
@@ -588,33 +647,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 		counts.Bytes += entry.Bytes
 		vectorCount += entry.CoveredChunks
 	}
-
-	status.setStage(engine.IndexStagePublishing)
-	revisionID := index.NewBuildID()
-	manifest := e.newManifestSkeleton(root, "rev-"+revisionID, previous)
-	manifest.ChunkerCapabilities = capabilities
-	manifest.Files = files
-	manifest.Tombstones = tombstones
-	manifest.Counts = counts
-	manifest.Segments = append([]index.SegmentRef{}, previous.Segments...)
-	if hasSegment {
-		manifest.Segments = append(manifest.Segments, index.SegmentRef{
-			ID:                   artifacts.buildID,
-			ChunksChecksum:       artifacts.chunksChecksum,
-			VectorsChecksum:      artifacts.vectorsChecksum,
-			VectorsIndexChecksum: artifacts.vectorsIndexChecksum,
-			Counts:               index.Counts{Files: len(recordsByFile), Chunks: len(records)},
-			VectorCount:          len(seman.entries),
-		})
-	}
-	if e.semanticEnabled() {
-		manifest.VectorCount = vectorCount
-	}
-	staging := ""
-	if hasSegment {
-		staging = artifacts.staging
-	}
-	return e.finishPublish(store, status, workspaceKey, manifest, staging, discard, seman, skippedFiles)
+	return counts, vectorCount
 }
 
 // assetsChanged 判断文件集合或内容身份是否变化。

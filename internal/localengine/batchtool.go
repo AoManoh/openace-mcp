@@ -95,15 +95,28 @@ func (e *Engine) PlanEmbedJobs(ctx context.Context, ref engine.WorkspaceRef, fn 
 	if _, err := e.acquireWriteLock(workspaceKey, store); err != nil {
 		return EmbedPlan{}, err
 	}
+	previous, records, err := e.planLiveRecords(ctx, workspaceKey, root, store)
+	if err != nil {
+		return EmbedPlan{}, err
+	}
+	plan.TotalChunks = len(records)
+	if err := e.tallyEmbedPlan(ctx, &plan, store, workspaceKey, previous, records, fn); err != nil {
+		return EmbedPlan{}, err
+	}
+	return plan, nil
+}
 
-	// 与 runBuild 阶段 1/2 同源:扫描 → (previous 复用 | 重切分)。
+// planLiveRecords 枚举工作区当前形态的存活 chunk 记录:与 runBuild
+// 阶段 1/2 同源——扫描 → (previous 逐字节未变文件复用已切分 chunk |
+// 变更文件重切分)。零 provider 调用。
+func (e *Engine) planLiveRecords(ctx context.Context, workspaceKey string, root pathutil.WorkspaceRoot, store *index.Store) (*index.Manifest, []chunkRecord, error) {
 	assets, _, err := workspace.FileAssetSource{Cache: e.statCacheFor(workspaceKey)}.LoadWithStats(ctx, root.CanonicalPath)
 	if err != nil {
-		return EmbedPlan{}, fmt.Errorf("扫描工作区: %w", err)
+		return nil, nil, fmt.Errorf("扫描工作区: %w", err)
 	}
 	previous, _, resolveErr := store.ResolveUsable()
 	if resolveErr != nil && !isNoRevision(resolveErr) {
-		return EmbedPlan{}, resolveErr
+		return nil, nil, resolveErr
 	}
 	var previousChunks map[string][]chunkRecord
 	if previous != nil {
@@ -114,7 +127,7 @@ func (e *Engine) PlanEmbedJobs(ctx context.Context, ref engine.WorkspaceRef, fn 
 	var records []chunkRecord
 	for _, asset := range assets {
 		if err := ctx.Err(); err != nil {
-			return EmbedPlan{}, err
+			return nil, nil, err
 		}
 		var fileRecords []chunkRecord
 		reused := false
@@ -130,7 +143,7 @@ func (e *Engine) PlanEmbedJobs(ctx context.Context, ref engine.WorkspaceRef, fn 
 			var skipped bool
 			fileRecords, skipped, err = e.chunkAsset(ctx, asset)
 			if err != nil {
-				return EmbedPlan{}, err
+				return nil, nil, err
 			}
 			if skipped || len(fileRecords) == 0 {
 				continue
@@ -138,22 +151,26 @@ func (e *Engine) PlanEmbedJobs(ctx context.Context, ref engine.WorkspaceRef, fn 
 		}
 		records = append(records, fileRecords...)
 	}
-	plan.TotalChunks = len(records)
+	return previous, records, nil
+}
 
-	// 复用池与拒绝集(embedRecords 步骤 1/2 同源判定)。
+// tallyEmbedPlan 按 embedKey 去重后对复用池与拒绝集归类计数(与
+// embedRecords 步骤 1/2 同源判定:active/previous revision → journal →
+// 拒绝集),pending 键回调 fn 导出待嵌任务。
+func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *index.Store, workspaceKey string, previous *index.Manifest, records []chunkRecord, fn func(EmbedJob) error) error {
 	var prior priorVectors
 	if previous != nil {
 		prior = e.loadPriorVectors(store, previous)
 	}
 	journal, err := e.journalFor(workspaceKey, store)
 	if err != nil {
-		return EmbedPlan{}, fmt.Errorf("打开 embedding journal: %w", err)
+		return fmt.Errorf("打开 embedding journal: %w", err)
 	}
 	journalKeys := journal.Snapshot()
 	seen := make(map[string]bool, len(records))
 	for _, record := range records {
 		if err := ctx.Err(); err != nil {
-			return EmbedPlan{}, err
+			return err
 		}
 		key := embedKey(record)
 		if seen[key] {
@@ -179,10 +196,10 @@ func (e *Engine) PlanEmbedJobs(ctx context.Context, ref engine.WorkspaceRef, fn 
 		}
 		plan.Pending++
 		if err := fn(EmbedJob{Key: key, Text: embedDocText(record)}); err != nil {
-			return EmbedPlan{}, err
+			return err
 		}
 	}
-	return plan, nil
+	return nil
 }
 
 // ImportEmbeddings 把离线批量结果回灌 journal:逐条校验维度并 L2 归一
