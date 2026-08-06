@@ -45,7 +45,11 @@ const (
 	defaultVoyageModel   = "voyage-code-3"
 	defaultDimension     = 1024
 	defaultBatchSize     = 128
-	defaultConcurrency   = 4
+	// defaultConcurrency 4→8(灰度反馈 2026-08-07:索引吞吐 450-780
+	// chunks/min 太慢)。嵌入是纯 I/O 等待,worker 数不受 GOMAXPROCS
+	// 约束;付费档 provider(如 Voyage 2000 RPM)吞吐随并发近线性,
+	// 免费档由 provider RPM 限速+429 退避兜底,提并发不改变计费总量。
+	defaultConcurrency = 8
 	// maxBatchSize 是单批条数硬上限（Voyage 官方 ≤1000 条）。
 	maxBatchSize = 1000
 )

@@ -130,6 +130,12 @@ type SemanticStatus struct {
 	PendingChunks  int `json:"pending_chunks,omitempty"`
 	EmbeddedChunks int `json:"embedded_chunks,omitempty"`
 	JournalEntries int `json:"journal_entries,omitempty"`
+	// EmbedRatePerMin/EmbedETASeconds 是构建期嵌入速率与剩余时间估算
+	// (灰度反馈 2026-08-07:只见 pending 无 ETA;加性 omitempty,
+	// 构建结束归零)。估算按本次构建平均速率,provider 限速波动下仅供
+	// 参考。
+	EmbedRatePerMin int `json:"embed_rate_per_min,omitempty"`
+	EmbedETASeconds int `json:"embed_eta_seconds,omitempty"`
 
 	// ProviderState 是 embedding circuit 状态：healthy/backoff/candidate；
 	// backoff 时 BackoffUntil 指明恢复探测时间（§15）。

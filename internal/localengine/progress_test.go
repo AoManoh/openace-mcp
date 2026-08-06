@@ -80,6 +80,14 @@ func TestEmbeddingProgressVisible(t *testing.T) {
 	if samples[0].Semantic.PendingChunks == 0 {
 		t.Fatalf("构建中应有待嵌入计数: %+v", samples[0].Semantic)
 	}
+	// 灰度反馈 2026-08-07:有进度时须携带速率估算(ETA 在剩余>0 时给出)。
+	last := samples[len(samples)-1].Semantic
+	if last.EmbeddedChunks > 0 && last.EmbedRatePerMin <= 0 {
+		t.Fatalf("有进度时应有速率估算: %+v", last)
+	}
+	if last.PendingChunks > 0 && last.EmbedETASeconds < 0 {
+		t.Fatalf("剩余量存在时 ETA 不应为负: %+v", last)
+	}
 
 	close(gate) // 放行剩余批次
 	if err := <-syncDone; err != nil {
