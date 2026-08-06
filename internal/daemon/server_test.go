@@ -464,6 +464,53 @@ func TestServerCompletesMultiRetrieveTask(t *testing.T) {
 	}
 }
 
+// P2(review 二批):daemon 聚合路径不得剥离每仓降级字段;聚合文本
+// 首行携带 [DEGRADED] 汇总横幅,multi_status 计 degraded_count。
+func TestAggregateMultiRetrieveResultsCarriesPerWorkspaceDegradation(t *testing.T) {
+	items := []multiRetrieveResult{
+		{directoryPath: "/tmp/healthy", result: engine.Result{Text: "hit A", RetrievalMode: "hybrid+rerank", SemanticCoverage: "100%"}},
+		{directoryPath: "/tmp/degraded", result: engine.Result{
+			Text:             "[DEGRADED] query-embedding-failed(provider-5xx); mode=lexical\n\nhit B",
+			RetrievalMode:    "lexical",
+			DegradedReason:   "query-embedding-failed(provider-5xx)",
+			SemanticCoverage: "93%",
+		}},
+		{directoryPath: "/tmp/bad", err: errors.New("workspace failed")},
+	}
+	aggregate, successCount := aggregateMultiRetrieveResults("", items)
+	if successCount != 2 {
+		t.Fatalf("expected 2 successes, got %d", successCount)
+	}
+	status := aggregate.MultiStatus
+	if status == nil {
+		t.Fatal("aggregate should expose multi status")
+	}
+	if status.DegradedCount != 1 {
+		t.Fatalf("degraded workspace should be counted: %+v", status)
+	}
+	byPath := map[string]engine.MultiWorkspaceStatus{}
+	for _, ws := range status.Workspaces {
+		byPath[ws.DirectoryPath] = ws
+	}
+	deg := byPath["/tmp/degraded"]
+	if deg.Status != "success" || deg.RetrievalMode != "lexical" || deg.DegradedReason != "query-embedding-failed(provider-5xx)" || deg.SemanticCoverage != "93%" {
+		t.Fatalf("degraded workspace entry should carry degradation fields: %+v", deg)
+	}
+	healthy := byPath["/tmp/healthy"]
+	if healthy.DegradedReason != "" || healthy.RetrievalMode != "hybrid+rerank" || healthy.SemanticCoverage != "100%" {
+		t.Fatalf("healthy workspace entry should carry mode without degradation: %+v", healthy)
+	}
+	if bad := byPath["/tmp/bad"]; bad.Status != "error" || bad.DegradedReason != "" || bad.RetrievalMode != "" {
+		t.Fatalf("failed workspace entry should not fake degradation fields: %+v", bad)
+	}
+	if !strings.HasPrefix(aggregate.Text, "[DEGRADED] 1 of 3 workspaces returned degraded results") {
+		t.Fatalf("aggregate text should lead with degraded banner: %q", aggregate.Text)
+	}
+	if !strings.Contains(aggregate.Text, "WARNING: 1 of 3 workspaces failed") {
+		t.Fatalf("failure warning should be preserved alongside degraded banner: %q", aggregate.Text)
+	}
+}
+
 func TestServerFailsMultiRetrieveTaskWhenAllWorkspacesFail(t *testing.T) {
 	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭

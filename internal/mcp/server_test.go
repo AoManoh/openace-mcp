@@ -51,6 +51,45 @@ func (fakeMultiSyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine
 	return engine.Result{CheckpointID: "checkpoint-" + req.Workspace.DirectoryPath, FileCount: 2}, nil
 }
 
+// transparencySyncer 返回带全套透明性/质量字段的检索结果（P1 用例）。
+type transparencySyncer struct{}
+
+func (transparencySyncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	return engine.Result{
+		Text:             "retrieved",
+		Engine:           "local-hybrid",
+		IndexRevision:    "rev-abc123",
+		RetrievalMode:    "hybrid+rerank",
+		SemanticCoverage: "87%",
+		RerankSent:       50,
+		EmbeddingProfile: "voyage/code-3/1024",
+	}, nil
+}
+
+func (transparencySyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
+	return engine.Result{FileCount: 1}, nil
+}
+
+// degradedMultiSyncer 让 /tmp/deg 仓返回降级结果、其余仓健康（P2 用例）。
+type degradedMultiSyncer struct{}
+
+func (degradedMultiSyncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	dir := req.Workspace.DirectoryPath
+	if strings.Contains(dir, "deg") {
+		return engine.Result{
+			Text:             "[DEGRADED] query-embedding-failed(provider-5xx); mode=lexical\n\nretrieved from " + dir,
+			RetrievalMode:    "lexical",
+			DegradedReason:   "query-embedding-failed(provider-5xx)",
+			SemanticCoverage: "93%",
+		}, nil
+	}
+	return engine.Result{Text: "retrieved from " + dir, RetrievalMode: "hybrid+rerank", SemanticCoverage: "100%"}, nil
+}
+
+func (degradedMultiSyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
+	return engine.Result{FileCount: 1}, nil
+}
+
 type blockingToolSyncer struct{}
 
 func (blockingToolSyncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
@@ -372,6 +411,68 @@ func TestMultiCodebaseRetrievalReportsAllFailuresAsToolError(t *testing.T) {
 	}
 	if !strings.Contains(out, `"partial_failure":false`) || !strings.Contains(out, `"failure_count":2`) {
 		t.Fatalf("all failures should include structured status: %s", out)
+	}
+}
+
+// P1(review 二批):单仓 codebase_retrieval 须以 structuredContent 携带
+// 与 task 路径同名的透明性/质量字段——调用方可程序化判断检索模式与
+// 降级状态,不再只能解析文本横幅。
+func TestCodebaseRetrievalCarriesStructuredTransparency(t *testing.T) {
+	out := runMCP(t, NewServer(transparencySyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"/tmp/workspace","information_request":"find code"}}}`)
+	if !strings.Contains(out, "structuredContent") {
+		t.Fatalf("retrieval should attach structured content: %s", out)
+	}
+	for _, want := range []string{
+		`"retrieval_mode":"hybrid+rerank"`,
+		`"semantic_coverage":"87%"`,
+		`"rerank_sent":50`,
+		`"embedding_profile":"voyage/code-3/1024"`,
+		`"index_revision":"rev-abc123"`,
+		`"engine":"local-hybrid"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("structured content should include %s: %s", want, out)
+		}
+	}
+
+	// 字段全空(纯词法零配置/legacy 形状)时不附着 structuredContent,
+	// 不得出现 "structuredContent":null(typed-nil 陷阱)。
+	plain := runMCP(t, NewServer(fakeSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"/tmp/workspace","information_request":"find code"}}}`)
+	if strings.Contains(plain, "structuredContent") {
+		t.Fatalf("plain result should not attach structured content: %s", plain)
+	}
+}
+
+// P2(review 二批):multi_status 每仓条目须携带降级字段,聚合层给
+// degraded_count 与首行 [DEGRADED] 汇总横幅;降级不是错误(isError=false)。
+func TestMultiCodebaseRetrievalExposesPerWorkspaceDegradation(t *testing.T) {
+	out := runMCP(t, NewServer(degradedMultiSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"multi_codebase_retrieval","arguments":{"directory_paths":["/tmp/one","/tmp/deg"],"information_request":"find shared code"}}}`)
+	if strings.Contains(out, `"isError":true`) {
+		t.Fatalf("degraded workspaces are not tool errors: %s", out)
+	}
+	for _, want := range []string{
+		`"degraded_count":1`,
+		`"degraded_reason":"query-embedding-failed(provider-5xx)"`,
+		`"retrieval_mode":"lexical"`,
+		`"retrieval_mode":"hybrid+rerank"`,
+		`"semantic_coverage":"93%"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("multi_status should carry per-workspace degradation %s: %s", want, out)
+		}
+	}
+	var response struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out), &response); err != nil {
+		t.Fatalf("decode MCP response: %v\n%s", err, out)
+	}
+	if len(response.Result.Content) == 0 || !strings.HasPrefix(response.Result.Content[0].Text, "[DEGRADED] 1 of 2 workspaces returned degraded results") {
+		t.Fatalf("aggregate text should lead with degraded banner: %s", out)
 	}
 }
 
