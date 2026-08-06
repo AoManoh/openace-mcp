@@ -231,4 +231,8 @@ type WorkspaceStatus struct {
 	NextWatchAt            *time.Time            `json:"next_watch_at,omitempty"`
 	LastBackgroundSyncAt   *time.Time            `json:"last_background_sync_at,omitempty"`
 	UpdatedAt              *time.Time            `json:"updated_at,omitempty"`
+	// TopLevelFileCounts 是现役索引按顶层目录的文件计数(灰度反馈三
+	// C.1:文件选择遵循 ignore 链但排除面完全黑盒,使用方为定位
+	// docs/ 缺失做了一整轮对照实验)。根文件归 "."。加性 omitempty。
+	TopLevelFileCounts map[string]int `json:"top_level_file_counts,omitempty"`
 }

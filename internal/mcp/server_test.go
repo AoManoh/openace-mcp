@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/daemon"
 	"github.com/AoManoh/openace-mcp/internal/engine"
@@ -222,7 +223,7 @@ func TestGrayFeedbackProtocolAppendsToInstructions(t *testing.T) {
 // 调用方。不可用模式下会话保持:initialize/tools/list 正常,任何
 // tools/call 返回失败原因与修复指引。
 func TestUnavailableServerSurfacesConnectFailure(t *testing.T) {
-	server := NewUnavailableServer(errors.New("openACE daemon at 127.0.0.1:8765 is not compatible with this MCP wrapper: wrapper revision aaa != daemon revision bbb"))
+	server := NewUnavailableServer(errors.New("openACE daemon at 127.0.0.1:8765 is not compatible with this MCP wrapper: wrapper revision aaa != daemon revision bbb"), nil)
 	init := runMCP(t, server, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
 	if !strings.Contains(init, "serverInfo") {
 		t.Fatalf("不可用模式 initialize 应正常应答: %s", init)
@@ -234,6 +235,38 @@ func TestUnavailableServerSurfacesConnectFailure(t *testing.T) {
 	call := runMCP(t, server, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"/tmp/w","information_request":"q"}}}`)
 	if !strings.Contains(call, `"isError":true`) || !strings.Contains(call, "wrapper revision aaa != daemon revision bbb") || !strings.Contains(call, "restart") {
 		t.Fatalf("tools/call 应透传失败原因与修复指引: %s", call)
+	}
+}
+
+// 灰度反馈三 C.4:不可用判定不做惰性重探测——坏 daemon 清除、好 daemon
+// 就位后,本会话仍永远返回启动期缓存的错误,必须重启会话。修复:失败
+// 路径按 TTL 重探测,探测成功即在本会话内自愈。
+func TestUnavailableServerReconnectsLazily(t *testing.T) {
+	attempts := 0
+	server := NewUnavailableServer(errors.New("daemon revision mismatch"), func() (engine.Service, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, errors.New("still mismatched")
+		}
+		return fakeSyncer{}, nil
+	})
+	call := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sync_workspace","arguments":{"directory_path":"/tmp/w"}}}`
+	first := runMCP(t, server, call)
+	if !strings.Contains(first, `"isError":true`) || !strings.Contains(first, "still mismatched") {
+		t.Fatalf("重探测失败应返回最新失败原因: %s", first)
+	}
+	// TTL 内不重试(防每调用都拉起重型 Connect)。
+	withinTTL := runMCP(t, server, call)
+	if attempts != 1 || !strings.Contains(withinTTL, `"isError":true`) {
+		t.Fatalf("TTL 内不应重试(attempts=%d): %s", attempts, withinTTL)
+	}
+	server.reconnectAt = time.Time{} // 模拟 TTL 过期
+	healed := runMCP(t, server, call)
+	if !strings.Contains(healed, "Workspace synced.") {
+		t.Fatalf("探测成功应在本会话自愈: %s", healed)
+	}
+	if server.unavailable != nil {
+		t.Fatalf("自愈后不可用标记应清除: %v", server.unavailable)
 	}
 }
 

@@ -279,6 +279,45 @@ func TestProviderProfileRejected(t *testing.T) {
 	}
 }
 
+// TestWorkspaceStatusTopLevelFileCounts(灰度反馈三 C.1 残余):状态面
+// 按顶层目录给出现役索引文件计数,让 ignore 链的排除面可见——预期目录
+// 计数为 0/缺失即选择面问题,使用方无需黑盒对照实验。根文件归 "."。
+func TestWorkspaceStatusTopLevelFileCounts(t *testing.T) {
+	e := newTestEngine(t)
+	root := newFixtureWorkspace(t)
+	writeFixture(t, root, "docs/plan.md", "# plan\n")
+	writeFixture(t, root, "docs/adr/adr-001.md", "# adr\n")
+	writeFixture(t, root, "src/app.go", "package app\n")
+	// 被 gitignore 排除的目录不应出现在计数里(排除可见性的另一半:
+	// 计数缺失即被排除的信号)。
+	writeFixture(t, root, ".gitignore", "/private/\n")
+	writeFixture(t, root, "private/secret.md", "# hidden\n")
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatal(err)
+	}
+	status, err := e.WorkspaceStatus(context.Background(), engineRef(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := status.TopLevelFileCounts
+	if counts["docs"] != 2 || counts["src"] != 1 {
+		t.Fatalf("顶层目录计数错误: %+v", counts)
+	}
+	if counts["."] < 3 { // main.go/util.py/README.md/.gitignore(敏感文件被拦截)
+		t.Fatalf("根文件应归 \".\": %+v", counts)
+	}
+	if _, ok := counts["private"]; ok {
+		t.Fatalf("被 ignore 的目录不应计数: %+v", counts)
+	}
+	total := 0
+	for _, n := range counts {
+		total += n
+	}
+	if total != status.FileCount {
+		t.Fatalf("计数总和(%d)应与 file_count(%d)一致", total, status.FileCount)
+	}
+}
+
 // TestConcurrentSyncSingleBuild 是暗坑 K12 的验收：并发 sync 合并为一次构建。
 func TestConcurrentSyncSingleBuild(t *testing.T) {
 	e := newTestEngine(t)

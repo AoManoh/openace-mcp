@@ -38,9 +38,11 @@ func main() {
 	if err != nil {
 		// 灰度反馈一号 P1-3:启动失败不再 exit(1) 了事——多数 MCP 客户端
 		// 不展示 stderr,调用方只见裸 "Failed to connect"。降级形态保持
-		// 会话,把 build/profile mismatch 等可行动文案经工具错误透传。
+		// 会话,把 build/profile mismatch 等可行动文案经工具错误透传;
+		// 并按 TTL 惰性重探测(灰度反馈三 C.4),daemon 修好后本会话自愈。
 		fmt.Fprintf(os.Stderr, "openace-mcp: %v\n", err)
-		if runErr := mcp.NewUnavailableServer(err).Run(ctx, os.Stdin, os.Stdout); runErr != nil {
+		reconnect := func() (engine.Service, error) { return buildService(ctx) }
+		if runErr := mcp.NewUnavailableServer(err, reconnect).Run(ctx, os.Stdin, os.Stdout); runErr != nil {
 			fmt.Fprintf(os.Stderr, "openace-mcp: %v\n", runErr)
 		}
 		os.Exit(1)
