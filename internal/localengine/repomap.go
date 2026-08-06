@@ -146,22 +146,49 @@ func renderRepoMap(revision string, files []mapFile, budget int, focus string) (
 		}
 		perDir[f.topDir] = append(perDir[f.topDir], f)
 	}
-	// 轮转选文件:每轮每目录取一个(该目录内分数序),直到预算感知的
-	// 数量上限;选中集再按目录分组渲染。
-	type pick struct {
-		file mapFile
-		dir  string
+	// 选择与渲染解耦(实测修复:轮转序线性输出会把跨目录条目挤进
+	// 错误的目录 header 下)。选择=轮转+预算(每轮每目录取一个,
+	// 保证顶层目录保底;边际成本含该目录 header 首次开销);渲染=
+	// 按目录分组,目录序=首选序,目录内按分数序。
+	title := fmt.Sprintf("# repo map: %s (%d files", revision, totalFiles(perDir))
+	if focus != "" {
+		title += fmt.Sprintf(", focus=%s", focus)
 	}
-	var picks []pick
+	title += ")\n"
+	dirHeader := func(dir string) string {
+		group := perDir[dir]
+		symbols := 0
+		for _, f := range group {
+			symbols += len(f.symbols)
+		}
+		return fmt.Sprintf("%s/ (%d files, %d symbols)\n", dir, len(group), symbols)
+	}
+	used := len(title)
+	selected := make(map[string][]mapFile)
+	dirCharged := make(map[string]bool)
+	shown := 0
+	truncated := false
 	round := 0
-	for {
+	for !truncated {
 		advanced := false
 		for _, dir := range dirOrder {
 			group := perDir[dir]
-			if round < len(group) {
-				picks = append(picks, pick{file: group[round], dir: dir})
-				advanced = true
+			if round >= len(group) {
+				continue
 			}
+			advanced = true
+			marginal := len(formatMapFile(group[round]))
+			if !dirCharged[dir] {
+				marginal += len(dirHeader(dir))
+			}
+			if used+marginal > budget {
+				truncated = true
+				break
+			}
+			used += marginal
+			dirCharged[dir] = true
+			selected[dir] = append(selected[dir], group[round])
+			shown++
 		}
 		if !advanced {
 			break
@@ -169,41 +196,17 @@ func renderRepoMap(revision string, files []mapFile, budget int, focus string) (
 		round++
 	}
 
-	title := fmt.Sprintf("# repo map: %s (%d files", revision, totalFiles(perDir))
-	if focus != "" {
-		title += fmt.Sprintf(", focus=%s", focus)
-	}
-	title += ")\n"
 	var out strings.Builder
 	out.WriteString(title)
-	shown := 0
-	truncated := false
-	rendered := make(map[string]bool)
-	dirHeaderDone := make(map[string]bool)
-	// 渲染顺序:按 picks 序(轮转保证目录保底),但同目录条目聚在该
-	// 目录 header 下需二次分组——为保持"预算内轮转公平",按 picks
-	// 线性输出,目录 header 首见时打印。
-	for _, p := range picks {
-		var section strings.Builder
-		if !dirHeaderDone[p.dir] {
-			group := perDir[p.dir]
-			symbols := 0
-			for _, f := range group {
-				symbols += len(f.symbols)
-			}
-			section.WriteString(fmt.Sprintf("%s/ (%d files, %d symbols)\n", p.dir, len(group), symbols))
+	for _, dir := range dirOrder {
+		group := selected[dir]
+		if len(group) == 0 {
+			continue
 		}
-		section.WriteString(formatMapFile(p.file))
-		if out.Len()+section.Len() > budget {
-			truncated = true
-			break
+		out.WriteString(dirHeader(dir))
+		for _, f := range group {
+			out.WriteString(formatMapFile(f))
 		}
-		if !dirHeaderDone[p.dir] {
-			dirHeaderDone[p.dir] = true
-		}
-		out.WriteString(section.String())
-		rendered[p.file.path] = true
-		shown++
 	}
 	if truncated {
 		out.WriteString(fmt.Sprintf("[map truncated: %d of %d files shown; raise max_output_length or use focus for a subtree]\n", shown, len(files)))
