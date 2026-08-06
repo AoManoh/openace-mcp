@@ -89,6 +89,32 @@ type Result struct {
 	// 13.1s 无法归因是 sync、embed、rerank 还是渲染)。检索路径恒填,
 	// sync 路径为空;加性 omitempty。
 	Timings *RetrievalTimings `json:"timings,omitempty"`
+	// Hits 是结构化命中清单(框架 18.2/S2):每个合并后候选块一条,
+	// 含 shown 标记——"候选存在但没交给调用方"从此机器可读,调用方
+	// 可对未展示 hit 定向 Read 续取。加性 omitempty,检索路径填充。
+	Hits []Hit `json:"hits,omitempty"`
+	// Display 是展示统计(候选块/实展块/实展文件/是否截断)。
+	Display *DisplayStats `json:"display,omitempty"`
+}
+
+// Hit 是单个检索命中的结构化引用(合并后块粒度,与正文 header 同源)。
+type Hit struct {
+	Path      string `json:"path"`
+	StartLine int    `json:"start_line"`
+	EndLine   int    `json:"end_line"`
+	Symbol    string `json:"symbol,omitempty"`
+	// Rank 是融合(+精排)后的展示序(1 起);Shown 表示正文实际包含
+	// 该块内容(paths 模式=头行已列出)。
+	Rank  int  `json:"rank"`
+	Shown bool `json:"shown"`
+}
+
+// DisplayStats 是单次检索的展示完整性统计(框架 18.2)。
+type DisplayStats struct {
+	CandidateBlocks int  `json:"candidate_blocks"`
+	ShownBlocks     int  `json:"shown_blocks"`
+	ShownFiles      int  `json:"shown_files"`
+	Truncated       bool `json:"truncated"`
 }
 
 // RetrievalTimings 是单次检索各阶段耗时(毫秒)。SyncMs 含查询前置

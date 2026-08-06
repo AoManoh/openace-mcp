@@ -123,6 +123,10 @@ type retrievalArgs struct {
 	DirectoryPath      string `json:"directory_path"`
 	ProviderProfileID  string `json:"provider_profile_id,omitempty"`
 	MaxOutputLength    int    `json:"max_output_length,omitempty"`
+	// Detail 是输出详略(框架 18.2/S2,用户候选"路径+行号优先"的
+	// 实验载体):full(默认,内容块)/paths(只回 path:range 头行,
+	// 内容由调用方按需 Read)。
+	Detail string `json:"detail,omitempty"`
 }
 
 type multiRetrievalArgs struct {
@@ -411,7 +415,7 @@ func (s *Server) handleRetrieval(ctx context.Context, id *json.RawMessage, rawAr
 	}
 	toolCtx, cancel := toolTimeoutContext(ctx)
 	defer cancel()
-	result, err := s.retrieve(toolCtx, args.DirectoryPath, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength)
+	result, err := s.retrieve(toolCtx, args.DirectoryPath, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength, args.Detail)
 	if err != nil {
 		return toolError(id, err.Error())
 	}
@@ -465,6 +469,14 @@ func retrievalStructured(result engine.Result) map[string]any {
 		// 阶段耗时(框架 18.3):调用方可归因延迟(sync/embed/rerank/
 		// render),灰度"13.1s 不知慢在哪"从此有数。
 		fields["timings"] = result.Timings
+	}
+	if len(result.Hits) > 0 {
+		// 结构化 hits 清单与展示统计(框架 18.2):候选到交付的完整性
+		// 机器可读,未展示 hit 可定向 Read 续取。
+		fields["hits"] = result.Hits
+	}
+	if result.Display != nil {
+		fields["display"] = result.Display
 	}
 	if len(fields) == 0 {
 		return nil
@@ -542,6 +554,7 @@ func (s *Server) handleStartRetrieval(ctx context.Context, id *json.RawMessage, 
 		ProviderProfileID:  args.ProviderProfileID,
 		InformationRequest: args.InformationRequest,
 		MaxOutputLength:    args.MaxOutputLength,
+		Detail:             args.Detail,
 	})
 	if err != nil {
 		return toolError(id, err.Error())
@@ -734,7 +747,7 @@ type multiRetrievalResult struct {
 	SemanticCoverage string
 }
 
-func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (engine.Result, error) {
+func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int, detail string) (engine.Result, error) {
 	return s.service.Search(ctx, engine.SearchRequest{
 		Workspace: engine.WorkspaceRef{
 			DirectoryPath:     dir,
@@ -742,6 +755,7 @@ func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID str
 		},
 		Query:        query,
 		MaxOutputLen: maxOutputLen,
+		Detail:       detail,
 	})
 }
 
@@ -809,7 +823,7 @@ func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerP
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := s.retrieve(ctx, path, providerProfileID, query, maxOutputLen)
+			result, err := s.retrieve(ctx, path, providerProfileID, query, maxOutputLen, "")
 			if err != nil {
 				results[i].Error = err.Error()
 				return
@@ -925,6 +939,10 @@ func activeInstructions() string {
 
 const retrievalDescription = "Search the local codebase index (hybrid lexical + semantic retrieval with reranking). Use this tool FIRST whenever you need to find code, configuration, tests, or documentation in the workspace before answering or editing. One focused intent per call; issue multiple calls for multi-part tasks. File selection honors .gitignore and .openaceignore: a directory that never appears in any result is usually excluded there (add a !pattern in .openaceignore to re-include gitignored paths)."
 
+// detailDescription 是输出详略契约(框架 18.2/S2;业界"默认小、按需大"
+// 光谱的参数化位:Anthropic response_format enum 同型)。
+const detailDescription = "Output detail: \"full\" (default) returns source content blocks; \"paths\" returns only `## path:start-end symbol` header lines so you can Read the files yourself — fresher (reads hit the live disk) and far cheaper in tokens, at the cost of one more round trip."
+
 // maxOutputLengthDescription 是 max_output_length 参数契约(灰度反馈:
 // 该参数此前无描述,调用方盲传小值致结果被截断、检索质量凭空劣化,
 // review P5 附带项;用户裁决 2026-08-07:质量优先,非明确要省 token
@@ -944,6 +962,7 @@ func retrievalTool() map[string]any {
 				"directory_path":      map[string]any{"type": "string", "description": "Absolute path of the workspace root to search."},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
+				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
 			},
 			"required": []string{"information_request", "directory_path"},
 		},
@@ -964,6 +983,7 @@ func multiRetrievalTool() map[string]any {
 				},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
+				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
 			},
 			"required": []string{"information_request", "directory_paths"},
 		},
@@ -996,6 +1016,7 @@ func startRetrievalTool() map[string]any {
 				"directory_path":      map[string]any{"type": "string"},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
+				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
 			},
 			"required": []string{"information_request", "directory_path"},
 		},
@@ -1016,6 +1037,7 @@ func startMultiRetrievalTool() map[string]any {
 				},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
+				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
 			},
 			"required": []string{"information_request", "directory_paths"},
 		},

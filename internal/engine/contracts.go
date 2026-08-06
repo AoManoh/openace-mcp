@@ -68,6 +68,10 @@ type SearchRequest struct {
 	Workspace    WorkspaceRef
 	Query        string
 	MaxOutputLen int
+	// Detail 是输出详略(框架 18.2/S2 实验载体):""/"full"=内容块
+	// (现状);"paths"=只回 path:range 头行,内容由调用方按需 Read
+	// (token 经济与磁盘新鲜度换一轮往返,默认不变,实验裁决)。
+	Detail string
 }
 
 // Service 是检索引擎的核心行为契约：同步索引与执行检索。

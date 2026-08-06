@@ -3,6 +3,7 @@ package localengine
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/AoManoh/openace-mcp/internal/index"
@@ -120,7 +121,8 @@ func TestRenderBudgetTruncation(t *testing.T) {
 		chunkRecord{ID: "b", RelPath: "b.go", Language: "go", StartLine: 1, EndLine: 1, Content: "beta"},
 	)
 	got := mustRender(t, handle, []rankedHit{{id: "a", score: 2}, {id: "b", score: 1}}, 30)
-	if !containsAll(got, "a.go", "[output truncated by max_output_length: 1 of 2 result blocks shown") || contains(got, "b.go") {
+	// b.go 的内容不得出现;其路径引用可经 omitted 清单合法携带(18.2)。
+	if !containsAll(got, "a.go", "[output truncated by max_output_length: 1 of 2 result blocks shown") || contains(got, "beta") {
 		t.Fatalf("预算截断行为错误: %q", got)
 	}
 }
@@ -153,6 +155,69 @@ func TestRenderBudgetPrioritizesFileCoverage(t *testing.T) {
 	full := mustRender(t, handle, hits, 0)
 	if !containsAll(full, "alpha one", "alpha two", "beta one", "gamma one") || contains(full, "[output truncated") {
 		t.Fatalf("预算充足应全量: %q", full)
+	}
+}
+
+// TestRenderProducesHitInventory(框架 18.2/S2):渲染同时产出结构化
+// hits 清单(path/行区间/symbol/rank/shown)与展示统计——"候选存在但
+// 调用方看不到"从此机器可读(cross-file 缺口 19/39 卡 rank6-10、灰度
+// 33 块只回 2 块,同源问题)。
+func TestRenderProducesHitInventory(t *testing.T) {
+	handle := newRenderHandle(t,
+		chunkRecord{ID: "a1", RelPath: "a.go", Language: "go", StartLine: 1, EndLine: 3, Symbol: "Alpha", Content: "alpha one\nl2\nl3"},
+		chunkRecord{ID: "b1", RelPath: "b.go", Language: "go", StartLine: 1, EndLine: 1, Symbol: "Beta", Content: "beta one"},
+		chunkRecord{ID: "c1", RelPath: "c.go", Language: "go", StartLine: 5, EndLine: 5, Content: "gamma one"},
+	)
+	hits := []rankedHit{{id: "a1", score: 3}, {id: "b1", score: 2}, {id: "c1", score: 1}}
+	// 预算只够 1 块:inventory 仍覆盖全部候选,shown 如实。
+	rendered, err := renderHitsWithInventory(handle, hits, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rendered.hits) != 3 {
+		t.Fatalf("inventory 应覆盖全部合并候选: %+v", rendered.hits)
+	}
+	first := rendered.hits[0]
+	if first.Path != "a.go" || first.StartLine != 1 || first.EndLine != 3 || first.Symbol != "Alpha" || first.Rank != 1 || !first.Shown {
+		t.Fatalf("首条 hit 元数据错误: %+v", first)
+	}
+	shown := 0
+	for _, h := range rendered.hits {
+		if h.Shown {
+			shown++
+		}
+	}
+	if shown != rendered.display.ShownBlocks || !rendered.display.Truncated {
+		t.Fatalf("展示统计与 inventory 不一致: shown=%d display=%+v", shown, rendered.display)
+	}
+	if rendered.display.CandidateBlocks != 3 || rendered.display.ShownFiles != shown {
+		t.Fatalf("统计字段错误: %+v", rendered.display)
+	}
+	// 截断时正文尾部列出未展示文件(弱 caller 无结构化访问也能续取)。
+	if !strings.Contains(rendered.text, "omitted files:") || !strings.Contains(rendered.text, "b.go:1-1") {
+		t.Fatalf("截断应附未展示文件清单: %q", rendered.text)
+	}
+}
+
+// TestRenderPathsDetailMode(用户候选:路径+行号优先返回,agent 自行
+// Read):detail=paths 时正文只有 header 行(零代码围栏),预算约束
+// 依旧;inventory/统计照常。
+func TestRenderPathsDetailMode(t *testing.T) {
+	handle := newRenderHandle(t,
+		chunkRecord{ID: "a1", RelPath: "a.go", Language: "go", StartLine: 1, EndLine: 3, Symbol: "Alpha", Content: "alpha one\nl2\nl3"},
+		chunkRecord{ID: "b1", RelPath: "b.go", Language: "go", StartLine: 1, EndLine: 1, Symbol: "Beta", Content: "beta one"},
+	)
+	hits := []rankedHit{{id: "a1", score: 3}, {id: "b1", score: 2}}
+	rendered, err := renderHitsDetail(handle, hits, 0, detailPaths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "## a.go:1-3 Alpha\n## b.go:1-1 Beta"
+	if rendered.text != want {
+		t.Fatalf("paths 模式正文应只有 header:\n--- want ---\n%s\n--- got ---\n%s", want, rendered.text)
+	}
+	if len(rendered.hits) != 2 || !rendered.hits[0].Shown || !rendered.hits[1].Shown {
+		t.Fatalf("paths 模式 inventory 应全 shown: %+v", rendered.hits)
 	}
 }
 

@@ -243,11 +243,16 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	handle := out.handle
 	defer e.releaseHandle(handle)
 
+	detail, err := parseDetail(req.Detail)
+	if err != nil {
+		return engine.Result{}, err
+	}
 	renderStart := time.Now()
-	text, renderErr := renderHits(handle, out.ordered, req.MaxOutputLen)
+	rendered, renderErr := renderHitsDetail(handle, out.ordered, req.MaxOutputLen, detail)
 	if renderErr != nil {
 		return engine.Result{}, renderErr
 	}
+	text := rendered.text
 	if out.timings != nil {
 		out.timings.RenderMs = time.Since(renderStart).Milliseconds()
 		out.timings.TotalMs = time.Since(out.started).Milliseconds()
@@ -262,6 +267,13 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	result.IndexRevision = handle.manifest.Revision
 	// 阶段耗时恒随检索结果携带(框架 18.3,加性字段)。
 	result.Timings = out.timings
+	// 结构化 hits 清单与展示统计(框架 18.2,加性字段):候选到交付
+	// 的完整性机器可读,未展示 hit 可定向 Read 续取。
+	result.Hits = rendered.hits
+	if rendered.display.CandidateBlocks > 0 {
+		display := rendered.display
+		result.Display = &display
+	}
 	// 路由分立可审计记录:触发即携带(含纯词法形态),未触发保持空
 	// (omitempty,wire 不变)。
 	result.QueryPlan = out.queryPlan
@@ -1111,9 +1123,44 @@ type renderBlock struct {
 // renderHits 把命中渲染为稳定文本格式（golden 锁定，暗坑 K13）：
 // 同文件重叠/相邻 chunk 合并，按最高分排序，MaxOutputLen 预算截断。
 // 内容按需 pread（D5），候选数受召回深度约束。
+// 输出详略模式(框架 18.2/S2;用户候选"路径+行号优先"的实验载体)。
+const (
+	detailFull  = "full"
+	detailPaths = "paths"
+)
+
+// parseDetail 校验详略参数;未知值按请求类错误拒绝(P7 语义)。
+func parseDetail(raw string) (string, error) {
+	switch strings.TrimSpace(raw) {
+	case "", detailFull:
+		return detailFull, nil
+	case detailPaths:
+		return detailPaths, nil
+	}
+	return "", engine.AsInvalidRequest(fmt.Errorf("invalid detail %q; use full or paths", raw))
+}
+
+// renderedResult 是渲染产物:正文 + 结构化 hits 清单 + 展示统计
+// (框架 18.2:候选到交付的完整性机器可读)。
+type renderedResult struct {
+	text    string
+	hits    []engine.Hit
+	display engine.DisplayStats
+}
+
+// renderHits 保持既有文本口径(detail=full)。
 func renderHits(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (string, error) {
+	rendered, err := renderHitsWithInventory(handle, hits, maxOutputLen)
+	return rendered.text, err
+}
+
+func renderHitsWithInventory(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (renderedResult, error) {
+	return renderHitsDetail(handle, hits, maxOutputLen, detailFull)
+}
+
+func renderHitsDetail(handle *revisionHandle, hits []rankedHit, maxOutputLen int, detail string) (renderedResult, error) {
 	if len(hits) == 0 {
-		return noHitsText, nil
+		return renderedResult{text: noHitsText}, nil
 	}
 	blocks := make([]renderBlock, 0, len(hits))
 	for _, hit := range hits {
@@ -1122,12 +1169,12 @@ func renderHits(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (str
 		}
 		record, err := handle.record(hit.id)
 		if err != nil {
-			return "", err
+			return renderedResult{}, err
 		}
 		blocks = append(blocks, renderBlock{record: record, score: hit.score})
 	}
 	if len(blocks) == 0 {
-		return noHitsText, nil
+		return renderedResult{text: noHitsText}, nil
 	}
 	merged := mergeBlocks(blocks)
 	sort.SliceStable(merged, func(i, j int) bool { return merged[i].score > merged[j].score })
@@ -1136,6 +1183,44 @@ func renderHits(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (str
 	if budget <= 0 {
 		budget = 20000
 	}
+	inventory := make([]engine.Hit, len(merged))
+	for i, block := range merged {
+		inventory[i] = engine.Hit{
+			Path: block.record.RelPath, StartLine: block.record.StartLine,
+			EndLine: block.record.EndLine, Symbol: block.record.Symbol, Rank: i + 1,
+		}
+	}
+
+	if detail == detailPaths {
+		// 路径+行号模式(用户候选):正文只有 header 行,内容由调用方
+		// 按需 Read——token 经济与磁盘新鲜度换一轮往返。预算仍适用
+		// (头行极小,实际几乎不截断)。
+		var out strings.Builder
+		shown := 0
+		truncated := false
+		for i := range merged {
+			line := blockHeader(merged[i].record) + "\n"
+			if out.Len()+len(line) > budget {
+				truncated = true
+				break
+			}
+			out.WriteString(line)
+			inventory[i].Shown = true
+			shown++
+		}
+		if truncated {
+			out.WriteString(truncationMarker(shown, len(merged)))
+		}
+		return renderedResult{
+			text: strings.TrimRight(out.String(), "\n"),
+			hits: inventory,
+			display: engine.DisplayStats{
+				CandidateBlocks: len(merged), ShownBlocks: shown,
+				ShownFiles: countShownFiles(merged, inventory), Truncated: truncated,
+			},
+		}, nil
+	}
+
 	numbered := renderLineNumbersEnabled()
 	sections := make([]string, len(merged))
 	for i, block := range merged {
@@ -1150,7 +1235,14 @@ func renderHits(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (str
 		for cut > 0 && !utf8.RuneStart(sections[0][cut]) {
 			cut--
 		}
-		return strings.TrimRight(sections[0][:cut]+truncationMarker(1, len(merged)), "\n"), nil
+		inventory[0].Shown = true
+		return renderedResult{
+			text: strings.TrimRight(sections[0][:cut]+truncationMarker(1, len(merged)), "\n"),
+			hits: inventory,
+			display: engine.DisplayStats{
+				CandidateBlocks: len(merged), ShownBlocks: 1, ShownFiles: 1, Truncated: true,
+			},
+		}, nil
 	}
 	// 预算内选块(灰度反馈四 §6.2):先保证每个命中文件至少一个片段
 	// (按分序),再回填同文件的更多片段——此前纯分序填充会让单个
@@ -1184,13 +1276,70 @@ func renderHits(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (str
 	for i := range merged {
 		if selected[i] {
 			out.WriteString(sections[i])
+			inventory[i].Shown = true
 			shown++
 		}
 	}
 	if truncated {
 		out.WriteString(truncationMarker(shown, len(merged)))
+		out.WriteString(omittedFilesLine(merged, selected))
 	}
-	return strings.TrimRight(out.String(), "\n"), nil
+	return renderedResult{
+		text: strings.TrimRight(out.String(), "\n"),
+		hits: inventory,
+		display: engine.DisplayStats{
+			CandidateBlocks: len(merged), ShownBlocks: shown,
+			ShownFiles: countShownFiles(merged, inventory), Truncated: truncated,
+		},
+	}, nil
+}
+
+// blockHeader 是块的 header 行(与 formatBlock 首行同源口径)。
+func blockHeader(record chunkRecord) string {
+	header := fmt.Sprintf("## %s:%d-%d", record.RelPath, record.StartLine, record.EndLine)
+	if record.Symbol != "" {
+		header += " " + record.Symbol
+	}
+	return header
+}
+
+// countShownFiles 统计实展文件数。
+func countShownFiles(merged []renderBlock, inventory []engine.Hit) int {
+	files := make(map[string]bool)
+	for i := range merged {
+		if inventory[i].Shown {
+			files[merged[i].record.RelPath] = true
+		}
+	}
+	return len(files)
+}
+
+// omittedFilesLine 列出零展示文件的最佳块引用(截断时随正文携带,
+// 弱 caller 无结构化访问也能定向 Read 续取;上限 10 条防自身膨胀)。
+func omittedFilesLine(merged []renderBlock, selected []bool) string {
+	shownFile := make(map[string]bool)
+	for i := range merged {
+		if selected[i] {
+			shownFile[merged[i].record.RelPath] = true
+		}
+	}
+	var refs []string
+	listed := make(map[string]bool)
+	for i := range merged {
+		path := merged[i].record.RelPath
+		if shownFile[path] || listed[path] {
+			continue
+		}
+		listed[path] = true
+		refs = append(refs, fmt.Sprintf("%s:%d-%d", path, merged[i].record.StartLine, merged[i].record.EndLine))
+		if len(refs) >= 10 {
+			break
+		}
+	}
+	if len(refs) == 0 {
+		return ""
+	}
+	return "omitted files: " + strings.Join(refs, ", ") + "\n"
 }
 
 // truncationMarkerPrefix 是输出预算截断标记的稳定前缀(golden/调用方

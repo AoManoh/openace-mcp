@@ -53,6 +53,9 @@ type retrieveRequest struct {
 	ProviderProfileID  string `json:"provider_profile_id,omitempty"`
 	InformationRequest string `json:"information_request"`
 	MaxOutputLength    int    `json:"max_output_length,omitempty"`
+	// Detail 是输出详略(框架 18.2/S2):""/"full"=内容块;"paths"=
+	// 只回 path:range 头行。非法值由引擎按请求类错误拒绝(400)。
+	Detail string `json:"detail,omitempty"`
 }
 
 func NewServer(service engine.Service) *Server {
@@ -306,7 +309,7 @@ func (s *Server) retrieve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	result, err := s.runRetrieve(r.Context(), req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, maxOutputLength)
+	result, err := s.runRetrieve(r.Context(), req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, maxOutputLength, req.Detail)
 	if err != nil {
 		writeUpstreamError(w, err)
 		return
@@ -528,7 +531,7 @@ func (s *Server) runTask(ctx context.Context, req TaskRequest) (engine.Result, e
 	case TaskKindSync:
 		result, err = s.runSync(ctx, req.DirectoryPath, req.ProviderProfileID)
 	case TaskKindRetrieve:
-		result, err = s.runRetrieve(ctx, req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength)
+		result, err = s.runRetrieve(ctx, req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength, req.Detail)
 	case TaskKindMultiRetrieve:
 		result, err = s.runMultiRetrieve(ctx, req.DirectoryPaths, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength)
 	default:
@@ -549,7 +552,7 @@ func (s *Server) runSync(ctx context.Context, dir string, providerProfileID stri
 	}})
 }
 
-func (s *Server) runRetrieve(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (engine.Result, error) {
+func (s *Server) runRetrieve(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int, detail string) (engine.Result, error) {
 	s.observeWorkspace(dir, providerProfileID)
 	return s.service.Search(ctx, engine.SearchRequest{
 		Workspace: engine.WorkspaceRef{
@@ -558,6 +561,7 @@ func (s *Server) runRetrieve(ctx context.Context, dir string, providerProfileID 
 		},
 		Query:        query,
 		MaxOutputLen: maxOutputLen,
+		Detail:       detail,
 	})
 }
 
@@ -582,7 +586,7 @@ func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, providerPr
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := s.runRetrieve(ctx, dir, providerProfileID, query, maxOutputLen)
+			result, err := s.runRetrieve(ctx, dir, providerProfileID, query, maxOutputLen, "")
 			results[i].result = result
 			results[i].err = err
 		}()

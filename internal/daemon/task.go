@@ -57,6 +57,8 @@ type TaskRequest struct {
 	ProviderProfileID  string   `json:"provider_profile_id,omitempty"`
 	InformationRequest string   `json:"information_request,omitempty"`
 	MaxOutputLength    int      `json:"max_output_length,omitempty"`
+	// Detail 是输出详略(框架 18.2,与同步检索同契约)。
+	Detail string `json:"detail,omitempty"`
 }
 
 type TaskSnapshot struct {

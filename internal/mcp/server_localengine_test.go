@@ -90,6 +90,24 @@ func ResolveWorkspaceKey(path string) string {
 	if !strings.Contains(wsStatus, "stage") || !strings.Contains(wsStatus, "file_count") {
 		t.Fatalf("direct 模式 workspace_status 应返回状态字段: %s", wsStatus)
 	}
+
+	// 框架 18.2/S2:structuredContent 携带 hits 清单/展示统计/阶段耗时;
+	// detail=paths 时正文只有 header 行(零代码围栏),内容由调用方
+	// 按需 Read。
+	structured := runMCP(t, server, `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"information_request":"ResolveWorkspaceKey","directory_path":`+jsonString(root)+`}}}`)
+	for _, want := range []string{`"hits"`, `"display"`, `"timings"`, `"shown_blocks"`, `"rank"`} {
+		if !strings.Contains(structured, want) {
+			t.Fatalf("structuredContent 缺 %s: %s", want, structured)
+		}
+	}
+	paths := runMCP(t, server, `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"information_request":"ResolveWorkspaceKey","directory_path":`+jsonString(root)+`,"detail":"paths"}}}`)
+	if !strings.Contains(paths, "## main.go:") || strings.Contains(paths, "```") {
+		t.Fatalf("paths 模式应只回 header 行: %s", paths)
+	}
+	bad := runMCP(t, server, `{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"information_request":"x","directory_path":`+jsonString(root)+`,"detail":"bogus"}}}`)
+	if !strings.Contains(bad, `"isError":true`) || !strings.Contains(bad, "invalid detail") {
+		t.Fatalf("非法 detail 应可行动报错: %s", bad)
+	}
 }
 
 // TestLocalEngineProfileIDRejectedViaMCP 验证 provider_profile_id 在
