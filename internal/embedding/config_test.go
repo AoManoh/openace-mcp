@@ -33,7 +33,7 @@ func TestDefaultsWithVoyageKey(t *testing.T) {
 		cfg.Model != "voyage-code-3" || cfg.Dimension != 1024 {
 		t.Fatalf("默认身份不符: %+v", cfg)
 	}
-	if cfg.BatchSize != 128 || cfg.MaxConcurrency != 4 || cfg.RPMBudget != 0 || cfg.TPMBudget != 0 {
+	if cfg.BatchSize != 128 || cfg.MaxConcurrency != 8 || cfg.RPMBudget != 0 || cfg.TPMBudget != 0 {
 		t.Fatalf("默认运维参数不符: %+v", cfg)
 	}
 	if cfg.Timeout != 60*time.Second || cfg.MaxRetries != 5 {

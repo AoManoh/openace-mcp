@@ -418,6 +418,7 @@ func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.Workspace
 }
 
 // buildProgressLabel 读取构建期进度快照(D8 可见性字段的错误文案投影)。
+// 有嵌入进度时附速率与 ETA(灰度反馈 2026-08-07:等待方需要"多久能好")。
 func (e *Engine) buildProgressLabel(workspaceKey string) string {
 	e.mu.Lock()
 	tracker := e.statuses[workspaceKey]
@@ -427,7 +428,14 @@ func (e *Engine) buildProgressLabel(workspaceKey string) string {
 	}
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
-	return fmt.Sprintf("stage=%s embedded=%d pending=%d", tracker.stage, tracker.embedDone, tracker.embedPending)
+	label := fmt.Sprintf("stage=%s embedded=%d pending=%d", tracker.stage, tracker.embedDone, tracker.embedPending)
+	if rate, eta := tracker.embedRateETALocked(time.Now().UTC()); rate > 0 {
+		label += fmt.Sprintf(" rate=%d/min", rate)
+		if eta > 0 {
+			label += fmt.Sprintf(" eta=%s", (time.Duration(eta) * time.Second).Round(time.Second))
+		}
+	}
+	return label
 }
 
 func (e *Engine) syncWorkspace(ctx context.Context, ref engine.WorkspaceRef) (engine.Result, error) {

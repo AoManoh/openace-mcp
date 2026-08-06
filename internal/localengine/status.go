@@ -47,15 +47,45 @@ type wsStatus struct {
 	// 构建期 embedding 进度（Stage 4 D8）：按批更新，构建结束归零。
 	embedPending int
 	embedDone    int
+	// embedStartedAt 是本次构建嵌入阶段起点(灰度反馈 2026-08-07:
+	// 大仓预热只见 pending 无速率/ETA,"在推进"与"多久能好"无从判断),
+	// 供速率与 ETA 估算;构建结束随进度一并归零。
+	embedStartedAt *time.Time
 }
 
 // setEmbedProgress 按批更新构建期 embedding 进度（D8/G2 可见性）。
 func (s *wsStatus) setEmbedProgress(pending int, done int) {
+	now := time.Now().UTC()
 	s.mu.Lock()
 	s.embedPending = pending
 	s.embedDone = done
-	s.updatedAt = time.Now().UTC()
+	if done == 0 {
+		s.embedStartedAt = &now
+	}
+	s.updatedAt = now
 	s.mu.Unlock()
+}
+
+// embedRateETA 按当前进度估算嵌入速率(chunks/min)与剩余秒数;
+// 无进度或刚起步时返回 (0,0)。调用方须持有 s.mu。
+func (s *wsStatus) embedRateETALocked(now time.Time) (int, int) {
+	if s.embedStartedAt == nil || s.embedDone <= 0 {
+		return 0, 0
+	}
+	elapsed := now.Sub(*s.embedStartedAt).Seconds()
+	if elapsed <= 0 {
+		return 0, 0
+	}
+	perSecond := float64(s.embedDone) / elapsed
+	rate := int(perSecond * 60)
+	if rate < 1 {
+		rate = 1
+	}
+	eta := 0
+	if s.embedPending > 0 && perSecond > 0 {
+		eta = int(float64(s.embedPending)/perSecond + 0.5)
+	}
+	return rate, eta
 }
 
 // setSemanticOutcome 记录最近一次构建的语义路交互结果（K35 拒绝数与
@@ -130,6 +160,7 @@ func (s *wsStatus) ready(manifest *index.Manifest, revisions int) {
 	s.stage = engine.IndexStageReady
 	s.embedPending = 0
 	s.embedDone = 0
+	s.embedStartedAt = nil
 	s.revision = manifest.Revision
 	s.fileCount = manifest.Counts.Files
 	s.chunkCount = manifest.Counts.Chunks
@@ -149,6 +180,7 @@ func (s *wsStatus) fail(err error) {
 	s.stage = engine.IndexStageFailed
 	s.embedPending = 0
 	s.embedDone = 0
+	s.embedStartedAt = nil
 	s.lastError = sanitizeError(err)
 	s.finishedAt = &now
 	s.updatedAt = now
@@ -261,6 +293,7 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 			semantic.LastError = tracker.embedError
 			semantic.PendingChunks = tracker.embedPending
 			semantic.EmbeddedChunks = tracker.embedDone
+			semantic.EmbedRatePerMin, semantic.EmbedETASeconds = tracker.embedRateETALocked(time.Now().UTC())
 			tracker.mu.Unlock()
 			// journal 条数（D4 可见性）：已打开的暂存区实时读取。
 			e.mu.Lock()

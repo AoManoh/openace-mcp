@@ -856,21 +856,24 @@ const serverInstructions = "openACE serves code retrieval for this workspace. Fo
 
 // EnvGrayFeedback 开启灰度反馈协议(用户明示 2026-08-07:灰度测试者
 // 自愿参与、事先知情,报告详尽优先——token 成本与隐私顾虑明确豁免)。
-// 开启后 instructions 追加诊断报告规范,调用 AI 每轮工具调用后输出
-// 多维事实报告,由用户汇总回传维护者。产品默认关闭,冻结文案不变。
+// 开启后 instructions 追加诊断报告规范,调用 AI 在任务收尾给用户交付
+// 答案时一次性汇总本次任务全部调用的多维事实报告,由用户回传维护者。
+// 产品默认关闭,冻结文案不变。
 const EnvGrayFeedback = "OPENACE_GRAY_FEEDBACK"
 
 // grayFeedbackInstructions 是灰度反馈协议文案:维度=事实(结构化字段
 // 原样抄录)/效果(预期 vs 实得,含排序问题)/体验(摩擦点逐条)/
-// 时间(观测耗时)/bug(最小复现,不可复现则记触发场景)。
-const grayFeedbackInstructions = "GRAY-TEST FEEDBACK PROTOCOL (this deployment opted in; verbose reports are expected and token cost is accepted): after EVERY openACE tool call, append a diagnostic report block so the user can relay it verbatim to the maintainers. Structure:\n" +
+// 时间(观测耗时)/bug(最小复现,不可复现则记触发场景)。时机=对话
+// 收尾一次性汇总(用户裁决 2026-08-07:逐调用输出会打断任务推进,
+// 正确位置是给用户交付答案时顺带输出)。
+const grayFeedbackInstructions = "GRAY-TEST FEEDBACK PROTOCOL (this deployment opted in; verbose reports are expected and token cost is accepted): when you deliver your final answer to the user, append ONE consolidated diagnostic report covering every openACE tool call made during the task. Do NOT interrupt the task to report per call; collect silently and report once at the end. For EACH call include:\n" +
 	"## openACE 调用诊断报告\n" +
 	"- call: tool name; workspace path; the information_request verbatim; approximate wall time you observed\n" +
 	"- outcome: hit / partial / miss — name the files or symbols you expected versus what was returned; call out ranking problems (target below noise), missing expected results, and truncation\n" +
 	"- facts: copy retrieval_mode, semantic_coverage, degraded_reason, rerank_sent, query_plan, index_revision and any [DEGRADED] banner or truncation marker from the result verbatim; on failure copy the exact error text\n" +
 	"- experience: setup, latency, output-format friction — one factual sentence each; rate this call 1-5 for usefulness to your actual task\n" +
 	"- bug: if anything misbehaved, give a minimal reproduction (workspace state, query, exact call sequence); if not reproducible, record the exact trigger context instead\n" +
-	"Be exhaustive and factual; report failures without softening. Do not skip the report even when the call succeeded."
+	"Be exhaustive and factual; report failures without softening. Never skip the end-of-task report, even when every call succeeded."
 
 // activeInstructions 组装 initialize 下发的 instructions:默认=冻结稿,
 // 灰度开关追加反馈协议。
@@ -882,7 +885,13 @@ func activeInstructions() string {
 	return serverInstructions
 }
 
-const retrievalDescription = "Search the local codebase index (hybrid lexical + semantic retrieval with reranking). Use this tool FIRST whenever you need to find code, configuration, tests, or documentation in the workspace before answering or editing. One focused intent per call; issue multiple calls for multi-part tasks."
+const retrievalDescription = "Search the local codebase index (hybrid lexical + semantic retrieval with reranking). Use this tool FIRST whenever you need to find code, configuration, tests, or documentation in the workspace before answering or editing. One focused intent per call; issue multiple calls for multi-part tasks. File selection honors .gitignore and .openaceignore: a directory that never appears in any result is usually excluded there (add a !pattern in .openaceignore to re-include gitignored paths)."
+
+// maxOutputLengthDescription 是 max_output_length 参数契约(灰度反馈:
+// 该参数此前无描述,调用方盲传小值致结果被截断、检索质量凭空劣化,
+// review P5 附带项;用户裁决 2026-08-07:质量优先,非明确要省 token
+// 不应设限)。
+const maxOutputLengthDescription = "Optional output budget in BYTES (default 20000, max 1000000). OMIT this unless the user explicitly wants to cap token spend: small values truncate results and silently degrade retrieval quality. When output is truncated a marker reports how many result blocks were shown."
 
 const informationRequestDescription = "A complete, specific description of what to find. Include: (1) the purpose or behavior you seek, in a full sentence; (2) exact identifiers if known (function/class/config key names, keep original casing); (3) artifact type hints when relevant (config file, test, docs). Preserve distinctive terms from the user's request verbatim; do not translate identifiers. Good: \"where is the retry backoff policy for embedding provider requests implemented\". Bad: \"retry\"."
 
@@ -896,7 +905,7 @@ func retrievalTool() map[string]any {
 				"information_request": map[string]any{"type": "string", "description": informationRequestDescription},
 				"directory_path":      map[string]any{"type": "string", "description": "Absolute path of the workspace root to search."},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
-				"max_output_length":   map[string]any{"type": "integer"},
+				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
 			},
 			"required": []string{"information_request", "directory_path"},
 		},
@@ -916,7 +925,7 @@ func multiRetrievalTool() map[string]any {
 					"items": map[string]any{"type": "string"},
 				},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
-				"max_output_length":   map[string]any{"type": "integer"},
+				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
 			},
 			"required": []string{"information_request", "directory_paths"},
 		},
@@ -948,7 +957,7 @@ func startRetrievalTool() map[string]any {
 				"information_request": map[string]any{"type": "string", "description": informationRequestDescription},
 				"directory_path":      map[string]any{"type": "string"},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
-				"max_output_length":   map[string]any{"type": "integer"},
+				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
 			},
 			"required": []string{"information_request", "directory_path"},
 		},
@@ -968,7 +977,7 @@ func startMultiRetrievalTool() map[string]any {
 					"items": map[string]any{"type": "string"},
 				},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
-				"max_output_length":   map[string]any{"type": "integer"},
+				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
 			},
 			"required": []string{"information_request", "directory_paths"},
 		},

@@ -28,10 +28,10 @@ func TestRenderFirstBlockRespectsBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Text) > 200+len(truncationMarker)+64 {
+	if len(result.Text) > 200+len(truncationMarker(1, 1))+64 {
 		t.Fatalf("首块未按预算截断: 请求 200,返回 %d 字节", len(result.Text))
 	}
-	if !strings.Contains(result.Text, "[output truncated by max_output_length]") {
-		t.Fatalf("截断无标记: %q", result.Text[:min(len(result.Text), 120)])
+	if !strings.Contains(result.Text, "[output truncated by max_output_length: 1 of ") {
+		t.Fatalf("截断标记应携带展示比例: %q", result.Text[:min(len(result.Text), 160)])
 	}
 }

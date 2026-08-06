@@ -120,7 +120,7 @@ func TestRenderBudgetTruncation(t *testing.T) {
 		chunkRecord{ID: "b", RelPath: "b.go", Language: "go", StartLine: 1, EndLine: 1, Content: "beta"},
 	)
 	got := mustRender(t, handle, []rankedHit{{id: "a", score: 2}, {id: "b", score: 1}}, 30)
-	if !containsAll(got, "a.go", "[output truncated by max_output_length]") || contains(got, "b.go") {
+	if !containsAll(got, "a.go", "[output truncated by max_output_length: 1 of 2 result blocks shown") || contains(got, "b.go") {
 		t.Fatalf("预算截断行为错误: %q", got)
 	}
 }

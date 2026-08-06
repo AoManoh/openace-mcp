@@ -1105,6 +1105,7 @@ func renderHits(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (str
 	}
 	numbered := renderLineNumbersEnabled()
 	truncated := false
+	shown := 0
 	for i, block := range merged {
 		section := formatBlock(block.record, numbered)
 		if i == 0 && len(section) > budget {
@@ -1118,6 +1119,7 @@ func renderHits(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (str
 			}
 			out.WriteString(section[:cut])
 			truncated = true
+			shown = 1
 			break
 		}
 		if i > 0 && out.Len()+len(section) > budget {
@@ -1125,15 +1127,22 @@ func renderHits(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (str
 			break
 		}
 		out.WriteString(section)
+		shown++
 	}
 	if truncated {
-		out.WriteString(truncationMarker)
+		out.WriteString(truncationMarker(shown, len(merged)))
 	}
 	return strings.TrimRight(out.String(), "\n"), nil
 }
 
-// truncationMarker 是输出预算截断的稳定标记(golden/调用方可依赖)。
-const truncationMarker = "\n[output truncated by max_output_length]\n"
+// truncationMarkerPrefix 是输出预算截断标记的稳定前缀(golden/调用方
+// 可依赖);完整标记携带展示比例与恢复动作(灰度反馈+用户裁决
+// 2026-08-07:截断必须可行动——调用方要能一眼判断漏了多少、如何拿全)。
+const truncationMarkerPrefix = "\n[output truncated by max_output_length"
+
+func truncationMarker(shown int, total int) string {
+	return fmt.Sprintf("%s: %d of %d result blocks shown; omit or raise max_output_length for complete results]\n", truncationMarkerPrefix, shown, total)
+}
 
 // mergeBlocks 只合并同文件真正重叠或严格相邻的块（next.Start ≤ current.End+1），
 // 取最高分。禁止跨间隙合并：缺行会让 header 行区间与内容错位（review B1）。
