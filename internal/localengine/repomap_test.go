@@ -77,8 +77,8 @@ func TestRepoMapFocus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(res.Text, "core/service.go:") || strings.Contains(res.Text, "web/handler.go") {
-		t.Fatalf("focus 过滤错误:\n%s", res.Text)
+	if !strings.Contains(res.Text, "core/ (") || !strings.Contains(res.Text, "core/service.go:") || strings.Contains(res.Text, "web/handler.go") {
+		t.Fatalf("focus 过滤/header 错误:\n%s", res.Text)
 	}
 }
 
