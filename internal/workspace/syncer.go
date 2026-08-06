@@ -659,6 +659,14 @@ func matchPathSegments(patterns []string, values []string) bool {
 		return len(values) == 0
 	}
 	if patterns[0] == "**" {
+		// 尾随 ** 须消费 ≥1 段(D6 差分审计,git 语义):`docs/**` 匹配
+		// docs 内的一切但不匹配 docs 目录本身——否则目录被判忽略触发
+		// 剪枝,git 层 `!docs/keep.md` 类 re-include 永无机会(git 的
+		// "父目录被排除则不可 re-include"规则只对显式排除目录成立)。
+		// 中段 ** 保持零段匹配(`a/**/b` 匹配 `a/b`,与 git 一致)。
+		if len(patterns) == 1 {
+			return len(values) >= 1
+		}
 		if matchPathSegments(patterns[1:], values) {
 			return true
 		}
