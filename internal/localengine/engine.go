@@ -375,6 +375,11 @@ type buildCall struct {
 	cancelled bool
 	result    engine.Result
 	err       error
+	// startedAt 是本构建的创建时点(单调时钟)。语义收紧(review -15 (1),
+	// 裁决 (i)):caller 只加入创建晚于自身到达的构建——更早的构建其扫描
+	// 可能未覆盖 caller 到达前的写入,等其结束后重新循环自建/加入新一轮,
+	// 保证"Sync 返回的索引包含调用前的全部写入"。
+	startedAt time.Time
 }
 
 // errQueryBuildWait 标记查询等待在建索引超界(P1 有界化);构建继续
@@ -450,6 +455,7 @@ func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.Workspa
 			}
 		}
 	}
+	arrival := time.Now()
 	for {
 		if err := ctx.Err(); err != nil {
 			return engine.Result{}, err
@@ -460,7 +466,13 @@ func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.Workspa
 			return engine.Result{}, errors.New("local-hybrid 引擎已关闭")
 		}
 		if call, ok := e.inflight[workspaceKey]; ok {
-			if call.cancelled {
+			// 语义收紧(review -15 (1),裁决 (i)):只加入创建晚于自身
+			// 到达的构建。更早的构建其扫描可能未覆盖 caller 到达前的
+			// 写入——等其结束后重循环,下一轮的构建创建时点必然晚于
+			// arrival(写入 < 到达 ≤ 新 startedAt < 新扫描),写入必被
+			// 覆盖;同波次并发 caller 在第二轮正常 join,singleflight
+			// 不放大(两轮收敛)。cancelled 构建沿用等待重试语义。
+			if call.cancelled || call.startedAt.Before(arrival) {
 				done := call.done
 				e.mu.Unlock()
 				select {
@@ -475,7 +487,7 @@ func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.Workspa
 			return e.waitBuild(ctx, workspaceKey, call, cancelOnLeave)
 		}
 		runCtx, cancel := context.WithCancel(context.Background())
-		call := &buildCall{done: make(chan struct{}), cancel: cancel, waiters: 1}
+		call := &buildCall{done: make(chan struct{}), cancel: cancel, waiters: 1, startedAt: time.Now()}
 		e.inflight[workspaceKey] = call
 		e.mu.Unlock()
 
