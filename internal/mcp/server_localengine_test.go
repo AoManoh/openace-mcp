@@ -108,6 +108,16 @@ func ResolveWorkspaceKey(path string) string {
 	if !strings.Contains(bad, `"isError":true`) || !strings.Contains(bad, "invalid detail") {
 		t.Fatalf("非法 detail 应可行动报错: %s", bad)
 	}
+
+	// repo_map R1(D4):orientation 面经完整链路可用;完整能力面
+	// (本测试 env=all)列出,处于 knownToolList。
+	repoMap := runMCP(t, server, `{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"repo_map","arguments":{"directory_path":`+jsonString(root)+`}}}`)
+	if !strings.Contains(repoMap, "repo map:") || !strings.Contains(repoMap, "main.go:1-") || !strings.Contains(repoMap, "ResolveWorkspaceKey") {
+		t.Fatalf("repo_map 输出异常: %s", repoMap)
+	}
+	if !strings.Contains(toolsList, `"repo_map"`) {
+		t.Fatalf("完整能力面应列出 repo_map: %s", toolsList)
+	}
 }
 
 // TestLocalEngineProfileIDRejectedViaMCP 验证 provider_profile_id 在

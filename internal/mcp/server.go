@@ -39,6 +39,7 @@ type Server struct {
 	tasker    Tasker
 	inspector engine.WorkspaceInspector
 	statuser  DaemonStatuser
+	mapper    engine.RepoMapper
 	// unavailable 非 nil = 启动失败但会话保持的降级形态(灰度反馈一号
 	// P1-3):initialize/tools/list 正常应答,任何 tools/call 返回失败
 	// 原因与修复指引——build/profile mismatch 的可行动文案从 stderr
@@ -74,6 +75,9 @@ func (s *Server) attachService(service engine.Service) {
 	}
 	if statuser, ok := service.(DaemonStatuser); ok {
 		s.statuser = statuser
+	}
+	if mapper, ok := service.(engine.RepoMapper); ok {
+		s.mapper = mapper
 	}
 }
 
@@ -134,6 +138,12 @@ type multiRetrievalArgs struct {
 	DirectoryPaths     []string `json:"directory_paths"`
 	ProviderProfileID  string   `json:"provider_profile_id,omitempty"`
 	MaxOutputLength    int      `json:"max_output_length,omitempty"`
+}
+
+type repoMapArgs struct {
+	DirectoryPath   string `json:"directory_path"`
+	MaxOutputLength int    `json:"max_output_length,omitempty"`
+	Focus           string `json:"focus,omitempty"`
 }
 
 type syncArgs struct {
@@ -205,6 +215,7 @@ func knownToolList() []string {
 		"start_codebase_retrieval", "start_multi_codebase_retrieval", "start_sync_workspace",
 		"task_status", "list_tasks", "cancel_task",
 		"daemon_status", "list_workspaces", "workspace_status",
+		"repo_map",
 	}
 }
 
@@ -338,6 +349,9 @@ func (s *Server) capabilityTools() []map[string]any {
 	if s.inspector != nil {
 		tools = append(tools, listWorkspacesTool(), workspaceStatusTool())
 	}
+	if s.mapper != nil {
+		tools = append(tools, repoMapTool())
+	}
 	return tools
 }
 
@@ -391,6 +405,7 @@ type toolHandler func(ctx context.Context, id *json.RawMessage, args json.RawMes
 func (s *Server) toolHandlers() map[string]toolHandler {
 	return map[string]toolHandler{
 		"codebase_retrieval":             s.handleRetrieval,
+		"repo_map":                       s.handleRepoMap,
 		"multi_codebase_retrieval":       s.handleMultiRetrieval,
 		"sync_workspace":                 s.handleSyncWorkspace,
 		"start_codebase_retrieval":       s.handleStartRetrieval,
@@ -428,6 +443,38 @@ func (s *Server) handleRetrieval(ctx context.Context, id *json.RawMessage, rawAr
 		return ok(id, toolResultWithStructured(rendered, false, structured))
 	}
 	return ok(id, toolResult(rendered, false))
+}
+
+// handleRepoMap 是 repo_map R1(D4):orientation 面,快照只读。
+func (s *Server) handleRepoMap(ctx context.Context, id *json.RawMessage, rawArgs json.RawMessage) rpcResponse {
+	if s.mapper == nil {
+		return toolError(id, "repo_map is not supported by this engine")
+	}
+	var args repoMapArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return fail(id, -32602, err.Error())
+	}
+	args.DirectoryPath = strings.TrimSpace(args.DirectoryPath)
+	if args.DirectoryPath == "" {
+		return toolError(id, "directory_path is required")
+	}
+	if err := validateMaxOutputLength(args.MaxOutputLength); err != nil {
+		return toolError(id, err.Error())
+	}
+	toolCtx, cancel := toolTimeoutContext(ctx)
+	defer cancel()
+	result, err := s.mapper.RepoMap(toolCtx, engine.RepoMapRequest{
+		Workspace:    engine.WorkspaceRef{DirectoryPath: args.DirectoryPath},
+		MaxOutputLen: args.MaxOutputLength,
+		Focus:        args.Focus,
+	})
+	if err != nil {
+		return toolError(id, err.Error())
+	}
+	if structured := retrievalStructured(result); structured != nil {
+		return ok(id, toolResultWithStructured(result.Text, false, structured))
+	}
+	return ok(id, toolResult(result.Text, false))
 }
 
 // retrievalStructured 构造单仓检索的 structuredContent(P1,review 二批:
@@ -938,6 +985,25 @@ func activeInstructions() string {
 }
 
 const retrievalDescription = "Search the local codebase index (hybrid lexical + semantic retrieval with reranking). Use this tool FIRST whenever you need to find code, configuration, tests, or documentation in the workspace before answering or editing. One focused intent per call; issue multiple calls for multi-part tasks. File selection honors .gitignore and .openaceignore: a directory that never appears in any result is usually excluded there (add a !pattern in .openaceignore to re-include gitignored paths)."
+
+func repoMapTool() map[string]any {
+	return map[string]any{
+		"name":        "repo_map",
+		"description": repoMapDescription,
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"directory_path":    map[string]any{"type": "string", "description": "Absolute path of the workspace to map."},
+				"max_output_length": map[string]any{"type": "integer", "description": maxOutputLengthDescription},
+				"focus":             map[string]any{"type": "string", "description": "Optional path prefix; map only that subtree (drill down from a full-repo map)."},
+			},
+			"required": []string{"directory_path"},
+		},
+	}
+}
+
+// repoMapDescription:orientation 面(D4 R1)——检索之前先认路。
+const repoMapDescription = "Budget-bounded map of the indexed repository: directories with per-file key symbols and line spans, importance-ranked (symbol density, tests/vendored deprioritized, every top-level directory represented). Read-only snapshot of the active index revision — never triggers indexing or provider calls; returns index_not_ready on a cold workspace. Use it to orient before searching, then follow up with codebase_retrieval or Read."
 
 // detailDescription 是输出详略契约(框架 18.2/S2;业界"默认小、按需大"
 // 光谱的参数化位:Anthropic response_format enum 同型)。
