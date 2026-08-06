@@ -27,7 +27,6 @@ func TestGoldenRepoCorpus(t *testing.T) {
 		files, astFiles, fallbackFiles int
 		emptyFiles                     int
 		astChunks, symbolChunks        int
-		funcChunks                     int
 		totalSpanLines                 int
 		astNanos, windowNanos          int64
 		fallbackList                   []string

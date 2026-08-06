@@ -623,15 +623,3 @@ func (s *concurrentSyncer) leave() {
 	s.mu.Unlock()
 }
 
-type testRateLimitError struct {
-	retryAfter time.Duration
-}
-
-func (e testRateLimitError) Error() string {
-	return `agents/codebase-retrieval returned HTTP 429: {"error":"Too many requests"}`
-}
-
-func (e testRateLimitError) RateLimitRetryAfter() (time.Duration, bool) {
-	return e.retryAfter, true
-}
-

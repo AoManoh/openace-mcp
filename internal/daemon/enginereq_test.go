@@ -12,17 +12,10 @@ func wsRefP(dir string, providerProfileID string) engine.WorkspaceRef {
 	return engine.WorkspaceRef{DirectoryPath: dir, ProviderProfileID: providerProfileID}
 }
 
-func syncReq(dir string) engine.SyncRequest {
-	return engine.SyncRequest{Workspace: wsRef(dir)}
-}
-
 func syncReqP(dir string, providerProfileID string) engine.SyncRequest {
 	return engine.SyncRequest{Workspace: wsRefP(dir, providerProfileID)}
 }
 
-func searchReq(dir string, query string, maxOutputLen int) engine.SearchRequest {
-	return engine.SearchRequest{Workspace: wsRef(dir), Query: query, MaxOutputLen: maxOutputLen}
-}
 
 func searchReqP(dir string, providerProfileID string, query string, maxOutputLen int) engine.SearchRequest {
 	return engine.SearchRequest{Workspace: wsRefP(dir, providerProfileID), Query: query, MaxOutputLen: maxOutputLen}
