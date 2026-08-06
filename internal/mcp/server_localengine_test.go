@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -74,14 +75,19 @@ func ResolveWorkspaceKey(path string) string {
 		t.Fatal("lexical-only 是完整能力，不得标记 DEGRADED（阶段计划 D2）")
 	}
 
-	// 状态查询走 direct 模式的 inspector 不可用路径以外的分支：
-	// direct localengine 无 Tasker，workspace_status 工具应不注册（与 legacy direct 一致）。
+	// P9(review 2026-08-06):direct 模式注册只读状态面——旧契约
+	// "与 legacy direct 一致"的依据随 Stage 7 删除失效;语义覆盖缺口
+	// 在 direct 形态必须有处可查。
 	toolsList := runMCP(t, server, `{"jsonrpc":"2.0","id":4,"method":"tools/list"}`)
-	if strings.Contains(toolsList, `"workspace_status"`) {
-		t.Fatalf("direct 模式不应注册 workspace_status 工具: %s", toolsList)
+	if !strings.Contains(toolsList, `"workspace_status"`) {
+		t.Fatalf("direct 模式应注册 workspace_status 只读状态工具(P9): %s", toolsList)
 	}
 	if !strings.Contains(toolsList, `"codebase_retrieval"`) || !strings.Contains(toolsList, `"sync_workspace"`) {
 		t.Fatalf("核心工具应注册: %s", toolsList)
+	}
+	wsStatus := runMCP(t, server, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"workspace_status","arguments":{"directory_path":`+strconv.Quote(root)+`}}}`)
+	if !strings.Contains(wsStatus, "stage") || !strings.Contains(wsStatus, "file_count") {
+		t.Fatalf("direct 模式 workspace_status 应返回状态字段: %s", wsStatus)
 	}
 }
 

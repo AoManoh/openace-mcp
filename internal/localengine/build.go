@@ -298,13 +298,23 @@ func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKe
 	status.setSkippedFiles(skippedFiles)
 	status.setSemanticOutcome(seman.rejected, seman.lastError)
 	status.ready(manifest, revisionCount(store, manifest))
-	return engine.Result{
+	result := engine.Result{
 		Engine:        EngineID,
 		IndexRevision: manifest.Revision,
 		FileCount:     manifest.Counts.Files,
 		Uploaded:      0,
 		Added:         manifest.Counts.Chunks,
-	}, nil
+	}
+	// P8(review 2026-08-06):sync 成功面不吞语义覆盖缺口——Result 携带
+	// 覆盖率;覆盖不完整即给降级原因(与查询路径同 token),Summary 可见。
+	// "禁止静默降级"红线在 sync 工具面闭合。
+	if e.semanticEnabled() {
+		result.SemanticCoverage = coveragePercent(manifest)
+		if !manifest.SemanticComplete() {
+			result.DegradedReason = "semantic-coverage-partial"
+		}
+	}
+	return result, nil
 }
 
 // coveredPerFile 统计每文件被向量覆盖的 chunk 数（覆盖口径 K31/K51;

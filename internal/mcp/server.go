@@ -96,7 +96,11 @@ func NewServer(service engine.Service) *Server {
 	if tasker, ok := service.(Tasker); ok {
 		server.tasker = tasker
 	}
-	if inspector, ok := service.(engine.WorkspaceInspector); ok && server.tasker != nil {
+	// P9(review 2026-08-06):inspector 注册不再以 tasker 存在为前提——
+	// 该前提源于"与 legacy direct 对齐",legacy 已在 Stage 7 删除。
+	// direct 模式恢复 workspace_status/list_workspaces 只读状态面,
+	// 语义覆盖缺口在两种形态下都有处可查。
+	if inspector, ok := service.(engine.WorkspaceInspector); ok {
 		server.inspector = inspector
 	}
 	if statuser, ok := service.(DaemonStatuser); ok {

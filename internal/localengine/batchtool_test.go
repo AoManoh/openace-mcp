@@ -100,18 +100,21 @@ func TestImportEmbeddingsZeroProviderSync(t *testing.T) {
 		t.Fatal("首建应有待嵌任务")
 	}
 
-	// 离线结果:合法向量 + 1 条零向量(跳过不入拒绝集)+ 1 条错维度 + 1 条重复键。
+	// 离线结果:1 条零向量 + 1 条错维度(均用合法键,R1 后陌生键在向量
+	// 校验前即被拒,病理向量路径必须以合法键触达)+ 全量合法向量 +
+	// 1 条重复键。坏行在前、同键好行在后:坏行按对应计数跳过,好行照常
+	// 落盘,发布仍完整。
 	type row struct {
 		key string
 		vec []float32
 	}
-	rows := make([]row, 0, len(jobs)+2)
+	rows := make([]row, 0, len(jobs)+3)
+	rows = append(rows, row{key: jobs[0].Key, vec: make([]float32, 8)}) // 零向量(合法键)
+	rows = append(rows, row{key: jobs[1].Key, vec: make([]float32, 4)}) // 错维度(合法键)
 	for _, job := range jobs {
 		rows = append(rows, row{key: job.Key, vec: fakeVector(8, job.Text)})
 	}
-	rows = append(rows, row{key: "deadbeef", vec: make([]float32, 8)}) // 零向量
-	rows = append(rows, row{key: "cafebabe", vec: make([]float32, 4)}) // 错维度
-	rows = append(rows, rows[0])                                       // 重复键
+	rows = append(rows, rows[2]) // 重复键(首个合法向量行)
 	i := 0
 	report, err := e.ImportEmbeddings(context.Background(), ref, func() (string, []float32, bool, error) {
 		if i >= len(rows) {
@@ -155,5 +158,59 @@ func TestBatchToolRequiresSemantic(t *testing.T) {
 		return "", nil, false, nil
 	}); err == nil {
 		t.Fatal("semantic off 时 ImportEmbeddings 应报错")
+	}
+}
+
+// R1(review 2026-08-06):陌生 key + 合法向量必须被拒——历史实现只做
+// 查重/维度/归一化,错误归属的向量可入 journal 并永久屏蔽该 chunk 的
+// 正确嵌入(journal 命中即不再送 provider)。
+func TestImportEmbeddingsRejectsForeignKeys(t *testing.T) {
+	server := newEmbedServer(t, 8)
+	e := newTestEngineWith(t, embedOptions(server.ts.URL, 8, 2, "fake-model"))
+	root := t.TempDir()
+	writeFixture(t, root, "pkg/a.go", "package pkg\n\nfunc A() {}\n")
+	ref := engine.WorkspaceRef{DirectoryPath: root}
+	var jobs []EmbedJob
+	if _, err := e.PlanEmbedJobs(context.Background(), ref, func(job EmbedJob) error {
+		jobs = append(jobs, job)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	foreign := "0123456789abcdef0123456789abcdef" // 形状合法、不属本仓 pending 集
+	rows := [][2]any{}
+	for _, job := range jobs {
+		rows = append(rows, [2]any{job.Key, fakeVector(8, job.Text)})
+	}
+	rows = append(rows, [2]any{foreign, fakeVector(8, "foreign-but-valid")})
+	i := 0
+	report, err := e.ImportEmbeddings(context.Background(), ref, func() (string, []float32, bool, error) {
+		if i >= len(rows) {
+			return "", nil, false, nil
+		}
+		r := rows[i]
+		i++
+		return r[0].(string), r[1].([]float32), true, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.UnknownKey != 1 {
+		t.Fatalf("陌生 key 应计入 UnknownKey=1,得到 %+v", report)
+	}
+	if report.Appended != len(jobs) {
+		t.Fatalf("合法键应全部落盘: %+v", report)
+	}
+	// journal 内不得含陌生 key(防垃圾永驻/挤占容量)。
+	store, err := e.storeFor(mustKey(t, e, root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := e.journalFor(mustKey(t, e, root), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := journal.Snapshot()[foreign]; ok {
+		t.Fatal("陌生 key 进入了 journal")
 	}
 }

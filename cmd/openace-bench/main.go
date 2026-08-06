@@ -746,6 +746,19 @@ type importResultLine struct {
 	Embedding []float32 `json:"embedding"`
 }
 
+// vectorsIdentityHeader 是 dump 文件首行的嵌入身份头(R2,review
+// 2026-08-06):跨子树搬运必须携带源身份,import 端与当前引擎身份强
+// 校验——同维度异模型的向量混入会破坏"子树=单一嵌入身份"不变量,且
+// 事后无法检出。无头文件(voyage_batch.py fetch 产物)按原样接受,
+// 键归属校验(R1)兜底。
+type vectorsIdentityHeader struct {
+	Identity *struct {
+		ProfileHash string `json:"embedding_profile_hash"`
+		Model       string `json:"embedding_model"`
+		Dimension   int    `json:"embedding_dimension"`
+	} `json:"identity,omitempty"`
+}
+
 // importEmbeddingResults 回灌面：流式读结果 jsonl → 引擎 journal；报告
 // 落 manifest 与 stdout。回灌后由下一次正常 sync 零 provider 收编发布。
 func importEmbeddingResults(ctx context.Context, eng *localengine.Engine, ref engine.WorkspaceRef, path string, out string, manifest runManifest) error {
@@ -757,12 +770,26 @@ func importEmbeddingResults(ctx context.Context, eng *localengine.Engine, ref en
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
 	lineNo := 0
+	identityChecked := false
 	report, err := eng.ImportEmbeddings(ctx, ref, func() (string, []float32, bool, error) {
 		for scanner.Scan() {
 			lineNo++
 			raw := scanner.Bytes()
 			if len(raw) == 0 {
 				continue
+			}
+			if !identityChecked {
+				identityChecked = true
+				var header vectorsIdentityHeader
+				if err := json.Unmarshal(raw, &header); err == nil && header.Identity != nil {
+					hash, model, dim := eng.EmbeddingIdentity()
+					if header.Identity.ProfileHash != hash || header.Identity.Dimension != dim {
+						return "", nil, false, fmt.Errorf(
+							"%s: 嵌入身份不匹配(R2)——源 profile=%s model=%s dim=%d,当前 profile=%s model=%s dim=%d;跨身份搬运会混入不可比向量,拒绝回灌",
+							path, header.Identity.ProfileHash, header.Identity.Model, header.Identity.Dimension, hash, model, dim)
+					}
+					continue // 身份头本身不是向量行
+				}
 			}
 			var line importResultLine
 			if err := json.Unmarshal(raw, &line); err != nil {
@@ -813,6 +840,16 @@ func dumpVectorsFromStore(root string, out string) error {
 	}
 	defer outFile.Close()
 	writer := bufio.NewWriterSize(outFile, 4<<20)
+	header, err := json.Marshal(map[string]any{"identity": map[string]any{
+		"embedding_profile_hash": manifest.EmbeddingProfileHash,
+		"embedding_model":        manifest.EmbeddingModel,
+		"embedding_dimension":    manifest.EmbeddingDimension,
+	}})
+	if err != nil {
+		return err
+	}
+	writer.Write(header)
+	writer.WriteByte('\n')
 	seen := make(map[string]bool)
 	count := 0
 	for _, segment := range manifest.Segments {
