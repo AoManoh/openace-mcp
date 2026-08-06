@@ -58,7 +58,8 @@ type TaskRequest struct {
 	InformationRequest string   `json:"information_request,omitempty"`
 	MaxOutputLength    int      `json:"max_output_length,omitempty"`
 	// Detail 是输出详略(框架 18.2,与同步检索同契约)。
-	Detail string `json:"detail,omitempty"`
+	Detail     string `json:"detail,omitempty"`
+	PathPrefix string `json:"path_prefix,omitempty"`
 }
 
 type TaskSnapshot struct {
@@ -71,6 +72,8 @@ type TaskSnapshot struct {
 	ProviderProfileID  string                `json:"provider_profile_id,omitempty"`
 	InformationRequest string                `json:"information_request,omitempty"`
 	MaxOutputLength    int                   `json:"max_output_length,omitempty"`
+	Detail             string                `json:"detail,omitempty"`
+	PathPrefix         string                `json:"path_prefix,omitempty"`
 	SubmittedAt        time.Time             `json:"submitted_at"`
 	StartedAt          *time.Time            `json:"started_at,omitempty"`
 	CompletedAt        *time.Time            `json:"completed_at,omitempty"`
@@ -217,6 +220,8 @@ func (s *TaskStore) Submit(req TaskRequest) (TaskSnapshot, error) {
 			ProviderProfileID:  normalized.ProviderProfileID,
 			InformationRequest: normalized.InformationRequest,
 			MaxOutputLength:    normalized.MaxOutputLength,
+			Detail:             normalized.Detail,
+			PathPrefix:         normalized.PathPrefix,
 			SubmittedAt:        time.Now().UTC(),
 		},
 	}
@@ -805,6 +810,8 @@ func requestFromSnapshot(snapshot TaskSnapshot) TaskRequest {
 		ProviderProfileID:  snapshot.ProviderProfileID,
 		InformationRequest: snapshot.InformationRequest,
 		MaxOutputLength:    snapshot.MaxOutputLength,
+		Detail:             snapshot.Detail,
+		PathPrefix:         snapshot.PathPrefix,
 	}
 }
 
@@ -860,6 +867,8 @@ func normalizeTaskRequest(req TaskRequest) (TaskRequest, error) {
 	req.DirectoryPath = strings.TrimSpace(req.DirectoryPath)
 	req.ProviderProfileID = strings.TrimSpace(req.ProviderProfileID)
 	req.InformationRequest = strings.TrimSpace(req.InformationRequest)
+	req.Detail = strings.TrimSpace(req.Detail)
+	req.PathPrefix = strings.TrimSpace(req.PathPrefix)
 	switch strings.TrimSpace(string(req.Kind)) {
 	case "sync", "sync_workspace", "sync-workspace":
 		req.Kind = TaskKindSync

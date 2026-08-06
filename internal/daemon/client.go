@@ -158,6 +158,7 @@ func (c *Client) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 		InformationRequest: req.Query,
 		MaxOutputLength:    req.MaxOutputLen,
 		Detail:             req.Detail,
+		PathPrefix:         req.PathPrefix,
 	}, &result)
 	return result, err
 }

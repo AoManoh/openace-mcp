@@ -130,7 +130,8 @@ type retrievalArgs struct {
 	// Detail 是输出详略(框架 18.2/S2,用户候选"路径+行号优先"的
 	// 实验载体):full(默认,内容块)/paths(只回 path:range 头行,
 	// 内容由调用方按需 Read)。
-	Detail string `json:"detail,omitempty"`
+	Detail     string `json:"detail,omitempty"`
+	PathPrefix string `json:"path_prefix,omitempty"`
 }
 
 type multiRetrievalArgs struct {
@@ -430,7 +431,7 @@ func (s *Server) handleRetrieval(ctx context.Context, id *json.RawMessage, rawAr
 	}
 	toolCtx, cancel := toolTimeoutContext(ctx)
 	defer cancel()
-	result, err := s.retrieve(toolCtx, args.DirectoryPath, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength, args.Detail)
+	result, err := s.retrieve(toolCtx, args.DirectoryPath, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength, args.Detail, args.PathPrefix)
 	if err != nil {
 		return toolError(id, err.Error())
 	}
@@ -639,6 +640,7 @@ func (s *Server) handleStartRetrieval(ctx context.Context, id *json.RawMessage, 
 		InformationRequest: args.InformationRequest,
 		MaxOutputLength:    args.MaxOutputLength,
 		Detail:             args.Detail,
+		PathPrefix:         args.PathPrefix,
 	})
 	if err != nil {
 		return toolError(id, err.Error())
@@ -831,7 +833,7 @@ type multiRetrievalResult struct {
 	SemanticCoverage string
 }
 
-func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int, detail string) (engine.Result, error) {
+func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int, detail string, pathPrefix string) (engine.Result, error) {
 	return s.service.Search(ctx, engine.SearchRequest{
 		Workspace: engine.WorkspaceRef{
 			DirectoryPath:     dir,
@@ -840,6 +842,7 @@ func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID str
 		Query:        query,
 		MaxOutputLen: maxOutputLen,
 		Detail:       detail,
+		PathPrefix:   pathPrefix,
 	})
 }
 
@@ -907,7 +910,7 @@ func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerP
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := s.retrieve(ctx, path, providerProfileID, query, maxOutputLen, "")
+			result, err := s.retrieve(ctx, path, providerProfileID, query, maxOutputLen, "", "")
 			if err != nil {
 				results[i].Error = err.Error()
 				return
@@ -1042,6 +1045,11 @@ func repoMapTool() map[string]any {
 // repoMapDescription:orientation 面(D4 R1)——检索之前先认路。
 const repoMapDescription = "Budget-bounded map of the indexed repository: directories with per-file key symbols and line spans, importance-ranked (symbol density, tests/vendored deprioritized, every top-level directory represented). Read-only snapshot of the active index revision — never triggers indexing or provider calls; returns index_not_ready on a cold workspace. Use it to orient before searching, then follow up with codebase_retrieval or Read."
 
+// pathPrefixDescription 是 repo_map 定向后的子树检索约束(真实 Devin
+// A/B:两臂都已知 internal/localengine,但根研究文档/tests 仍挤占生产
+// 定义;显式前缀可把 rerank/输出预算留给目标子树)。
+const pathPrefixDescription = "Optional indexed relative path prefix (for example `internal/localengine`). Filters fused candidates before reranking; use after repo_map identifies the relevant subtree. Omit for repository-wide search."
+
 // detailDescription 是输出详略契约(框架 18.2/S2;业界"默认小、按需大"
 // 光谱的参数化位:Anthropic response_format enum 同型)。
 const detailDescription = "Output detail: \"full\" (default) returns source content blocks; \"paths\" returns only `## path:start-end symbol` header lines so you can Read the files yourself — fresher (reads hit the live disk) and far cheaper in tokens, at the cost of one more round trip."
@@ -1066,6 +1074,7 @@ func retrievalTool() map[string]any {
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
 				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
+				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
 			},
 			"required": []string{"information_request", "directory_path"},
 		},
@@ -1087,6 +1096,7 @@ func multiRetrievalTool() map[string]any {
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
 				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
+				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
 			},
 			"required": []string{"information_request", "directory_paths"},
 		},
@@ -1120,6 +1130,7 @@ func startRetrievalTool() map[string]any {
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
 				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
+				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
 			},
 			"required": []string{"information_request", "directory_path"},
 		},
@@ -1141,6 +1152,7 @@ func startMultiRetrievalTool() map[string]any {
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
 				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
+				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
 			},
 			"required": []string{"information_request", "directory_paths"},
 		},
