@@ -33,11 +33,11 @@ func TestQueryBuildWaitColdStart(t *testing.T) {
 	// lexical-first 关闭档(保险丝路径钉住):冷仓在词法中间发布缺席时
 	// 仍是有界错误而非悬挂;默认档的冷仓即时可服务由 lexical_first_test
 	// 钉住。
-	t.Setenv(EnvLexicalFirst, "off")
 	server := slowEmbedServer(t, dim, 300*time.Millisecond)
 	defer server.ts.Close()
 	opts := embedOptions(server.ts.URL, dim, 1, "fake-model") // batch=1:逐 chunk 慢嵌
 	opts.QueryBuildWait = 150 * time.Millisecond
+	opts.DisableLexicalFirst = true
 	e := newTestEngineWith(t, opts)
 	root := newFixtureWorkspace(t)
 

@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"context"
@@ -144,20 +143,12 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 		fullBuildReason(previous, contentChanged, needsLexicalRebuild, repairRequested))
 }
 
-// EnvLexicalFirst 支配冷仓 lexical-first 中间发布(框架 18.1/S4);
-// 默认开启,"off" 关闭(灰度保险丝:关闭即回到"embedding 结束才可
-// 检索"的历史行为)。
-const EnvLexicalFirst = "OPENACE_LEXICAL_FIRST"
-
-func lexicalFirstEnabled() bool {
-	return strings.TrimSpace(strings.ToLower(os.Getenv(EnvLexicalFirst))) != "off"
-}
-
 // publishLexicalInterim 发布冷仓词法中间 revision:与最终发布同一
 // staging/manifest/原子发布机制,向量文件为空集(合法,K10;
 // vectorIndexes 载入 Count=0,dense 路自然"覆盖为空"短路,不触发
-// repair)。失败只记日志语义(返回 nil),不阻塞主构建。
-func (e *Engine) publishLexicalInterim(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, records []chunkRecord, files map[string]index.FileEntry, recordsByFile map[string][]chunkRecord, capabilities map[string]string, totalBytes int64) *index.Manifest {
+// repair)。失败返回 nil 且不阻塞主构建(中间发布是可用性增益,
+// 最终发布仍是正确性路径)。
+func (e *Engine) publishLexicalInterim(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, records []chunkRecord, files map[string]index.FileEntry, capabilities map[string]string, totalBytes int64) *index.Manifest {
 	if err := ctx.Err(); err != nil {
 		return nil
 	}
@@ -491,8 +482,8 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 	// 阻塞主构建(词法先行是增益,不是正确性依赖);显式 Sync 语义
 	// 不变(仍阻塞到最终发布)。嵌入中途崩溃时词法 revision 保持可
 	// 服务,下次 sync 走既有 semantic-fill 收敛。
-	if previous == nil && e.semanticEnabled() && len(records) > 0 && lexicalFirstEnabled() {
-		if lexManifest := e.publishLexicalInterim(ctx, store, status, root, workspaceKey, records, files, recordsByFile, capabilities, totalBytes); lexManifest != nil {
+	if previous == nil && e.semanticEnabled() && len(records) > 0 && e.lexicalFirst {
+		if lexManifest := e.publishLexicalInterim(ctx, store, status, root, workspaceKey, records, files, capabilities, totalBytes); lexManifest != nil {
 			previous = lexManifest
 		}
 	}
