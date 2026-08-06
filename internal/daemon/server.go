@@ -450,7 +450,31 @@ func (s *Server) taskItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.attachTaskServedBy(&task)
+	s.attachTaskProgress(r.Context(), &task)
 	writeJSON(w, http.StatusOK, task)
+}
+
+// attachTaskProgress 给 running 态任务现查工作区进度(P3,灰度反馈):
+// stage + 文件数 + 语义嵌入进度,失败静默留空(诊断字段不阻断任务面)。
+func (s *Server) attachTaskProgress(ctx context.Context, task *TaskSnapshot) {
+	if task.State != TaskStateRunning || strings.TrimSpace(task.DirectoryPath) == "" {
+		return
+	}
+	inspector, ok := s.workspaceInspector()
+	if !ok {
+		return
+	}
+	statusCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	status, err := inspector.WorkspaceStatus(statusCtx, engine.WorkspaceRef{DirectoryPath: task.DirectoryPath})
+	if err != nil {
+		return
+	}
+	progress := fmt.Sprintf("stage=%s files=%d", status.Stage, status.FileCount)
+	if status.Semantic != nil && (status.Semantic.PendingChunks > 0 || status.Semantic.EmbeddedChunks > 0) {
+		progress += fmt.Sprintf(" embedded=%d pending=%d", status.Semantic.EmbeddedChunks, status.Semantic.PendingChunks)
+	}
+	task.Progress = progress
 }
 
 func (s *Server) runTask(ctx context.Context, req TaskRequest) (engine.Result, error) {

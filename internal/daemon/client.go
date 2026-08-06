@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/engine"
@@ -30,6 +32,8 @@ type Client struct {
 
 	capMu                     sync.Mutex
 	providerProfilesSupported bool
+	// recover 是连接拒绝时的恢复回调(SetRecoverHook;managed 重拉)。
+	recover func(context.Context) error
 }
 
 type healthResponse struct {
@@ -206,29 +210,55 @@ func (c *Client) CancelTask(ctx context.Context, id string) (TaskSnapshot, error
 	return result, err
 }
 
+// SetRecoverHook 注册连接拒绝时的恢复回调(managed 模式接线:daemon 死亡
+// 后重拉)。回调成功即对同一请求重试一次;nil 或回调失败保持原错误。
+// 修复灰度/自食共同暴露的可靠性缺口:daemon 崩溃后 wrapper 内所有调用
+// 永远 connection refused,用户只能重启 IDE 会话。
+func (c *Client) SetRecoverHook(fn func(context.Context) error) {
+	c.recover = fn
+}
+
 func (c *Client) post(ctx context.Context, path string, reqBody any, out any) error {
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(payload))
-	if err != nil {
-		return err
+	send := func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(payload))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("content-type", "application/json")
+		req.Header.Set("user-agent", "openace-mcp-shim/0.1")
+		c.authorize(req)
+		return c.do(req, path, out)
 	}
-	req.Header.Set("content-type", "application/json")
-	req.Header.Set("user-agent", "openace-mcp-shim/0.1")
-	c.authorize(req)
-	return c.do(req, path, out)
+	return c.withRecover(ctx, send)
 }
 
 func (c *Client) get(ctx context.Context, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
-	if err != nil {
+	send := func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("user-agent", "openace-mcp-shim/0.1")
+		c.authorize(req)
+		return c.do(req, path, out)
+	}
+	return c.withRecover(ctx, send)
+}
+
+// withRecover 执行请求;连接拒绝且注册了恢复回调时,恢复成功后重试一次。
+func (c *Client) withRecover(ctx context.Context, send func() error) error {
+	err := send()
+	if err == nil || c.recover == nil || ctx.Err() != nil || !errors.Is(err, syscall.ECONNREFUSED) {
 		return err
 	}
-	req.Header.Set("user-agent", "openace-mcp-shim/0.1")
-	c.authorize(req)
-	return c.do(req, path, out)
+	if recoverErr := c.recover(ctx); recoverErr != nil {
+		return fmt.Errorf("%w(daemon 重拉失败: %v)", err, recoverErr)
+	}
+	return send()
 }
 
 func (c *Client) authorize(req *http.Request) {
