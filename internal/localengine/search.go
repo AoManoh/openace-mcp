@@ -541,6 +541,14 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 			reasons = append(reasons, rerankReason)
 		}
 	}
+	// 碎片门 spike(候选 (l)):只在程序化 Options opt-in 时过滤
+	// fallback 的纯日期/纯符号碎片;默认关闭,零行为变化。放在
+	// rerank 后、渲染前,不改变召回/精排候选池,可立即回退。
+	ordered, _, fragmentErr := e.filterFragmentNoise(handle, ordered)
+	if fragmentErr != nil {
+		e.releaseHandle(handle)
+		return retrieval{}, fragmentErr
+	}
 
 	out := retrieval{
 		handle: handle, ordered: ordered, mode: mode,

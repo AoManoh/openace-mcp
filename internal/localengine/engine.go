@@ -76,6 +76,9 @@ type Engine struct {
 	// freshnessWindow>0 时,上次成功同步距今小于窗口的查询跳过内联
 	// 扫描(Stage 6 前置;新鲜度上界=窗口)。
 	freshnessWindow time.Duration
+	// fragmentGate 是碎片密度门 spike(候选 (l));仅 Options 程序化
+	// 开启,生产 env 不暴露,默认 false。
+	fragmentGate bool
 
 	mu       sync.Mutex
 	inflight map[string]*buildCall
@@ -143,6 +146,7 @@ func New(opts Options) (*Engine, error) {
 	e.queryBuildWait = opts.QueryBuildWait
 	e.buildWaitSlice = 5 * time.Second
 	e.freshnessWindow = opts.FreshnessWindow
+	e.fragmentGate = opts.FragmentGate
 	e.storeProfile = e.profile.ID + "-v" + e.profile.Version
 	// 模板版本注入(M9② 单一事实源):ProfileHash 与子树后缀取同一常量。
 	// 注入使既有 ProfileHash 变化——随 A2'(23aab91)同一 BREAKING 窗口
