@@ -439,6 +439,13 @@ func (s *Server) handleRetrieval(ctx context.Context, id *json.RawMessage, rawAr
 		text = "No relevant code sections were found."
 	}
 	rendered := text + "\n\n" + result.Summary()
+	if diagnostics := retrievalDiagnosticsText(result); diagnostics != "" {
+		// 结构化字段的文本兜底(真实 Devin -p Agent A/B 2026-08-07:
+		// MCP bridge 未向 Agent 展开 structuredContent,导致 timings/hits/
+		// display 虽在 wire 中却不可见,灰度协议无法记录)。紧凑单行
+		// 保证所有客户端都能诊断;structuredContent 仍是机器读主合同。
+		rendered += "\n" + diagnostics
+	}
 	if structured := retrievalStructured(result); structured != nil {
 		return ok(id, toolResultWithStructured(rendered, false, structured))
 	}
@@ -475,6 +482,32 @@ func (s *Server) handleRepoMap(ctx context.Context, id *json.RawMessage, rawArgs
 		return ok(id, toolResultWithStructured(result.Text, false, structured))
 	}
 	return ok(id, toolResult(result.Text, false))
+}
+
+// retrievalDiagnosticsText 把关键结构化诊断投影为一行文本兜底。
+// 不含查询/内容/绝对路径,仅计时与计数(隐私面不扩张)。
+func retrievalDiagnosticsText(result engine.Result) string {
+	var parts []string
+	if result.RetrievalMode != "" {
+		parts = append(parts, "mode="+result.RetrievalMode)
+	}
+	if result.RerankSent > 0 {
+		parts = append(parts, fmt.Sprintf("rerank_sent=%d", result.RerankSent))
+	}
+	if result.Timings != nil {
+		t := result.Timings
+		parts = append(parts, fmt.Sprintf("timings_ms[total=%d sync=%d lexical=%d embed=%d vector=%d fuse=%d rerank=%d render=%d]",
+			t.TotalMs, t.SyncMs, t.LexicalMs, t.QueryEmbedMs, t.VectorMs, t.FuseMs, t.RerankMs, t.RenderMs))
+	}
+	if result.Display != nil {
+		d := result.Display
+		parts = append(parts, fmt.Sprintf("display[candidates=%d shown=%d files=%d truncated=%t]",
+			d.CandidateBlocks, d.ShownBlocks, d.ShownFiles, d.Truncated))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "diagnostics: " + strings.Join(parts, " ")
 }
 
 // retrievalStructured 构造单仓检索的 structuredContent(P1,review 二批:
