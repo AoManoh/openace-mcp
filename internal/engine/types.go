@@ -85,6 +85,24 @@ type Result struct {
 	// compaction-segments|compaction-garbage|semantic-fill>";no-op 不
 	// 发布时为空。加性 omitempty。
 	BuildMode string `json:"build_mode,omitempty"`
+	// Timings 是检索阶段耗时分解(框架 18.3/灰度候选 (e):热检索
+	// 13.1s 无法归因是 sync、embed、rerank 还是渲染)。检索路径恒填,
+	// sync 路径为空;加性 omitempty。
+	Timings *RetrievalTimings `json:"timings,omitempty"`
+}
+
+// RetrievalTimings 是单次检索各阶段耗时(毫秒)。SyncMs 含查询前置
+// (内联同步/有界等待/句柄获取);QueryEmbedMs/VectorMs 仅语义路;
+// FuseMs 为 RRF 融合本体;RenderMs 含合并与预算渲染。
+type RetrievalTimings struct {
+	SyncMs       int64 `json:"sync_ms"`
+	LexicalMs    int64 `json:"lexical_ms"`
+	QueryEmbedMs int64 `json:"query_embed_ms,omitempty"`
+	VectorMs     int64 `json:"vector_ms,omitempty"`
+	FuseMs       int64 `json:"fuse_ms,omitempty"`
+	RerankMs     int64 `json:"rerank_ms,omitempty"`
+	RenderMs     int64 `json:"render_ms"`
+	TotalMs      int64 `json:"total_ms"`
 }
 
 // Summary 输出一行人类可读的结果摘要，供 MCP 工具文本渲染使用。

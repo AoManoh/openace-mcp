@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/AoManoh/openace-mcp/internal/engine"
@@ -227,6 +228,9 @@ type retrieval struct {
 	queryEmbedFailed bool
 	// queryPlan 是路由分立规划记录(方案 -13,触发时非空)。
 	queryPlan string
+	// timings 是阶段耗时分解(框架 18.3);render/total 由 Search 补齐。
+	timings *engine.RetrievalTimings
+	started time.Time
 }
 
 // Search 实现 engine.Service：按需同步后执行 lexical（+dense RRF）
@@ -239,9 +243,14 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	handle := out.handle
 	defer e.releaseHandle(handle)
 
+	renderStart := time.Now()
 	text, renderErr := renderHits(handle, out.ordered, req.MaxOutputLen)
 	if renderErr != nil {
 		return engine.Result{}, renderErr
+	}
+	if out.timings != nil {
+		out.timings.RenderMs = time.Since(renderStart).Milliseconds()
+		out.timings.TotalMs = time.Since(out.started).Milliseconds()
 	}
 	degradedReason := strings.Join(out.reasons, ",")
 	if degradedReason != "" {
@@ -251,6 +260,8 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	result.Text = text
 	result.Engine = EngineID
 	result.IndexRevision = handle.manifest.Revision
+	// 阶段耗时恒随检索结果携带(框架 18.3,加性字段)。
+	result.Timings = out.timings
 	// 路由分立可审计记录:触发即携带(含纯词法形态),未触发保持空
 	// (omitempty,wire 不变)。
 	result.QueryPlan = out.queryPlan
@@ -447,7 +458,7 @@ func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, dep
 		}
 	}
 	if e.semanticEnabled() {
-		denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, depth)
+		denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, depth, nil)
 		if denseErr != nil {
 			return RouteCandidates{}, denseErr
 		}
@@ -475,17 +486,22 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		// P7:请求类标记,daemon 面映射 400 而非 502。
 		return retrieval{}, engine.AsInvalidRequest(errors.New("查询内容为空"))
 	}
+	timings := &engine.RetrievalTimings{}
+	started := time.Now()
 	handle, workspaceKey, syncResult, reasons, err := e.acquireQueryHandle(ctx, req.Workspace)
+	timings.SyncMs = time.Since(started).Milliseconds()
 	if err != nil {
 		return retrieval{}, err
 	}
 
+	lexStart := time.Now()
 	lexHits, planLabel, err := e.lexicalRoute(ctx, handle, query)
+	timings.LexicalMs = time.Since(lexStart).Milliseconds()
 	if err != nil {
 		e.releaseHandle(handle)
 		return retrieval{}, err
 	}
-	ordered, mode, coverage, fuseReasons, err := e.fuseRoutes(ctx, workspaceKey, handle, query, lexHits)
+	ordered, mode, coverage, fuseReasons, err := e.fuseRoutes(ctx, workspaceKey, handle, query, lexHits, timings)
 	if err != nil {
 		e.releaseHandle(handle)
 		return retrieval{}, err
@@ -496,7 +512,9 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	rerankApplied := false
 	rerankSent := 0
 	if e.rerankClient != nil && len(ordered) > 0 {
+		rerankStart := time.Now()
 		reordered, applied, sent, rerankReason, rerankErr := e.rerankOrder(ctx, handle, query, ordered)
+		timings.RerankMs = time.Since(rerankStart).Milliseconds()
 		if rerankErr != nil {
 			e.releaseHandle(handle)
 			return retrieval{}, rerankErr
@@ -518,6 +536,8 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		rerankSent: rerankSent, rerankApplied: rerankApplied,
 		queryEmbedFailed: hasQueryEmbedFailure(reasons),
 		queryPlan:        planLabel,
+		timings:          timings,
+		started:          started,
 	}
 	if err := e.checkQualityStrict(reasons, rerankApplied, len(ordered) > 0); err != nil {
 		e.releaseHandle(handle)
@@ -597,7 +617,7 @@ func (e *Engine) lexicalRoute(ctx context.Context, handle *revisionHandle, query
 // 锚,dense 未执行时回退词法序;纯词法沿用真实 BM25 分数,渲染行为与
 // Stage 2 逐字节一致(K32)。返回 (候选序, 模式, 覆盖率, 降级原因)。
 // 不负责句柄释放。
-func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, lexHits []lexical.Hit) ([]rankedHit, string, string, []string, error) {
+func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, lexHits []lexical.Hit, timings *engine.RetrievalTimings) ([]rankedHit, string, string, []string, error) {
 	if !e.semanticEnabled() {
 		ordered := make([]rankedHit, 0, len(lexHits))
 		for _, hit := range lexHits {
@@ -605,7 +625,7 @@ func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *re
 		}
 		return ordered, "lexical", "", nil, nil
 	}
-	denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, hybridRouteTopK)
+	denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, hybridRouteTopK, timings)
 	if denseErr != nil {
 		return nil, "", "", nil, denseErr
 	}
@@ -617,7 +637,13 @@ func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *re
 	var ordered []rankedHit
 	if denseIDs != nil {
 		mode = "hybrid"
+		fuseStart := time.Now()
 		fused := fusion.RRFWeighted(lexIDs, denseIDs, e.fusionParams())
+		defer func() {
+			if timings != nil {
+				timings.FuseMs = time.Since(fuseStart).Milliseconds()
+			}
+		}()
 		ids := make([]string, 0, len(fused))
 		for _, f := range fused {
 			ids = append(ids, f.ID)
@@ -701,7 +727,7 @@ func filterLiveHits(handle *revisionHandle, hits []lexical.Hit) []lexical.Hit {
 // 语义路未执行）、降级原因与致命错误（ctx 取消或 deny 拒绝）。多
 // segment 逐段 exact 检索后确定性归并（score desc, ID asc，暗坑 K27），
 // 死 chunk 在归并后过滤（暗坑 K39）。
-func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, depth int) ([]string, []string, error) {
+func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, depth int, timings *engine.RetrievalTimings) ([]string, []string, error) {
 	ixs, loadErr := handle.vectorIndexes(e.embedCfg.Dimension)
 	if loadErr != nil {
 		if errors.Is(loadErr, vector.ErrEnvelopeExceeded) {
@@ -727,7 +753,11 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 		// 语义路无候选可召回，覆盖缺口由调用方按 manifest 如实上报。
 		return nil, nil, nil
 	}
+	embedStart := time.Now()
 	queryVector, embedErr := e.embedClient.EmbedQuery(ctx, query)
+	if timings != nil {
+		timings.QueryEmbedMs = time.Since(embedStart).Milliseconds()
+	}
 	if embedErr != nil {
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
@@ -737,6 +767,7 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 		}
 		return nil, []string{"query-embedding-failed(" + failureClass(embedErr) + ")"}, nil
 	}
+	vectorStart := time.Now()
 	var merged []vector.Hit
 	for _, ix := range ixs {
 		queryCopy := make([]float32, len(queryVector))
@@ -762,6 +793,9 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 		if len(ids) >= depth {
 			break
 		}
+	}
+	if timings != nil {
+		timings.VectorMs = time.Since(vectorStart).Milliseconds()
 	}
 	return ids, nil, nil
 }
