@@ -76,6 +76,9 @@ type Engine struct {
 	// freshnessWindow>0 时,上次成功同步距今小于窗口的查询跳过内联
 	// 扫描(Stage 6 前置;新鲜度上界=窗口)。
 	freshnessWindow time.Duration
+	// lexicalFirst 控制冷仓词法中间发布;生产默认 true,仅 Options
+	// 程序化保险丝可关闭(不暴露 env,避免配置指纹语义漂移)。
+	lexicalFirst bool
 	// fragmentGate 是碎片密度门 spike(候选 (l));仅 Options 程序化
 	// 开启,生产 env 不暴露,默认 false。
 	fragmentGate bool
@@ -146,6 +149,7 @@ func New(opts Options) (*Engine, error) {
 	e.queryBuildWait = opts.QueryBuildWait
 	e.buildWaitSlice = 5 * time.Second
 	e.freshnessWindow = opts.FreshnessWindow
+	e.lexicalFirst = !opts.DisableLexicalFirst
 	e.fragmentGate = opts.FragmentGate
 	e.storeProfile = e.profile.ID + "-v" + e.profile.Version
 	// 模板版本注入(M9② 单一事实源):ProfileHash 与子树后缀取同一常量。
