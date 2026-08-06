@@ -72,6 +72,10 @@ type Options struct {
 	QualityStrict bool
 	// QueryBuildWait 是查询等待在建索引的上界;0 = 无界(现状)。
 	QueryBuildWait time.Duration
+	// FragmentGate 开启碎片密度门 spike(候选 (l));仅测试/bench
+	// 程序化覆盖,无环境变量,默认 false。生产引入须等真实碎片语料
+	// 验证与用户裁决。
+	FragmentGate bool
 }
 
 // OptionsFromEnv 解析 local-hybrid 的 provider 与降级配置；
