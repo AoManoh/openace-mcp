@@ -250,7 +250,8 @@ func (e *Engine) EngineID() string {
 // rejectProfileID 拒绝 legacy ACE 专属的 provider_profile_id（迁移方案 §7.3）。
 func rejectProfileID(ref engine.WorkspaceRef) error {
 	if strings.TrimSpace(ref.ProviderProfileID) != "" {
-		return fmt.Errorf("provider_profile_id 仅适用于 legacy ACE 引擎；local-hybrid 不接受该参数（收到 %q）", ref.ProviderProfileID)
+		// P7:请求类标记,daemon 面映射 400 而非 502。
+		return engine.AsInvalidRequest(fmt.Errorf("provider_profile_id 仅适用于 legacy ACE 引擎；local-hybrid 不接受该参数（收到 %q）", ref.ProviderProfileID))
 	}
 	return nil
 }
@@ -259,7 +260,8 @@ func rejectProfileID(ref engine.WorkspaceRef) error {
 func (e *Engine) resolveRoot(dir string) (pathutil.WorkspaceRoot, string, error) {
 	root, err := pathutil.ResolveWorkspaceRoot(dir)
 	if err != nil {
-		return pathutil.WorkspaceRoot{}, "", err
+		// P7:目录不存在/非法是调用方可修复的输入错误。
+		return pathutil.WorkspaceRoot{}, "", engine.AsInvalidRequest(err)
 	}
 	sum := sha256.Sum256([]byte(root.CanonicalPath + "\x00" + string(root.PathKind) + "\x00" + root.HostOS))
 	key := sanitizeKey(filepath.Base(root.CanonicalPath)) + "-" + hex.EncodeToString(sum[:])[:12]

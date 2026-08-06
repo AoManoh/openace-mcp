@@ -398,7 +398,7 @@ func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, dep
 	}
 	query := strings.TrimSpace(req.Query)
 	if query == "" {
-		return RouteCandidates{}, errors.New("查询内容为空")
+		return RouteCandidates{}, engine.AsInvalidRequest(errors.New("查询内容为空"))
 	}
 	if depth <= 0 {
 		depth = hybridRouteTopK
@@ -472,7 +472,8 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	}
 	query := strings.TrimSpace(req.Query)
 	if query == "" {
-		return retrieval{}, errors.New("查询内容为空")
+		// P7:请求类标记,daemon 面映射 400 而非 502。
+		return retrieval{}, engine.AsInvalidRequest(errors.New("查询内容为空"))
 	}
 	// 检索前确保索引就绪（与 legacy Syncer 的 retrieval 语义一致）。
 	syncResult, syncErr := e.syncWorkspaceForQuery(ctx, req.Workspace)

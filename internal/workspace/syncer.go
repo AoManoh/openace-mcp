@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
 )
 
@@ -79,10 +80,12 @@ func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]f
 	// 收录或静默返回空集。
 	rootInfo, err := os.Stat(root)
 	if err != nil {
-		return nil, stats, fmt.Errorf("workspace root is not accessible: %w", err)
+		// P7:根不存在/不可达是调用方传错目录的典型形态,打请求类
+		// 标记(daemon 面映射 400 而非 502)。
+		return nil, stats, engine.AsInvalidRequest(fmt.Errorf("workspace root is not accessible: %w", err))
 	}
 	if !rootInfo.IsDir() {
-		return nil, stats, fmt.Errorf("workspace root is not a directory: %s", root)
+		return nil, stats, engine.AsInvalidRequest(fmt.Errorf("workspace root is not a directory: %s", root))
 	}
 	// 根的叶组件为 symlink→目录时,WalkDir 对根用 Lstat 会把它当
 	// "非常规文件"跳过并成功返回空集(H2 机理);解析到真实目录再走。

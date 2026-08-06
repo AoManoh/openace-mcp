@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -242,5 +244,68 @@ func TestClientDecodesWorkspaceUpstreamHealth(t *testing.T) {
 	}
 	if status.UpstreamStatus != "backoff" || status.UpstreamRetryAfter != "30s" {
 		t.Fatalf("workspace status should decode upstream health: %+v", status)
+	}
+}
+
+// P6(review 二批):响应体超 4MiB 被 LimitReader 截断后,不得报裸
+// "unexpected end of JSON input"——错误须带端点与"响应过大/缩小请求"
+// 的可行动提示。
+func TestClientReportsOversizedResponse(t *testing.T) {
+	big := strings.Repeat("x", (4<<20)+100)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"tasks":[{"id":"` + big + `"}]}`))
+	}))
+	defer server.Close()
+
+	_, err := NewClient(server.URL).ListTasks(context.Background(), 0)
+	if err == nil {
+		t.Fatal("oversized response should fail")
+	}
+	if !strings.Contains(err.Error(), "/v1/tasks") || !strings.Contains(err.Error(), "4MiB") {
+		t.Fatalf("error should carry endpoint and size hint: %v", err)
+	}
+}
+
+// P6 附带:正常大小但畸形的响应,decode 错误须带端点上下文。
+func TestClientWrapsDecodeErrorsWithEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{broken`))
+	}))
+	defer server.Close()
+
+	_, err := NewClient(server.URL).ListTasks(context.Background(), 0)
+	if err == nil || !strings.Contains(err.Error(), "/v1/tasks") {
+		t.Fatalf("decode error should carry endpoint context: %v", err)
+	}
+}
+
+// P12(review 二批):默认 token 档下 wrapper 侧 token 文件读取失败被
+// 静默吞掉(return "")→ 全部请求无解释 401。失败原因必须随 401 外显,
+// 并给出 OPENACE_DAEMON_TOKEN 恢复路径。
+func TestClientSurfacesTokenLoadFailureOn401(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// UserCacheDir → XDG_CACHE_HOME;路径分量是普通文件 → token 目录
+	// 创建必然失败。
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(blocker, "cache"))
+	t.Setenv("OPENACE_DAEMON_TOKEN", "")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+	}))
+	defer server.Close()
+
+	err := NewClient(server.URL).Health(context.Background())
+	if err == nil {
+		t.Fatal("401 must fail")
+	}
+	if !strings.Contains(err.Error(), "token") || !strings.Contains(err.Error(), "OPENACE_DAEMON_TOKEN") {
+		t.Fatalf("401 error should surface token load failure with recovery hint: %v", err)
 	}
 }

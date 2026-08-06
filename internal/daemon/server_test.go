@@ -25,6 +25,9 @@ func (fakeSyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Resu
 }
 
 func (fakeSyncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	if strings.Contains(req.Workspace.DirectoryPath, "invalid") {
+		return engine.Result{}, engine.AsInvalidRequest(errors.New("workspace directory is invalid"))
+	}
 	if strings.Contains(req.Workspace.DirectoryPath, "bad") {
 		return engine.Result{}, errors.New("workspace failed")
 	}
@@ -461,6 +464,41 @@ func TestServerCompletesMultiRetrieveTask(t *testing.T) {
 	}
 	if len(completed.DirectoryPaths) != 2 {
 		t.Fatalf("task should retain directory paths: %+v", completed)
+	}
+}
+
+// P7(review 二批):请求类引擎错误(engine.AsInvalidRequest 标记)须映射
+// 400 而非 502——重试必然再失败的输入错误不得伪装成可重试的网关故障。
+func TestRetrieveClassifiesInvalidRequestErrors(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
+	server := newDaemonHTTPTestServer(t, fakeSyncer{})
+
+	post := func(t *testing.T, dir string) (int, string) {
+		t.Helper()
+		payload, err := json.Marshal(retrieveRequest{DirectoryPath: dir, InformationRequest: "find code"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.Post(server.URL+"/v1/retrieve", "application/json", bytes.NewReader(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var body struct {
+			Error string `json:"error"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, body.Error
+	}
+
+	if code, msg := post(t, "/tmp/invalid-input"); code != http.StatusBadRequest || msg != "workspace directory is invalid" {
+		t.Fatalf("invalid request should map to 400 with original text, got %d %q", code, msg)
+	}
+	if code, _ := post(t, "/tmp/bad"); code != http.StatusBadGateway {
+		t.Fatalf("engine faults should keep 502, got %d", code)
 	}
 }
 
