@@ -46,8 +46,9 @@ const (
 // ErrEnvelopeExceeded 表示向量规模超出已验证 envelope，语义路应显式降级。
 var ErrEnvelopeExceeded = errors.New("vector index exceeds verified exact-search envelope")
 
-// Entry 是一行向量对应的 chunk 身份；ContentHash 是纯内容 hash，
-// 供跨 revision 复用键控（阶段计划 D2/K5）。
+// Entry 是一行向量对应的 chunk 身份；ContentHash 是历史字段名，当前
+// 子树承载 localengine embedKey(模板/path/symbol/language/content hash)，
+// 供跨 revision/profile 复用；具体键语义由 profile/template 身份约束。
 type Entry struct {
 	ID          string `json:"id"`
 	ContentHash string `json:"content_hash"`

@@ -29,6 +29,8 @@ type semanticOutcome struct {
 	coveredByActive int
 	// newlyEmbedded 是本次经 provider 新获取的唯一内容数。
 	newlyEmbedded int
+	// crossProfileReused 是实际命中兼容旧 profile 子树的唯一键数。
+	crossProfileReused int
 	// rejected 是零向量/NaN 被拒的数量（暗坑 K35）。
 	rejected int
 	// lastError 是最后一次批失败的脱敏消息（状态上报）。
@@ -77,6 +79,9 @@ type priorVectors struct {
 	// 向量数据（按纯 content hash 键控，revision 优先级高于 journal）。
 	activeByHash map[string][]float32
 	olderByHash  map[string][]float32
+	// crossProfileByHash 来自同 workspace、同 embedding identity/template
+	// 的旧 chunk profile 子树。优先级低于当前 active/previous,只读复用。
+	crossProfileByHash map[string][]float32
 	// activeIDs 是 active revision 中已持久化向量的 chunk ID 集
 	// （delta 构建计算未触及 chunk 覆盖时使用，暗坑 K51）。
 	activeIDs map[string]bool
@@ -87,9 +92,10 @@ type priorVectors struct {
 // 新嵌入补齐（K25 自愈路径）。
 func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest) priorVectors {
 	prior := priorVectors{
-		activeByHash: map[string][]float32{},
-		olderByHash:  map[string][]float32{},
-		activeIDs:    map[string]bool{},
+		activeByHash:       map[string][]float32{},
+		olderByHash:        map[string][]float32{},
+		crossProfileByHash: map[string][]float32{},
+		activeIDs:          map[string]bool{},
 	}
 	dimension := e.embedCfg.Dimension
 	manifest := previous
@@ -143,9 +149,12 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	}
 	status.setStage(engine.IndexStageEmbedding)
 
-	// 1) 复用优先级：active revision → previous revision → journal（K41）。
+	// 1) 复用优先级：active revision → previous revision → 兼容旧
+	// profile 子树 → journal。跨 profile 只在 embedding identity/template
+	// 精确一致时由发现层注入。
 	reuse := make(map[string][]float32, len(prior.activeByHash))
 	activeUsable := make(map[string]bool, len(prior.activeByHash))
+	crossUsable := make(map[string]bool, len(prior.crossProfileByHash))
 	for hash, vec := range prior.activeByHash {
 		reuse[hash] = vec
 		activeUsable[hash] = true
@@ -153,6 +162,12 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	for hash, vec := range prior.olderByHash {
 		if _, ok := reuse[hash]; !ok {
 			reuse[hash] = vec
+		}
+	}
+	for hash, vec := range prior.crossProfileByHash {
+		if _, ok := reuse[hash]; !ok {
+			reuse[hash] = vec
+			crossUsable[hash] = true
 		}
 	}
 	for hash, vec := range journal.Snapshot() {
@@ -176,6 +191,9 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		}
 		seen[key] = true
 		if _, ok := reuse[key]; ok {
+			if crossUsable[key] {
+				out.crossProfileReused++
+			}
 			continue
 		}
 		if journal.Rejected(key) {
