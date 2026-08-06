@@ -97,6 +97,9 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 // 仅 managed 自有地址接线——手工 daemon(manual-daemon 模式)生命周期
 // 归用户,不代拉。
 func attachRecoverHook(client *daemon.Client, managedAddr string, requestedEngine string, expectedProfile string) {
+	// Connect 时兼容性已复验;把期望身份绑定到 Client,后续每个带
+	// served_by 的响应零额外请求复验,防会话中途 daemon 换血。
+	client.SetExpectedIdentity(buildinfo.Current(), requestedEngine, expectedProfile)
 	client.SetRecoverHook(func(ctx context.Context) error {
 		releaseLock, err := acquireStartupLock(ctx, managedAddr, startupTimeout())
 		if err != nil {

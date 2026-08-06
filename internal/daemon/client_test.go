@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AoManoh/openace-mcp/internal/buildinfo"
 	"github.com/AoManoh/openace-mcp/internal/engine"
+	"github.com/AoManoh/openace-mcp/internal/runtimeinfo"
 )
 
 func TestClientHealth(t *testing.T) {
@@ -59,6 +61,45 @@ func TestClientDaemonStatus(t *testing.T) {
 	}
 	if status.PID != 123 || !status.Capabilities["runtime_identity"] || status.CacheNamespace != "test" {
 		t.Fatalf("unexpected status: %+v", status)
+	}
+}
+
+// 会话中途 daemon 换血的响应身份必须 fail-closed(加注 28 实证:
+// 旧 wrapper 静默对话新 daemon,未知结构化字段被剥掉)。校验复用响应
+// 自带 served_by,零额外 HTTP 请求。
+func TestClientRejectsMidSessionDaemonIdentityChange(t *testing.T) {
+	served := runtimeinfo.ServedBy{
+		Service: "openace-daemon", Engine: engine.EngineLocalHybrid,
+		EngineProfile: "profile-a",
+		Build:         buildinfo.Info{Version: "v1", VCSRevision: "aaa"},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(engine.Result{Text: "ok", ServedBy: &served})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	client.SetExpectedIdentity(buildinfo.Info{Version: "v1", VCSRevision: "aaa"}, engine.EngineLocalHybrid, "profile-a")
+	if _, err := client.Search(context.Background(), searchReqP("/tmp/project", "", "find code", 0)); err != nil {
+		t.Fatalf("相同身份应通过: %v", err)
+	}
+
+	served.Build = buildinfo.Info{Version: "v2", VCSRevision: "bbb"}
+	if _, err := client.Search(context.Background(), searchReqP("/tmp/project", "", "find code", 0)); err == nil || !strings.Contains(err.Error(), "daemon identity changed during this MCP session") || !strings.Contains(err.Error(), "aaa") || !strings.Contains(err.Error(), "bbb") {
+		t.Fatalf("换血身份应明确拒绝: %v", err)
+	}
+}
+
+func TestClientIdentityValidationAllowsLegacyMissingServedBy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(engine.Result{Text: "legacy"})
+	}))
+	defer server.Close()
+	client := NewClient(server.URL)
+	client.SetExpectedIdentity(buildinfo.Info{Version: "v1", VCSRevision: "aaa"}, engine.EngineLocalHybrid, "profile-a")
+	if _, err := client.Search(context.Background(), searchReqP("/tmp/project", "", "find code", 0)); err != nil {
+		t.Fatalf("served_by 缺失的旧响应保持兼容: %v", err)
 	}
 }
 
