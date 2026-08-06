@@ -93,6 +93,7 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	}
 	// 权限跳过如实上报(M1 配套状态面,K6 上抛口径)。
 	status.setPermissionSkipped(scanStats.PermissionSkippedFiles)
+	status.setScannedFiles(len(assets))
 
 	previous, _, resolveErr := store.ResolveUsable()
 	if resolveErr != nil && !isNoRevision(resolveErr) {

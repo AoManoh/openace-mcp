@@ -180,7 +180,7 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 | `OPENACE_RERANK_PROVIDER` | 可选精排:`tei` / `voyage` / `off`;默认 `voyage` 且缺 key 即关闭。`_BASE_URL`/`_API_KEY`/`_MODEL`/`_MAX_TOKENS` 语义同上 |
 | `OPENACE_RETRIEVAL_DEGRADE` / `OPENACE_RERANK_DEGRADE` | 语义路/精排失败策略:`allow`(默认,放行并标 `[DEGRADED]`)/ `deny`(返回可行动错误) |
 | `OPENACE_QUALITY_STRICT` | `on` = 质量严格档:语义链路任一缺口(覆盖 <100%、查询嵌入失败、已配置的 rerank 未生效等)直接报错;要求已配置 embedding。默认 `off`。结构化结果携带 `rerank_sent`/`query_embed_failed`/`embedding_profile` |
-| `OPENACE_QUERY_BUILD_WAIT` | 查询等待在建索引的上界(如 `30s`):超时后有旧索引按 allow/deny 降级,无旧索引返回带进度的错误;空/0 = 等到构建完成(默认) |
+| `OPENACE_QUERY_BUILD_WAIT` | 查询等待在建索引的上界,**默认 `90s`**(小于工具超时,冷仓首建期间的同步检索返回带构建进度的可行动错误,而非裸超时):超时后有旧索引按 allow/deny 降级,无旧索引返回带进度的错误;显式 `0` = 等到构建完成 |
 | `OPENACE_PROVIDER_TIMEOUT` / `OPENACE_PROVIDER_MAX_RETRIES` | provider HTTP 超时(默认 `60s`)与单批重试上限(默认 `5`) |
 | `OPENACE_MODE` | `auto` / `direct` / `manual-daemon`(默认 `auto`) |
 | `OPENACE_CACHE_NAMESPACE` | cache 命名空间,隔离账号/tenant/测试批次 |
