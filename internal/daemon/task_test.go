@@ -201,12 +201,20 @@ func TestTaskStoreListOmitsResultText(t *testing.T) {
 	if tasks[0].Result.Text != "" {
 		t.Fatalf("list should omit result text, got %q", tasks[0].Result.Text)
 	}
+	// P4(review 二批):省略必须显式标记——"Text": "" 与真实空结果同形,
+	// 调用方无从区分"结果为空"与"列表视图省略"。
+	if !tasks[0].ResultTextOmitted {
+		t.Fatalf("list should flag omitted result text: %+v", tasks[0])
+	}
 	detail, ok := store.Get(task.ID)
 	if !ok {
 		t.Fatal("task should exist")
 	}
 	if detail.Result == nil || detail.Result.Text == "" {
 		t.Fatalf("detail should retain result text: %+v", detail)
+	}
+	if detail.ResultTextOmitted {
+		t.Fatalf("detail keeps full text and must not flag omission: %+v", detail)
 	}
 }
 

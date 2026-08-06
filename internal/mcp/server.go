@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -109,34 +110,75 @@ func NewServer(service engine.Service) *Server {
 	return server
 }
 
+// maxInputLineBytes 是单条 MCP 输入行上限(与历史 Scanner 缓冲一致)。
+const maxInputLineBytes = 8 * 1024 * 1024
+
 func (s *Server) Run(ctx context.Context, in io.Reader, out io.Writer) error {
-	scanner := bufio.NewScanner(in)
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	reader := bufio.NewReaderSize(in, 64*1024)
 	enc := json.NewEncoder(out)
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	for {
+		line, tooLong, readErr := readInputLine(reader, maxInputLineBytes)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return readErr
 		}
-		var req rpcRequest
-		if err := json.Unmarshal([]byte(line), &req); err != nil {
-			resp := rpcResponse{JSONRPC: "2.0", ID: nil, Error: &rpcError{Code: -32700, Message: err.Error()}}
+		if tooLong {
+			// P13(review 二批):此前 Scanner 超限 ErrTooLong 直接终结
+			// 整个会话进程;超长参数只应得到协议错误,会话继续。
+			resp := rpcResponse{JSONRPC: "2.0", ID: nil, Error: &rpcError{Code: -32700, Message: fmt.Sprintf("input line exceeds %d bytes and was discarded", maxInputLineBytes)}}
 			if err := enc.Encode(resp); err != nil {
 				return err
 			}
-			continue
+		} else if line = strings.TrimSpace(line); line != "" {
+			var req rpcRequest
+			if err := json.Unmarshal([]byte(line), &req); err != nil {
+				resp := rpcResponse{JSONRPC: "2.0", ID: nil, Error: &rpcError{Code: -32700, Message: err.Error()}}
+				if err := enc.Encode(resp); err != nil {
+					return err
+				}
+			} else if req.ID == nil {
+				s.handleNotification(req)
+			} else {
+				resp := s.handle(ctx, req)
+				if err := enc.Encode(resp); err != nil {
+					return err
+				}
+			}
 		}
-		if req.ID == nil {
-			s.handleNotification(req)
-			continue
-		}
-		resp := s.handle(ctx, req)
-		if err := enc.Encode(resp); err != nil {
-			return err
+		if readErr != nil {
+			return nil
 		}
 	}
-	return scanner.Err()
+}
+
+// readInputLine 读取一行(上限 limit 字节,含换行符);超限时丢弃该行
+// 剩余字节并报告 tooLong,由调用方回协议错误后继续会话。EOF 随最后
+// 一行(可无换行)一并返回 io.EOF。
+func readInputLine(reader *bufio.Reader, limit int) (string, bool, error) {
+	var buf []byte
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if len(buf)+len(fragment) > limit {
+			// 丢弃当前行剩余字节直到换行或 EOF。
+			for {
+				if err == nil {
+					return "", true, nil
+				}
+				if !errors.Is(err, bufio.ErrBufferFull) {
+					return "", true, err
+				}
+				_, err = reader.ReadSlice('\n')
+			}
+		}
+		buf = append(buf, fragment...)
+		if err == nil {
+			return string(buf), false, nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return string(buf), false, err
+	}
 }
 
 func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
@@ -846,7 +888,7 @@ func taskStatusTool() map[string]any {
 func listTasksTool() map[string]any {
 	return map[string]any{
 		"name":        "list_tasks",
-		"description": "List recent openACE daemon tasks for diagnostics and pressure-test observation.",
+		"description": "List recent openACE daemon tasks for diagnostics and pressure-test observation. Result text is omitted in this list view (entries set result_text_omitted); use task_status to fetch the full text of a task.",
 		"inputSchema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{

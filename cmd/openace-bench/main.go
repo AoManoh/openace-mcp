@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -106,7 +107,7 @@ func run() error {
 		// 回灌面把离线批量结果写入 journal（下一次 sync 零 provider 收编）。
 		dumpEmbedJobs = flag.Bool("dump-embed-jobs", false, "导出待嵌任务清单而非评分（embed-jobs.jsonl）")
 		importVectors = flag.String("import-embeddings", "", "回灌批量嵌入结果 jsonl（{custom_id, embedding[]}）")
-		syncOnly      = flag.Bool("sync-only", false, "只执行一次 sync 并打印覆盖状态（回灌后触发零 provider 发布）")
+		syncOnly      = flag.Bool("sync-only", false, "只执行一次 sync 并打印覆盖状态（回灌后触发零 provider 发布;缺向量时拒绝执行防在线补付,R3）")
 		// 跨子树向量复用（profile 升版零重付,2026-08-05 v5 迁移教训）：
 		// 从既有子树导出 {embedKey, vector},喂给 -import-embeddings 后
 		// 新子树 sync 只对真正变化的 chunk 付费。
@@ -249,6 +250,14 @@ func run() error {
 	}
 	if *importVectors != "" {
 		return importEmbeddingResults(ctx, eng, ref, *importVectors, *out, manifest)
+	}
+	// R3(review 二批):-sync-only 的"零 provider 发布"从期望升级为约束
+	// ——发布前用零费计划面复核缺口,缺口非零拒绝执行,防部分回灌后
+	// 静默转在线付费。
+	if *syncOnly {
+		if err := ensureSyncOnlyZeroProvider(ctx, eng, ref); err != nil {
+			return err
+		}
 	}
 	// 预热一次 sync（首建），之后每查询的 sync 为 no-op 快路径。
 	if _, err := eng.Sync(ctx, engine.SyncRequest{Workspace: ref}); err != nil {
@@ -736,6 +745,25 @@ func dumpEmbedJobList(ctx context.Context, eng *localengine.Engine, ref engine.W
 	}
 	fmt.Printf("embed jobs dumped: pending=%d reusable=%d rejected=%d unique=%d (model=%s dim=%d profile=%s) → %s\n",
 		plan.Pending, plan.Reusable, plan.Rejected, plan.UniqueKeys, plan.Model, plan.Dimension, plan.StoreProfile, out)
+	return nil
+}
+
+// ensureSyncOnlyZeroProvider 是 -sync-only 的零费预检(R3,review 二批):
+// flag 文案宣称"零 provider 发布",但 Sync 对 journal 未覆盖的 pending
+// 键照常在线嵌入付费——部分回灌/工作区漂移下用户以为零费实际补付。
+// 用零费计划面(PlanEmbedJobs)复核缺口,缺口非零拒绝执行;纯词法形态
+// (无 provider)天然零费直接放行。
+func ensureSyncOnlyZeroProvider(ctx context.Context, eng *localengine.Engine, ref engine.WorkspaceRef) error {
+	plan, err := eng.PlanEmbedJobs(ctx, ref, func(localengine.EmbedJob) error { return nil })
+	if err != nil {
+		if errors.Is(err, localengine.ErrSemanticRequired) {
+			return nil
+		}
+		return fmt.Errorf("-sync-only 零费预检: %w", err)
+	}
+	if plan.Pending > 0 {
+		return fmt.Errorf("-sync-only 拒绝执行: %d 个 chunk 缺向量,同步将在线嵌入付费;先 -import-embeddings 补灌缺口,或去掉 -sync-only 明示接受在线嵌入", plan.Pending)
+	}
 	return nil
 }
 

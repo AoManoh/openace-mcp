@@ -314,7 +314,7 @@ func (s *Server) workspaceStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	status, err := s.workspaceStatusForProvider(r.Context(), inspector, req.DirectoryPath, req.ProviderProfileID)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeUpstreamError(w, err)
 		return
 	}
 	s.decorateWorkspaceStatus(&status)
@@ -630,9 +630,15 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-// writeUpstreamError 把引擎错误映射为 502(Stage 7 简化:legacy 上游
-// 429 直通逻辑随 ACE 引擎删除;local-hybrid 的 provider 失败在引擎层
-// 已分类为可行动文本,按引擎错误原样透出)。
+// writeUpstreamError 把引擎错误映射为 HTTP 状态(Stage 7 简化:legacy
+// 上游 429 直通逻辑随 ACE 引擎删除;local-hybrid 的 provider 失败在
+// 引擎层已分类为可行动文本,按引擎错误原样透出)。P7(review 二批):
+// 请求类错误(目录非法/参数被拒/查询为空)分流 400——重试必然再失败,
+// 不得伪装成可重试的网关故障;其余保持 502。
 func writeUpstreamError(w http.ResponseWriter, err error) {
+	if engine.IsInvalidRequest(err) {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	writeError(w, http.StatusBadGateway, err.Error())
 }

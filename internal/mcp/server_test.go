@@ -505,6 +505,25 @@ func TestMultiCodebaseRetrievalValidatesWorkspaceLimit(t *testing.T) {
 	}
 }
 
+// P13(review 二批):单条输入超 8MiB 此前令 Scanner ErrTooLong 终结整个
+// MCP 会话进程;超长行只应得到 -32700 协议错误,会话继续服务后续请求。
+func TestRunSurvivesOversizedInputLine(t *testing.T) {
+	huge := strings.Repeat("x", 9<<20)
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"information_request":"` + huge + `","directory_path":"/tmp/w"}}}` + "\n" +
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}` + "\n"
+	var out bytes.Buffer
+	if err := NewServer(fakeSyncer{}).Run(context.Background(), strings.NewReader(input), &out); err != nil {
+		t.Fatalf("oversized line must not kill the session: %v", err)
+	}
+	response := out.String()
+	if !strings.Contains(response, "-32700") {
+		t.Fatalf("oversized line should yield protocol error: %s", response)
+	}
+	if !strings.Contains(response, `"id":2`) || !strings.Contains(response, "codebase_retrieval") {
+		t.Fatalf("session should keep serving after oversized line: %s", response)
+	}
+}
+
 func runMCP(t *testing.T, server *Server, line string) string {
 	t.Helper()
 	var out bytes.Buffer

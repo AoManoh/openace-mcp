@@ -78,6 +78,10 @@ type TaskSnapshot struct {
 	// 服务端应答时按 DirectoryPath 现查(stage/files/嵌入进度),供调用方
 	// 区分"在推进"与"卡死";非 running 或无从查询时为空。
 	Progress string `json:"progress,omitempty"`
+	// ResultTextOmitted 表示列表视图有意省略了 Result.Text(P4,review
+	// 二批:省略后 "Text": "" 与真实空结果同形,调用方极易误读为"检索
+	// 结果为空")。仅 List 摘要置位;task_status 详情恒为 false。
+	ResultTextOmitted bool `json:"result_text_omitted,omitempty"`
 }
 
 type TaskRunner func(context.Context, TaskRequest) (engine.Result, error)
@@ -946,8 +950,10 @@ func cloneTask(in TaskSnapshot) TaskSnapshot {
 
 func cloneTaskSummary(in TaskSnapshot) TaskSnapshot {
 	out := cloneTask(in)
-	if out.Result != nil {
+	if out.Result != nil && out.Result.Text != "" {
+		// P4:省略显式标记,防 "Text": "" 被误读为空结果。
 		out.Result.Text = ""
+		out.ResultTextOmitted = true
 	}
 	return out
 }

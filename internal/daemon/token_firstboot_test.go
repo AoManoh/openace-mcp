@@ -21,7 +21,10 @@ func TestClientTokenFirstBootConvergence(t *testing.T) {
 		t.Fatalf("前置:token 文件不应存在: %v", err)
 	}
 	// wrapper 侧先构造(模拟 daemon 尚未启动)。
-	clientSide := clientToken(addr)
+	clientSide, err := clientToken(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// daemon 侧随后解析(load-or-create)。
 	t.Setenv("OPENACE_DAEMON_LISTEN_ADDR", addr)
 	serverSide, err := resolveAuthToken()
@@ -41,8 +44,8 @@ func TestClientTokenFirstBootConvergence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := clientToken(addr2); got != serverFirst {
-		t.Fatalf("daemon 先启不收敛:client=%q server=%q", got, serverFirst)
+	if got, err := clientToken(addr2); err != nil || got != serverFirst {
+		t.Fatalf("daemon 先启不收敛:client=%q server=%q err=%v", got, serverFirst, err)
 	}
 	// 文件权限维持 0600。
 	info, err := os.Stat(TokenFilePath(addr))

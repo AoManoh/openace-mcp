@@ -63,9 +63,10 @@ type ImportReport struct {
 	UnknownKey int
 }
 
-// errSemanticRequired:批量工具依赖 embedding profile 定位 storeProfile
-// 子树,semantic off 时无从谈起,显式拒绝防静默空转白灌。
-var errSemanticRequired = errors.New("batch 工具需要已配置的 embedding provider(storeProfile 子树由 embedding profile 决定)")
+// ErrSemanticRequired:批量工具依赖 embedding profile 定位 storeProfile
+// 子树,semantic off 时无从谈起,显式拒绝防静默空转白灌。导出供 bench
+// -sync-only 零费预检辨识纯词法形态(R3:无 provider 即无在线费用)。
+var ErrSemanticRequired = errors.New("batch 工具需要已配置的 embedding provider(storeProfile 子树由 embedding profile 决定)")
 
 // PlanEmbedJobs 枚举工作区当前形态下的待嵌任务:与在线构建同源的扫描
 // 与切分(含 previous chunk 复用),同源的复用池判定(active/previous
@@ -76,7 +77,7 @@ func (e *Engine) PlanEmbedJobs(ctx context.Context, ref engine.WorkspaceRef, fn 
 		return EmbedPlan{}, err
 	}
 	if !e.semanticEnabled() {
-		return EmbedPlan{}, errSemanticRequired
+		return EmbedPlan{}, ErrSemanticRequired
 	}
 	plan := EmbedPlan{
 		Dimension:    e.embedCfg.Dimension,
@@ -243,7 +244,7 @@ func (e *Engine) ImportEmbeddings(ctx context.Context, ref engine.WorkspaceRef, 
 		return ImportReport{}, err
 	}
 	if !e.semanticEnabled() {
-		return ImportReport{}, errSemanticRequired
+		return ImportReport{}, ErrSemanticRequired
 	}
 	root, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
 	if err != nil {

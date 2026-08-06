@@ -29,6 +29,9 @@ type Client struct {
 	baseURL string
 	http    *http.Client
 	token   string
+	// tokenErr 记录默认档 token 读取失败的原因(P12,review 二批:此前
+	// return "" 吞错,所有请求以无解释 401 呈现);随 401 错误外显。
+	tokenErr error
 
 	capMu                     sync.Mutex
 	providerProfilesSupported bool
@@ -43,12 +46,14 @@ type healthResponse struct {
 }
 
 func NewClient(addr string) *Client {
+	token, tokenErr := clientToken(addr)
 	return &Client{
 		baseURL: baseURL(addr),
 		http: &http.Client{
 			Timeout: 30 * time.Minute,
 		},
-		token: clientToken(addr),
+		token:    token,
+		tokenErr: tokenErr,
 	}
 }
 
@@ -58,20 +63,21 @@ func NewClient(addr string) *Client {
 // 启动都收敛到同一 token。历史实现在文件缺失时缓存空 token,全新机器
 // 首启(wrapper 先构造 client、daemon 随后自建 token)健康探测永远 401
 // (review -15 灰度前置缺陷)。对 off 档或历史无认证 daemon,多带
-// Authorization 头无害(服务端零认证路径不校验)。
-func clientToken(addr string) string {
+// Authorization 头无害(服务端零认证路径不校验)。读取失败不再吞错
+// (P12):记录原因,请求撞 401 时随错误外显。
+func clientToken(addr string) (string, error) {
 	env := strings.TrimSpace(os.Getenv("OPENACE_DAEMON_TOKEN"))
 	if strings.EqualFold(env, tokenModeOff) {
-		return ""
+		return "", nil
 	}
 	if env != "" {
-		return env
+		return env, nil
 	}
 	_, token, err := LoadOrCreateToken(addr)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return token
+	return token, nil
 }
 
 func (c *Client) Health(ctx context.Context) error {
@@ -267,6 +273,10 @@ func (c *Client) authorize(req *http.Request) {
 	}
 }
 
+// maxResponseBodyBytes 是客户端读取 daemon 响应体的上限(本地 DoS 面
+// 收敛;与服务端请求体上限同量级)。
+const maxResponseBodyBytes = 4 << 20
+
 func (c *Client) do(req *http.Request, path string, out any) error {
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -274,17 +284,35 @@ func (c *Client) do(req *http.Request, path string, out any) error {
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	// 多读 1 字节以区分"恰好等于上限"与"被截断"(P6:此前满额截断后
+	// decode 报裸 unexpected end of JSON input,无端点、无恢复提示)。
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes+1))
 	if err != nil {
 		return err
 	}
+	truncated := len(data) > maxResponseBodyBytes
+	if truncated {
+		data = data[:maxResponseBodyBytes]
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("daemon %s returned HTTP %d: %s", path, resp.StatusCode, strings.TrimSpace(string(data)))
+		message := fmt.Sprintf("daemon %s returned HTTP %d: %s", path, resp.StatusCode, strings.TrimSpace(string(data)))
+		// P12:默认 token 档读取失败此前被静默吞掉,401 无从解释;
+		// 把失败原因与恢复路径附在错误上。
+		if resp.StatusCode == http.StatusUnauthorized && c.tokenErr != nil {
+			message += fmt.Sprintf("(wrapper 侧 daemon token 读取失败: %v;可显式设 OPENACE_DAEMON_TOKEN 或修复权限)", c.tokenErr)
+		}
+		return errors.New(message)
+	}
+	if truncated {
+		return fmt.Errorf("daemon %s response exceeded 4MiB and was truncated; retry with a smaller limit or narrower request", path)
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
 		return nil
 	}
-	return json.Unmarshal(data, out)
+	if err := json.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("daemon %s: decode response: %w", path, err)
+	}
+	return nil
 }
 
 func baseURL(addr string) string {
