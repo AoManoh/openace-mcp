@@ -200,7 +200,59 @@ type fakeProviderSyncer struct {
 	fakeTasker
 }
 
+// D2(吸收清单 codegraph #1):默认单工具面——多工具面导致弱 caller
+// mis-pick 且每会话白烧 schema tokens;完整面经 OPENACE_MCP_TOOLS 恢复。
+func TestToolsListDefaultsToMinimalFace(t *testing.T) {
+	out := runMCP(t, NewServer(fakeTasker{}), `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if !strings.Contains(out, `"codebase_retrieval"`) {
+		t.Fatalf("最小面应含主检索工具: %s", out)
+	}
+	for _, hidden := range []string{"multi_codebase_retrieval", "sync_workspace", "start_codebase_retrieval", "task_status", "daemon_status", "workspace_status", "list_tasks"} {
+		if strings.Contains(out, `"`+hidden+`"`) {
+			t.Fatalf("默认面不应列出 %s: %s", hidden, out)
+		}
+	}
+}
+
+// D2:未列出的工具保留 handler——按名直调仍被处理(工具面只影响发现,
+// 不影响能力;既有编排/文档引用零破坏)。
+func TestHiddenToolsRemainCallable(t *testing.T) {
+	out := runMCP(t, NewServer(fakeSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sync_workspace","arguments":{"directory_path":"/tmp/workspace"}}}`)
+	if !strings.Contains(out, "Workspace synced.") {
+		t.Fatalf("未列出的工具应可按名调用: %s", out)
+	}
+}
+
+// D2:自定义清单与能力面取交集(direct 模式没有 task 面,清单里的
+// task_status 不出现,不报错——同一配置可跨形态共用)。
+func TestToolsListEnvCustomListIntersectsCapability(t *testing.T) {
+	t.Setenv(EnvMCPTools, "codebase_retrieval, task_status")
+	withTasks := runMCP(t, NewServer(fakeTasker{}), `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if !strings.Contains(withTasks, `"codebase_retrieval"`) || !strings.Contains(withTasks, `"task_status"`) {
+		t.Fatalf("daemon 形态应列出清单内两个工具: %s", withTasks)
+	}
+	if strings.Contains(withTasks, `"sync_workspace"`) {
+		t.Fatalf("清单外工具不应列出: %s", withTasks)
+	}
+	direct := runMCP(t, NewServer(fakeSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if !strings.Contains(direct, `"codebase_retrieval"`) || strings.Contains(direct, `"task_status"`) {
+		t.Fatalf("direct 形态应按能力面交集列出: %s", direct)
+	}
+}
+
+// D2:清单里的未知工具名 fail-fast(会话起点即可行动报错,防拼写错误
+// 静默缩面)。
+func TestRunFailsFastOnUnknownToolInAllowlist(t *testing.T) {
+	t.Setenv(EnvMCPTools, "codebase_retrieval,typo_tool")
+	var out bytes.Buffer
+	err := NewServer(fakeSyncer{}).Run(context.Background(), strings.NewReader(""), &out)
+	if err == nil || !strings.Contains(err.Error(), "typo_tool") || !strings.Contains(err.Error(), EnvMCPTools) {
+		t.Fatalf("未知工具名应在启动即报可行动错误: %v", err)
+	}
+}
+
 func TestToolsListOnlyIncludesTaskToolsForTasker(t *testing.T) {
+	t.Setenv(EnvMCPTools, "all") // D2 后完整能力面须显式开启
 	direct := runMCP(t, NewServer(fakeSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
 	if !strings.Contains(direct, "multi_codebase_retrieval") {
 		t.Fatalf("direct syncer should list multi retrieval tool: %s", direct)

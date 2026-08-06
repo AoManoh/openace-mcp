@@ -113,7 +113,65 @@ func NewServer(service engine.Service) *Server {
 // maxInputLineBytes 是单条 MCP 输入行上限(与历史 Scanner 缓冲一致)。
 const maxInputLineBytes = 8 * 1024 * 1024
 
+// EnvMCPTools 支配 tools/list 暴露面(D2,吸收清单 codegraph #1:
+// 多工具面导致弱 caller mis-pick,且每会话为用不到的 schema 白烧
+// tokens——工具面就是提示工程)。未设/空 = 最小面(仅
+// codebase_retrieval);"all" = 完整能力面;逗号清单 = 指定面(与
+// 能力面取交集,同一配置可跨 direct/daemon 形态共用)。未列出的工具
+// 保留 handler,按名调用仍被处理——只影响发现,不影响能力。
+const EnvMCPTools = "OPENACE_MCP_TOOLS"
+
+// resolveToolFace 解析工具面配置:返回 (指定面, 是否全量, 错误)。
+// 未知工具名 fail-fast(防拼写错误静默缩面)。
+func resolveToolFace() (map[string]bool, bool, error) {
+	value := strings.TrimSpace(os.Getenv(EnvMCPTools))
+	if value == "" {
+		return map[string]bool{"codebase_retrieval": true}, false, nil
+	}
+	if strings.EqualFold(value, "all") {
+		return nil, true, nil
+	}
+	known := knownToolNames()
+	allow := make(map[string]bool)
+	for _, part := range strings.Split(value, ",") {
+		name := strings.ReplaceAll(strings.TrimSpace(part), "-", "_")
+		if name == "" {
+			continue
+		}
+		if !known[name] {
+			return nil, false, fmt.Errorf("%s: unknown tool %q; valid tools: %s (or \"all\")", EnvMCPTools, name, strings.Join(knownToolList(), ", "))
+		}
+		allow[name] = true
+	}
+	if len(allow) == 0 {
+		return map[string]bool{"codebase_retrieval": true}, false, nil
+	}
+	return allow, false, nil
+}
+
+// knownToolList 是全部工具名(与 toolHandlers 键一致,稳定序)。
+func knownToolList() []string {
+	return []string{
+		"codebase_retrieval", "multi_codebase_retrieval", "sync_workspace",
+		"start_codebase_retrieval", "start_multi_codebase_retrieval", "start_sync_workspace",
+		"task_status", "list_tasks", "cancel_task",
+		"daemon_status", "list_workspaces", "workspace_status",
+	}
+}
+
+func knownToolNames() map[string]bool {
+	names := make(map[string]bool)
+	for _, name := range knownToolList() {
+		names[name] = true
+	}
+	return names
+}
+
 func (s *Server) Run(ctx context.Context, in io.Reader, out io.Writer) error {
+	// D2 fail-fast:工具面配置非法即拒绝启动(会话起点可行动报错)。
+	if _, _, err := resolveToolFace(); err != nil {
+		return err
+	}
 	reader := bufio.NewReaderSize(in, 64*1024)
 	enc := json.NewEncoder(out)
 
@@ -198,15 +256,15 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
 			"instructions": serverInstructions,
 		})
 	case "tools/list":
-		tools := []any{retrievalTool(), multiRetrievalTool(), syncTool()}
-		if s.tasker != nil {
-			tools = append(tools, startRetrievalTool(), startMultiRetrievalTool(), startSyncTool(), taskStatusTool(), listTasksTool(), cancelTaskTool())
+		allow, all, err := resolveToolFace()
+		if err != nil {
+			return fail(req.ID, -32603, err.Error())
 		}
-		if s.statuser != nil {
-			tools = append(tools, daemonStatusTool())
-		}
-		if s.inspector != nil {
-			tools = append(tools, listWorkspacesTool(), workspaceStatusTool())
+		tools := []any{}
+		for _, tool := range s.capabilityTools() {
+			if all || allow[tool["name"].(string)] {
+				tools = append(tools, tool)
+			}
 		}
 		return ok(req.ID, map[string]any{"tools": tools})
 	case "tools/call":
@@ -214,6 +272,23 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
 	default:
 		return fail(req.ID, -32601, "method not found: "+req.Method)
 	}
+}
+
+// capabilityTools 返回当前形态的完整能力面(能力守卫:task 面仅 daemon、
+// 状态面按 statuser/inspector 注册);tools/list 在其上按 D2 工具面
+// 配置过滤,handler 表不受影响。
+func (s *Server) capabilityTools() []map[string]any {
+	tools := []map[string]any{retrievalTool(), multiRetrievalTool(), syncTool()}
+	if s.tasker != nil {
+		tools = append(tools, startRetrievalTool(), startMultiRetrievalTool(), startSyncTool(), taskStatusTool(), listTasksTool(), cancelTaskTool())
+	}
+	if s.statuser != nil {
+		tools = append(tools, daemonStatusTool())
+	}
+	if s.inspector != nil {
+		tools = append(tools, listWorkspacesTool(), workspaceStatusTool())
+	}
+	return tools
 }
 
 func (s *Server) handleNotification(req rpcRequest) {

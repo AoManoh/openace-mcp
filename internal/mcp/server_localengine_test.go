@@ -19,6 +19,7 @@ import (
 func TestLocalEngineEndToEnd(t *testing.T) {
 	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
 	t.Setenv("OPENACE_CACHE_NAMESPACE", "e2e")
+	t.Setenv(EnvMCPTools, "all") // 本测试断言完整能力面注册(P9),非默认面
 	// 断言全程无凭据。
 	for _, key := range []string{"VOYAGE_API_KEY"} {
 		t.Setenv(key, "")
