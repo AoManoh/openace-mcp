@@ -30,7 +30,7 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 网络受限时在命令前加 `GOPROXY=https://goproxy.cn,direct GOSUMDB=sum.golang.google.cn`(PowerShell 用 `$env:GOPROXY=...` 形式)。
 
 > `-tags` 选择内嵌的 Tree-sitter 语法子集(当前 AST 支持的十种语言,二进制约 31MB)。省略 `-tags` 功能完全一致,但内嵌全部 206 种语法(约 49MB)——切分行为不变,只是体积更大。
-> 固定版本:把 `@main` 换成 `@<tag-or-commit>`。升级 = 重跑同一条命令 + 重启 MCP 会话(运行中的进程不会热更新)。
+> **版本优先钉精确 commit**:把 `@main` 换成 `@<commit>`。`@main` 经 Go module proxy(尤其镜像代理)可能解析到缓存的旧提交而非远端最新——装完用 `openace-mcp version` 核对实际构建。升级三步 = 重跑安装命令 → 停掉旧 daemon(`pkill -f 'openace-mcp daemon'`)→ 重启 MCP 会话(wrapper 与 daemon 有 build 等值校验,旧 daemon 不停会被明确拒绝)。
 
 ### 第 2 步:把配置贴进你的 MCP 客户端
 
@@ -193,6 +193,7 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 | `OPENACE_QUERY_BUILD_WAIT` | 查询等待在建索引的上界,**默认 `90s`**(小于工具超时,冷仓首建期间的同步检索返回带构建进度的可行动错误,而非裸超时):超时后有旧索引按 allow/deny 降级,无旧索引返回带进度的错误;显式 `0` = 等到构建完成 |
 | `OPENACE_MCP_TOOLS` | MCP 工具面:未设 = 只暴露 `codebase_retrieval`;`all` = 完整能力面;或逗号清单指定 |
 | `OPENACE_RENDER_LINE_NUMBERS` | `1` = 检索结果围栏内逐行携带真实文件行号(`cat -n` 形状,Read-parity 试验面);默认关闭 |
+| `OPENACE_GRAY_FEEDBACK` | `1` = instructions 追加灰度反馈协议:调用 AI 每轮工具调用后输出多维诊断报告(事实/效果/体验/耗时/bug 复现),供测试者汇总回传。默认关闭 |
 | `OPENACE_PROVIDER_TIMEOUT` / `OPENACE_PROVIDER_MAX_RETRIES` | provider HTTP 超时(默认 `60s`)与单批重试上限(默认 `5`) |
 | `OPENACE_MODE` | `auto` / `direct` / `manual-daemon`(默认 `auto`) |
 | `OPENACE_CACHE_NAMESPACE` | cache 命名空间,隔离账号/tenant/测试批次 |

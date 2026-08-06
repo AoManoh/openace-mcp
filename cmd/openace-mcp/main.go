@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/AoManoh/openace-mcp/internal/buildinfo"
 	"github.com/AoManoh/openace-mcp/internal/daemon"
 	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/localengine"
@@ -16,16 +17,32 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "daemon" {
-		runDaemon()
-		return
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "daemon":
+			runDaemon()
+			return
+		case "version", "-version", "--version", "-v":
+			// 灰度反馈一号 2.2-2:核对版本此前只能裸跑二进制,而裸跑
+			// 进 MCP 模式会在 auto 档隐式拉起 daemon(且带着当时可能
+			// 残缺的 provider env,产出错误 engine profile 的野 daemon)。
+			// version 子命令零副作用:不连、不拉起任何进程。
+			fmt.Println(versionString())
+			return
+		}
 	}
 
 	ctx := context.Background()
 
 	service, err := buildService(ctx)
 	if err != nil {
+		// 灰度反馈一号 P1-3:启动失败不再 exit(1) 了事——多数 MCP 客户端
+		// 不展示 stderr,调用方只见裸 "Failed to connect"。降级形态保持
+		// 会话,把 build/profile mismatch 等可行动文案经工具错误透传。
 		fmt.Fprintf(os.Stderr, "openace-mcp: %v\n", err)
+		if runErr := mcp.NewUnavailableServer(err).Run(ctx, os.Stdin, os.Stdout); runErr != nil {
+			fmt.Fprintf(os.Stderr, "openace-mcp: %v\n", runErr)
+		}
 		os.Exit(1)
 	}
 	server := mcp.NewServer(service)
@@ -42,6 +59,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "openace-mcp: %v\n", runErr)
 		os.Exit(1)
 	}
+}
+
+// versionString 输出构建身份(与 daemon 启动日志、daemon_status 同源)。
+func versionString() string {
+	build := buildinfo.Current()
+	return fmt.Sprintf("openace-mcp %s (%s)", build.Version, build.VCSRevision)
 }
 
 func buildService(ctx context.Context) (engine.Service, error) {
