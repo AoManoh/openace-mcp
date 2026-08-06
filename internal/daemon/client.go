@@ -16,7 +16,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/AoManoh/openace-mcp/internal/buildinfo"
 	"github.com/AoManoh/openace-mcp/internal/engine"
+	"github.com/AoManoh/openace-mcp/internal/runtimeinfo"
 )
 
 // daemon HTTP client 对上层暴露与本地引擎一致的通用 contract。
@@ -37,6 +39,14 @@ type Client struct {
 	providerProfilesSupported bool
 	// recover 是连接拒绝时的恢复回调(SetRecoverHook;managed 重拉)。
 	recover func(context.Context) error
+
+	// expected* 是 managed Connect 成功时绑定的运行身份。后续每个
+	// daemon-backed 响应利用自带 served_by 零额外请求复验,防会话
+	// 中途 daemon 换血后旧 wrapper 静默读取新 wire 并剥未知字段。
+	identityExpected bool
+	expectedBuild    buildinfo.Info
+	expectedEngine   string
+	expectedProfile  string
 }
 
 type healthResponse struct {
@@ -180,6 +190,13 @@ func (c *Client) ListWorkspaceStatuses(ctx context.Context) ([]engine.WorkspaceS
 		Workspaces []engine.WorkspaceStatus `json:"workspaces"`
 	}
 	err := c.get(ctx, "/v1/workspaces", &result)
+	if err == nil {
+		for i := range result.Workspaces {
+			if err = c.validateServedBy(result.Workspaces[i].ServedBy); err != nil {
+				break
+			}
+		}
+	}
 	return result.Workspaces, err
 }
 
@@ -215,6 +232,13 @@ func (c *Client) ListTasks(ctx context.Context, limit int) ([]TaskSnapshot, erro
 		Tasks []TaskSnapshot `json:"tasks"`
 	}
 	err := c.get(ctx, path, &result)
+	if err == nil {
+		for i := range result.Tasks {
+			if err = c.validateServedBy(result.Tasks[i].ServedBy); err != nil {
+				break
+			}
+		}
+	}
 	return result.Tasks, err
 }
 
@@ -228,6 +252,53 @@ func (c *Client) CancelTask(ctx context.Context, id string) (TaskSnapshot, error
 	var result TaskSnapshot
 	err := c.post(ctx, "/v1/tasks/"+url.PathEscape(id)+"/cancel", map[string]any{}, &result)
 	return result, err
+}
+
+// SetExpectedIdentity 绑定 managed Connect 已复验的 build/engine/profile。
+// manual-daemon 不调用本方法,生命周期与兼容责任仍归用户。
+func (c *Client) SetExpectedIdentity(build buildinfo.Info, engineID string, profile string) {
+	c.expectedBuild = build
+	c.expectedEngine = engineID
+	c.expectedProfile = profile
+	c.identityExpected = true
+}
+
+// validateServedBy 对响应自带身份做零额外请求复验。served_by 缺失保持
+// 兼容(旧 daemon/测试 fixture);一旦明确携带且冲突即 fail-closed。
+func (c *Client) validateServedBy(served *runtimeinfo.ServedBy) error {
+	if !c.identityExpected || served == nil || served.Service == "" {
+		return nil
+	}
+	mismatch := ""
+	if served.Service != "openace-daemon" {
+		mismatch = fmt.Sprintf("service %q", served.Service)
+	} else if c.expectedBuild.VCSRevision != "" && served.Build.VCSRevision != "" && c.expectedBuild.VCSRevision != served.Build.VCSRevision {
+		mismatch = fmt.Sprintf("wrapper revision %s != daemon revision %s", c.expectedBuild.VCSRevision, served.Build.VCSRevision)
+	} else if c.expectedBuild.Version != "" && served.Build.Version != "" && c.expectedBuild.Version != "(devel)" && served.Build.Version != "(devel)" && c.expectedBuild.Version != served.Build.Version {
+		mismatch = fmt.Sprintf("wrapper version %s != daemon version %s", c.expectedBuild.Version, served.Build.Version)
+	} else if c.expectedEngine != "" && served.Engine != "" && c.expectedEngine != served.Engine {
+		mismatch = fmt.Sprintf("wrapper engine %q != daemon engine %q", c.expectedEngine, served.Engine)
+	} else if c.expectedProfile != "" && served.EngineProfile != "" && c.expectedProfile != served.EngineProfile {
+		mismatch = fmt.Sprintf("wrapper engine profile %s != daemon engine profile %s", c.expectedProfile, served.EngineProfile)
+	}
+	if mismatch == "" {
+		return nil
+	}
+	return fmt.Errorf("daemon identity changed during this MCP session: %s; restart the MCP session or restore the expected daemon", mismatch)
+}
+
+func (c *Client) validateDecodedIdentity(out any) error {
+	switch value := out.(type) {
+	case *engine.Result:
+		return c.validateServedBy(value.ServedBy)
+	case *engine.WorkspaceStatus:
+		return c.validateServedBy(value.ServedBy)
+	case *TaskSnapshot:
+		return c.validateServedBy(value.ServedBy)
+	case *Status:
+		return c.validateServedBy(&value.ServedBy)
+	}
+	return nil
 }
 
 // SetRecoverHook 注册连接拒绝时的恢复回调(managed 模式接线:daemon 死亡
@@ -325,6 +396,9 @@ func (c *Client) do(req *http.Request, path string, out any) error {
 	}
 	if err := json.Unmarshal(data, out); err != nil {
 		return fmt.Errorf("daemon %s: decode response: %w", path, err)
+	}
+	if err := c.validateDecodedIdentity(out); err != nil {
+		return err
 	}
 	return nil
 }
