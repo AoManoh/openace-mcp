@@ -234,6 +234,44 @@ func TestTaskStoreLimitsLargeResultText(t *testing.T) {
 	}
 }
 
+// P3(review 二批):multi 任务文本被 1MiB 截断时,被截掉小节的降级/错误
+// 语义须经 multi_status 结构化字段兜底——limitTaskResult 只裁 Text,
+// 每仓状态(含 P2 降级字段)不受截断影响。
+func TestTaskStoreLimitsLargeResultTextKeepsMultiStatus(t *testing.T) {
+	useTempTaskStore(t)
+	largeText := strings.Repeat("x", maxTaskResultTextBytes+1024)
+	multi := &engine.MultiRetrievalStatus{
+		TotalWorkspaces: 2,
+		SuccessCount:    2,
+		DegradedCount:   1,
+		Workspaces: []engine.MultiWorkspaceStatus{
+			{DirectoryPath: "/tmp/one", Status: "success", RetrievalMode: "hybrid+rerank"},
+			{DirectoryPath: "/tmp/deg", Status: "success", RetrievalMode: "lexical", DegradedReason: "query-embedding-failed(provider-5xx)", SemanticCoverage: "93%"},
+		},
+	}
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
+		return engine.Result{Text: largeText, MultiStatus: multi}, nil
+	}, 2)
+	cleanupTaskStore(t, store)
+
+	task, err := store.Submit(TaskRequest{Kind: TaskKindMultiRetrieve, DirectoryPaths: []string{"/tmp/one", "/tmp/deg"}, InformationRequest: "find code"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := waitForTaskState(t, store, task.ID, TaskStateCompleted)
+	if completed.Result == nil || !strings.Contains(completed.Result.Text, "task result truncated") {
+		t.Fatalf("truncated result should include marker: %+v", completed.Result)
+	}
+	status := completed.Result.MultiStatus
+	if status == nil || status.DegradedCount != 1 || len(status.Workspaces) != 2 {
+		t.Fatalf("multi status should survive truncation: %+v", status)
+	}
+	deg := status.Workspaces[1]
+	if deg.DegradedReason != "query-embedding-failed(provider-5xx)" || deg.RetrievalMode != "lexical" || deg.SemanticCoverage != "93%" {
+		t.Fatalf("per-workspace degradation fields should survive truncation: %+v", deg)
+	}
+}
+
 func TestTaskStoreRunsTasksConcurrently(t *testing.T) {
 	useTempTaskStore(t)
 	release := make(chan struct{})

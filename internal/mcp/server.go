@@ -253,7 +253,52 @@ func (s *Server) handleRetrieval(ctx context.Context, id *json.RawMessage, rawAr
 	if text == "" {
 		text = "No relevant code sections were found."
 	}
-	return ok(id, toolResult(text+"\n\n"+result.Summary(), false))
+	rendered := text + "\n\n" + result.Summary()
+	if structured := retrievalStructured(result); structured != nil {
+		return ok(id, toolResultWithStructured(rendered, false, structured))
+	}
+	return ok(id, toolResult(rendered, false))
+}
+
+// retrievalStructured 构造单仓检索的 structuredContent(P1,review 二批:
+// 同一次检索经 start_codebase_retrieval→task_status 能拿到全部透明性
+// 字段,同步路径却只回文本——决策 11 字段在主工具面丢失)。键名与
+// task 快照里 engine.Result 的 JSON tag 逐一对应。local-hybrid 恒有
+// engine/index_revision;透明性字段按 K32/K34 仅在 provider 配置或降级
+// 时出现。字段全空(legacy 形状结果)时返回 nil 不附着,wire 加性。
+func retrievalStructured(result engine.Result) map[string]any {
+	fields := map[string]any{}
+	if result.Engine != "" {
+		fields["engine"] = result.Engine
+	}
+	if result.IndexRevision != "" {
+		fields["index_revision"] = result.IndexRevision
+	}
+	if result.RetrievalMode != "" {
+		fields["retrieval_mode"] = result.RetrievalMode
+	}
+	if result.DegradedReason != "" {
+		fields["degraded_reason"] = result.DegradedReason
+	}
+	if result.SemanticCoverage != "" {
+		fields["semantic_coverage"] = result.SemanticCoverage
+	}
+	if result.RerankSent > 0 {
+		fields["rerank_sent"] = result.RerankSent
+	}
+	if result.QueryPlan != "" {
+		fields["query_plan"] = result.QueryPlan
+	}
+	if result.QueryEmbedFailed {
+		fields["query_embed_failed"] = true
+	}
+	if result.EmbeddingProfile != "" {
+		fields["embedding_profile"] = result.EmbeddingProfile
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	return fields
 }
 
 func (s *Server) handleMultiRetrieval(ctx context.Context, id *json.RawMessage, rawArgs json.RawMessage) rpcResponse {
@@ -511,6 +556,11 @@ type multiRetrievalResult struct {
 	Text          string
 	Summary       string
 	Error         string
+	// 每仓降级透明性素材(P2):进 multi_status 结构化条目,文本被
+	// 截断时仍可获取。
+	RetrievalMode    string
+	DegradedReason   string
+	SemanticCoverage string
 }
 
 func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int) (engine.Result, error) {
@@ -599,6 +649,9 @@ func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerP
 			}
 			results[i].Text = text
 			results[i].Summary = result.Summary()
+			results[i].RetrievalMode = result.RetrievalMode
+			results[i].DegradedReason = result.DegradedReason
+			results[i].SemanticCoverage = result.SemanticCoverage
 		}()
 	}
 	wg.Wait()
@@ -622,6 +675,13 @@ func summarizeMultiRetrievalResults(providerProfileID string, results []multiRet
 			status.FailureCount++
 		} else {
 			status.SuccessCount++
+			// P2:每仓降级字段进结构化条目;降级仓单独计数。
+			item.RetrievalMode = result.RetrievalMode
+			item.DegradedReason = result.DegradedReason
+			item.SemanticCoverage = result.SemanticCoverage
+			if result.DegradedReason != "" {
+				status.DegradedCount++
+			}
 		}
 		status.Workspaces = append(status.Workspaces, item)
 	}
@@ -631,6 +691,9 @@ func summarizeMultiRetrievalResults(providerProfileID string, results []multiRet
 
 func formatMultiRetrievalResults(results []multiRetrievalResult, status engine.MultiRetrievalStatus) string {
 	var out strings.Builder
+	// P2:有降级仓时聚合文本以 [DEGRADED] 汇总横幅开头(单仓首行横幅
+	// 的心智模型;每仓横幅仍在各自小节内)。
+	out.WriteString(status.DegradedBanner())
 	out.WriteString("Cross-workspace retrieval results")
 	if status.FailureCount > 0 {
 		out.WriteString(fmt.Sprintf("\nWARNING: %d of %d workspaces failed; successful results are partial.", status.FailureCount, status.TotalWorkspaces))

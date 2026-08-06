@@ -146,12 +146,26 @@ type SemanticStatus struct {
 
 // MultiRetrievalStatus 汇总一次跨工作区检索的每仓结果。
 type MultiRetrievalStatus struct {
-	ProviderProfileID string                 `json:"provider_profile_id,omitempty"`
-	TotalWorkspaces   int                    `json:"total_workspaces"`
-	SuccessCount      int                    `json:"success_count"`
-	FailureCount      int                    `json:"failure_count"`
-	PartialFailure    bool                   `json:"partial_failure"`
-	Workspaces        []MultiWorkspaceStatus `json:"workspaces"`
+	ProviderProfileID string `json:"provider_profile_id,omitempty"`
+	TotalWorkspaces   int    `json:"total_workspaces"`
+	SuccessCount      int    `json:"success_count"`
+	FailureCount      int    `json:"failure_count"`
+	// DegradedCount 是成功但处于降级的工作区数（P2，review 二批；
+	// omitempty 加性，wire 不变）。降级仓计入 SuccessCount 而非
+	// FailureCount——结果可用，但质量受限须外显。
+	DegradedCount  int                    `json:"degraded_count,omitempty"`
+	PartialFailure bool                   `json:"partial_failure"`
+	Workspaces     []MultiWorkspaceStatus `json:"workspaces"`
+}
+
+// DegradedBanner 返回跨仓降级聚合横幅（无降级仓时为空串）。放在聚合
+// 文本首行，与单仓 [DEGRADED] 首行横幅同一心智模型（决策 11）；文本被
+// 截断时每仓状态仍可经 multi_status 结构化字段获取（P3 兜底）。
+func (s MultiRetrievalStatus) DegradedBanner() string {
+	if s.DegradedCount == 0 {
+		return ""
+	}
+	return fmt.Sprintf("[DEGRADED] %d of %d workspaces returned degraded results; see per-workspace banners and multi_status\n", s.DegradedCount, s.TotalWorkspaces)
 }
 
 // MultiWorkspaceStatus 是跨工作区检索中单个工作区的结果条目。
@@ -159,6 +173,14 @@ type MultiWorkspaceStatus struct {
 	DirectoryPath string `json:"directory_path"`
 	Status        string `json:"status"`
 	Error         string `json:"error,omitempty"`
+
+	// —— 每仓降级透明性字段（P2，review 二批：此前两条聚合路径都把
+	// Result 的降级字段剥离，multi_status 里降级仓与健康仓同形——
+	// "禁止静默降级"在 multi 工具面的缺口）。语义同 Result 的同名
+	// 字段；全部 omitempty，错误仓与纯词法零配置路径不出现，wire 加性。
+	RetrievalMode    string `json:"retrieval_mode,omitempty"`
+	DegradedReason   string `json:"degraded_reason,omitempty"`
+	SemanticCoverage string `json:"semantic_coverage,omitempty"`
 }
 
 // WorkspaceStatus 描述单个工作区的索引与运行状态。

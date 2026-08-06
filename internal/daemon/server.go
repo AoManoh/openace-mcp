@@ -585,6 +585,15 @@ func aggregateMultiRetrieveResults(providerProfileID string, results []multiRetr
 			text = "No relevant code sections were found."
 		}
 		status.SuccessCount++
+		// P2(review 二批):每仓降级透明性字段进 multi_status 结构化条目
+		// ——任务文本被 1MiB 截断(limitTaskResult 只裁 Text)时,被截掉
+		// 小节的降级语义仍可经结构化字段获取(P3 兜底)。
+		workspaceStatus.RetrievalMode = item.result.RetrievalMode
+		workspaceStatus.DegradedReason = item.result.DegradedReason
+		workspaceStatus.SemanticCoverage = item.result.SemanticCoverage
+		if item.result.DegradedReason != "" {
+			status.DegradedCount++
+		}
 		status.Workspaces = append(status.Workspaces, workspaceStatus)
 		out.WriteString(text)
 		out.WriteString("\n\n")
@@ -603,7 +612,9 @@ func aggregateMultiRetrieveResults(providerProfileID string, results []multiRetr
 		out.WriteString(strings.TrimPrefix(outString, "Cross-workspace retrieval results"))
 	}
 	aggregate.MultiStatus = &status
-	aggregate.Text = out.String()
+	// P2:有降级仓时聚合文本以 [DEGRADED] 汇总横幅开头(与 mcp 同步
+	// 路径、单仓首行横幅同一心智模型)。
+	aggregate.Text = status.DegradedBanner() + out.String()
 	return aggregate, status.SuccessCount
 }
 
