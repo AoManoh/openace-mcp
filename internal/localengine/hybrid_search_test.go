@@ -85,6 +85,15 @@ func TestHybridHitsSemanticOnlyTarget(t *testing.T) {
 	if result.SemanticCoverage != "100%" {
 		t.Fatalf("覆盖应为 100%%: %q", result.SemanticCoverage)
 	}
+	// 框架 18.3:语义路径的阶段耗时全链携带(embed/vector 非负,
+	// total 覆盖各段)。
+	if result.Timings == nil {
+		t.Fatal("hybrid 检索应携带阶段耗时")
+	}
+	if result.Timings.QueryEmbedMs < 0 || result.Timings.VectorMs < 0 ||
+		result.Timings.TotalMs < result.Timings.LexicalMs {
+		t.Fatalf("hybrid 阶段耗时异常: %+v", result.Timings)
+	}
 }
 
 // TestSearchRoutesExposesBothRoutes 是 T10b hook 契约：融合前双路候选

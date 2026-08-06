@@ -461,6 +461,11 @@ func retrievalStructured(result engine.Result) map[string]any {
 	if result.EmbeddingProfile != "" {
 		fields["embedding_profile"] = result.EmbeddingProfile
 	}
+	if result.Timings != nil {
+		// 阶段耗时(框架 18.3):调用方可归因延迟(sync/embed/rerank/
+		// render),灰度"13.1s 不知慢在哪"从此有数。
+		fields["timings"] = result.Timings
+	}
 	if len(fields) == 0 {
 		return nil
 	}

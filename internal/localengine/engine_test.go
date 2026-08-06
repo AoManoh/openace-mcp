@@ -322,6 +322,32 @@ func TestSyncReportsDeltaAddedAndBuildMode(t *testing.T) {
 	}
 }
 
+// TestSearchCarriesStageTimings(框架 18.3/灰度候选 (e)):热检索 13.1s
+// 无法归因是 sync、query embed、rerank 还是渲染——Result 恒带阶段耗时
+// 分解(加性 omitempty 字段),延迟从此可归因。
+func TestSearchCarriesStageTimings(t *testing.T) {
+	e := newTestEngine(t)
+	root := newFixtureWorkspace(t)
+	res, err := e.Search(context.Background(), searchRequest(root, "HandleLogin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tm := res.Timings
+	if tm == nil {
+		t.Fatal("Result 应携带阶段耗时")
+	}
+	if tm.TotalMs < 0 || tm.SyncMs < 0 || tm.LexicalMs < 0 || tm.RenderMs < 0 {
+		t.Fatalf("耗时字段不应为负: %+v", tm)
+	}
+	if tm.TotalMs < tm.LexicalMs || tm.TotalMs < tm.RenderMs {
+		t.Fatalf("total 应覆盖各阶段: %+v", tm)
+	}
+	// 纯词法路径:query embed/vector/rerank 为零。
+	if tm.QueryEmbedMs != 0 || tm.VectorMs != 0 || tm.RerankMs != 0 {
+		t.Fatalf("纯词法路径语义阶段应为零: %+v", tm)
+	}
+}
+
 // TestWorkspaceStatusTopLevelFileCounts(灰度反馈三 C.1 残余):状态面
 // 按顶层目录给出现役索引文件计数,让 ignore 链的排除面可见——预期目录
 // 计数为 0/缺失即选择面问题,使用方无需黑盒对照实验。根文件归 "."。
