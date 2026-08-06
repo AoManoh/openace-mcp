@@ -95,9 +95,9 @@ func ResolveWorkspaceKey(path string) string {
 	// detail=paths 时正文只有 header 行(零代码围栏),内容由调用方
 	// 按需 Read。
 	structured := runMCP(t, server, `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"information_request":"ResolveWorkspaceKey","directory_path":`+jsonString(root)+`}}}`)
-	for _, want := range []string{`"hits"`, `"display"`, `"timings"`, `"shown_blocks"`, `"rank"`} {
+	for _, want := range []string{`"hits"`, `"display"`, `"timings"`, `"shown_blocks"`, `"rank"`, `diagnostics:`, `timings_ms[`, `display[candidates=`} {
 		if !strings.Contains(structured, want) {
-			t.Fatalf("structuredContent 缺 %s: %s", want, structured)
+			t.Fatalf("结构化/文本诊断缺 %s: %s", want, structured)
 		}
 	}
 	paths := runMCP(t, server, `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"information_request":"ResolveWorkspaceKey","directory_path":`+jsonString(root)+`,"detail":"paths"}}}`)
