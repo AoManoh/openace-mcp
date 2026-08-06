@@ -90,7 +90,11 @@ func aggregateMapFiles(handle *revisionHandle, focus string) []mapFile {
 		entry, ok := byPath[meta.RelPath]
 		if !ok {
 			top := "."
-			if i := strings.IndexByte(meta.RelPath, '/'); i > 0 {
+			if focus != "" {
+				// focus 地图以请求子树本身作 header(真实 Agent 反馈:
+				// focus=internal/localengine 却显示 internal/ 会丢失定向语义)。
+				top = focus
+			} else if i := strings.IndexByte(meta.RelPath, '/'); i > 0 {
 				top = meta.RelPath[:i]
 			}
 			entry = &mapFile{path: meta.RelPath, topDir: top}
