@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
 )
 
 func TestScanSkipsInvalidUTF8(t *testing.T) {
@@ -256,4 +255,3 @@ func writeWorkspaceTestFile(t *testing.T, root string, rel string, content strin
 		t.Fatal(err)
 	}
 }
-

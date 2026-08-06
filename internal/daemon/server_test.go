@@ -622,4 +622,3 @@ func (s *concurrentSyncer) leave() {
 	s.active--
 	s.mu.Unlock()
 }
-
