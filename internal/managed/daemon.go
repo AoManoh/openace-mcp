@@ -34,22 +34,25 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 		expectedProfile = opts.Fingerprint()
 	}
 	addr := daemonAddrFromEnv()
+	managedAddr := managedDaemonAddr(addr)
 	client := daemon.NewClient(addr)
 	if err := reusable(ctx, client, requestedEngine, expectedProfile); err == nil {
+		attachRecoverHook(client, managedAddr, requestedEngine, expectedProfile)
 		return client, nil
 	} else if healthy(ctx, client) {
 		return nil, err
 	}
-	managedAddr := managedDaemonAddr(addr)
 	managedClient := daemon.NewClient(managedAddr)
 	if managedAddr != addr {
 		if err := reusable(ctx, managedClient, requestedEngine, expectedProfile); err == nil {
+			attachRecoverHook(managedClient, managedAddr, requestedEngine, expectedProfile)
 			return managedClient, nil
 		} else if healthy(ctx, managedClient) {
 			return nil, err
 		}
 	}
 	if err := reusable(ctx, managedClient, requestedEngine, expectedProfile); err == nil {
+		attachRecoverHook(managedClient, managedAddr, requestedEngine, expectedProfile)
 		return managedClient, nil
 	} else if healthy(ctx, managedClient) {
 		return nil, err
@@ -57,6 +60,7 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 	releaseLock, err := acquireStartupLock(ctx, managedAddr, startupTimeout())
 	if err != nil {
 		if err := reusable(ctx, managedClient, requestedEngine, expectedProfile); err == nil {
+			attachRecoverHook(managedClient, managedAddr, requestedEngine, expectedProfile)
 			return managedClient, nil
 		} else if healthy(ctx, managedClient) {
 			return nil, err
@@ -65,6 +69,7 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 	}
 	defer releaseLock()
 	if err := reusable(ctx, managedClient, requestedEngine, expectedProfile); err == nil {
+		attachRecoverHook(managedClient, managedAddr, requestedEngine, expectedProfile)
 		return managedClient, nil
 	} else if healthy(ctx, managedClient) {
 		return nil, err
@@ -82,7 +87,38 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 	if err := reusable(ctx, managedClient, requestedEngine, expectedProfile); err != nil {
 		return nil, withDaemonLog(err, logPath)
 	}
+	attachRecoverHook(managedClient, managedAddr, requestedEngine, expectedProfile)
 	return managedClient, nil
+}
+
+// attachRecoverHook 给 managed 客户端接线 daemon 死亡自愈(灰度/自食
+// 2026-08-06 共同缺口):连接拒绝时按 Connect 同款序列(启动锁→复用
+// 探测→拉起→就绪→身份复验)重拉,随后由 client 对原请求重试一次。
+// 仅 managed 自有地址接线——手工 daemon(manual-daemon 模式)生命周期
+// 归用户,不代拉。
+func attachRecoverHook(client *daemon.Client, managedAddr string, requestedEngine string, expectedProfile string) {
+	client.SetRecoverHook(func(ctx context.Context) error {
+		releaseLock, err := acquireStartupLock(ctx, managedAddr, startupTimeout())
+		if err != nil {
+			// 锁竞争:他进程可能正在重拉,复用探测即可。
+			return reusable(ctx, client, requestedEngine, expectedProfile)
+		}
+		defer releaseLock()
+		if err := reusable(ctx, client, requestedEngine, expectedProfile); err == nil {
+			return nil
+		}
+		logPath, err := startDaemon(managedAddr)
+		if err != nil {
+			return err
+		}
+		if err := waitReady(ctx, client, startupTimeout()); err != nil {
+			return withDaemonLog(err, logPath)
+		}
+		if err := reusable(ctx, client, requestedEngine, expectedProfile); err != nil {
+			return withDaemonLog(err, logPath)
+		}
+		return nil
+	})
 }
 
 func reusable(ctx context.Context, client *daemon.Client, requestedEngine string, expectedProfile string) error {

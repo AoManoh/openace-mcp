@@ -622,3 +622,52 @@ func (s *concurrentSyncer) leave() {
 	s.active--
 	s.mu.Unlock()
 }
+
+// P3(灰度反馈 2026-08-06):running 态 sync 任务的 task_status 携带
+// 工作区进度摘要,调用方可区分"在推进"与"卡死"。
+func TestTaskStatusCarriesProgressWhileRunning(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off")
+	release := make(chan struct{})
+	syncer := blockingWorkspaceSyncer{release: release}
+	server := newDaemonHTTPTestServer(t, syncer)
+
+	task := postTask(t, server.URL, TaskRequest{Kind: TaskKindSync, DirectoryPath: "/tmp/project"})
+	deadline := time.Now().Add(3 * time.Second)
+	var got TaskSnapshot
+	for {
+		resp, err := http.Get(server.URL + "/v1/tasks/" + task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if got.State == TaskStateRunning && got.Progress != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("running 任务未携带进度: %+v", got)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(got.Progress, "stage=") || !strings.Contains(got.Progress, "files=3") {
+		t.Fatalf("进度摘要形状不符: %q", got.Progress)
+	}
+	close(release)
+}
+
+// blockingWorkspaceSyncer 的 Sync 阻塞直至放行,状态面复用固定值。
+type blockingWorkspaceSyncer struct {
+	fakeWorkspaceSyncer
+	release chan struct{}
+}
+
+func (b blockingWorkspaceSyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+	}
+	return engine.Result{CheckpointID: "checkpoint"}, nil
+}

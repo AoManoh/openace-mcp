@@ -74,6 +74,10 @@ type TaskSnapshot struct {
 	CompletedAt        *time.Time            `json:"completed_at,omitempty"`
 	Error              string                `json:"error,omitempty"`
 	Result             *engine.Result        `json:"result,omitempty"`
+	// Progress 是 running 态的工作区进度摘要(P3,灰度反馈 2026-08-06):
+	// 服务端应答时按 DirectoryPath 现查(stage/files/嵌入进度),供调用方
+	// 区分"在推进"与"卡死";非 running 或无从查询时为空。
+	Progress string `json:"progress,omitempty"`
 }
 
 type TaskRunner func(context.Context, TaskRequest) (engine.Result, error)
