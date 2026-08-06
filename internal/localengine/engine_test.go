@@ -322,6 +322,43 @@ func TestSyncReportsDeltaAddedAndBuildMode(t *testing.T) {
 	}
 }
 
+// TestSearchPathPrefixFiltersCandidates(Devin -p A/B 2026-08-07):
+// repo_map 已把范围收敛到 internal/localengine,但检索仍让根研究文档/
+// tests 挤占生产定义。显式 path_prefix 在融合后/rerank 前过滤候选,
+// 默认不变;非法绝对/逃逸前缀按请求错误拒绝。
+func TestSearchPathPrefixFiltersCandidates(t *testing.T) {
+	e := newTestEngine(t)
+	root := t.TempDir()
+	writeFixture(t, root, "src/service.go", "package service\n\n// SessionService handles session restore.\nfunc SessionService() {}\n")
+	writeFixture(t, root, "docs/service.md", "# Session Service\n\nSessionService handles session restore documentation.\n")
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatal(err)
+	}
+	req := searchRequest(root, "SessionService session restore")
+	req.PathPrefix = "src"
+	res, err := e.Search(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Text, "src/service.go") || strings.Contains(res.Text, "docs/service.md") {
+		t.Fatalf("path_prefix 过滤错误: %q", res.Text)
+	}
+	for _, hit := range res.Hits {
+		if !strings.HasPrefix(hit.Path, "src/") {
+			t.Fatalf("结构化 hit 越出前缀: %+v", hit)
+		}
+	}
+	bad := searchRequest(root, "SessionService")
+	bad.PathPrefix = "../src"
+	if _, err := e.Search(context.Background(), bad); err == nil || !strings.Contains(err.Error(), "path_prefix") {
+		t.Fatalf("逃逸前缀应拒绝: %v", err)
+	}
+	bad.PathPrefix = "/src"
+	if _, err := e.Search(context.Background(), bad); err == nil || !strings.Contains(err.Error(), "path_prefix") {
+		t.Fatalf("绝对前缀应拒绝: %v", err)
+	}
+}
+
 // TestSearchCarriesStageTimings(框架 18.3/灰度候选 (e)):热检索 13.1s
 // 无法归因是 sync、query embed、rerank 还是渲染——Result 恒带阶段耗时
 // 分解(加性 omitempty 字段),延迟从此可归因。
