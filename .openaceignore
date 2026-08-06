@@ -1,5 +1,0 @@
-# 本地检索范围(优先于 .augmentignore,同目录并存时后者整体失效)。
-# 历史 .augmentignore 的 !docs/ re-include 会把 benchmarks fixtures 的
-# 海量 markdown 送进嵌入(2026-08-06 dogfood 事故 #3,≈2M tokens 止损),
-# 此文件收敛范围:源码树 + 根级治理文件,不纳入 docs/ 与 skills/。
-!AGENTS.md
