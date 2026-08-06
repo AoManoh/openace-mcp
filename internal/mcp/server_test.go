@@ -200,6 +200,43 @@ type fakeProviderSyncer struct {
 	fakeTasker
 }
 
+// 灰度反馈协议(用户明示 2026-08-07):开启后 instructions 追加诊断
+// 报告规范——调用 AI 每轮检索后输出多维事实报告,用户汇总回传改进。
+// 产品默认不带(冻结文案不变)。
+func TestGrayFeedbackProtocolAppendsToInstructions(t *testing.T) {
+	plain := runMCP(t, NewServer(fakeSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	if strings.Contains(plain, "GRAY-TEST FEEDBACK PROTOCOL") {
+		t.Fatalf("默认 instructions 不得携带灰度协议: %s", plain)
+	}
+	t.Setenv(EnvGrayFeedback, "1")
+	gray := runMCP(t, NewServer(fakeSyncer{}), `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	for _, want := range []string{"GRAY-TEST FEEDBACK PROTOCOL", "诊断报告", "reproduction"} {
+		if !strings.Contains(gray, want) {
+			t.Fatalf("灰度 instructions 应含 %q: %s", want, gray)
+		}
+	}
+}
+
+// 灰度反馈一号 P1-3:Connect 失败此前直接 exit(1),客户端只见裸
+// "Failed to connect",build/profile mismatch 的可行动文案永远到不了
+// 调用方。不可用模式下会话保持:initialize/tools/list 正常,任何
+// tools/call 返回失败原因与修复指引。
+func TestUnavailableServerSurfacesConnectFailure(t *testing.T) {
+	server := NewUnavailableServer(errors.New("openACE daemon at 127.0.0.1:8765 is not compatible with this MCP wrapper: wrapper revision aaa != daemon revision bbb"))
+	init := runMCP(t, server, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	if !strings.Contains(init, "serverInfo") {
+		t.Fatalf("不可用模式 initialize 应正常应答: %s", init)
+	}
+	list := runMCP(t, server, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if !strings.Contains(list, "codebase_retrieval") {
+		t.Fatalf("不可用模式应仍列出工具面: %s", list)
+	}
+	call := runMCP(t, server, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"/tmp/w","information_request":"q"}}}`)
+	if !strings.Contains(call, `"isError":true`) || !strings.Contains(call, "wrapper revision aaa != daemon revision bbb") || !strings.Contains(call, "restart") {
+		t.Fatalf("tools/call 应透传失败原因与修复指引: %s", call)
+	}
+}
+
 // D2(吸收清单 codegraph #1):默认单工具面——多工具面导致弱 caller
 // mis-pick 且每会话白烧 schema tokens;完整面经 OPENACE_MCP_TOOLS 恢复。
 func TestToolsListDefaultsToMinimalFace(t *testing.T) {

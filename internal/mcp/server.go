@@ -39,6 +39,18 @@ type Server struct {
 	tasker    Tasker
 	inspector engine.WorkspaceInspector
 	statuser  DaemonStatuser
+	// unavailable 非 nil = 启动失败但会话保持的降级形态(灰度反馈一号
+	// P1-3):initialize/tools/list 正常应答,任何 tools/call 返回失败
+	// 原因与修复指引——build/profile mismatch 的可行动文案从 stderr
+	// (多数 MCP 客户端不展示)搬进调用方看得见的工具错误。
+	unavailable error
+}
+
+// NewUnavailableServer 构造启动失败降级形态的 MCP 服务(见
+// Server.unavailable)。此前 Connect 失败直接 exit(1),客户端只见裸
+// "Failed to connect",两轮灰度反馈均卡在此排障。
+func NewUnavailableServer(cause error) *Server {
+	return &Server{unavailable: cause}
 }
 
 type rpcRequest struct {
@@ -253,7 +265,8 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
 			},
 			// instructions 是 caller LLM 的检索使用引导(方案③,E4 变体
 			// V2 冻结稿):仅增强字段,旧客户端忽略,零 wire 变更。
-			"instructions": serverInstructions,
+			// 灰度反馈协议按 env 追加(EnvGrayFeedback)。
+			"instructions": activeInstructions(),
 		})
 	case "tools/list":
 		allow, all, err := resolveToolFace()
@@ -322,6 +335,9 @@ func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 	var params toolCallParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return fail(req.ID, -32602, err.Error())
+	}
+	if s.unavailable != nil {
+		return toolError(req.ID, fmt.Sprintf("openACE is unavailable in this session: %v; fix the daemon or configuration, then restart the MCP session", s.unavailable))
 	}
 	name := strings.ReplaceAll(params.Name, "-", "_")
 	handler, ok := s.toolHandlers()[name]
@@ -837,6 +853,34 @@ func formatMultiRetrievalResults(results []multiRetrievalResult, status engine.M
 // 来源 E4 变体 V2(docs/benchmarks/work/e4/variant-v2.json);provider 中立、
 // 引擎中立,≤1024 字符约束由单测钉住。
 const serverInstructions = "openACE serves code retrieval for this workspace. For vague user asks, decompose into focused retrieval intents and call codebase_retrieval once per intent before answering. Keep the user's distinctive terminology in requests; add known identifiers and file-type hints. If results look degraded (a [DEGRADED] banner appears), tell the user retrieval quality is reduced and why."
+
+// EnvGrayFeedback 开启灰度反馈协议(用户明示 2026-08-07:灰度测试者
+// 自愿参与、事先知情,报告详尽优先——token 成本与隐私顾虑明确豁免)。
+// 开启后 instructions 追加诊断报告规范,调用 AI 每轮工具调用后输出
+// 多维事实报告,由用户汇总回传维护者。产品默认关闭,冻结文案不变。
+const EnvGrayFeedback = "OPENACE_GRAY_FEEDBACK"
+
+// grayFeedbackInstructions 是灰度反馈协议文案:维度=事实(结构化字段
+// 原样抄录)/效果(预期 vs 实得,含排序问题)/体验(摩擦点逐条)/
+// 时间(观测耗时)/bug(最小复现,不可复现则记触发场景)。
+const grayFeedbackInstructions = "GRAY-TEST FEEDBACK PROTOCOL (this deployment opted in; verbose reports are expected and token cost is accepted): after EVERY openACE tool call, append a diagnostic report block so the user can relay it verbatim to the maintainers. Structure:\n" +
+	"## openACE 调用诊断报告\n" +
+	"- call: tool name; workspace path; the information_request verbatim; approximate wall time you observed\n" +
+	"- outcome: hit / partial / miss — name the files or symbols you expected versus what was returned; call out ranking problems (target below noise), missing expected results, and truncation\n" +
+	"- facts: copy retrieval_mode, semantic_coverage, degraded_reason, rerank_sent, query_plan, index_revision and any [DEGRADED] banner or truncation marker from the result verbatim; on failure copy the exact error text\n" +
+	"- experience: setup, latency, output-format friction — one factual sentence each; rate this call 1-5 for usefulness to your actual task\n" +
+	"- bug: if anything misbehaved, give a minimal reproduction (workspace state, query, exact call sequence); if not reproducible, record the exact trigger context instead\n" +
+	"Be exhaustive and factual; report failures without softening. Do not skip the report even when the call succeeded."
+
+// activeInstructions 组装 initialize 下发的 instructions:默认=冻结稿,
+// 灰度开关追加反馈协议。
+func activeInstructions() string {
+	switch strings.TrimSpace(strings.ToLower(os.Getenv(EnvGrayFeedback))) {
+	case "1", "true", "on", "yes":
+		return serverInstructions + "\n\n" + grayFeedbackInstructions
+	}
+	return serverInstructions
+}
 
 const retrievalDescription = "Search the local codebase index (hybrid lexical + semantic retrieval with reranking). Use this tool FIRST whenever you need to find code, configuration, tests, or documentation in the workspace before answering or editing. One focused intent per call; issue multiple calls for multi-part tasks."
 
