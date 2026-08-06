@@ -375,12 +375,13 @@ func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKe
 	// 现场 1975 文件小改动显示 "Added=19028",被解读为升级触发全量
 	// 重嵌的虚惊);BuildMode 显式外显构建形态与成因。
 	result := engine.Result{
-		Engine:        EngineID,
-		IndexRevision: manifest.Revision,
-		FileCount:     manifest.Counts.Files,
-		Uploaded:      0,
-		Added:         added,
-		BuildMode:     buildMode,
+		Engine:             EngineID,
+		IndexRevision:      manifest.Revision,
+		FileCount:          manifest.Counts.Files,
+		Uploaded:           0,
+		Added:              added,
+		BuildMode:          buildMode,
+		CrossProfileReused: seman.crossProfileReused,
 	}
 	// P8(review 2026-08-06):sync 成功面不吞语义覆盖缺口——Result 携带
 	// 覆盖率;覆盖不完整即给降级原因(与查询路径同 token),Summary 可见。
@@ -490,8 +491,16 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 
 	// 阶段 2.5：语义路（semantic off 时零开销直通，K32）。
 	var prior priorVectors
-	if e.semanticEnabled() && previous != nil {
-		prior = e.loadPriorVectors(store, previous)
+	if e.semanticEnabled() {
+		if previous != nil {
+			prior = e.loadPriorVectors(store, previous)
+		}
+		// 兼容旧 chunk profile 子树是最低优先级 prior；当前 active/
+		// previous 始终优先。完整现役 revision 无需再载入兄弟大向量集
+		// (避免 compaction 平白翻倍 RSS);仅冷仓/覆盖缺口路径发现。
+		if previous == nil || !previous.SemanticComplete() {
+			e.mergeSiblingProfileVectors(store, root, &prior)
+		}
 	}
 	seman, err := e.embedRecords(ctx, store, workspaceKey, prior, records, status)
 	if err != nil {

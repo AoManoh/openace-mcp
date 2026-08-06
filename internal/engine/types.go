@@ -85,6 +85,9 @@ type Result struct {
 	// compaction-segments|compaction-garbage|semantic-fill>";no-op 不
 	// 发布时为空。加性 omitempty。
 	BuildMode string `json:"build_mode,omitempty"`
+	// CrossProfileReused 是本次构建从同 workspace 兼容旧 profile 子树
+	// 自动复用的唯一向量键数。升级成本透明;0 省略。
+	CrossProfileReused int `json:"cross_profile_reused,omitempty"`
 	// Timings 是检索阶段耗时分解(框架 18.3/灰度候选 (e):热检索
 	// 13.1s 无法归因是 sync、embed、rerank 还是渲染)。检索路径恒填,
 	// sync 路径为空;加性 omitempty。
@@ -141,6 +144,9 @@ func (r Result) Summary() string {
 		// 调用方不再从进度与计数反猜"是否被全量重建"。
 		if r.BuildMode != "" {
 			summary += " build=" + r.BuildMode
+		}
+		if r.CrossProfileReused > 0 {
+			summary += fmt.Sprintf(" cross_profile_reused=%d", r.CrossProfileReused)
 		}
 		// P8:同步面的语义覆盖如实外显(覆盖率恒随语义路携带;降级原因
 		// 仅缺口时出现),direct/daemon 两形态同文案。
