@@ -49,8 +49,12 @@ func NewClient(addr string) *Client {
 }
 
 // clientToken 解析客户端凭据(M5,与服务端 resolveAuthToken 对偶):
-// env=off → 空;env 非空 → 显式值;env 未设 → 读 token 状态文件
-// (不存在则空——连接 off 档或历史 daemon 时无害)。
+// env=off → 空;env 非空 → 显式值;env 未设 → 默认档走与服务端相同的
+// load-or-create——文件缺失时由先到方原子创建,wrapper/daemon 无论谁先
+// 启动都收敛到同一 token。历史实现在文件缺失时缓存空 token,全新机器
+// 首启(wrapper 先构造 client、daemon 随后自建 token)健康探测永远 401
+// (review -15 灰度前置缺陷)。对 off 档或历史无认证 daemon,多带
+// Authorization 头无害(服务端零认证路径不校验)。
 func clientToken(addr string) string {
 	env := strings.TrimSpace(os.Getenv("OPENACE_DAEMON_TOKEN"))
 	if strings.EqualFold(env, tokenModeOff) {
@@ -59,15 +63,11 @@ func clientToken(addr string) string {
 	if env != "" {
 		return env
 	}
-	path := TokenFilePath(addr)
-	if path == "" {
-		return ""
-	}
-	data, err := os.ReadFile(path)
+	_, token, err := LoadOrCreateToken(addr)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(data))
+	return token
 }
 
 func (c *Client) Health(ctx context.Context) error {
