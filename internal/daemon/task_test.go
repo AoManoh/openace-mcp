@@ -44,6 +44,34 @@ func TestTaskStoreCompletesRetrieveTask(t *testing.T) {
 	}
 }
 
+// detail/path_prefix 必须穿过 queued snapshot→runner→持久化恢复链。
+// 真实 Agent A/B 后补查发现初版只加了 TaskRequest 字段,TaskSnapshot
+// 未持久化,异步工具会静默丢参数。
+func TestTaskStorePersistsRetrievePresentationArgs(t *testing.T) {
+	useTempTaskStore(t)
+	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (engine.Result, error) {
+		if req.Detail != "paths" || req.PathPrefix != "internal/localengine" {
+			t.Fatalf("runner 丢展示参数: %+v", req)
+		}
+		return engine.Result{Text: "result"}, nil
+	}, 1)
+	cleanupTaskStore(t, store)
+	task, err := store.Submit(TaskRequest{
+		Kind: TaskKindRetrieve, DirectoryPath: "/tmp/workspace",
+		InformationRequest: "find code", Detail: "paths", PathPrefix: "internal/localengine",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := waitForTaskState(t, store, task.ID, TaskStateCompleted)
+	if completed.Detail != "paths" || completed.PathPrefix != "internal/localengine" {
+		t.Fatalf("snapshot 丢展示参数: %+v", completed)
+	}
+	if req := requestFromSnapshot(completed); req.Detail != "paths" || req.PathPrefix != "internal/localengine" {
+		t.Fatalf("恢复请求丢展示参数: %+v", req)
+	}
+}
+
 func TestTaskStoreCompletesMultiRetrieveTask(t *testing.T) {
 	useTempTaskStore(t)
 	store := NewTaskStore(func(ctx context.Context, req TaskRequest) (engine.Result, error) {

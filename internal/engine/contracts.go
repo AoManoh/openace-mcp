@@ -72,6 +72,9 @@ type SearchRequest struct {
 	// (现状);"paths"=只回 path:range 头行,内容由调用方按需 Read
 	// (token 经济与磁盘新鲜度换一轮往返,默认不变,实验裁决)。
 	Detail string
+	// PathPrefix 可选索引相对路径前缀(如 internal/localengine):
+	// 融合后/rerank 前过滤候选,用于 repo_map 定向后的子树检索。
+	PathPrefix string
 }
 
 // RepoMapRequest 是仓库地图请求(repo_map R1,D4):快照只读,冷仓

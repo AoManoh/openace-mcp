@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -498,6 +499,10 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		// P7:请求类标记,daemon 面映射 400 而非 502。
 		return retrieval{}, engine.AsInvalidRequest(errors.New("查询内容为空"))
 	}
+	pathPrefix, err := normalizeSearchPathPrefix(req.PathPrefix)
+	if err != nil {
+		return retrieval{}, err
+	}
 	timings := &engine.RetrievalTimings{}
 	started := time.Now()
 	handle, workspaceKey, syncResult, reasons, err := e.acquireQueryHandle(ctx, req.Workspace)
@@ -519,6 +524,13 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		return retrieval{}, err
 	}
 	reasons = append(reasons, fuseReasons...)
+	if pathPrefix != "" {
+		ordered = filterRankedByPathPrefix(handle, ordered, pathPrefix)
+		if planLabel != "" {
+			planLabel += " "
+		}
+		planLabel += "path_prefix=" + pathPrefix
+	}
 
 	// 可选精排：只重排已召回候选头部，失败绝不丢候选（D7/D8(b)）。
 	rerankApplied := false
@@ -731,6 +743,36 @@ func containsRerankReason(reasons []string) bool {
 // §7 -8):门 B 复扫证明 hybrid 下惩罚在全部防护面零收益(防护由机制 A
 // latin guard 与 dense 融合承担),代价集中于 locale-gold 查询(sealed v2
 // 门 B 翻转实例;关闭后 dev 端到端 R@5 +15pp)。回归钉板:locale_gold_test.go。
+
+// normalizeSearchPathPrefix 校验并归一索引相对前缀。它不用于磁盘
+// 拼接,但仍拒绝绝对/逃逸形态,保持调用方心智与 workspace root 边界一致。
+func normalizeSearchPathPrefix(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	prefix := strings.Trim(strings.ReplaceAll(raw, "\\", "/"), "/")
+	if prefix == "" {
+		return "", nil
+	}
+	absolute := strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "\\") || (len(raw) >= 2 && raw[1] == ':')
+	if absolute || prefix == ".." || strings.HasPrefix(prefix, "../") || strings.Contains(prefix, "/../") {
+		return "", engine.AsInvalidRequest(fmt.Errorf("invalid path_prefix %q: expected an indexed relative path prefix", raw))
+	}
+	clean := pathpkg.Clean(prefix)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", engine.AsInvalidRequest(fmt.Errorf("invalid path_prefix %q: expected an indexed relative path prefix", raw))
+	}
+	return clean, nil
+}
+
+func filterRankedByPathPrefix(handle *revisionHandle, ordered []rankedHit, prefix string) []rankedHit {
+	filtered := ordered[:0]
+	for _, hit := range ordered {
+		meta, ok := handle.chunks[hit.id]
+		if ok && (meta.RelPath == prefix || strings.HasPrefix(meta.RelPath, prefix+"/")) {
+			filtered = append(filtered, hit)
+		}
+	}
+	return filtered
+}
 
 // filterLiveHits 过滤词法命中中的死 chunk（统一 choke point 的词法半边）。
 func filterLiveHits(handle *revisionHandle, hits []lexical.Hit) []lexical.Hit {
