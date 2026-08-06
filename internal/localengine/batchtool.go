@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	"github.com/AoManoh/openace-mcp/internal/engine"
+	"github.com/AoManoh/openace-mcp/internal/index"
+	"github.com/AoManoh/openace-mcp/internal/pathutil"
 	"github.com/AoManoh/openace-mcp/internal/vector"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
@@ -53,6 +55,12 @@ type ImportReport struct {
 	BadVector int
 	// WrongDim 是维度不符而跳过的条数。
 	WrongDim int
+	// UnknownKey 是不属于本仓当前合法 embedKey 集而被拒的条数(R1,
+	// review 2026-08-06):错误归属的向量一旦入 journal,该 chunk 的
+	// 正确嵌入会被永久屏蔽(journal 命中即不再送 provider),且垃圾键
+	// 永驻 journal 挤占容量。合法集与 PlanEmbedJobs 同源(当前工作区
+	// 扫描+切分的全量 embedKey)。
+	UnknownKey int
 }
 
 // errSemanticRequired:批量工具依赖 embedding profile 定位 storeProfile
@@ -180,6 +188,56 @@ func (e *Engine) PlanEmbedJobs(ctx context.Context, ref engine.WorkspaceRef, fn 
 // (与在线路径同口径,vector.Write 拒绝未归一输入),journal 已有键跳过。
 // next 返回 ok=false 表示流结束。回灌后一次正常 Sync 即零 provider 调用
 // 收编发布,发布随即 CompactAfterPublish 清理 journal。
+// legalEmbedKeys 枚举当前工作区全量合法 embedKey(与 PlanEmbedJobs 的
+// records 枚举同源:扫描 + 未变文件复用上一 revision 记录 + 变更文件
+// 现切),供 ImportEmbeddings 做键归属校验(R1)。
+func (e *Engine) legalEmbedKeys(ctx context.Context, root pathutil.WorkspaceRoot, store *index.Store) (map[string]bool, error) {
+	assets, err := workspace.FileAssetSource{}.Load(ctx, root.CanonicalPath)
+	if err != nil {
+		return nil, fmt.Errorf("扫描工作区: %w", err)
+	}
+	previous, _, resolveErr := store.ResolveUsable()
+	if resolveErr != nil && !isNoRevision(resolveErr) {
+		return nil, resolveErr
+	}
+	previousChunks := map[string][]chunkRecord{}
+	if previous != nil {
+		if loaded, err := loadLiveChunkRecordsByFile(store, previous); err == nil {
+			previousChunks = loaded
+		}
+	}
+	legal := make(map[string]bool, len(assets)*8)
+	for _, asset := range assets {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var fileRecords []chunkRecord
+		reused := false
+		if previous != nil {
+			if entry, ok := previous.Files[asset.RelPath]; ok && entry.ContentHash == asset.BlobName {
+				if reuse, ok := previousChunks[asset.RelPath]; ok {
+					fileRecords = reuse
+					reused = true
+				}
+			}
+		}
+		if !reused {
+			var skipped bool
+			fileRecords, skipped, err = e.chunkAsset(ctx, asset)
+			if err != nil {
+				return nil, err
+			}
+			if skipped {
+				continue
+			}
+		}
+		for _, record := range fileRecords {
+			legal[embedKey(record)] = true
+		}
+	}
+	return legal, nil
+}
+
 func (e *Engine) ImportEmbeddings(ctx context.Context, ref engine.WorkspaceRef, next func() (key string, vec []float32, ok bool, err error)) (ImportReport, error) {
 	if err := rejectProfileID(ref); err != nil {
 		return ImportReport{}, err
@@ -187,7 +245,7 @@ func (e *Engine) ImportEmbeddings(ctx context.Context, ref engine.WorkspaceRef, 
 	if !e.semanticEnabled() {
 		return ImportReport{}, errSemanticRequired
 	}
-	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
+	root, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
 	if err != nil {
 		return ImportReport{}, err
 	}
@@ -201,6 +259,10 @@ func (e *Engine) ImportEmbeddings(ctx context.Context, ref engine.WorkspaceRef, 
 	journal, err := e.journalFor(workspaceKey, store)
 	if err != nil {
 		return ImportReport{}, fmt.Errorf("打开 embedding journal: %w", err)
+	}
+	legal, err := e.legalEmbedKeys(ctx, root, store)
+	if err != nil {
+		return ImportReport{}, err
 	}
 
 	report := ImportReport{}
@@ -231,6 +293,10 @@ func (e *Engine) ImportEmbeddings(ctx context.Context, ref engine.WorkspaceRef, 
 		if !ok {
 			break
 		}
+		if !legal[key] {
+			report.UnknownKey++
+			continue
+		}
 		if _, dup := existing[key]; dup {
 			report.Existing++
 			continue
@@ -259,4 +325,9 @@ func (e *Engine) ImportEmbeddings(ctx context.Context, ref engine.WorkspaceRef, 
 		return report, err
 	}
 	return report, nil
+}
+
+// EmbeddingIdentity 暴露当前语义身份三元组(R2,bench 回灌身份校验)。
+func (e *Engine) EmbeddingIdentity() (profileHash string, model string, dimension int) {
+	return e.embedCfg.ProfileHash(), e.embedCfg.Model, e.embedCfg.Dimension
 }

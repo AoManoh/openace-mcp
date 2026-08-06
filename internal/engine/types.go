@@ -86,7 +86,16 @@ type Result struct {
 // 文案变化仅影响实验性引擎，e2e golden 同步更新并在阶段记录声明）。
 func (r Result) Summary() string {
 	if r.Engine == EngineLocalHybrid && r.CheckpointID == "" {
-		return fmt.Sprintf("revision=%s files=%d added_chunks=%d deleted=%d", r.IndexRevision, r.FileCount, r.Added, r.Deleted)
+		summary := fmt.Sprintf("revision=%s files=%d added_chunks=%d deleted=%d", r.IndexRevision, r.FileCount, r.Added, r.Deleted)
+		// P8:同步面的语义覆盖如实外显(覆盖率恒随语义路携带;降级原因
+		// 仅缺口时出现),direct/daemon 两形态同文案。
+		if r.SemanticCoverage != "" {
+			summary += " semantic_coverage=" + r.SemanticCoverage
+		}
+		if r.DegradedReason != "" {
+			summary += " degraded=" + r.DegradedReason
+		}
+		return summary
 	}
 	if r.ProviderProfileID != "" {
 		return fmt.Sprintf("provider_profile_id=%s checkpoint=%s files=%d uploaded=%d added=%d deleted=%d", r.ProviderProfileID, r.CheckpointID, r.FileCount, r.Uploaded, r.Added, r.Deleted)

@@ -390,6 +390,13 @@ var errQueryBuildWait = errors.New("query wait for index build exceeded")
 // 以其为上界等待在建构建;超界即脱离等待(不取消构建,phantom waiter
 // 保证后续 leave 也不会取消),错误带构建进度与 env 名(可行动)。
 func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.WorkspaceRef) (engine.Result, error) {
+	// freshness 窗口短路只属于查询期内联同步(F2,review 2026-08-06):
+	// 显式 Sync 永远真实扫描——"编辑后 sync 即可见"不受窗口影响。
+	if e.freshnessWindow > 0 {
+		if res, ok := e.freshnessShortcut(ref); ok {
+			return res, nil
+		}
+	}
 	if e.queryBuildWait <= 0 {
 		return e.syncWorkspace(ctx, ref)
 	}
@@ -425,6 +432,32 @@ func (e *Engine) syncWorkspace(ctx context.Context, ref engine.WorkspaceRef) (en
 	return e.syncWorkspaceDetachable(ctx, ref, true)
 }
 
+// freshnessShortcut 在窗口内以现役 revision 直接应答(仅查询期内联同步
+// 使用;F2 后显式 Sync 不经此路)。失败过的 workspace 不短路(lastSyncOK
+// 仅成功刷新),保证故障不被窗口掩盖。
+func (e *Engine) freshnessShortcut(ref engine.WorkspaceRef) (engine.Result, bool) {
+	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
+	if err != nil {
+		return engine.Result{}, false
+	}
+	e.mu.Lock()
+	last, ok := e.lastSyncOK[workspaceKey]
+	e.mu.Unlock()
+	if !ok || time.Since(last) >= e.freshnessWindow {
+		return engine.Result{}, false
+	}
+	handle, herr := e.acquireHandle(workspaceKey)
+	if herr != nil {
+		return engine.Result{}, false
+	}
+	manifest := handle.manifest
+	e.releaseHandle(handle)
+	return engine.Result{
+		Engine: EngineID, IndexRevision: manifest.Revision,
+		FileCount: manifest.Counts.Files,
+	}, true
+}
+
 // syncWorkspaceDetachable 的 cancelOnLeave=false 供有界查询等待使用:
 // 等待者超时脱离时不递减 waiters(留 phantom waiter),构建不因此被
 // 取消——有界化的全部意义就是"查询先走,构建继续"。
@@ -435,25 +468,6 @@ func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.Workspa
 	root, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
 	if err != nil {
 		return engine.Result{}, err
-	}
-	// freshness 窗口短路(Stage 6 前置):窗口内且已有成功同步 → 直接
-	// 用现役 revision 应答;显式 Sync(bench 首建/用户触发)不走本入口
-	// 之外的路径,窗口只作用于查询期内联同步。失败过的 workspace 不
-	// 短路(lastSyncOK 仅成功刷新),保证故障不被窗口掩盖。
-	if e.freshnessWindow > 0 {
-		e.mu.Lock()
-		last, ok := e.lastSyncOK[workspaceKey]
-		e.mu.Unlock()
-		if ok && time.Since(last) < e.freshnessWindow {
-			if handle, herr := e.acquireHandle(workspaceKey); herr == nil {
-				manifest := handle.manifest
-				e.releaseHandle(handle)
-				return engine.Result{
-					Engine: EngineID, IndexRevision: manifest.Revision,
-					FileCount: manifest.Counts.Files,
-				}, nil
-			}
-		}
 	}
 	arrival := time.Now()
 	for {

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/fusion"
@@ -1072,6 +1073,19 @@ func renderHits(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (str
 	truncated := false
 	for i, block := range merged {
 		section := formatBlock(block.record)
+		if i == 0 && len(section) > budget {
+			// F3(review 2026-08-06):首块超预算硬截断到预算并打标——
+			// 历史豁免使 MaxOutputLen=200 也可能返回数 KB,静默打爆
+			// 调用方的上下文预算管理。按字节截断可能落在多字节字符
+			// 中间,回退到最近的合法 UTF-8 边界。
+			cut := budget
+			for cut > 0 && !utf8.RuneStart(section[cut]) {
+				cut--
+			}
+			out.WriteString(section[:cut])
+			truncated = true
+			break
+		}
 		if i > 0 && out.Len()+len(section) > budget {
 			truncated = true
 			break
@@ -1079,10 +1093,13 @@ func renderHits(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (str
 		out.WriteString(section)
 	}
 	if truncated {
-		out.WriteString("\n[output truncated by max_output_length]\n")
+		out.WriteString(truncationMarker)
 	}
 	return strings.TrimRight(out.String(), "\n"), nil
 }
+
+// truncationMarker 是输出预算截断的稳定标记(golden/调用方可依赖)。
+const truncationMarker = "\n[output truncated by max_output_length]\n"
 
 // mergeBlocks 只合并同文件真正重叠或严格相邻的块（next.Start ≤ current.End+1），
 // 取最高分。禁止跨间隙合并：缺行会让 header 行区间与内容错位（review B1）。
