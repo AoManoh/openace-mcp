@@ -475,114 +475,22 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		// P7:请求类标记,daemon 面映射 400 而非 502。
 		return retrieval{}, engine.AsInvalidRequest(errors.New("查询内容为空"))
 	}
-	// 检索前确保索引就绪（与 legacy Syncer 的 retrieval 语义一致）。
-	syncResult, syncErr := e.syncWorkspaceForQuery(ctx, req.Workspace)
-	if syncErr != nil && ctx.Err() != nil {
-		return retrieval{}, ctx.Err()
-	}
-	_, workspaceKey, err := e.resolveRoot(req.Workspace.DirectoryPath)
+	handle, workspaceKey, syncResult, reasons, err := e.acquireQueryHandle(ctx, req.Workspace)
 	if err != nil {
 		return retrieval{}, err
 	}
-	handle, handleErr := e.acquireHandle(workspaceKey)
-	var reasons []string
-	if syncErr != nil {
-		// D8(d)/review S23：索引刷新失败但存在可用 revision 时，
-		// allow 以旧索引服务并显式标记 stale，deny 报错。查询等待在建
-		// 索引超界(P1 有界化)同构处理,原因区分为 index-building。
-		if handleErr != nil {
-			return retrieval{}, syncErr
-		}
-		reason, label := "stale-index", "index refresh failed"
-		if errors.Is(syncErr, errQueryBuildWait) {
-			reason, label = "index-building", "index still building"
-		}
-		if e.retrievalDegrade == DegradeDeny {
-			e.releaseHandle(handle)
-			return retrieval{}, degradeDeniedError(label, syncErr, EnvRetrievalDegrade)
-		}
-		reasons = append(reasons, reason)
-		syncResult = engine.Result{Engine: EngineID, FileCount: handle.manifest.Counts.Files}
-	} else if handleErr != nil {
-		return retrieval{}, handleErr
-	}
 
-	mode := "lexical"
-	lexTopK := defaultTopK
-	if e.semanticEnabled() {
-		lexTopK = hybridRouteTopK
-	}
-	// 路由分立(方案 -13):含结构 token 的非 CJK 自然语言查询,词法路
-	// 改用结构 token 变体聚焦;dense 与 rerank 路保持原查询。零命中
-	// 兜底回退原查询,不触发时行为与历史逐字节一致。
-	plan := planLexicalQuery(query)
-	planLabel := ""
-	lexQuery := query
-	if plan.Triggered {
-		lexQuery = plan.LexicalQuery
-		planLabel = plan.LexicalQuery
-	}
-	lexHits, err := handle.lex.SearchWeighted(ctx, lexQuery, lexTopK, e.lexWeights)
+	lexHits, planLabel, err := e.lexicalRoute(ctx, handle, query)
 	if err != nil {
 		e.releaseHandle(handle)
-		return retrieval{}, fmt.Errorf("词法检索: %w", err)
+		return retrieval{}, err
 	}
-	if plan.Triggered && len(lexHits) == 0 {
-		planLabel += " fallback=original"
-		lexHits, err = handle.lex.SearchWeighted(ctx, query, lexTopK, e.lexWeights)
-		if err != nil {
-			e.releaseHandle(handle)
-			return retrieval{}, fmt.Errorf("词法检索(回退): %w", err)
-		}
+	ordered, mode, coverage, fuseReasons, err := e.fuseRoutes(ctx, workspaceKey, handle, query, lexHits)
+	if err != nil {
+		e.releaseHandle(handle)
+		return retrieval{}, err
 	}
-	// 统一过滤 choke point（暗坑 K39/K44）：两路召回都可能命中旧
-	// segment 中被 supersede/tombstone 的死 chunk，进入融合前按存活
-	// 集过滤，杜绝死内容占据候选位。
-	lexHits = filterLiveHits(handle, lexHits)
-
-	var ordered []rankedHit
-	coverage := ""
-	if e.semanticEnabled() {
-		denseIDs, denseReasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, hybridRouteTopK)
-		if denseErr != nil {
-			e.releaseHandle(handle)
-			return retrieval{}, denseErr
-		}
-		reasons = append(reasons, denseReasons...)
-		lexIDs := make([]string, 0, len(lexHits))
-		for _, hit := range lexHits {
-			lexIDs = append(lexIDs, hit.ID)
-		}
-		if denseIDs != nil {
-			mode = "hybrid"
-			fused := fusion.RRFWeighted(lexIDs, denseIDs, e.fusionParams())
-			ids := make([]string, 0, len(fused))
-			for _, f := range fused {
-				ids = append(ids, f.ID)
-			}
-			// 词法锚(T11 业务冒烟发现的边界):dense 路存活但语义失真
-			// (弱模型/错配)时,加权融合会把词法唯一强命中压出精排窗口。
-			// 保证词法首位进入 rerank head 窗口——四语料 12,497 查询离线
-			// 复算证明零质量代价(R@5/R@10 逐位不变),而精排从此必然
-			// "看得见"最强词法信号;窗口 5 的激进版被证伪(cosqa -3.6pp)。
-			if len(lexIDs) > 0 {
-				ids = anchorWithinWindow(ids, lexIDs[0], rerankHeadLimit)
-			}
-			ordered = rankByPosition(ids)
-		} else {
-			ordered = rankByPosition(lexIDs)
-		}
-		coverage = coveragePercent(handle.manifest)
-		if !handle.manifest.SemanticComplete() {
-			reasons = append(reasons, "semantic-coverage-partial")
-		}
-	} else {
-		// 纯词法：沿用真实 BM25 分数，渲染行为与 Stage 2 逐字节一致（K32）。
-		ordered = make([]rankedHit, 0, len(lexHits))
-		for _, hit := range lexHits {
-			ordered = append(ordered, rankedHit{id: hit.ID, score: hit.Score})
-		}
-	}
+	reasons = append(reasons, fuseReasons...)
 
 	// 可选精排：只重排已召回候选头部，失败绝不丢候选（D7/D8(b)）。
 	rerankApplied := false
@@ -611,21 +519,145 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		queryEmbedFailed: hasQueryEmbedFailure(reasons),
 		queryPlan:        planLabel,
 	}
-	// 方案④ strict 闸:语义链路任一缺口显式报错而非降级放行。触发面 =
-	// 任何降级 reason(覆盖缺口/查询嵌入失败/rerank 跳过/stale/向量不可用)
-	// ∪ 配置了 rerank 但未生效。错误指名 env 与缺口 token,供调用方定位。
-	if e.qualityStrict {
-		violations := append([]string(nil), reasons...)
-		if e.rerankClient != nil && !rerankApplied && len(ordered) > 0 && !containsRerankReason(reasons) {
-			violations = append(violations, "rerank-not-applied")
-		}
-		if len(violations) > 0 {
-			e.releaseHandle(handle)
-			return retrieval{}, fmt.Errorf("%s=on: 语义质量缺口 [%s],拒绝返回不完整结果(改用 %s=off 可降级放行)",
-				EnvQualityStrict, strings.Join(violations, ","), EnvQualityStrict)
-		}
+	if err := e.checkQualityStrict(reasons, rerankApplied, len(ordered) > 0); err != nil {
+		e.releaseHandle(handle)
+		return retrieval{}, err
 	}
 	return out, nil
+}
+
+// acquireQueryHandle 完成查询前置:按需同步(查询期语义,P1 有界等待)、
+// 解析工作区键并取用活跃 revision 句柄。同步失败但存在可用句柄时按
+// D8(d)/review S23 降级语义处理:allow 以旧索引服务并显式标记 stale
+// (在建等待超界区分为 index-building),deny 报错。错误路径不持有句柄。
+func (e *Engine) acquireQueryHandle(ctx context.Context, ref engine.WorkspaceRef) (*revisionHandle, string, engine.Result, []string, error) {
+	// 检索前确保索引就绪（与 legacy Syncer 的 retrieval 语义一致）。
+	syncResult, syncErr := e.syncWorkspaceForQuery(ctx, ref)
+	if syncErr != nil && ctx.Err() != nil {
+		return nil, "", engine.Result{}, nil, ctx.Err()
+	}
+	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
+	if err != nil {
+		return nil, "", engine.Result{}, nil, err
+	}
+	handle, handleErr := e.acquireHandle(workspaceKey)
+	var reasons []string
+	if syncErr != nil {
+		if handleErr != nil {
+			return nil, "", engine.Result{}, nil, syncErr
+		}
+		reason, label := "stale-index", "index refresh failed"
+		if errors.Is(syncErr, errQueryBuildWait) {
+			reason, label = "index-building", "index still building"
+		}
+		if e.retrievalDegrade == DegradeDeny {
+			e.releaseHandle(handle)
+			return nil, "", engine.Result{}, nil, degradeDeniedError(label, syncErr, EnvRetrievalDegrade)
+		}
+		reasons = append(reasons, reason)
+		syncResult = engine.Result{Engine: EngineID, FileCount: handle.manifest.Counts.Files}
+	} else if handleErr != nil {
+		return nil, "", engine.Result{}, nil, handleErr
+	}
+	return handle, workspaceKey, syncResult, reasons, nil
+}
+
+// lexicalRoute 执行词法召回:路由分立规划(方案 -13,含结构 token 的
+// 非 CJK 自然语言查询词法路改用结构 token 变体聚焦,零命中兜底回退
+// 原查询,不触发时行为与历史逐字节一致)+ 存活过滤(统一 choke point
+// 的词法半边,暗坑 K39/K44:召回可能命中旧 segment 中被 supersede/
+// tombstone 的死 chunk,进入融合前按存活集过滤)。不负责句柄释放。
+func (e *Engine) lexicalRoute(ctx context.Context, handle *revisionHandle, query string) ([]lexical.Hit, string, error) {
+	lexTopK := defaultTopK
+	if e.semanticEnabled() {
+		lexTopK = hybridRouteTopK
+	}
+	plan := planLexicalQuery(query)
+	planLabel := ""
+	lexQuery := query
+	if plan.Triggered {
+		lexQuery = plan.LexicalQuery
+		planLabel = plan.LexicalQuery
+	}
+	lexHits, err := handle.lex.SearchWeighted(ctx, lexQuery, lexTopK, e.lexWeights)
+	if err != nil {
+		return nil, "", fmt.Errorf("词法检索: %w", err)
+	}
+	if plan.Triggered && len(lexHits) == 0 {
+		planLabel += " fallback=original"
+		lexHits, err = handle.lex.SearchWeighted(ctx, query, lexTopK, e.lexWeights)
+		if err != nil {
+			return nil, "", fmt.Errorf("词法检索(回退): %w", err)
+		}
+	}
+	return filterLiveHits(handle, lexHits), planLabel, nil
+}
+
+// fuseRoutes 融合双路候选:语义启用时 dense 召回 + RRF 加权融合 + 词法
+// 锚,dense 未执行时回退词法序;纯词法沿用真实 BM25 分数,渲染行为与
+// Stage 2 逐字节一致(K32)。返回 (候选序, 模式, 覆盖率, 降级原因)。
+// 不负责句柄释放。
+func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, lexHits []lexical.Hit) ([]rankedHit, string, string, []string, error) {
+	if !e.semanticEnabled() {
+		ordered := make([]rankedHit, 0, len(lexHits))
+		for _, hit := range lexHits {
+			ordered = append(ordered, rankedHit{id: hit.ID, score: hit.Score})
+		}
+		return ordered, "lexical", "", nil, nil
+	}
+	denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, hybridRouteTopK)
+	if denseErr != nil {
+		return nil, "", "", nil, denseErr
+	}
+	lexIDs := make([]string, 0, len(lexHits))
+	for _, hit := range lexHits {
+		lexIDs = append(lexIDs, hit.ID)
+	}
+	mode := "lexical"
+	var ordered []rankedHit
+	if denseIDs != nil {
+		mode = "hybrid"
+		fused := fusion.RRFWeighted(lexIDs, denseIDs, e.fusionParams())
+		ids := make([]string, 0, len(fused))
+		for _, f := range fused {
+			ids = append(ids, f.ID)
+		}
+		// 词法锚(T11 业务冒烟发现的边界):dense 路存活但语义失真
+		// (弱模型/错配)时,加权融合会把词法唯一强命中压出精排窗口。
+		// 保证词法首位进入 rerank head 窗口——四语料 12,497 查询离线
+		// 复算证明零质量代价(R@5/R@10 逐位不变),而精排从此必然
+		// "看得见"最强词法信号;窗口 5 的激进版被证伪(cosqa -3.6pp)。
+		if len(lexIDs) > 0 {
+			ids = anchorWithinWindow(ids, lexIDs[0], rerankHeadLimit)
+		}
+		ordered = rankByPosition(ids)
+	} else {
+		ordered = rankByPosition(lexIDs)
+	}
+	coverage := coveragePercent(handle.manifest)
+	if !handle.manifest.SemanticComplete() {
+		reasons = append(reasons, "semantic-coverage-partial")
+	}
+	return ordered, mode, coverage, reasons, nil
+}
+
+// checkQualityStrict 方案④ strict 闸:语义链路任一缺口显式报错而非降级
+// 放行。触发面 = 任何降级 reason(覆盖缺口/查询嵌入失败/rerank 跳过/
+// stale/向量不可用)∪ 配置了 rerank 但未生效。错误指名 env 与缺口
+// token,供调用方定位。
+func (e *Engine) checkQualityStrict(reasons []string, rerankApplied bool, hasCandidates bool) error {
+	if !e.qualityStrict {
+		return nil
+	}
+	violations := append([]string(nil), reasons...)
+	if e.rerankClient != nil && !rerankApplied && hasCandidates && !containsRerankReason(reasons) {
+		violations = append(violations, "rerank-not-applied")
+	}
+	if len(violations) > 0 {
+		return fmt.Errorf("%s=on: 语义质量缺口 [%s],拒绝返回不完整结果(改用 %s=off 可降级放行)",
+			EnvQualityStrict, strings.Join(violations, ","), EnvQualityStrict)
+	}
+	return nil
 }
 
 // hasQueryEmbedFailure 判定降级原因中是否含查询嵌入失败(方案④字段)。

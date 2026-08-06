@@ -73,29 +73,9 @@ func scanFileSkipDisposition(err error) (skip bool, permission bool) {
 
 func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]fileBlob, ScanStats, error) {
 	var stats ScanStats
-	// H2 第二层防御(第一层是 pathutil.ResolveWorkspaceRoot 的
-	// EvalSymlinks;此处兜住旧 state 文件里的 canonical_path、直接
-	// 调用 scan 的路径):根必须解析为一个存在的目录,否则显式报错
-	// ——与"根不存在时 WalkDir 报错"的行为对齐,禁止把根当单文件
-	// 收录或静默返回空集。
-	rootInfo, err := os.Stat(root)
+	root, err := resolveScanRoot(root)
 	if err != nil {
-		// P7:根不存在/不可达是调用方传错目录的典型形态,打请求类
-		// 标记(daemon 面映射 400 而非 502)。
-		return nil, stats, engine.AsInvalidRequest(fmt.Errorf("workspace root is not accessible: %w", err))
-	}
-	if !rootInfo.IsDir() {
-		return nil, stats, engine.AsInvalidRequest(fmt.Errorf("workspace root is not a directory: %s", root))
-	}
-	// 根的叶组件为 symlink→目录时,WalkDir 对根用 Lstat 会把它当
-	// "非常规文件"跳过并成功返回空集(H2 机理);解析到真实目录再走。
-	// 中间组件的 symlink 由内核路径解析处理,不受影响。
-	if lst, lerr := os.Lstat(root); lerr == nil && lst.Mode()&fs.ModeSymlink != 0 {
-		resolved, rerr := filepath.EvalSymlinks(root)
-		if rerr != nil {
-			return nil, stats, fmt.Errorf("resolve workspace root symlink: %w", rerr)
-		}
-		root = resolved
+		return nil, stats, err
 	}
 	maxBytes := int64(maxFileBytes())
 	// F6 扫描器债修复:ignore 规则按目录栈管理,而非在整个 walk 期单调
@@ -129,15 +109,7 @@ func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]f
 		}
 		if d.IsDir() {
 			if path != root {
-				if shouldAlwaysSkipDir(name) {
-					return filepath.SkipDir
-				}
-				stack.unwindTo(rel)
-				localRules := loadIgnoreRulesForDir(path, rel)
-				stack.push(rel, localRules)
-				if stack.Match(rel, true) && !localRules.hasAugmentInclude() && !stack.hasAugmentDescendantInclude(rel) {
-					return filepath.SkipDir
-				}
+				return enterScanDir(&stack, path, rel, name)
 			}
 			return nil
 		}
@@ -158,19 +130,9 @@ func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]f
 					files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: hit})
 					return nil
 				}
-				content, ok, err := readIndexableContent(ctx, path, maxBytes)
-				if err != nil {
-					// M1:单文件 TOCTOU/权限错误只跳过该文件,不中止整次扫描。
-					if skip, denied := scanFileSkipDisposition(err); skip {
-						if denied {
-							stats.PermissionSkippedFiles++
-						}
-						return nil
-					}
+				content, ok, err := readScanBlob(ctx, path, maxBytes, &stats)
+				if err != nil || !ok {
 					return err
-				}
-				if !ok {
-					return nil
 				}
 				name := blobName(rel, content)
 				cache.store(rel, info.Size(), info.ModTime(), name)
@@ -179,19 +141,9 @@ func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]f
 				return nil
 			}
 		}
-		content, ok, err := readIndexableContent(ctx, path, maxBytes)
-		if err != nil {
-			// M1:单文件 TOCTOU/权限错误只跳过该文件,不中止整次扫描。
-			if skip, denied := scanFileSkipDisposition(err); skip {
-				if denied {
-					stats.PermissionSkippedFiles++
-				}
-				return nil
-			}
+		content, ok, err := readScanBlob(ctx, path, maxBytes, &stats)
+		if err != nil || !ok {
 			return err
-		}
-		if !ok {
-			return nil
 		}
 		files = append(files, fileBlob{
 			AbsPath:  path,
@@ -208,6 +160,69 @@ func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]f
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].RelPath < files[j].RelPath })
 	return files, stats, nil
+}
+
+// resolveScanRoot 校验并规范化扫描根。H2 第二层防御(第一层是
+// pathutil.ResolveWorkspaceRoot 的 EvalSymlinks;此处兜住旧 state 文件里
+// 的 canonical_path、直接调用 scan 的路径):根必须解析为一个存在的目录,
+// 否则显式报错——与"根不存在时 WalkDir 报错"的行为对齐,禁止把根当
+// 单文件收录或静默返回空集。根的叶组件为 symlink→目录时,WalkDir 对根
+// 用 Lstat 会把它当"非常规文件"跳过并成功返回空集(H2 机理);解析到
+// 真实目录再走,中间组件的 symlink 由内核路径解析处理,不受影响。
+func resolveScanRoot(root string) (string, error) {
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		// P7:根不存在/不可达是调用方传错目录的典型形态,打请求类
+		// 标记(daemon 面映射 400 而非 502)。
+		return "", engine.AsInvalidRequest(fmt.Errorf("workspace root is not accessible: %w", err))
+	}
+	if !rootInfo.IsDir() {
+		return "", engine.AsInvalidRequest(fmt.Errorf("workspace root is not a directory: %s", root))
+	}
+	if lst, lerr := os.Lstat(root); lerr == nil && lst.Mode()&fs.ModeSymlink != 0 {
+		resolved, rerr := filepath.EvalSymlinks(root)
+		if rerr != nil {
+			return "", fmt.Errorf("resolve workspace root symlink: %w", rerr)
+		}
+		root = resolved
+	}
+	return root, nil
+}
+
+// enterScanDir 处理 walk 的目录条目:维护 F6 规则栈并做跳过判定,
+// 返回 filepath.SkipDir 或 nil(判定语义与规则求值序不变)。
+func enterScanDir(stack *ruleStack, path string, rel string, name string) error {
+	if shouldAlwaysSkipDir(name) {
+		return filepath.SkipDir
+	}
+	stack.unwindTo(rel)
+	localRules := loadIgnoreRulesForDir(path, rel)
+	stack.push(rel, localRules)
+	if stack.Match(rel, true) && !localRules.hasAugmentInclude() && !stack.hasAugmentDescendantInclude(rel) {
+		return filepath.SkipDir
+	}
+	return nil
+}
+
+// readScanBlob 读取单文件可索引内容并归置 M1 跳过语义:ok=false 表示
+// 该文件跳过(不可索引内容,或 TOCTOU/权限错误——权限跳过计入 stats),
+// err 仅在致命时非 nil(中止整次扫描)。
+func readScanBlob(ctx context.Context, path string, maxBytes int64, stats *ScanStats) ([]byte, bool, error) {
+	content, ok, err := readIndexableContent(ctx, path, maxBytes)
+	if err != nil {
+		// M1:单文件 TOCTOU/权限错误只跳过该文件,不中止整次扫描。
+		if skip, denied := scanFileSkipDisposition(err); skip {
+			if denied {
+				stats.PermissionSkippedFiles++
+			}
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	return content, true, nil
 }
 
 func maxFileBytes() int {
