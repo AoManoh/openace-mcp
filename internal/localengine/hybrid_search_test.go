@@ -323,7 +323,10 @@ func TestRerankTokenBudgetKeepsTailComplete(t *testing.T) {
 		}
 		return 0.1
 	}, nil)
-	query := "login parse_config demo application"
+	// 查询保持非结构 token 形态(parse config 分写):本测试的对象是
+	// token 预算截断语义,需要多文档基线;parse_config 会触发路由分立
+	// 聚焦到单文档,那是 queryplan 测试的领域。
+	query := "login parse config demo application"
 
 	baseline := newTestEngineWith(t, Options{})
 	root := newFixtureWorkspace(t)

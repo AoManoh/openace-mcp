@@ -224,6 +224,8 @@ type retrieval struct {
 	rerankSent       int
 	rerankApplied    bool
 	queryEmbedFailed bool
+	// queryPlan 是路由分立规划记录(方案 -13,触发时非空)。
+	queryPlan string
 }
 
 // Search 实现 engine.Service：按需同步后执行 lexical（+dense RRF）
@@ -248,6 +250,9 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	result.Text = text
 	result.Engine = EngineID
 	result.IndexRevision = handle.manifest.Revision
+	// 路由分立可审计记录:触发即携带(含纯词法形态),未触发保持空
+	// (omitempty,wire 不变)。
+	result.QueryPlan = out.queryPlan
 	// 透明性字段：provider 已配置或发生降级时填充；纯词法正常路径
 	// 保持空（Stage 2 wire 不变，K32/K34）。
 	if e.semanticEnabled() || e.rerankClient != nil || degradedReason != "" {
@@ -410,9 +415,21 @@ func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, dep
 	}
 	defer e.releaseHandle(handle)
 
-	lexHits, err := handle.lex.SearchWeighted(ctx, query, depth, e.lexWeights)
+	// 与 retrieve 同口径应用路由分立(方案 -13),保证 routes dump 诊断
+	// 与生产词法路一致;dense 路仍用原查询。
+	lexQuery := query
+	if plan := planLexicalQuery(query); plan.Triggered {
+		lexQuery = plan.LexicalQuery
+	}
+	lexHits, err := handle.lex.SearchWeighted(ctx, lexQuery, depth, e.lexWeights)
 	if err != nil {
 		return RouteCandidates{}, fmt.Errorf("词法检索: %w", err)
+	}
+	if lexQuery != query && len(lexHits) == 0 {
+		lexHits, err = handle.lex.SearchWeighted(ctx, query, depth, e.lexWeights)
+		if err != nil {
+			return RouteCandidates{}, fmt.Errorf("词法检索(回退): %w", err)
+		}
 	}
 	lexHits = filterLiveHits(handle, lexHits)
 	out := RouteCandidates{Lex: make([]CandidateRef, 0, len(lexHits))}
@@ -493,10 +510,28 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	if e.semanticEnabled() {
 		lexTopK = hybridRouteTopK
 	}
-	lexHits, err := handle.lex.SearchWeighted(ctx, query, lexTopK, e.lexWeights)
+	// 路由分立(方案 -13):含结构 token 的非 CJK 自然语言查询,词法路
+	// 改用结构 token 变体聚焦;dense 与 rerank 路保持原查询。零命中
+	// 兜底回退原查询,不触发时行为与历史逐字节一致。
+	plan := planLexicalQuery(query)
+	planLabel := ""
+	lexQuery := query
+	if plan.Triggered {
+		lexQuery = plan.LexicalQuery
+		planLabel = plan.LexicalQuery
+	}
+	lexHits, err := handle.lex.SearchWeighted(ctx, lexQuery, lexTopK, e.lexWeights)
 	if err != nil {
 		e.releaseHandle(handle)
 		return retrieval{}, fmt.Errorf("词法检索: %w", err)
+	}
+	if plan.Triggered && len(lexHits) == 0 {
+		planLabel += " fallback=original"
+		lexHits, err = handle.lex.SearchWeighted(ctx, query, lexTopK, e.lexWeights)
+		if err != nil {
+			e.releaseHandle(handle)
+			return retrieval{}, fmt.Errorf("词法检索(回退): %w", err)
+		}
 	}
 	// 统一过滤 choke point（暗坑 K39/K44）：两路召回都可能命中旧
 	// segment 中被 supersede/tombstone 的死 chunk，进入融合前按存活
@@ -572,6 +607,7 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		reasons: reasons, coverage: coverage, syncResult: syncResult,
 		rerankSent: rerankSent, rerankApplied: rerankApplied,
 		queryEmbedFailed: hasQueryEmbedFailure(reasons),
+		queryPlan:        planLabel,
 	}
 	// 方案④ strict 闸:语义链路任一缺口显式报错而非降级放行。触发面 =
 	// 任何降级 reason(覆盖缺口/查询嵌入失败/rerank 跳过/stale/向量不可用)
