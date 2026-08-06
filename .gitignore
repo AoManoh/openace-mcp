@@ -111,3 +111,6 @@ $RECYCLE.BIN/
 # they must never ride along on a bulk `git add`.
 /.playwright-mcp/
 /openace-handoff-*.tar.gz
+
+# Local retrieval scope policy stays untracked (see README: manage locally).
+/.openaceignore
