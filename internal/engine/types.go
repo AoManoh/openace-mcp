@@ -79,6 +79,12 @@ type Result struct {
 	QueryEmbedFailed bool `json:"query_embed_failed,omitempty"`
 	// EmbeddingProfile 是语义路身份短指纹（provider/model/dimension）。
 	EmbeddingProfile string `json:"embedding_profile,omitempty"`
+	// BuildMode 是本次 sync 的构建形态与成因(灰度反馈四 §6.1:重建
+	// 原因不可见时调用方只能从进度条反猜):"delta" 或
+	// "full:<first-build|lexical-selfheal|vector-repair|schema-upgrade|
+	// compaction-segments|compaction-garbage|semantic-fill>";no-op 不
+	// 发布时为空。加性 omitempty。
+	BuildMode string `json:"build_mode,omitempty"`
 }
 
 // Summary 输出一行人类可读的结果摘要，供 MCP 工具文本渲染使用。
@@ -87,6 +93,11 @@ type Result struct {
 func (r Result) Summary() string {
 	if r.Engine == EngineLocalHybrid && r.CheckpointID == "" {
 		summary := fmt.Sprintf("revision=%s files=%d added_chunks=%d deleted=%d", r.IndexRevision, r.FileCount, r.Added, r.Deleted)
+		// 构建形态外显(灰度反馈四 §6.1):delta/full 及其成因直说,
+		// 调用方不再从进度与计数反猜"是否被全量重建"。
+		if r.BuildMode != "" {
+			summary += " build=" + r.BuildMode
+		}
 		// P8:同步面的语义覆盖如实外显(覆盖率恒随语义路携带;降级原因
 		// 仅缺口时出现),direct/daemon 两形态同文案。
 		if r.SemanticCoverage != "" {
