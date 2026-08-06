@@ -47,6 +47,11 @@ const (
 	EnvQueryBuildWait = "OPENACE_QUERY_BUILD_WAIT"
 )
 
+// defaultQueryBuildWait 是查询有界等待的默认上界(P2,灰度反馈
+// 2026-08-06):须小于 wrapper 工具超时(默认 110s),使引擎的可行动
+// 错误(带构建进度与 env 名)先于裸传输超时到达调用方。
+const defaultQueryBuildWait = 90 * time.Second
+
 // Options 是 local-hybrid 引擎的完整构造配置；零值 = Stage 2 行为
 // （semantic off、rerank off、降级 allow）。
 type Options struct {
@@ -96,9 +101,20 @@ func OptionsFromEnv() (Options, error) {
 	if err != nil {
 		return Options{}, err
 	}
-	buildWait, err := reliability.DurationEnv(EnvQueryBuildWait, 0)
-	if err != nil {
-		return Options{}, err
+	// P2(灰度反馈 2026-08-06):默认有界 90s——冷仓首建期间的同步检索
+	// 在工具超时(110s)之前拿到带进度的可行动错误(errQueryBuildWait
+	// 路径),而非挂到裸传输超时;显式 "0" 保留"等到构建完成"。
+	buildWait := defaultQueryBuildWait
+	if raw := strings.TrimSpace(os.Getenv(EnvQueryBuildWait)); raw != "" {
+		if raw == "0" || raw == "0s" {
+			buildWait = 0
+		} else {
+			parsed, err := reliability.DurationEnv(EnvQueryBuildWait, defaultQueryBuildWait)
+			if err != nil {
+				return Options{}, err
+			}
+			buildWait = parsed
+		}
 	}
 	// 模板版本注入(M9②):env 路径与引擎构造双点注入同一常量,保证
 	// wrapper/daemon 的 Fingerprint 与引擎侧 ProfileHash 同源。

@@ -69,6 +69,16 @@ func (s *wsStatus) setSemanticOutcome(rejected int, lastError string) {
 }
 
 // setSkippedFiles 记录内容门禁跳过的文件数（暗坑 K6）。
+// setScannedFiles 在扫描完成即回填文件数(P4,灰度反馈 2026-08-06):
+// 构建期 file_count 不再是 0 与 embedded_chunks 并存的失真态;发布时
+// ready() 以 manifest 实数覆盖。
+func (s *wsStatus) setScannedFiles(count int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fileCount = count
+	s.updatedAt = time.Now().UTC()
+}
+
 func (s *wsStatus) setSkippedFiles(count int) {
 	s.mu.Lock()
 	s.skippedFiles = count
