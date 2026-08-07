@@ -1072,7 +1072,7 @@ const repoMapDescription = "Budget-bounded map of the indexed repository: direct
 // pathPrefixDescription 是 repo_map 定向后的子树检索约束(真实 Devin
 // A/B:两臂都已知 internal/localengine,但根研究文档/tests 仍挤占生产
 // 定义;显式前缀可把 rerank/输出预算留给目标子树)。
-const pathPrefixDescription = "Optional indexed relative path prefix (for example `internal/localengine`). Filters fused candidates before reranking; use after repo_map identifies the relevant subtree. Omit for repository-wide search."
+const pathPrefixDescription = "Optional indexed relative path prefix (for example `internal/localengine`). Filters fused candidates before reranking. Use ONLY when the user explicitly names that subtree or prior retrieval directly observed the target identifier there. Never infer an exclusive prefix from a truncated repo_map or directory summary: omitted subtrees may contain the answer. Omit for repository-wide or ambiguous conceptual searches."
 
 // detailDescription 是输出详略契约(框架 18.2/S2;业界"默认小、按需大"
 // 光谱的参数化位:Anthropic response_format enum 同型)。
