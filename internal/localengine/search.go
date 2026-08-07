@@ -49,6 +49,7 @@ type chunkMeta struct {
 // K39/K44）。向量索引按需懒加载并随句柄常驻（revision 不可变，加载一次
 // 即定格）。
 type revisionHandle struct {
+	engine       *Engine
 	workspaceKey string
 	manifest     *index.Manifest
 	lex          *lexical.Index
@@ -64,6 +65,7 @@ type revisionHandle struct {
 
 	vecOnce sync.Once
 	vecIxs  []*vector.Index
+	vecKeys []string
 	vecErr  error
 }
 
@@ -115,9 +117,74 @@ func (h *revisionHandle) closeContentFiles() {
 	}
 }
 
+type sharedVectorIndex struct {
+	ready chan struct{}
+	ix    *vector.Index
+	err   error
+	refs  int
+}
+
+func vectorSegmentKey(dir string, dimension int, dataChecksum string, indexChecksum string) string {
+	return fmt.Sprintf("%s\x00%d\x00%s\x00%s", dir, dimension, dataChecksum, indexChecksum)
+}
+
+func (e *Engine) acquireVectorSegment(dir string, dimension int, dataChecksum string, indexChecksum string, maxVectors int) (*vector.Index, string, error) {
+	key := vectorSegmentKey(dir, dimension, dataChecksum, indexChecksum)
+	e.vectorMu.Lock()
+	if shared, ok := e.vectorSegments[key]; ok {
+		shared.refs++
+		e.vectorMu.Unlock()
+		<-shared.ready
+		if shared.err != nil {
+			e.releaseVectorSegments([]string{key})
+			return nil, "", shared.err
+		}
+		if shared.ix.Count() > maxVectors {
+			e.releaseVectorSegments([]string{key})
+			return nil, "", fmt.Errorf("%w: %d > %d", vector.ErrEnvelopeExceeded, shared.ix.Count(), maxVectors)
+		}
+		return shared.ix, key, nil
+	}
+	shared := &sharedVectorIndex{ready: make(chan struct{}), refs: 1}
+	e.vectorSegments[key] = shared
+	e.vectorMu.Unlock()
+
+	ix, err := vector.Load(dir, dimension, dataChecksum, indexChecksum, maxVectors)
+	e.vectorMu.Lock()
+	shared.ix, shared.err = ix, err
+	close(shared.ready)
+	if err != nil {
+		delete(e.vectorSegments, key)
+	}
+	e.vectorMu.Unlock()
+	if err != nil {
+		return nil, "", err
+	}
+	return ix, key, nil
+}
+
+func (e *Engine) releaseVectorSegments(keys []string) {
+	if e == nil || len(keys) == 0 {
+		return
+	}
+	e.vectorMu.Lock()
+	defer e.vectorMu.Unlock()
+	for _, key := range keys {
+		shared, ok := e.vectorSegments[key]
+		if !ok {
+			continue
+		}
+		shared.refs--
+		if shared.refs <= 0 {
+			delete(e.vectorSegments, key)
+		}
+	}
+}
+
 // vectorIndexes 懒加载本 revision 全部 segment 的向量索引；任一校验失败
-// 只降级语义路，不影响词法可用性（暗坑 K25）。总量超出 envelope 显式
-// 拒绝（§18，暗坑 K49 同族）。
+// 只降级语义路，不影响词法可用性（暗坑 K25）。Engine 级 segment cache
+// 让 active/previous 共享不可变段；每段加载前传剩余累计 envelope，禁止
+// "全部分配后才发现超 400K"。
 func (h *revisionHandle) vectorIndexes(dimension int) ([]*vector.Index, error) {
 	h.vecOnce.Do(func() {
 		if !h.manifest.HasVectors() {
@@ -125,27 +192,59 @@ func (h *revisionHandle) vectorIndexes(dimension int) ([]*vector.Index, error) {
 			return
 		}
 		total := 0
+		limit := vector.DefaultMaxResidentVectors
+		if h.engine != nil && h.engine.vectorMaxResident > 0 {
+			limit = h.engine.vectorMaxResident
+		}
 		indexes := make([]*vector.Index, 0, len(h.manifest.Segments))
+		keys := make([]string, 0, len(h.manifest.Segments))
 		for i, segment := range h.manifest.Segments {
 			if segment.VectorsChecksum == "" {
 				continue
 			}
-			ix, err := vector.Load(h.segmentDirs[i], dimension,
-				segment.VectorsChecksum, segment.VectorsIndexChecksum, 0)
+			remaining := limit - total
+			if remaining <= 0 {
+				h.vecErr = fmt.Errorf("%w: cumulative segment rows exceed %d", vector.ErrEnvelopeExceeded, limit)
+				break
+			}
+			var ix *vector.Index
+			var key string
+			var err error
+			if h.engine != nil {
+				ix, key, err = h.engine.acquireVectorSegment(h.segmentDirs[i], dimension,
+					segment.VectorsChecksum, segment.VectorsIndexChecksum, remaining)
+			} else {
+				ix, err = vector.Load(h.segmentDirs[i], dimension,
+					segment.VectorsChecksum, segment.VectorsIndexChecksum, remaining)
+			}
 			if err != nil {
 				h.vecErr = err
-				return
+				break
 			}
 			total += ix.Count()
 			indexes = append(indexes, ix)
+			if key != "" {
+				keys = append(keys, key)
+			}
 		}
-		if total > vector.DefaultMaxResidentVectors {
-			h.vecErr = fmt.Errorf("%w: %d > %d", vector.ErrEnvelopeExceeded, total, vector.DefaultMaxResidentVectors)
+		if h.vecErr != nil {
+			if h.engine != nil {
+				h.engine.releaseVectorSegments(keys)
+			}
 			return
 		}
 		h.vecIxs = indexes
+		h.vecKeys = keys
 	})
 	return h.vecIxs, h.vecErr
+}
+
+func (h *revisionHandle) releaseVectorIndexes() {
+	if h.engine != nil {
+		h.engine.releaseVectorSegments(h.vecKeys)
+	}
+	h.vecKeys = nil
+	h.vecIxs = nil
 }
 
 // loadLiveChunkMetas 扫描 revision 全部 segment 的 chunks.jsonl，产出
@@ -1100,7 +1199,7 @@ func (e *Engine) openOrReuseHandle(store *index.Store, workspaceKey string, mani
 		return nil, err
 	}
 	handle := &revisionHandle{
-		workspaceKey: workspaceKey, manifest: manifest, lex: lex, chunks: chunks,
+		engine: e, workspaceKey: workspaceKey, manifest: manifest, lex: lex, chunks: chunks,
 		segmentDirs: segmentDirs, refs: 1,
 	}
 
@@ -1135,15 +1234,17 @@ func (e *Engine) releaseHandle(handle *revisionHandle) {
 	if shouldClose {
 		_ = handle.lex.Close()
 		handle.closeContentFiles()
+		handle.releaseVectorIndexes()
 	}
 }
 
-// retireHandles 在新 revision 发布后退役不再保留的句柄
-// （只保留 active 与 previous；使用中的句柄延迟到引用归零关闭）。
-func (e *Engine) retireHandles(workspaceKey string, activeRevision string, previousRevision string) {
+// retireHandles 在新 revision 发布后只保留 active 句柄。previous 的
+// 磁盘 revision 仍由 GC 保留,需要回退时可重新打开；闲置 previous 句柄
+// 不应让 compaction 前后的两套完整向量同时常驻。使用中的旧句柄按引用
+// 计数延迟关闭。
+func (e *Engine) retireHandles(workspaceKey string, activeRevision string, _ string) {
 	keep := map[string]bool{
-		handleKey(workspaceKey, activeRevision):   true,
-		handleKey(workspaceKey, previousRevision): true,
+		handleKey(workspaceKey, activeRevision): true,
 	}
 	var closable []*revisionHandle
 	e.mu.Lock()
@@ -1161,6 +1262,7 @@ func (e *Engine) retireHandles(workspaceKey string, activeRevision string, previ
 	for _, handle := range closable {
 		_ = handle.lex.Close()
 		handle.closeContentFiles()
+		handle.releaseVectorIndexes()
 	}
 }
 
