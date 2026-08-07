@@ -23,6 +23,7 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/lexical"
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
 	"github.com/AoManoh/openace-mcp/internal/rerank"
+	"github.com/AoManoh/openace-mcp/internal/vector"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
@@ -88,6 +89,11 @@ type Engine struct {
 	statuses map[string]*wsStatus
 	stores   map[string]*index.Store
 	handles  map[string]*revisionHandle
+	// vectorSegments 是 Engine 级 immutable segment 向量缓存；active/
+	// previous revision 共享 segment 时只常驻一份,按 handle 引用计数释放。
+	vectorMu          sync.Mutex
+	vectorSegments    map[string]*sharedVectorIndex
+	vectorMaxResident int
 	// repair 记录查询期发现向量不可用的工作区，下次 sync 强制重建自愈
 	// （暗坑 K25；键为 workspaceKey，构建开始时消费）。
 	repair map[string]bool
@@ -119,19 +125,21 @@ var (
 // New 创建 local-hybrid 引擎；opts 零值 = Stage 2 词法行为（K32）。
 func New(opts Options) (*Engine, error) {
 	e := &Engine{
-		profile:          chunk.DefaultProfile(),
-		retrievalDegrade: normalizeDegrade(opts.RetrievalDegrade),
-		rerankDegrade:    normalizeDegrade(opts.RerankDegrade),
-		lexWeights:       lexical.DefaultWeights(),
-		inflight:         make(map[string]*buildCall),
-		statuses:         make(map[string]*wsStatus),
-		stores:           make(map[string]*index.Store),
-		handles:          make(map[string]*revisionHandle),
-		repair:           make(map[string]bool),
-		journals:         make(map[string]*index.Journal),
-		statCaches:       make(map[string]*workspace.StatCache),
-		lastSyncOK:       make(map[string]time.Time),
-		locks:            make(map[string]*index.ProcessLock),
+		profile:           chunk.DefaultProfile(),
+		retrievalDegrade:  normalizeDegrade(opts.RetrievalDegrade),
+		rerankDegrade:     normalizeDegrade(opts.RerankDegrade),
+		lexWeights:        lexical.DefaultWeights(),
+		inflight:          make(map[string]*buildCall),
+		statuses:          make(map[string]*wsStatus),
+		stores:            make(map[string]*index.Store),
+		handles:           make(map[string]*revisionHandle),
+		vectorSegments:    make(map[string]*sharedVectorIndex),
+		vectorMaxResident: vector.DefaultMaxResidentVectors,
+		repair:            make(map[string]bool),
+		journals:          make(map[string]*index.Journal),
+		statCaches:        make(map[string]*workspace.StatCache),
+		lastSyncOK:        make(map[string]time.Time),
+		locks:             make(map[string]*index.ProcessLock),
 	}
 	if opts.LexicalWeights != nil {
 		e.lexWeights = *opts.LexicalWeights
@@ -710,6 +718,7 @@ func (e *Engine) Close(ctx context.Context) error {
 				firstErr = err
 			}
 			handle.closeContentFiles()
+			handle.releaseVectorIndexes()
 			delete(e.handles, revision)
 		}
 	}
