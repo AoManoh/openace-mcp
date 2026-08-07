@@ -617,7 +617,31 @@ func (s *Server) handleSyncWorkspace(ctx context.Context, id *json.RawMessage, r
 	if err != nil {
 		return toolError(id, err.Error())
 	}
-	return ok(id, toolResult("Workspace synced.\n"+result.Summary(), false))
+	text := "Workspace synced.\n" + result.Summary()
+	return ok(id, toolResultWithStructured(text, false, syncStructured(result)))
+}
+
+func syncStructured(result engine.Result) map[string]any {
+	fields := map[string]any{
+		"engine":         result.Engine,
+		"index_revision": result.IndexRevision,
+		"file_count":     result.FileCount,
+		"added_chunks":   result.Added,
+		"deleted":        result.Deleted,
+	}
+	if result.BuildMode != "" {
+		fields["build_mode"] = result.BuildMode
+	}
+	if result.CrossProfileReused > 0 {
+		fields["cross_profile_reused"] = result.CrossProfileReused
+	}
+	if result.SemanticCoverage != "" {
+		fields["semantic_coverage"] = result.SemanticCoverage
+	}
+	if result.DegradedReason != "" {
+		fields["degraded_reason"] = result.DegradedReason
+	}
+	return fields
 }
 
 func (s *Server) handleStartRetrieval(ctx context.Context, id *json.RawMessage, rawArgs json.RawMessage) rpcResponse {
