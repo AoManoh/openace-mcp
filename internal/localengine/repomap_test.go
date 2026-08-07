@@ -55,6 +55,37 @@ func TestRepoMapBasicShape(t *testing.T) {
 	}
 }
 
+// immutable revision 的聚合缓存只构建一次；focus 从缓存过滤且返回独立
+// 切片，后续排序/标签修改不污染全仓地图。
+func TestRepoMapCachesRevisionAggregation(t *testing.T) {
+	handle := &revisionHandle{chunks: map[string]chunkMeta{
+		"a": {RelPath: "src/a.go", EndLine: 10, Symbol: "Alpha"},
+		"b": {RelPath: "docs/b.md", EndLine: 5, Symbol: "Beta"},
+	}}
+	full := cachedMapFiles(handle, "")
+	if len(full) != 2 || len(handle.repoMapFiles) != 2 {
+		t.Fatalf("首次聚合异常: full=%+v cache=%+v", full, handle.repoMapFiles)
+	}
+	// 模拟不应发生的底层 map 变化，证明 once 后不重扫；revision 本身
+	// 在生产中不可变。
+	handle.chunks["c"] = chunkMeta{RelPath: "src/c.go", EndLine: 3, Symbol: "Gamma"}
+	focus := cachedMapFiles(handle, "src")
+	if len(focus) != 1 || focus[0].path != "src/a.go" || focus[0].topDir != "src" {
+		t.Fatalf("focus 缓存过滤异常: %+v", focus)
+	}
+	focus[0].symbols[0] = "mutated"
+	again := cachedMapFiles(handle, "")
+	var srcSymbol string
+	for _, file := range again {
+		if file.path == "src/a.go" {
+			srcSymbol = file.symbols[0]
+		}
+	}
+	if len(again) != 2 || srcSymbol != "Alpha" {
+		t.Fatalf("调用方修改污染缓存: %+v", again)
+	}
+}
+
 // R1-2:测试文件负先验——同目录下 handler.go 应排在 handler_test.go 前。
 func TestRepoMapTestFileDeprioritized(t *testing.T) {
 	e, root := repoMapFixture(t)
