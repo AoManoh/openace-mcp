@@ -83,9 +83,11 @@ type priorVectors struct {
 	// 的旧 chunk profile 子树。优先级低于当前 active/previous,只读复用。
 	crossProfileByHash map[string][]float32
 	// activeLoadedRows/ExpectedRows 对比可识别"逻辑完整、物理损坏"。
-	activeLoadedRows   int
-	activeExpectedRows int
-	loadedRows         int
+	activeLoadedRows       int
+	activeExpectedRows     int
+	activeLoadedSegments   int
+	activeExpectedSegments int
+	loadedRows             int
 	// activeIDs 是 active revision 中已持久化向量的 chunk ID 集
 	// （delta 构建计算未触及 chunk 覆盖时使用，暗坑 K51）。
 	activeIDs map[string]bool
@@ -107,6 +109,11 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest) 
 	loadedRows := 0
 	if previous != nil {
 		prior.activeExpectedRows = previous.VectorCount
+		for _, segment := range previous.Segments {
+			if segment.VectorsChecksum != "" {
+				prior.activeExpectedSegments++
+			}
+		}
 	}
 	for hop := 0; manifest != nil && hop < 2; hop++ {
 		for _, segment := range manifest.Segments {
@@ -127,6 +134,7 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest) 
 			prior.loadedRows = loadedRows
 			if hop == 0 {
 				prior.activeLoadedRows += ix.Count()
+				prior.activeLoadedSegments++
 			}
 			for i, entry := range ix.Entries() {
 				if hop == 0 {
