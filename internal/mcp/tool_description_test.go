@@ -3,6 +3,8 @@ package mcp
 import (
 	"strings"
 	"testing"
+
+	"github.com/AoManoh/openace-mcp/internal/engine"
 )
 
 // 方案③(2026-08-02 批准)文案契约:工具描述引擎中立、参数描述齐备、
@@ -46,6 +48,18 @@ func TestToolDescriptionsContract(t *testing.T) {
 	}
 	if !strings.Contains(serverInstructions, "codebase_retrieval") {
 		t.Fatal("instructions 应指名检索工具")
+	}
+}
+
+// 跨 profile 复用量须在同步结构化结果中可机读。
+func TestSyncStructuredIncludesCrossProfileReuse(t *testing.T) {
+	fields := syncStructured(engine.Result{
+		Engine: engine.EngineLocalHybrid, IndexRevision: "rev-1", FileCount: 3,
+		Added: 4, BuildMode: "full:first-build", CrossProfileReused: 99,
+		SemanticCoverage: "100%",
+	})
+	if fields["cross_profile_reused"] != 99 || fields["build_mode"] != "full:first-build" || fields["semantic_coverage"] != "100%" {
+		t.Fatalf("sync structured 复用字段缺失: %+v", fields)
 	}
 }
 

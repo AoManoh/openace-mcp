@@ -62,7 +62,9 @@ func (e *Engine) mergeSiblingProfileVectors(current *index.Store, root pathutil.
 	})
 	for _, candidate := range candidates {
 		loaded := e.loadPriorVectors(candidate.store, candidate.manifest)
-		if len(loaded.activeByHash)+len(loaded.olderByHash) == 0 {
+		// 候选 active 物理载入必须覆盖 manifest 宣称的全部向量；部分
+		// 损坏候选不能因"尚存一条"就阻止后续健康 sibling 参与。
+		if loaded.activeLoadedRows < loaded.activeExpectedRows || loaded.activeLoadedRows == 0 {
 			continue
 		}
 		if prior.crossProfileByHash == nil {

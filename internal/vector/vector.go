@@ -8,12 +8,14 @@
 package vector
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -100,29 +102,11 @@ func Write(dir string, dimension int, entries []Entry, vectors [][]float32) (dat
 	if dimension <= 0 {
 		return "", "", errors.New("dimension 必须为正")
 	}
-	data := make([]byte, 0, len(vectors)*dimension*4)
-	var scratch [4]byte
-	for i, v := range vectors {
-		if len(v) != dimension {
-			return "", "", fmt.Errorf("第 %d 行维度 %d 与配置 %d 不符", i, len(v), dimension)
-		}
-		var sum float64
-		for _, x := range v {
-			f := float64(x)
-			if math.IsNaN(f) || math.IsInf(f, 0) {
-				return "", "", fmt.Errorf("第 %d 行含非有限分量", i)
-			}
-			sum += f * f
-		}
-		if math.Abs(sum-1) > 0.01 {
-			return "", "", fmt.Errorf("第 %d 行未归一化（norm²=%.4f）；必须先经 Normalize", i, sum)
-		}
-		for _, x := range v {
-			binary.LittleEndian.PutUint32(scratch[:], math.Float32bits(x))
-			data = append(data, scratch[:]...)
-		}
-	}
-	if err := writeFileSync(filepath.Join(dir, DataFileName), data); err != nil {
+	// 流式写 vectors.dat:旧实现先构造 count×dim×4 的完整 byte[]，
+	// 与调用方已持有的 float32 vectors 同时常驻；k8s 345K×1024 时
+	// 平白增加约1.4GiB峰值。按行复用小缓冲并同步计算 checksum。
+	dataChecksum, err = writeVectorData(filepath.Join(dir, DataFileName), dimension, vectors)
+	if err != nil {
 		return "", "", err
 	}
 	header := indexHeader{SchemaVersion: indexSchemaVersion, Dimension: dimension, Count: len(entries), Entries: entries}
@@ -133,7 +117,54 @@ func Write(dir string, dimension int, entries []Entry, vectors [][]float32) (dat
 	if err := writeFileSync(filepath.Join(dir, IndexFileName), idxBytes); err != nil {
 		return "", "", err
 	}
-	return checksumBytes(data), checksumBytes(idxBytes), nil
+	return dataChecksum, checksumBytes(idxBytes), nil
+}
+
+func writeVectorData(path string, dimension int, vectors [][]float32) (checksum string, err error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+	}()
+	hash := sha256.New()
+	writer := bufio.NewWriterSize(io.MultiWriter(f, hash), 4<<20)
+	row := make([]byte, dimension*4)
+	for i, v := range vectors {
+		if len(v) != dimension {
+			return "", fmt.Errorf("第 %d 行维度 %d 与配置 %d 不符", i, len(v), dimension)
+		}
+		var sum float64
+		for j, x := range v {
+			value := float64(x)
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				return "", fmt.Errorf("第 %d 行含非有限分量", i)
+			}
+			sum += value * value
+			binary.LittleEndian.PutUint32(row[j*4:], math.Float32bits(x))
+		}
+		if math.Abs(sum-1) > 0.01 {
+			return "", fmt.Errorf("第 %d 行未归一化（norm²=%.4f）；必须先经 Normalize", i, sum)
+		}
+		if _, err := writer.Write(row); err != nil {
+			return "", err
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		return "", err
+	}
+	if err := f.Sync(); err != nil {
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	closed = true
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // writeFileSync 以 0600 + O_EXCL 写入并落盘（staging 内新文件）。
@@ -194,20 +225,43 @@ func Load(dir string, wantDimension int, wantDataChecksum string, wantIndexCheck
 	if header.Count > maxVectors {
 		return nil, fmt.Errorf("%w: %d > %d", ErrEnvelopeExceeded, header.Count, maxVectors)
 	}
-	dataBytes, err := os.ReadFile(filepath.Join(dir, DataFileName))
+	dataPath := filepath.Join(dir, DataFileName)
+	info, err := os.Stat(dataPath)
 	if err != nil {
 		return nil, fmt.Errorf("读取 %s: %w", DataFileName, err)
 	}
-	if wantDataChecksum != "" && checksumBytes(dataBytes) != wantDataChecksum {
-		return nil, fmt.Errorf("%s checksum 不符（文件损坏）", DataFileName)
+	wantBytes := int64(header.Count) * int64(header.Dimension) * 4
+	if info.Size() != wantBytes {
+		return nil, fmt.Errorf("%s 尺寸 %d 与 count×dim×4=%d 不符（K24）", DataFileName, info.Size(), wantBytes)
 	}
-	wantBytes := header.Count * header.Dimension * 4
-	if len(dataBytes) != wantBytes {
-		return nil, fmt.Errorf("%s 尺寸 %d 与 count×dim×4=%d 不符（K24）", DataFileName, len(dataBytes), wantBytes)
+	// 流式校验+解码:旧实现同时常驻完整 dataBytes 与 float32 data,
+	// 大仓单段瞬时约翻倍。现在仅保留最终 float32 与64KiB缓冲。
+	f, err := os.Open(dataPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s: %w", DataFileName, err)
 	}
+	defer f.Close()
+	hash := sha256.New()
+	reader := io.TeeReader(bufio.NewReaderSize(f, 4<<20), hash)
 	data := make([]float32, header.Count*header.Dimension)
-	for i := range data {
-		data[i] = math.Float32frombits(binary.LittleEndian.Uint32(dataBytes[i*4:]))
+	const floatsPerBlock = 16 * 1024
+	buf := make([]byte, floatsPerBlock*4)
+	for offset := 0; offset < len(data); {
+		count := len(data) - offset
+		if count > floatsPerBlock {
+			count = floatsPerBlock
+		}
+		block := buf[:count*4]
+		if _, err := io.ReadFull(reader, block); err != nil {
+			return nil, fmt.Errorf("读取 %s: %w", DataFileName, err)
+		}
+		for i := 0; i < count; i++ {
+			data[offset+i] = math.Float32frombits(binary.LittleEndian.Uint32(block[i*4:]))
+		}
+		offset += count
+	}
+	if wantDataChecksum != "" && hex.EncodeToString(hash.Sum(nil)) != wantDataChecksum {
+		return nil, fmt.Errorf("%s checksum 不符（文件损坏）", DataFileName)
 	}
 	return &Index{dimension: header.Dimension, entries: header.Entries, data: data}, nil
 }
