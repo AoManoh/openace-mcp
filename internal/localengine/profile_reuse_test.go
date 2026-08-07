@@ -113,19 +113,30 @@ func TestProfileUpgradeSkipsCorruptSiblingForHealthyOlderProfile(t *testing.T) {
 	}
 
 	e5, _ := buildVersion("5")
-	if err := e5.Close(context.Background()); err != nil {
+	e6, store6 := buildVersion("6") // 自动从 v5 复用
+	// 替换既有文件形成 delta:base物理行可等于active存活VectorCount，
+	// 破坏delta时旧"物理行数>=存活行数"会误判完整。先让v5/v6都
+	// 收敛相同内容，再让v6最后激活成为优先候选。
+	writeFixture(t, root, "main.go", fixtureMainGo+"\n// profile reuse delta\n")
+	if _, err := e5.Sync(context.Background(), syncRequest(root)); err != nil {
 		t.Fatal(err)
 	}
-	e6, store6 := buildVersion("6") // 自动从 v5 复用,激活时间更新
+	if _, err := e6.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatal(err)
+	}
 	manifest6, _, err := store6.ResolveUsable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	segment := manifest6.Segments[0]
+	if len(manifest6.Segments) < 2 {
+		t.Fatalf("预期 multi-segment delta: %+v", manifest6.Segments)
+	}
+	segment := manifest6.Segments[len(manifest6.Segments)-1]
 	if err := os.WriteFile(filepath.Join(store6.SegmentPathFor(segment.ID), vector.DataFileName), []byte("corrupt"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_ = e6.Close(context.Background())
+	_ = e5.Close(context.Background())
 
 	server.mu.Lock()
 	before := server.calls
