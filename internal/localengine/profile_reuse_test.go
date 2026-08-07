@@ -2,8 +2,13 @@ package localengine
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/AoManoh/openace-mcp/internal/index"
+	"github.com/AoManoh/openace-mcp/internal/vector"
 )
 
 // 自动跨 profile 向量复用(2026-08-07 v7 迁移实证:524,885 unique 中
@@ -73,6 +78,162 @@ func TestProfileUpgradeAutomaticallyReusesSiblingVectors(t *testing.T) {
 	}
 	if second.CrossProfileReused <= 0 {
 		t.Fatalf("结果应外显跨 profile 复用数: %+v", second)
+	}
+}
+
+// 最大候选部分损坏时必须继续尝试次新健康 sibling,避免整仓重付。
+func TestProfileUpgradeSkipsCorruptSiblingForHealthyOlderProfile(t *testing.T) {
+	const dim = 8
+	server := newEmbedServer(t, dim)
+	defer server.ts.Close()
+	opts := embedOptions(server.ts.URL, dim, 8, "same-model")
+	root := newFixtureWorkspace(t)
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	t.Setenv("OPENACE_CACHE_NAMESPACE", "test")
+
+	buildVersion := func(version string) (*Engine, *index.Store) {
+		e, err := New(opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.profile.Version = version
+		e.storeProfile = strings.Replace(e.storeProfile, "default-v7", "default-v"+version, 1)
+		if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
+			t.Fatal(err)
+		}
+		_, key, err := e.resolveRoot(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err := e.storeFor(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e, store
+	}
+
+	e5, _ := buildVersion("5")
+	if err := e5.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	e6, store6 := buildVersion("6") // 自动从 v5 复用,激活时间更新
+	manifest6, _, err := store6.ResolveUsable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	segment := manifest6.Segments[0]
+	if err := os.WriteFile(filepath.Join(store6.SegmentPathFor(segment.ID), vector.DataFileName), []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = e6.Close(context.Background())
+
+	server.mu.Lock()
+	before := server.calls
+	server.mu.Unlock()
+	e7, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e7.Close(context.Background())
+	res, err := e7.Sync(context.Background(), syncRequest(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	after := server.calls
+	server.mu.Unlock()
+	if after != before || res.CrossProfileReused == 0 {
+		t.Fatalf("应跳过损坏 v6 并复用健康 v5: calls %d→%d result=%+v", before, after, res)
+	}
+}
+
+// 当前 profile manifest 逻辑100%但物理向量损坏时,查询登记 repair 后
+// Sync 应回退兼容 sibling,而不是整仓重新付费。
+func TestVectorRepairReusesHealthySiblingProfile(t *testing.T) {
+	const dim = 8
+	server := newEmbedServer(t, dim)
+	defer server.ts.Close()
+	opts := embedOptions(server.ts.URL, dim, 8, "same-model")
+	root := newFixtureWorkspace(t)
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	t.Setenv("OPENACE_CACHE_NAMESPACE", "test")
+
+	e6, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e6.profile.Version = "6"
+	e6.storeProfile = strings.Replace(e6.storeProfile, "default-v7", "default-v6", 1)
+	if _, err := e6.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatal(err)
+	}
+	_ = e6.Close(context.Background())
+
+	e7, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e7.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatal(err)
+	}
+	_, key, _ := e7.resolveRoot(root)
+	store, _ := e7.storeFor(key)
+	manifest, _, _ := store.ResolveUsable()
+	segment := manifest.Segments[0]
+	if err := os.WriteFile(filepath.Join(store.SegmentPathFor(segment.ID), vector.DataFileName), []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := e7.Search(context.Background(), searchRequest(root, "HandleLogin")); err != nil || !strings.Contains(res.DegradedReason, "vector-data-unavailable") {
+		t.Fatalf("损坏查询应降级并登记 repair: %+v err=%v", res, err)
+	}
+	server.mu.Lock()
+	before := server.calls
+	server.mu.Unlock()
+	res, err := e7.Sync(context.Background(), syncRequest(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	after := server.calls
+	server.mu.Unlock()
+	if after != before || res.CrossProfileReused == 0 || res.SemanticCoverage != "100%" {
+		t.Fatalf("repair 应复用 sibling 零重付: calls %d→%d result=%+v", before, after, res)
+	}
+	_ = e7.Close(context.Background())
+}
+
+// active/previous 共享 segment 必须只加载一次,否则大仓迁移峰值翻倍。
+func TestLoadPriorVectorsDeduplicatesSharedSegments(t *testing.T) {
+	const dim = 8
+	server := newEmbedServer(t, dim)
+	defer server.ts.Close()
+	e := newTestEngineWith(t, embedOptions(server.ts.URL, dim, 8, "same-model"))
+	root := newFixtureWorkspace(t)
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, root, "new.go", "package app\n\nfunc NewThing() {}\n")
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatal(err)
+	}
+	_, key, err := e.resolveRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := e.storeFor(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, _, err := store.ResolveUsable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior := e.loadPriorVectors(store, manifest)
+	if prior.activeLoadedRows != manifest.VectorCount {
+		t.Fatalf("active 载入行数=%d want=%d", prior.activeLoadedRows, manifest.VectorCount)
+	}
+	if prior.loadedRows != prior.activeLoadedRows {
+		t.Fatalf("previous 共享 segment 被重复载入: total=%d active=%d", prior.loadedRows, prior.activeLoadedRows)
 	}
 }
 

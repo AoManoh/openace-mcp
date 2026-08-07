@@ -82,6 +82,10 @@ type priorVectors struct {
 	// crossProfileByHash 来自同 workspace、同 embedding identity/template
 	// 的旧 chunk profile 子树。优先级低于当前 active/previous,只读复用。
 	crossProfileByHash map[string][]float32
+	// activeLoadedRows/ExpectedRows 对比可识别"逻辑完整、物理损坏"。
+	activeLoadedRows   int
+	activeExpectedRows int
+	loadedRows         int
 	// activeIDs 是 active revision 中已持久化向量的 chunk ID 集
 	// （delta 构建计算未触及 chunk 覆盖时使用，暗坑 K51）。
 	activeIDs map[string]bool
@@ -99,15 +103,30 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest) 
 	}
 	dimension := e.embedCfg.Dimension
 	manifest := previous
+	seenSegments := make(map[string]bool)
+	loadedRows := 0
+	if previous != nil {
+		prior.activeExpectedRows = previous.VectorCount
+	}
 	for hop := 0; manifest != nil && hop < 2; hop++ {
 		for _, segment := range manifest.Segments {
-			if segment.VectorsChecksum == "" {
+			if segment.VectorsChecksum == "" || seenSegments[segment.ID] {
 				continue
 			}
+			seenSegments[segment.ID] = true
+			remaining := vector.DefaultMaxResidentVectors - loadedRows
+			if remaining <= 0 {
+				break
+			}
 			ix, err := vector.Load(store.SegmentPathFor(segment.ID), dimension,
-				segment.VectorsChecksum, segment.VectorsIndexChecksum, 0)
+				segment.VectorsChecksum, segment.VectorsIndexChecksum, remaining)
 			if err != nil {
 				continue
+			}
+			loadedRows += ix.Count()
+			prior.loadedRows = loadedRows
+			if hop == 0 {
+				prior.activeLoadedRows += ix.Count()
 			}
 			for i, entry := range ix.Entries() {
 				if hop == 0 {
@@ -120,7 +139,7 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest) 
 				}
 			}
 		}
-		if manifest.PreviousRevision == "" {
+		if manifest.PreviousRevision == "" || loadedRows >= vector.DefaultMaxResidentVectors {
 			break
 		}
 		older, err := store.LoadManifest(manifest.PreviousRevision)

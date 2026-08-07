@@ -498,7 +498,7 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 		// 兼容旧 chunk profile 子树是最低优先级 prior；当前 active/
 		// previous 始终优先。完整现役 revision 无需再载入兄弟大向量集
 		// (避免 compaction 平白翻倍 RSS);仅冷仓/覆盖缺口路径发现。
-		if previous == nil || !previous.SemanticComplete() {
+		if previous == nil || !previous.SemanticComplete() || prior.activeLoadedRows < prior.activeExpectedRows {
 			e.mergeSiblingProfileVectors(store, root, &prior)
 		}
 	}
