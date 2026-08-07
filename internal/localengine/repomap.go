@@ -50,7 +50,7 @@ func (e *Engine) RepoMap(ctx context.Context, req engine.RepoMapRequest) (engine
 	defer e.releaseHandle(handle)
 
 	focus := strings.Trim(strings.TrimSpace(req.Focus), "/")
-	files := aggregateMapFiles(handle, focus)
+	files := cachedMapFiles(handle, focus)
 	if len(files) == 0 {
 		if focus != "" {
 			return engine.Result{}, engine.AsInvalidRequest(fmt.Errorf("focus %q matches no indexed files", req.Focus))
@@ -80,21 +80,35 @@ func (e *Engine) RepoMap(ctx context.Context, req engine.RepoMapRequest) (engine
 	return result, nil
 }
 
-// aggregateMapFiles 按文件聚合 chunk 元数据并打确定性重要度分。
-func aggregateMapFiles(handle *revisionHandle, focus string) []mapFile {
-	byPath := make(map[string]*mapFile)
-	for _, meta := range handle.chunks {
-		if focus != "" && !(meta.RelPath == focus || strings.HasPrefix(meta.RelPath, focus+"/")) {
+// cachedMapFiles 对 immutable revision 的全仓聚合只做一次；调用方拿到
+// 独立切片(可安全排序/改 topDir)。focus 在文件级过滤,无需重扫 chunks。
+func cachedMapFiles(handle *revisionHandle, focus string) []mapFile {
+	handle.repoMapOnce.Do(func() {
+		handle.repoMapFiles = aggregateMapFiles(handle)
+	})
+	files := make([]mapFile, 0, len(handle.repoMapFiles))
+	for _, file := range handle.repoMapFiles {
+		if focus != "" && !(file.path == focus || strings.HasPrefix(file.path, focus+"/")) {
 			continue
 		}
+		clone := file
+		clone.symbols = append([]string(nil), file.symbols...)
+		if focus != "" {
+			clone.topDir = focus
+		}
+		files = append(files, clone)
+	}
+	return files
+}
+
+// aggregateMapFiles 按文件聚合 chunk 元数据并打确定性重要度分。
+func aggregateMapFiles(handle *revisionHandle) []mapFile {
+	byPath := make(map[string]*mapFile)
+	for _, meta := range handle.chunks {
 		entry, ok := byPath[meta.RelPath]
 		if !ok {
 			top := "."
-			if focus != "" {
-				// focus 地图以请求子树本身作 header(真实 Agent 反馈:
-				// focus=internal/localengine 却显示 internal/ 会丢失定向语义)。
-				top = focus
-			} else if i := strings.IndexByte(meta.RelPath, '/'); i > 0 {
+			if i := strings.IndexByte(meta.RelPath, '/'); i > 0 {
 				top = meta.RelPath[:i]
 			}
 			entry = &mapFile{path: meta.RelPath, topDir: top}

@@ -67,6 +67,11 @@ type revisionHandle struct {
 	vecIxs  []*vector.Index
 	vecKeys []string
 	vecErr  error
+
+	// repoMapFiles 是 immutable revision 的文件/符号聚合缓存。大仓每次
+	// 重扫全部 chunkMeta 成本秒级；focus 只过滤本缓存。
+	repoMapOnce  sync.Once
+	repoMapFiles []mapFile
 }
 
 // record 按需取回 chunk 全量记录（pread + 行级校验，暗坑 K47）。
