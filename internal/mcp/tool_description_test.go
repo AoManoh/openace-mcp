@@ -51,6 +51,15 @@ func TestToolDescriptionsContract(t *testing.T) {
 	}
 }
 
+// 巨量灰度回归:path_prefix 不得从截断目录图推断排他子树。
+func TestPathPrefixDescriptionGuardsAgainstTruncatedMapInference(t *testing.T) {
+	for _, want := range []string{"ONLY", "truncated repo_map", "ambiguous conceptual"} {
+		if !strings.Contains(pathPrefixDescription, want) {
+			t.Fatalf("path_prefix 防误收窄契约缺 %q: %s", want, pathPrefixDescription)
+		}
+	}
+}
+
 // 跨 profile 复用量须在同步结构化结果中可机读。
 func TestSyncStructuredIncludesCrossProfileReuse(t *testing.T) {
 	fields := syncStructured(engine.Result{
