@@ -60,11 +60,46 @@ type runManifest struct {
 }
 
 type resultLine struct {
-	QueryID string   `json:"qid"`
-	Group   string   `json:"group,omitempty"`
-	Docs    []string `json:"docs"`
-	HitRank int      `json:"hit_rank"` // 0 = 未命中
-	Elapsed int64    `json:"elapsed_ms"`
+	QueryID string      `json:"qid"`
+	Group   string      `json:"group,omitempty"`
+	Docs    []string    `json:"docs"`
+	Hits    []resultHit `json:"hits,omitempty"`
+	HitRank int         `json:"hit_rank"` // 0 = 未命中
+	Elapsed int64       `json:"elapsed_ms"`
+}
+
+type resultHit struct {
+	DocID     string `json:"doc_id"`
+	Path      string `json:"path"`
+	StartLine int    `json:"start_line"`
+	EndLine   int    `json:"end_line"`
+}
+
+func collapseCandidates(candidates []localengine.CandidateRef, pathToDoc map[string]string, topK int) ([]string, []resultHit) {
+	if topK <= 0 {
+		return nil, nil
+	}
+	docs := make([]string, 0, topK)
+	hits := make([]resultHit, 0, topK)
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		docID := pathToDoc[candidate.RelPath]
+		if docID == "" {
+			// 无 docmap 时 docid=完整相对路径（weaksup/sealed 的
+			// qrels 契约）；去扩展名取 basename 会跨目录撞名。
+			docID = candidate.RelPath
+		}
+		if seen[docID] {
+			continue
+		}
+		seen[docID] = true
+		docs = append(docs, docID)
+		hits = append(hits, resultHit{DocID: docID, Path: candidate.RelPath, StartLine: candidate.StartLine, EndLine: candidate.EndLine})
+		if len(docs) >= topK {
+			break
+		}
+	}
+	return docs, hits
 }
 
 func run() error {
@@ -213,7 +248,7 @@ func run() error {
 		// 只评有 qrels 的查询（协议 §3：缺判定剔除并计数）。
 		evaluable = make([]bench.Query, 0, len(queryList))
 		for _, query := range queryList {
-			if len(qrelSet[query.ID]) > 0 {
+			if bench.HasPositiveQrels(qrelSet[query.ID]) {
 				evaluable = append(evaluable, query)
 			}
 		}
@@ -338,24 +373,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("query %s: %w", query.ID, err)
 		}
-		docs := make([]string, 0, *topK)
-		seen := map[string]bool{}
-		for _, candidate := range candidates {
-			docID := pathToDoc[candidate.RelPath]
-			if docID == "" {
-				// 无 docmap 时 docid=完整相对路径（weaksup/sealed 的
-				// qrels 契约）；去扩展名取 basename 会跨目录撞名。
-				docID = candidate.RelPath
-			}
-			if seen[docID] {
-				continue
-			}
-			seen[docID] = true
-			docs = append(docs, docID)
-			if len(docs) >= *topK {
-				break
-			}
-		}
+		docs, hits := collapseCandidates(candidates, pathToDoc, *topK)
 		runResults[query.ID] = docs
 		hitRank := 0
 		for rank, docID := range docs {
@@ -365,7 +383,7 @@ func run() error {
 			}
 		}
 		line, _ := json.Marshal(resultLine{
-			QueryID: query.ID, Group: query.Group, Docs: docs,
+			QueryID: query.ID, Group: query.Group, Docs: docs, Hits: hits,
 			HitRank: hitRank, Elapsed: time.Since(start).Milliseconds(),
 		})
 		writer.Write(line)
