@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 )
 
@@ -98,6 +99,87 @@ func TestMetricsSecondImplementationCrossCheck(t *testing.T) {
 	}
 }
 
+func TestMultiGoldMetricsKnownAnswers(t *testing.T) {
+	ranked := []string{"d1", "x", "d2", "d1", "d3"}
+	relevant := map[string]int{"d1": 3, "d2": 2, "d3": 1, "d4": 1}
+	if got := setRecallAtK(ranked, relevant, 3); got != 0.5 {
+		t.Fatalf("set recall@3: %v", got)
+	}
+	if got := allHitAtK(ranked, relevant, 10); got != 0 {
+		t.Fatalf("all hit@10: %v", got)
+	}
+	wantAP3 := (1.0 + 2.0/3.0) / 4.0
+	if got := averagePrecisionAtK(ranked, relevant, 3); math.Abs(got-wantAP3) > 1e-12 {
+		t.Fatalf("AP@3: got %v want %v", got, wantAP3)
+	}
+	wantDCG3 := 7.0 + 3.0/math.Log2(4)
+	wantIDCG3 := 7.0 + 3.0/math.Log2(3) + 1.0/math.Log2(4)
+	if got := ndcgAtK(ranked, relevant, 3); math.Abs(got-wantDCG3/wantIDCG3) > 1e-12 {
+		t.Fatalf("nDCG@3: got %v want %v", got, wantDCG3/wantIDCG3)
+	}
+}
+
+func TestMultiGoldMetricsSecondImplementationCrossCheck(t *testing.T) {
+	ranked := []string{"d3", "x", "d1", "d3", "d5", "d2", "z"}
+	relevant := map[string]int{"d1": 2, "d2": 1, "d3": 3, "d4": 1}
+	unique := func(k int) []string {
+		seen := map[string]bool{}
+		out := []string{}
+		for _, id := range ranked {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			out = append(out, id)
+			if len(out) == k {
+				break
+			}
+		}
+		return out
+	}
+	positive := 0
+	grades := []int{}
+	for _, rel := range relevant {
+		if rel > 0 {
+			positive++
+			grades = append(grades, rel)
+		}
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(grades)))
+	for _, k := range []int{1, 2, 3, 5, 10} {
+		top := unique(k)
+		hits, ap, dcg := 0, 0.0, 0.0
+		for i, id := range top {
+			if relevant[id] <= 0 {
+				continue
+			}
+			hits++
+			ap += float64(hits) / float64(i+1)
+			dcg += (math.Pow(2, float64(relevant[id])) - 1) / math.Log2(float64(i+2))
+		}
+		idcg := 0.0
+		for i := 0; i < len(grades) && i < k; i++ {
+			idcg += (math.Pow(2, float64(grades[i])) - 1) / math.Log2(float64(i+2))
+		}
+		if got, want := setRecallAtK(ranked, relevant, k), float64(hits)/float64(positive); math.Abs(got-want) > 1e-12 {
+			t.Fatalf("set recall@%d: %v vs %v", k, got, want)
+		}
+		wantAll := 0.0
+		if hits == positive {
+			wantAll = 1
+		}
+		if got := allHitAtK(ranked, relevant, k); got != wantAll {
+			t.Fatalf("all hit@%d: %v vs %v", k, got, wantAll)
+		}
+		if got, want := averagePrecisionAtK(ranked, relevant, k), ap/float64(positive); math.Abs(got-want) > 1e-12 {
+			t.Fatalf("AP@%d: %v vs %v", k, got, want)
+		}
+		if got, want := ndcgAtK(ranked, relevant, k), dcg/idcg; math.Abs(got-want) > 1e-12 {
+			t.Fatalf("nDCG@%d: %v vs %v", k, got, want)
+		}
+	}
+}
+
 // TestEvaluateSkipsMissingQrels 缺 qrels 的查询剔除并如实计数，不稀释均值。
 func TestEvaluateSkipsMissingQrels(t *testing.T) {
 	queries := []Query{{ID: "q1", Group: "g"}, {ID: "q-noqrels", Group: "g"}}
@@ -109,6 +191,17 @@ func TestEvaluateSkipsMissingQrels(t *testing.T) {
 			if score.Mean != 1.0 || score.Queries != 1 || score.SkippedNoQrels != 1 {
 				t.Fatalf("缺 qrels 处理错误: %+v", score)
 			}
+		}
+	}
+}
+
+func TestEvaluateSkipsZeroOnlyQrels(t *testing.T) {
+	queries := []Query{{ID: "q1", Group: "g"}, {ID: "q-zero", Group: "g"}}
+	qrels := Qrels{"q1": {"d1": 1}, "q-zero": {"x": 0}}
+	run := Run{"q1": {"d1"}, "q-zero": {"x"}}
+	for _, score := range Evaluate(queries, qrels, run) {
+		if score.Group == "g" && (score.Queries != 1 || score.SkippedNoQrels != 1 || math.IsNaN(score.Mean)) {
+			t.Fatalf("零相关 qrels 应跳过: %+v", score)
 		}
 	}
 }

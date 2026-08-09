@@ -33,7 +33,7 @@ type Run map[string][]string
 
 // perQueryScore 计算单查询指标；rankedIDs 去重后按位次评估。
 func recallAtK(ranked []string, relevant map[string]int, k int) float64 {
-	if len(relevant) == 0 {
+	if !HasPositiveQrels(relevant) {
 		return math.NaN()
 	}
 	limit := k
@@ -49,7 +49,7 @@ func recallAtK(ranked []string, relevant map[string]int, k int) float64 {
 }
 
 func mrrAtK(ranked []string, relevant map[string]int, k int) float64 {
-	if len(relevant) == 0 {
+	if !HasPositiveQrels(relevant) {
 		return math.NaN()
 	}
 	limit := k
@@ -64,6 +64,113 @@ func mrrAtK(ranked []string, relevant map[string]int, k int) float64 {
 	return 0
 }
 
+func uniqueAtK(ranked []string, k int) []string {
+	if k <= 0 {
+		return nil
+	}
+	out := make([]string, 0, k)
+	seen := make(map[string]bool, k)
+	for _, id := range ranked {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+		if len(out) == k {
+			break
+		}
+	}
+	return out
+}
+
+func positiveCount(relevant map[string]int) int {
+	count := 0
+	for _, rel := range relevant {
+		if rel > 0 {
+			count++
+		}
+	}
+	return count
+}
+
+func HasPositiveQrels(relevant map[string]int) bool {
+	return positiveCount(relevant) > 0
+}
+
+func setRecallAtK(ranked []string, relevant map[string]int, k int) float64 {
+	total := positiveCount(relevant)
+	if total == 0 {
+		return math.NaN()
+	}
+	hits := 0
+	for _, id := range uniqueAtK(ranked, k) {
+		if relevant[id] > 0 {
+			hits++
+		}
+	}
+	return float64(hits) / float64(total)
+}
+
+func allHitAtK(ranked []string, relevant map[string]int, k int) float64 {
+	total := positiveCount(relevant)
+	if total == 0 {
+		return math.NaN()
+	}
+	hits := 0
+	for _, id := range uniqueAtK(ranked, k) {
+		if relevant[id] > 0 {
+			hits++
+		}
+	}
+	if hits == total {
+		return 1
+	}
+	return 0
+}
+
+func averagePrecisionAtK(ranked []string, relevant map[string]int, k int) float64 {
+	total := positiveCount(relevant)
+	if total == 0 {
+		return math.NaN()
+	}
+	hits, sum := 0, 0.0
+	for rank, id := range uniqueAtK(ranked, k) {
+		if relevant[id] <= 0 {
+			continue
+		}
+		hits++
+		sum += float64(hits) / float64(rank+1)
+	}
+	return sum / float64(total)
+}
+
+func ndcgAtK(ranked []string, relevant map[string]int, k int) float64 {
+	grades := make([]int, 0, len(relevant))
+	for _, rel := range relevant {
+		if rel > 0 {
+			grades = append(grades, rel)
+		}
+	}
+	if len(grades) == 0 {
+		return math.NaN()
+	}
+	dcg := 0.0
+	for rank, id := range uniqueAtK(ranked, k) {
+		if relevant[id] > 0 {
+			dcg += (math.Pow(2, float64(relevant[id])) - 1) / math.Log2(float64(rank+2))
+		}
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(grades)))
+	idcg := 0.0
+	for rank := 0; rank < len(grades) && rank < k; rank++ {
+		idcg += (math.Pow(2, float64(grades[rank])) - 1) / math.Log2(float64(rank+2))
+	}
+	if idcg == 0 {
+		return math.NaN()
+	}
+	return dcg / idcg
+}
+
 // Metric 标识一个可计算指标。
 type Metric struct {
 	Name string
@@ -76,6 +183,19 @@ func StandardMetrics() []Metric {
 		{Name: "recall@5", Eval: func(r []string, rel map[string]int) float64 { return recallAtK(r, rel, 5) }},
 		{Name: "recall@10", Eval: func(r []string, rel map[string]int) float64 { return recallAtK(r, rel, 10) }},
 		{Name: "mrr@10", Eval: func(r []string, rel map[string]int) float64 { return mrrAtK(r, rel, 10) }},
+		{Name: "set_recall@1", Eval: func(r []string, rel map[string]int) float64 { return setRecallAtK(r, rel, 1) }},
+		{Name: "set_recall@2", Eval: func(r []string, rel map[string]int) float64 { return setRecallAtK(r, rel, 2) }},
+		{Name: "set_recall@5", Eval: func(r []string, rel map[string]int) float64 { return setRecallAtK(r, rel, 5) }},
+		{Name: "set_recall@10", Eval: func(r []string, rel map[string]int) float64 { return setRecallAtK(r, rel, 10) }},
+		{Name: "set_recall@50", Eval: func(r []string, rel map[string]int) float64 { return setRecallAtK(r, rel, 50) }},
+		{Name: "all_hit@1", Eval: func(r []string, rel map[string]int) float64 { return allHitAtK(r, rel, 1) }},
+		{Name: "all_hit@2", Eval: func(r []string, rel map[string]int) float64 { return allHitAtK(r, rel, 2) }},
+		{Name: "all_hit@5", Eval: func(r []string, rel map[string]int) float64 { return allHitAtK(r, rel, 5) }},
+		{Name: "all_hit@10", Eval: func(r []string, rel map[string]int) float64 { return allHitAtK(r, rel, 10) }},
+		{Name: "all_hit@50", Eval: func(r []string, rel map[string]int) float64 { return allHitAtK(r, rel, 50) }},
+		{Name: "map@10", Eval: func(r []string, rel map[string]int) float64 { return averagePrecisionAtK(r, rel, 10) }},
+		{Name: "map@50", Eval: func(r []string, rel map[string]int) float64 { return averagePrecisionAtK(r, rel, 50) }},
+		{Name: "ndcg@10", Eval: func(r []string, rel map[string]int) float64 { return ndcgAtK(r, rel, 10) }},
 	}
 }
 
@@ -116,7 +236,7 @@ func Evaluate(queries []Query, qrels Qrels, run Run) []GroupScore {
 			sum, n, skipped := 0.0, 0, 0
 			for _, query := range members {
 				relevant := qrels[query.ID]
-				if len(relevant) == 0 {
+				if !HasPositiveQrels(relevant) {
 					skipped++
 					continue
 				}
@@ -153,7 +273,7 @@ func PairedBootstrap(queries []Query, qrels Qrels, runA Run, runB Run, metric Me
 			continue
 		}
 		relevant := qrels[query.ID]
-		if len(relevant) == 0 {
+		if !HasPositiveQrels(relevant) {
 			continue
 		}
 		a := metric.Eval(runA[query.ID], relevant)
