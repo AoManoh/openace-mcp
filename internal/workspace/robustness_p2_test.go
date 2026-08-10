@@ -60,9 +60,9 @@ func TestReadIndexableContentBoundsPostStatRead(t *testing.T) {
 	const maxBytes = int64(1024)
 
 	// 对照组:无替换时小文件正常可读,证明用例不因门禁空转而假绿。
-	content, ok, err := readIndexableContent(context.Background(), path, maxBytes)
-	if err != nil || !ok || !bytes.Equal(content, small) {
-		t.Fatalf("对照组应读到原始内容: content=%q ok=%v err=%v", content, ok, err)
+	content, ok, oversize, err := readIndexableContent(context.Background(), path, maxBytes, maxBytes)
+	if err != nil || !ok || oversize || !bytes.Equal(content, small) {
+		t.Fatalf("对照组应读到原始内容: content=%q ok=%v oversize=%v err=%v", content, ok, oversize, err)
 	}
 
 	giant := bytes.Repeat([]byte{'a'}, 512*1024) // 超限 512 倍
@@ -71,7 +71,7 @@ func TestReadIndexableContentBoundsPostStatRead(t *testing.T) {
 			t.Fatal(err)
 		}
 	}}
-	content, ok, err = readIndexableContent(ctx, path, maxBytes)
+	content, ok, oversize, err = readIndexableContent(ctx, path, maxBytes, maxBytes)
 	if err != nil {
 		t.Fatalf("TOCTOU 替换不应报错(按跳过处理): %v", err)
 	}
@@ -81,8 +81,8 @@ func TestReadIndexableContentBoundsPostStatRead(t *testing.T) {
 	if got := int64(len(content)); got > maxBytes {
 		t.Fatalf("TOCTOU 窗口内发生无界读: 读入 %d 字节 > maxBytes=%d", got, maxBytes)
 	}
-	if ok {
-		t.Fatal("读取期超限文件必须按 oversize 跳过口径处理(ok=false)")
+	if ok || !oversize {
+		t.Fatalf("读取期超限文件必须按 oversize 跳过口径处理: ok=%v oversize=%v", ok, oversize)
 	}
 }
 

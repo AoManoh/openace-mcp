@@ -91,8 +91,9 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	if err != nil {
 		return engine.Result{}, fmt.Errorf("扫描工作区: %w", err)
 	}
-	// 权限跳过如实上报(M1 配套状态面,K6 上抛口径)。
+	// 权限/超限跳过如实上报(M1 配套状态面,K6 上抛口径)。
 	status.setPermissionSkipped(scanStats.PermissionSkippedFiles)
+	status.setOversizeSkipped(scanStats.OversizeSkippedFiles)
 	status.setScannedFiles(len(assets))
 
 	previous, _, resolveErr := store.ResolveUsable()

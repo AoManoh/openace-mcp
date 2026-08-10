@@ -32,6 +32,9 @@ type wsStatus struct {
 	skippedFiles  int
 	// permissionSkipped 是扫描期因权限被跳过的文件数(M1 配套,K6)。
 	permissionSkipped int
+	// oversizeSkipped 是扫描期因超过文本上限被跳过的文件数(2026-08-10
+	// 大文件修复配套,K6)。
+	oversizeSkipped int
 	capabilities      map[string]string
 	lastError         string
 	skippedRevisions  []string
@@ -134,6 +137,13 @@ func (s *wsStatus) setSkippedFiles(count int) {
 func (s *wsStatus) setPermissionSkipped(count int) {
 	s.mu.Lock()
 	s.permissionSkipped = count
+	s.mu.Unlock()
+}
+
+// setOversizeSkipped 记录扫描期因超过文本上限被跳过的文件数(K6)。
+func (s *wsStatus) setOversizeSkipped(count int) {
+	s.mu.Lock()
+	s.oversizeSkipped = count
 	s.mu.Unlock()
 }
 
@@ -252,8 +262,8 @@ func (s *wsStatus) snapshot() engine.WorkspaceStatus {
 		updated := s.updatedAt
 		status.UpdatedAt = &updated
 	}
-	if len(s.capabilities) > 0 || s.revisionCount > 0 || len(s.skippedRevisions) > 0 || s.skippedFiles > 0 || s.permissionSkipped > 0 {
-		status.UpstreamStatus = capabilitySummary(s.capabilities, s.revisionCount, s.skippedFiles, s.permissionSkipped, s.skippedRevisions)
+	if len(s.capabilities) > 0 || s.revisionCount > 0 || len(s.skippedRevisions) > 0 || s.skippedFiles > 0 || s.permissionSkipped > 0 || s.oversizeSkipped > 0 {
+		status.UpstreamStatus = capabilitySummary(s.capabilities, s.revisionCount, s.skippedFiles, s.permissionSkipped, s.oversizeSkipped, s.skippedRevisions)
 	}
 	return status
 }
@@ -261,7 +271,7 @@ func (s *wsStatus) snapshot() engine.WorkspaceStatus {
 // capabilitySummary 把 chunker 能力、revision 保留数、内容门禁跳过数
 // 与损坏回退信息压缩为一行可读文本（Stage 2 复用现有 UpstreamStatus
 // 字段承载本地引擎详情，避免提前扩表；Stage 3 状态扩展时再字段化）。
-func capabilitySummary(capabilities map[string]string, revisions int, skippedFiles int, permissionSkipped int, skippedRevisions []string) string {
+func capabilitySummary(capabilities map[string]string, revisions int, skippedFiles int, permissionSkipped int, oversizeSkipped int, skippedRevisions []string) string {
 	parts := make([]string, 0, len(capabilities)+3)
 	languages := make([]string, 0, len(capabilities))
 	for language := range capabilities {
@@ -279,6 +289,9 @@ func capabilitySummary(capabilities map[string]string, revisions int, skippedFil
 	}
 	if permissionSkipped > 0 {
 		parts = append(parts, "permission_skipped="+strconv.Itoa(permissionSkipped))
+	}
+	if oversizeSkipped > 0 {
+		parts = append(parts, "oversize_skipped="+strconv.Itoa(oversizeSkipped))
 	}
 	if len(skippedRevisions) > 0 {
 		parts = append(parts, "skipped="+strings.Join(skippedRevisions, ","))
