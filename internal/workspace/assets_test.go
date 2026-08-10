@@ -58,13 +58,13 @@ func TestFileAssetSourceMatchesLegacyScan(t *testing.T) {
 func TestFileAssetSourceMatchesLegacyScanForKnowledgeAssets(t *testing.T) {
 	root := t.TempDir()
 	writeAssetTestFiles(t, root, map[string]string{
-		".gitignore":                "/AGENTS.md\n/CLAUDE.md\n/.augment-guidelines\n/.augment/\n/docs/\n/skills/\n",
-		".augmentignore":            "!AGENTS.md\n!CLAUDE.md\n!.augment-guidelines\n!.augment/rules/**/*.md\n!docs/**/*.md\n!skills/**/SKILL.md\n!skills/**/SPEC.md\n",
+		".gitignore":                "/AGENTS.md\n/CLAUDE.md\n/guidelines.md\n/rules/\n/docs/\n/skills/\n",
+		".openaceignore":            "!AGENTS.md\n!CLAUDE.md\n!guidelines.md\n!rules/**/*.md\n!docs/**/*.md\n!skills/**/SKILL.md\n!skills/**/SPEC.md\n",
 		"AGENTS.md":                 "project instructions\n",
 		"CLAUDE.md":                 "claude instructions\n",
-		".augment-guidelines":       "project guidelines\n",
-		".augment/rules/project.md": "project rule\n",
-		".augment/rules/script.py":  "print('not included')\n",
+		"guidelines.md":              "project guidelines\n",
+		"rules/project.md":           "project rule\n",
+		"rules/script.py":           "print('not included')\n",
 		"docs/decision.md":          "important project knowledge\n",
 		"docs/script.py":            "print('not included')\n",
 		"skills/local/SKILL.md":     "local skill knowledge\n",
@@ -86,7 +86,7 @@ func TestFileAssetSourceMatchesLegacyScanForKnowledgeAssets(t *testing.T) {
 	}
 
 	got := assetRelPaths(gotAssets)
-	want := ".augment-guidelines,.augment/rules/project.md,.augmentignore,.gitignore,AGENTS.md,CLAUDE.md,docs/decision.md,main.go,skills/local/SKILL.md,skills/local/SPEC.md"
+	want := ".gitignore,.openaceignore,AGENTS.md,CLAUDE.md,docs/decision.md,guidelines.md,main.go,rules/project.md,skills/local/SKILL.md,skills/local/SPEC.md"
 	if got != want {
 		t.Fatalf("unexpected asset paths:\n got: %s\nwant: %s", got, want)
 	}
@@ -95,9 +95,9 @@ func TestFileAssetSourceMatchesLegacyScanForKnowledgeAssets(t *testing.T) {
 func TestFileAssetSourceHardDenyCannotBeReincluded(t *testing.T) {
 	root := t.TempDir()
 	writeAssetTestFiles(t, root, map[string]string{
-		".gitignore":                "/.augment/\n/docs/\n",
-		".augmentignore":            "!.augment/**\n!docs/**\n",
-		".augment/session.json":     `{"accessToken":"fake"}`,
+		".gitignore":                "/state/\n/docs/\n",
+		".openaceignore":            "!state/**\n!docs/**\n",
+		"state/session.json":        `{"accessToken":"fake"}`,
 		"docs/private/.env.local":   "SECRET=fake\n",
 		"docs/private/cert.key":     "private key\n",
 		"docs/private/cert.p12":     "keystore\n",
@@ -114,7 +114,7 @@ func TestFileAssetSourceHardDenyCannotBeReincluded(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := assetRelPaths(assets)
-	want := ".augmentignore,.gitignore,docs/private/notes.md,main.go"
+	want := ".gitignore,.openaceignore,docs/private/notes.md,main.go"
 	if got != want {
 		t.Fatalf("unexpected asset paths:\n got: %s\nwant: %s", got, want)
 	}

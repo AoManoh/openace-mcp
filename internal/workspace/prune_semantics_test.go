@@ -6,7 +6,7 @@ import (
 )
 
 // P1「目录级剪枝」语义钉住(2026-08-03):扫描器对被忽略目录的下钻剪枝
-// **早已存在**(scanWithCache:Match(dir)=ignored 且本目录无 augment
+// **早已存在**(scanWithCache:Match(dir)=ignored 且本目录无 include 层
 // include 且活动规则无 descendant-include 时 SkipDir)。本文件把剪枝的
 // 语义边界固化为回归契约,防后续优化悄悄改变行为:
 //
