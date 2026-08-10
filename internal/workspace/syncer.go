@@ -24,6 +24,13 @@ import (
 
 const defaultMaxFileBytes = 1 << 20
 
+// defaultMaxTextFileBytes 是"纯文本超限带"的上限(2026-08-10 用户批准):
+// (maxFileBytes, maxTextFileBytes] 区间内通过二进制/UTF-8 门禁的文件照常
+// 索引,不再整篇静默跳过——R02 证据:OTel CHANGELOG.md(1.109MB)单文件占
+// decision top10 miss 的 15.7%。二进制文件与更大的文件维持跳过;上限存在
+// 的理由不变:限制单文件读入内存与嵌入成本的上界。
+const defaultMaxTextFileBytes = 4 << 20
+
 type fileBlob struct {
 	AbsPath  string
 	RelPath  string
@@ -47,6 +54,9 @@ func scanWithCache(ctx context.Context, root string, cache *StatCache) ([]fileBl
 type ScanStats struct {
 	// PermissionSkippedFiles 是因 fs.ErrPermission 被跳过的文件条目数。
 	PermissionSkippedFiles int
+	// OversizeSkippedFiles 是因超过文本上限(maxTextFileBytes)被跳过的
+	// 文件条目数(2026-08-10 大文件修复配套;二进制跳过不计入)。
+	OversizeSkippedFiles int
 }
 
 // scanFileSkipDisposition 分类扫描期"单文件条目"的读取/stat 错误(M1):
@@ -78,6 +88,7 @@ func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]f
 		return nil, stats, err
 	}
 	maxBytes := int64(maxFileBytes())
+	textMaxBytes := int64(maxTextFileBytes())
 	// F6 扫描器债修复:ignore 规则按目录栈管理,而非在整个 walk 期单调
 	// 累积——旧实现里已完成兄弟子树的规则(经 base 检查必然空转)仍被
 	// 每个后续文件逐条求值,大仓深处一次 Match 扫上千条规则(sealed
@@ -130,7 +141,7 @@ func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]f
 					files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: hit})
 					return nil
 				}
-				content, ok, err := readScanBlob(ctx, path, maxBytes, &stats)
+				content, ok, err := readScanBlob(ctx, path, maxBytes, textMaxBytes, &stats)
 				if err != nil || !ok {
 					return err
 				}
@@ -141,7 +152,7 @@ func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]f
 				return nil
 			}
 		}
-		content, ok, err := readScanBlob(ctx, path, maxBytes, &stats)
+		content, ok, err := readScanBlob(ctx, path, maxBytes, textMaxBytes, &stats)
 		if err != nil || !ok {
 			return err
 		}
@@ -206,9 +217,9 @@ func enterScanDir(stack *ruleStack, path string, rel string, name string) error 
 
 // readScanBlob 读取单文件可索引内容并归置 M1 跳过语义:ok=false 表示
 // 该文件跳过(不可索引内容,或 TOCTOU/权限错误——权限跳过计入 stats),
-// err 仅在致命时非 nil(中止整次扫描)。
-func readScanBlob(ctx context.Context, path string, maxBytes int64, stats *ScanStats) ([]byte, bool, error) {
-	content, ok, err := readIndexableContent(ctx, path, maxBytes)
+// err 仅在致命时非 nil(中止整次扫描)。超限跳过按 K6 口径计数。
+func readScanBlob(ctx context.Context, path string, maxBytes int64, textMaxBytes int64, stats *ScanStats) ([]byte, bool, error) {
+	content, ok, oversize, err := readIndexableContent(ctx, path, maxBytes, textMaxBytes)
 	if err != nil {
 		// M1:单文件 TOCTOU/权限错误只跳过该文件,不中止整次扫描。
 		if skip, denied := scanFileSkipDisposition(err); skip {
@@ -220,6 +231,9 @@ func readScanBlob(ctx context.Context, path string, maxBytes int64, stats *ScanS
 		return nil, false, err
 	}
 	if !ok {
+		if oversize {
+			stats.OversizeSkippedFiles++
+		}
 		return nil, false, nil
 	}
 	return content, true, nil
@@ -227,6 +241,16 @@ func readScanBlob(ctx context.Context, path string, maxBytes int64, stats *ScanS
 
 func maxFileBytes() int {
 	return positiveIntEnv("OPENACE_MAX_FILE_BYTES", defaultMaxFileBytes)
+}
+
+// maxTextFileBytes 是纯文本文件的独立大小上限(≥ maxFileBytes;配置到
+// 等于通用上限即关闭超限文本带,回到历史行为)。
+func maxTextFileBytes() int {
+	value := positiveIntEnv("OPENACE_MAX_TEXT_FILE_BYTES", defaultMaxTextFileBytes)
+	if general := maxFileBytes(); value < general {
+		return general
+	}
+	return value
 }
 
 func positiveIntEnv(name string, fallback int) int {
@@ -270,43 +294,53 @@ func shouldAlwaysSkipFile(rel string, name string) bool {
 	return false
 }
 
-func readIndexableContent(ctx context.Context, path string, maxBytes int64) ([]byte, bool, error) {
+// readIndexableContent 读取单文件可索引内容。textMaxBytes(≥ maxBytes)是
+// 纯文本超限带上限:大小在 (maxBytes, textMaxBytes] 的文件必须通过二进制/
+// UTF-8 门禁才收录(2026-08-10 大文件修复);超过 textMaxBytes 一律跳过并以
+// oversize=true 标记(供 K6 计数;二进制跳过不算 oversize)。
+func readIndexableContent(ctx context.Context, path string, maxBytes int64, textMaxBytes int64) ([]byte, bool, bool, error) {
+	if textMaxBytes < maxBytes {
+		textMaxBytes = maxBytes
+	}
 	if err := ctx.Err(); err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
-	if !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxBytes {
-		return nil, false, nil
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		return nil, false, false, nil
+	}
+	if info.Size() > textMaxBytes {
+		return nil, false, true, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	// L2:stat 与读取之间存在 TOCTOU 窗口——文件可能已被替换为超限
-	// 大文件,os.ReadFile 会无界整读入内存。读取按 maxBytes+1 设上界,
+	// 大文件,os.ReadFile 会无界整读入内存。读取按 textMaxBytes+1 设上界,
 	// 读满上界即证明实际内容超限,按既有 oversize 跳过口径处理
-	// (与上方 stat 期 size > maxBytes 的处置一致:ok=false, err=nil)。
+	// (与上方 stat 期 size > textMaxBytes 的处置一致:ok=false, err=nil)。
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	defer f.Close()
-	content, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	content, err := io.ReadAll(io.LimitReader(f, textMaxBytes+1))
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
-	if int64(len(content)) > maxBytes {
-		return nil, false, nil
+	if int64(len(content)) > textMaxBytes {
+		return nil, false, true, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	if looksBinary(content) || !utf8.Valid(content) {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
-	return content, true, nil
+	return content, true, false, nil
 }
 
 type ignoreRules []ignoreRule
