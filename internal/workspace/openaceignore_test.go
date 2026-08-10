@@ -5,11 +5,11 @@ import (
 	"testing"
 )
 
-// 方案⑤(2026-08-02 批准,B 语义):.openaceignore 为 canonical;同目录
-// 存在 .openaceignore 时 .augmentignore 规则整体被屏蔽(逐目录遮蔽);
-// 仅 alias 时行为与历史一致(兼容迁移=改名)。
+// 方案⑤(2026-08-02)确立 .openaceignore 为 canonical;2026-08-10 用户批示
+// "augment 的所有引用都可以移除":.augmentignore 兼容别名整体退役,仅
+// canonical 生效(别名文件按普通文件对待,不再解析其规则)。
 
-// TestOpenaceignoreAloneReincludes:仅 canonical——与 .augmentignore 同语义。
+// TestOpenaceignoreAloneReincludes:canonical 的 ! re-include 语义。
 func TestOpenaceignoreAloneReincludes(t *testing.T) {
 	root := t.TempDir()
 	for rel, content := range map[string]string{
@@ -31,16 +31,13 @@ func TestOpenaceignoreAloneReincludes(t *testing.T) {
 	}
 }
 
-// TestOpenaceignoreShadowsAugmentignore:双文件并存——canonical 生效,
-// alias 规则整体失效(B 语义;alias 文件本身仍被索引)。
-func TestOpenaceignoreShadowsAugmentignore(t *testing.T) {
+// TestAugmentignoreAliasIsInert:别名退役——.augmentignore 的规则不再被
+// 解析,gitignored 内容不因它复活;别名文件本身按普通文件索引。
+func TestAugmentignoreAliasIsInert(t *testing.T) {
 	root := t.TempDir()
 	for rel, content := range map[string]string{
-		".gitignore": "/docs/\n/skills/\n",
-		// alias 想放行 skills;canonical 只放行 docs——若 alias 生效,
-		// skills/SKILL.md 会出现在扫描集,即违反 B 语义。
-		".augmentignore":  "!skills/\n!skills/**\n",
-		".openaceignore":  "!docs/\n!docs/**\n",
+		".gitignore":      "/docs/\n/skills/\n",
+		".augmentignore":  "!docs/\n!docs/**\n!skills/\n!skills/**\n",
 		"docs/note.md":    "knowledge\n",
 		"skills/SKILL.md": "skill\n",
 		"main.go":         "package main\n",
@@ -52,20 +49,20 @@ func TestOpenaceignoreShadowsAugmentignore(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := scannedRelPaths(scanned)
-	want := ".augmentignore,.gitignore,.openaceignore,docs/note.md,main.go"
+	want := ".augmentignore,.gitignore,main.go"
 	if got != want {
-		t.Fatalf("canonical 在场时 alias 规则应整体被屏蔽:\n got: %s\nwant: %s", got, want)
+		t.Fatalf("退役后 alias 规则不得生效:\n got: %s\nwant: %s", got, want)
 	}
 }
 
-// TestOpenaceignoreNestedShadowing:遮蔽按目录粒度——根用 canonical,
-// 子目录仅有 alias 时子目录 alias 仍生效(迁移可渐进)。
-func TestOpenaceignoreNestedShadowing(t *testing.T) {
+// TestOpenaceignoreNestedReinclude:子目录 canonical 对父级 gitignored
+// 内容的 ! re-include 仍按目录粒度生效。
+func TestOpenaceignoreNestedReinclude(t *testing.T) {
 	root := t.TempDir()
 	for rel, content := range map[string]string{
 		".gitignore":         "sub/\ndocs/\n",
 		".openaceignore":     "!docs/\n!docs/**\n",
-		"sub/.augmentignore": "!keep.md\n",
+		"sub/.openaceignore": "!keep.md\n",
 		"sub/keep.md":        "important\n",
 		"sub/drop.md":        "ignored\n",
 		"docs/note.md":       "knowledge\n",
@@ -80,7 +77,7 @@ func TestOpenaceignoreNestedShadowing(t *testing.T) {
 	got := scannedRelPaths(scanned)
 	want := ".gitignore,.openaceignore,docs/note.md,main.go,sub/keep.md"
 	if got != want {
-		t.Fatalf("子目录 alias(无同目录 canonical)应仍生效:\n got: %s\nwant: %s", got, want)
+		t.Fatalf("子目录 canonical re-include 应生效:\n got: %s\nwant: %s", got, want)
 	}
 }
 

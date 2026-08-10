@@ -209,7 +209,7 @@ func enterScanDir(stack *ruleStack, path string, rel string, name string) error 
 	stack.unwindTo(rel)
 	localRules := loadIgnoreRulesForDir(path, rel)
 	stack.push(rel, localRules)
-	if stack.Match(rel, true) && !localRules.hasAugmentInclude() && !stack.hasAugmentDescendantInclude(rel) {
+	if stack.Match(rel, true) && !localRules.hasOpenaceInclude() && !stack.hasOpenaceDescendantInclude(rel) {
 		return filepath.SkipDir
 	}
 	return nil
@@ -288,9 +288,6 @@ func shouldAlwaysSkipFile(rel string, name string) bool {
 	case ".pem", ".key", ".p12", ".pfx", ".jks", ".kdb", ".crt", ".cer", ".der", ".csr", ".p7b", ".p7c":
 		return true
 	}
-	if (strings.HasPrefix(rel, ".augment/") || strings.Contains(rel, "/.augment/")) && name == "session.json" {
-		return true
-	}
 	return false
 }
 
@@ -359,7 +356,7 @@ type ignoreLayer int
 const (
 	ignoreLayerDefault ignoreLayer = iota
 	ignoreLayerGit
-	ignoreLayerAugment
+	ignoreLayerOpenace
 )
 
 const defaultIgnoreRuleData = `
@@ -397,18 +394,11 @@ func loadIgnoreRulesForDir(dir string, base string) ignoreRules {
 	}{
 		{name: ".gitignore", layer: ignoreLayerGit},
 		{name: ".ignore", layer: ignoreLayerGit},
-		// .openaceignore 是 canonical(方案⑤,2026-08-02,B 语义):
-		// 同目录存在时 .augmentignore 规则整体被遮蔽(逐目录粒度,
-		// 迁移=改名可渐进);仅 alias 时兼容语义与历史一致。层级同
-		// augment 层(可 ! re-include gitignored,hard deny 不可覆盖)。
-		{name: ".openaceignore", layer: ignoreLayerAugment},
-		{name: ".augmentignore", layer: ignoreLayerAugment},
+		// .openaceignore 是唯一 include 层文件(方案⑤,2026-08-02;
+		// 2026-08-10 用户批示移除 augment 全部引用,.augmentignore 兼容
+		// 别名退役):可 ! re-include gitignored,hard deny 不可覆盖。
+		{name: ".openaceignore", layer: ignoreLayerOpenace},
 	} {
-		if spec.name == ".augmentignore" {
-			if _, err := os.Stat(filepath.Join(dir, ".openaceignore")); err == nil {
-				continue
-			}
-		}
 		data, err := os.ReadFile(filepath.Join(dir, spec.name))
 		if err != nil {
 			continue
@@ -464,7 +454,7 @@ type ruleFrame struct {
 	rules  ignoreRules
 }
 
-// ruleStack 按祖先链维护活动规则(F6 修复):Match/hasAugmentDescendantInclude
+// ruleStack 按祖先链维护活动规则(F6 修复):Match/hasOpenaceDescendantInclude
 // 只遍历当前路径祖先目录贡献的规则,与历史"全量累积"判定逐位等价
 // (非祖先规则受 base 约束必然不匹配),复杂度从 O(仓内全部规则) 降到
 // O(祖先链规则)。
@@ -487,7 +477,7 @@ func (s *ruleStack) unwindTo(rel string) {
 	}
 }
 
-// Match 语义与 ignoreRules.Match 一致:先非 augment 层后 augment 层,
+// Match 语义与 ignoreRules.Match 一致:先非 include 层后 include 层,
 // 同层内后加载(更深目录)者胜;帧序即加载序。
 func (s ruleStack) Match(rel string, isDir bool) bool {
 	rel = pathpkg.Clean(filepath.ToSlash(rel))
@@ -497,14 +487,14 @@ func (s ruleStack) Match(rel string, isDir bool) bool {
 	ignored := false
 	for _, frame := range s {
 		for _, rule := range frame.rules {
-			if rule.layer != ignoreLayerAugment && rule.matches(rel, isDir) {
+			if rule.layer != ignoreLayerOpenace && rule.matches(rel, isDir) {
 				ignored = !rule.negated
 			}
 		}
 	}
 	for _, frame := range s {
 		for _, rule := range frame.rules {
-			if rule.layer == ignoreLayerAugment && rule.matches(rel, isDir) {
+			if rule.layer == ignoreLayerOpenace && rule.matches(rel, isDir) {
 				ignored = !rule.negated
 			}
 		}
@@ -512,9 +502,9 @@ func (s ruleStack) Match(rel string, isDir bool) bool {
 	return ignored
 }
 
-func (s ruleStack) hasAugmentDescendantInclude(rel string) bool {
+func (s ruleStack) hasOpenaceDescendantInclude(rel string) bool {
 	for _, frame := range s {
-		if frame.rules.hasAugmentDescendantInclude(rel) {
+		if frame.rules.hasOpenaceDescendantInclude(rel) {
 			return true
 		}
 	}
@@ -528,34 +518,34 @@ func (rules ignoreRules) Match(rel string, isDir bool) bool {
 	}
 	ignored := false
 	for _, rule := range rules {
-		if rule.layer != ignoreLayerAugment && rule.matches(rel, isDir) {
+		if rule.layer != ignoreLayerOpenace && rule.matches(rel, isDir) {
 			ignored = !rule.negated
 		}
 	}
 	for _, rule := range rules {
-		if rule.layer == ignoreLayerAugment && rule.matches(rel, isDir) {
+		if rule.layer == ignoreLayerOpenace && rule.matches(rel, isDir) {
 			ignored = !rule.negated
 		}
 	}
 	return ignored
 }
 
-func (rules ignoreRules) hasAugmentInclude() bool {
+func (rules ignoreRules) hasOpenaceInclude() bool {
 	for _, rule := range rules {
-		if rule.layer == ignoreLayerAugment && rule.negated {
+		if rule.layer == ignoreLayerOpenace && rule.negated {
 			return true
 		}
 	}
 	return false
 }
 
-func (rules ignoreRules) hasAugmentDescendantInclude(rel string) bool {
+func (rules ignoreRules) hasOpenaceDescendantInclude(rel string) bool {
 	rel = pathpkg.Clean(filepath.ToSlash(rel))
 	if rel == "." || rel == "" {
 		return false
 	}
 	for _, rule := range rules {
-		if rule.layer == ignoreLayerAugment && rule.negated && rule.canMatchInside(rel) {
+		if rule.layer == ignoreLayerOpenace && rule.negated && rule.canMatchInside(rel) {
 			return true
 		}
 	}

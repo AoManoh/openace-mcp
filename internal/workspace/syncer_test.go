@@ -44,7 +44,7 @@ func TestScanSkipsSecretLikeFiles(t *testing.T) {
 	root := t.TempDir()
 	files := map[string]string{
 		"main.go":       "package main\n",
-		".env":          "AUGMENT_TOKEN=fake-token\n",
+		".env":          "FAKE_TOKEN=fake-token\n",
 		"id_ed25519":    "private-key\n",
 		"cert.pem":      "private-cert\n",
 		"cert.crt":      "public-cert\n",
@@ -168,16 +168,16 @@ func TestScanHonorsNestedIgnoreAndOverridesParent(t *testing.T) {
 	}
 }
 
-func TestScanAugmentignoreCanReincludeGitignoredAssets(t *testing.T) {
+func TestScanOpenaceignoreCanReincludeGitignoredAssets(t *testing.T) {
 	root := t.TempDir()
 	for rel, content := range map[string]string{
-		".gitignore":                 "/AGENTS.md\n/CLAUDE.md\n/.augment-guidelines\n/.augment/\n/docs/\n/skills/\n",
-		".augmentignore":             "!AGENTS.md\n!CLAUDE.md\n!.augment-guidelines\n!.augment/\n!.augment/rules/\n!.augment/rules/**/\n!.augment/rules/**/*.md\n!docs/\n!docs/**\n!skills/\n!skills/**/\n!skills/**/*.md\n",
+		".gitignore":                 "/AGENTS.md\n/CLAUDE.md\n/guidelines.md\n/rules/\n/docs/\n/skills/\n",
+		".openaceignore":             "!AGENTS.md\n!CLAUDE.md\n!guidelines.md\n!rules/\n!rules/**/\n!rules/**/*.md\n!docs/\n!docs/**\n!skills/\n!skills/**/\n!skills/**/*.md\n",
 		"AGENTS.md":                  "project instructions\n",
 		"CLAUDE.md":                  "claude instructions\n",
-		".augment-guidelines":        "project guidelines\n",
-		".augment/rules/project.md":  "project rule\n",
-		".augment/rules/script.py":   "print('not included')\n",
+		"guidelines.md":              "project guidelines\n",
+		"rules/project.md":           "project rule\n",
+		"rules/script.py":            "print('not included')\n",
 		"docs/decision.md":           "important project knowledge\n",
 		"skills/local/SKILL.md":      "local skill knowledge\n",
 		"skills/local/script.py":     "print('not included')\n",
@@ -202,18 +202,18 @@ func TestScanAugmentignoreCanReincludeGitignoredAssets(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := scannedRelPaths(scanned)
-	want := ".augment-guidelines,.augment/rules/project.md,.augmentignore,.gitignore,AGENTS.md,CLAUDE.md,docs/decision.md,main.go,skills/local/SKILL.md"
+	want := ".gitignore,.openaceignore,AGENTS.md,CLAUDE.md,docs/decision.md,guidelines.md,main.go,rules/project.md,skills/local/SKILL.md"
 	if got != want {
 		t.Fatalf("unexpected scanned files:\n got: %s\nwant: %s", got, want)
 	}
 }
 
-func TestScanNestedAugmentignoreCanReincludeParentIgnoredFile(t *testing.T) {
+func TestScanNestedOpenaceignoreCanReincludeParentIgnoredFile(t *testing.T) {
 	root := t.TempDir()
 	for rel, content := range map[string]string{
 		".gitignore":         "sub/\n",
 		"main.go":            "package main\n",
-		"sub/.augmentignore": "!keep.md\n",
+		"sub/.openaceignore": "!keep.md\n",
 		"sub/keep.md":        "important local knowledge\n",
 		"sub/drop.md":        "still ignored\n",
 	} {

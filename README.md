@@ -180,7 +180,7 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 !docs/**/*.md
 ```
 
-兼容:`.augmentignore` 作为迁移别名继续被读取;同目录两者并存时 `.openaceignore` 生效(逐目录判定)。迁移 = 直接改名。
+忽略/放行规则只读取 `.openaceignore`(gitignore 语法,`!` 可复活被 gitignore 的知识文件;安全硬拒绝名单不可覆盖)。
 
 ## 常用环境变量
 

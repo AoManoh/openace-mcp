@@ -17,7 +17,7 @@ func TestStressLargeWorkspaceScanAndSync(t *testing.T) {
 	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
 
 	stressWriteFile(t, root, ".gitignore", "/docs/\n/skills/\nnode_modules/\nignored-root/\n*.tmp\n")
-	stressWriteFile(t, root, ".augmentignore", "!docs/\n!docs/**\n!skills/\n!skills/**/\n!skills/**/*.md\n")
+	stressWriteFile(t, root, ".openaceignore", "!docs/\n!docs/**\n!skills/\n!skills/**/\n!skills/**/*.md\n")
 	stressWriteFile(t, root, "main.go", "package main\n")
 
 	for dir := 0; dir < 60; dir++ {
