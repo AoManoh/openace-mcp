@@ -427,8 +427,8 @@ func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.Workspace
 	// 切片等待(灰度反馈三 C.2):预算切成 buildWaitSlice 粒度,每片
 	// 醒来核对构建 ETA——ETA 超出剩余预算且有旧 revision 可答时提前
 	// 脱离,立即让上层以旧索引降级应答,不再等满整个预算(大仓重建
-	// ETA 分钟级时,等满 90s 再降级是纯延迟)。ETA 未知(首批未完成)
-	// 或无旧 revision 时行为与整段等待一致。
+	// ETA 分钟级时,等满整个 buildWait 预算再降级是纯延迟)。ETA 未知
+	// (首批未完成)或无旧 revision 时行为与整段等待一致。
 	deadline := time.Now().Add(e.queryBuildWait)
 	for {
 		remaining := time.Until(deadline)

@@ -111,9 +111,10 @@ func OptionsFromEnv() (Options, error) {
 	if err != nil {
 		return Options{}, err
 	}
-	// P2(灰度反馈 2026-08-06):默认有界 90s——冷仓首建期间的同步检索
-	// 在工具超时(110s)之前拿到带进度的可行动错误(errQueryBuildWait
-	// 路径),而非挂到裸传输超时;显式 "0" 保留"等到构建完成"。
+	// P2(灰度反馈 2026-08-06;2026-08-11 收紧至 40s,见
+	// defaultQueryBuildWait 注释):冷仓首建期间的同步检索在客户端
+	// 请求超时之前拿到带进度的可行动错误(errQueryBuildWait 路径),
+	// 而非挂到裸传输超时;显式 "0" 保留"等到构建完成"。
 	buildWait := defaultQueryBuildWait
 	if raw := strings.TrimSpace(os.Getenv(EnvQueryBuildWait)); raw != "" {
 		if raw == "0" || raw == "0s" {
