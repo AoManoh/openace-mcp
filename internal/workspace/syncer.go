@@ -81,7 +81,18 @@ func scanFileSkipDisposition(err error) (skip bool, permission bool) {
 	}
 }
 
+// scanProgressEvery 是扫描期进度回报粒度(P-gray-01:大仓首扫增量上报,
+// 避免状态面长期 files=0 被误判卡死;500 在 5 万文件仓上约百次回调,开销可忽略)。
+const scanProgressEvery = 500
+
 func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]fileBlob, ScanStats, error) {
+	return scanWithProgress(ctx, root, cache, nil)
+}
+
+// scanWithProgress 同 scanWithCacheStats,progress 非 nil 时每收录
+// scanProgressEvery 个文件回调一次(单调递增,不含最终值语义——完成数
+// 由调用方在扫描结束后以全量覆盖)。
+func scanWithProgress(ctx context.Context, root string, cache *StatCache, progress func(int)) ([]fileBlob, ScanStats, error) {
 	var stats ScanStats
 	root, err := resolveScanRoot(root)
 	if err != nil {
@@ -134,11 +145,17 @@ func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]f
 		if d.Type()&fs.ModeType != 0 {
 			return nil
 		}
+		report := func() {
+			if progress != nil && len(files)%scanProgressEvery == 0 {
+				progress(len(files))
+			}
+		}
 		if cache != nil {
 			if info, infoErr := d.Info(); infoErr == nil {
 				if hit, ok := cache.lookup(rel, info.Size(), info.ModTime(), scanStart); ok {
 					seen[rel] = true
 					files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: hit})
+					report()
 					return nil
 				}
 				content, ok, err := readScanBlob(ctx, path, maxBytes, textMaxBytes, &stats)
@@ -149,6 +166,7 @@ func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]f
 				cache.store(rel, info.Size(), info.ModTime(), name)
 				seen[rel] = true
 				files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: name})
+				report()
 				return nil
 			}
 		}
@@ -161,6 +179,7 @@ func scanWithCacheStats(ctx context.Context, root string, cache *StatCache) ([]f
 			RelPath:  rel,
 			BlobName: blobName(rel, content),
 		})
+		report()
 		return nil
 	})
 	if cache != nil && err == nil {
