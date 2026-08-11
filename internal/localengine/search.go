@@ -575,7 +575,7 @@ func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, dep
 		}
 	}
 	if e.semanticEnabled() {
-		denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, depth, nil)
+		denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, depth, nil, nil)
 		if denseErr != nil {
 			return RouteCandidates{}, denseErr
 		}
@@ -616,19 +616,21 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	}
 
 	lexStart := time.Now()
-	lexHits, planLabel, err := e.lexicalRoute(ctx, handle, query)
+	lexHits, planLabel, err := e.lexicalRoute(ctx, handle, query, pathPrefix)
 	timings.LexicalMs = time.Since(lexStart).Milliseconds()
 	if err != nil {
 		e.releaseHandle(handle)
 		return retrieval{}, err
 	}
-	ordered, mode, coverage, fuseReasons, err := e.fuseRoutes(ctx, workspaceKey, handle, query, lexHits, timings)
+	ordered, mode, coverage, fuseReasons, err := e.fuseRoutes(ctx, workspaceKey, handle, query, lexHits, timings, pathPrefix)
 	if err != nil {
 		e.releaseHandle(handle)
 		return retrieval{}, err
 	}
 	reasons = append(reasons, fuseReasons...)
 	if pathPrefix != "" {
+		// P-gray-02 修复后前缀已下推到双路;此处过滤保留为守护
+		// (词法锚/融合实现演化时的越界兜底),正常路径应为恒等。
 		ordered = filterRankedByPathPrefix(handle, ordered, pathPrefix)
 		if planLabel != "" {
 			planLabel += " "
@@ -723,7 +725,7 @@ func (e *Engine) acquireQueryHandle(ctx context.Context, ref engine.WorkspaceRef
 // 原查询,不触发时行为与历史逐字节一致)+ 存活过滤(统一 choke point
 // 的词法半边,暗坑 K39/K44:召回可能命中旧 segment 中被 supersede/
 // tombstone 的死 chunk,进入融合前按存活集过滤)。不负责句柄释放。
-func (e *Engine) lexicalRoute(ctx context.Context, handle *revisionHandle, query string) ([]lexical.Hit, string, error) {
+func (e *Engine) lexicalRoute(ctx context.Context, handle *revisionHandle, query string, pathPrefix string) ([]lexical.Hit, string, error) {
 	lexTopK := defaultTopK
 	if e.semanticEnabled() {
 		lexTopK = hybridRouteTopK
@@ -735,13 +737,13 @@ func (e *Engine) lexicalRoute(ctx context.Context, handle *revisionHandle, query
 		lexQuery = plan.LexicalQuery
 		planLabel = plan.LexicalQuery
 	}
-	lexHits, err := handle.lex.SearchWeighted(ctx, lexQuery, lexTopK, e.lexWeights)
+	lexHits, err := handle.lex.SearchWeightedPrefix(ctx, lexQuery, lexTopK, e.lexWeights, pathPrefix)
 	if err != nil {
 		return nil, "", fmt.Errorf("词法检索: %w", err)
 	}
 	if plan.Triggered && len(lexHits) == 0 {
 		planLabel += " fallback=original"
-		lexHits, err = handle.lex.SearchWeighted(ctx, query, lexTopK, e.lexWeights)
+		lexHits, err = handle.lex.SearchWeightedPrefix(ctx, query, lexTopK, e.lexWeights, pathPrefix)
 		if err != nil {
 			return nil, "", fmt.Errorf("词法检索(回退): %w", err)
 		}
@@ -753,7 +755,7 @@ func (e *Engine) lexicalRoute(ctx context.Context, handle *revisionHandle, query
 // 锚,dense 未执行时回退词法序;纯词法沿用真实 BM25 分数,渲染行为与
 // Stage 2 逐字节一致(K32)。返回 (候选序, 模式, 覆盖率, 降级原因)。
 // 不负责句柄释放。
-func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, lexHits []lexical.Hit, timings *engine.RetrievalTimings) ([]rankedHit, string, string, []string, error) {
+func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, lexHits []lexical.Hit, timings *engine.RetrievalTimings, pathPrefix string) ([]rankedHit, string, string, []string, error) {
 	if !e.semanticEnabled() {
 		ordered := make([]rankedHit, 0, len(lexHits))
 		for _, hit := range lexHits {
@@ -761,7 +763,7 @@ func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *re
 		}
 		return ordered, "lexical", "", nil, nil
 	}
-	denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, hybridRouteTopK, timings)
+	denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, hybridRouteTopK, timings, chunkPrefixPredicate(handle, pathPrefix))
 	if denseErr != nil {
 		return nil, "", "", nil, denseErr
 	}
@@ -867,6 +869,17 @@ func normalizeSearchPathPrefix(raw string) (string, error) {
 	return clean, nil
 }
 
+// chunkPrefixPredicate 构造 dense 路的子树谓词;prefix 为空返回 nil(全域)。
+func chunkPrefixPredicate(handle *revisionHandle, prefix string) func(id string) bool {
+	if prefix == "" {
+		return nil
+	}
+	return func(id string) bool {
+		meta, ok := handle.chunks[id]
+		return ok && (meta.RelPath == prefix || strings.HasPrefix(meta.RelPath, prefix+"/"))
+	}
+}
+
 func filterRankedByPathPrefix(handle *revisionHandle, ordered []rankedHit, prefix string) []rankedHit {
 	filtered := ordered[:0]
 	for _, hit := range ordered {
@@ -893,7 +906,7 @@ func filterLiveHits(handle *revisionHandle, hits []lexical.Hit) []lexical.Hit {
 // 语义路未执行）、降级原因与致命错误（ctx 取消或 deny 拒绝）。多
 // segment 逐段 exact 检索后确定性归并（score desc, ID asc，暗坑 K27），
 // 死 chunk 在归并后过滤（暗坑 K39）。
-func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, depth int, timings *engine.RetrievalTimings) ([]string, []string, error) {
+func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, depth int, timings *engine.RetrievalTimings, allow func(id string) bool) ([]string, []string, error) {
 	ixs, loadErr := handle.vectorIndexes(e.embedCfg.Dimension)
 	if loadErr != nil {
 		if errors.Is(loadErr, vector.ErrEnvelopeExceeded) {
@@ -938,7 +951,7 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 	for _, ix := range ixs {
 		queryCopy := make([]float32, len(queryVector))
 		copy(queryCopy, queryVector)
-		segmentHits, searchErr := ix.Search(ctx, queryCopy, depth)
+		segmentHits, searchErr := ix.SearchFiltered(ctx, queryCopy, depth, allow)
 		if searchErr != nil {
 			return nil, nil, searchErr
 		}
