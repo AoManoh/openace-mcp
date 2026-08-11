@@ -19,9 +19,11 @@ type AssetSource interface {
 
 // FileAssetSource 扫描 workspace 产出资产集;Cache 非 nil 时按
 // (size,mtime) 短路复用 blobName(T11 定值,长驻进程每 workspace
-// 一个实例),nil 时行为与历史逐字节一致。
+// 一个实例),nil 时行为与历史逐字节一致。Progress 非 nil 时在扫描期
+// 周期性回报已收录文件数(P-gray-01:大仓首扫不再长期显示 files=0)。
 type FileAssetSource struct {
-	Cache *StatCache
+	Cache    *StatCache
+	Progress func(scanned int)
 }
 
 var _ AssetSource = FileAssetSource{}
@@ -34,7 +36,7 @@ func (s FileAssetSource) Load(ctx context.Context, root string) (AssetSet, error
 // LoadWithStats 同 Load,并回传扫描跳过统计(K6 上抛口径:调用方状态面
 // 如实上报权限跳过数,不静默吞)。
 func (s FileAssetSource) LoadWithStats(ctx context.Context, root string) (AssetSet, ScanStats, error) {
-	files, stats, err := scanWithCacheStats(ctx, root, s.Cache)
+	files, stats, err := scanWithProgress(ctx, root, s.Cache, s.Progress)
 	if err != nil {
 		return nil, stats, err
 	}
