@@ -7,16 +7,16 @@ import (
 )
 
 // P2(灰度反馈):查询有界等待默认开启——冷仓首建期间的同步检索在
-// 工具超时(110s)之前拿到带进度的可行动错误,而非裸传输超时。
-// 默认 90s;显式 "0" 保留"等到构建完成"的历史行为。
+// 客户端超时(Cursor ~60s,自家 wrapper 110s)之前拿到带进度的可行动
+// 错误,而非裸传输超时。默认 40s;显式 "0" 保留"等到构建完成"。
 func TestQueryBuildWaitDefaultBounded(t *testing.T) {
 	os.Unsetenv("OPENACE_QUERY_BUILD_WAIT")
 	opts, err := OptionsFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if opts.QueryBuildWait != 90*time.Second {
-		t.Fatalf("默认 QueryBuildWait 应为 90s(P2 灰度修复),得到 %v", opts.QueryBuildWait)
+	if opts.QueryBuildWait != 40*time.Second {
+		t.Fatalf("默认 QueryBuildWait 应为 40s(2026-08-11 客户端超时对齐),得到 %v", opts.QueryBuildWait)
 	}
 	t.Setenv("OPENACE_QUERY_BUILD_WAIT", "0")
 	opts, err = OptionsFromEnv()
