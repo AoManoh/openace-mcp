@@ -290,6 +290,13 @@ func (ix *Index) Row(i int) []float32 {
 // （§11.2），并行仅是加速手段；tie-break 按 (score desc, ID asc) 保证
 // 确定性（暗坑 K27）。query 会被就地归一化。
 func (ix *Index) Search(ctx context.Context, query []float32, topK int) ([]Hit, error) {
+	return ix.SearchFiltered(ctx, query, topK, nil)
+}
+
+// SearchFiltered 同 Search,allow 非 nil 时只在谓词放行的条目中选 topK
+// (P-gray-02 前缀下推:被海量无关子树淹没时,受限深度的全局 topK 再过滤
+// 会漏掉目标子树;谓词在选择阶段生效,评分全量不变)。
+func (ix *Index) SearchFiltered(ctx context.Context, query []float32, topK int, allow func(id string) bool) ([]Hit, error) {
 	if len(query) != ix.dimension {
 		return nil, fmt.Errorf("查询维度 %d 与索引 %d 不符", len(query), ix.dimension)
 	}
@@ -362,8 +369,14 @@ func (ix *Index) Search(ctx context.Context, query []float32, topK int) ([]Hit, 
 		topK = count
 	}
 	hits := make([]Hit, 0, topK)
-	for _, row := range order[:topK] {
+	for _, row := range order {
+		if allow != nil && !allow(ix.entries[row].ID) {
+			continue
+		}
 		hits = append(hits, Hit{ID: ix.entries[row].ID, ContentHash: ix.entries[row].ContentHash, Score: scores[row]})
+		if len(hits) >= topK {
+			break
+		}
 	}
 	return hits, nil
 }

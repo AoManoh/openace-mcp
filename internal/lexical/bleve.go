@@ -327,6 +327,14 @@ func (i *Index) Search(ctx context.Context, queryText string, topK int) ([]Hit, 
 
 // SearchWeighted 按显式子句权重执行 BM25 检索；权重 <=0 的子句省略。
 func (i *Index) SearchWeighted(ctx context.Context, queryText string, topK int, w Weights) ([]Hit, error) {
+	return i.SearchWeightedPrefix(ctx, queryText, topK, w, "")
+}
+
+// SearchWeightedPrefix 同 SearchWeighted,pathPrefix 非空时按 path_raw
+// (keyword 字段)把候选域收敛到该子树后再选 topK(P-gray-02 前缀下推:
+// 后置过滤在受限深度下会被无关子树淹没为空)。前缀语义与引擎侧一致:
+// 等于该路径本身,或以 prefix+"/" 开头。
+func (i *Index) SearchWeightedPrefix(ctx context.Context, queryText string, topK int, w Weights, pathPrefix string) ([]Hit, error) {
 	if i.idx == nil {
 		return nil, ErrClosed
 	}
@@ -392,8 +400,16 @@ func (i *Index) SearchWeighted(ctx context.Context, queryText string, topK int, 
 		return nil, nil
 	}
 
-	disjunction := bleve.NewDisjunctionQuery(clauses...)
-	request := bleve.NewSearchRequestOptions(query.Query(disjunction), topK, 0, false)
+	var q query.Query = bleve.NewDisjunctionQuery(clauses...)
+	if pathPrefix != "" {
+		exact := bleve.NewTermQuery(pathPrefix)
+		exact.SetField("path_raw")
+		subtree := bleve.NewPrefixQuery(pathPrefix + "/")
+		subtree.SetField("path_raw")
+		scope := bleve.NewDisjunctionQuery(exact, subtree)
+		q = bleve.NewConjunctionQuery(q, scope)
+	}
+	request := bleve.NewSearchRequestOptions(q, topK, 0, false)
 	result, err := i.idx.SearchInContext(ctx, request)
 	if err != nil {
 		return nil, err
