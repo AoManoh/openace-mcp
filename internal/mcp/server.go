@@ -139,6 +139,10 @@ type multiRetrievalArgs struct {
 	DirectoryPaths     []string `json:"directory_paths"`
 	ProviderProfileID  string   `json:"provider_profile_id,omitempty"`
 	MaxOutputLength    int      `json:"max_output_length,omitempty"`
+	// Detail/PathPrefix 与单仓 retrievalArgs 同契约,应用到每个 workspace
+	// (P0 修复:schema 一直公开这两个参数,实现却静默丢弃)。
+	Detail     string `json:"detail,omitempty"`
+	PathPrefix string `json:"path_prefix,omitempty"`
 }
 
 type repoMapArgs struct {
@@ -576,6 +580,8 @@ func (s *Server) handleMultiRetrieval(ctx context.Context, id *json.RawMessage, 
 	}
 	args.InformationRequest = strings.TrimSpace(args.InformationRequest)
 	args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
+	args.Detail = strings.TrimSpace(args.Detail)
+	args.PathPrefix = strings.TrimSpace(args.PathPrefix)
 	if args.InformationRequest == "" {
 		return toolError(id, "information_request is required")
 	}
@@ -588,7 +594,7 @@ func (s *Server) handleMultiRetrieval(ctx context.Context, id *json.RawMessage, 
 	}
 	toolCtx, cancel := toolTimeoutContext(ctx)
 	defer cancel()
-	results := s.retrieveMultiple(toolCtx, paths, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength)
+	results := s.retrieveMultiple(toolCtx, paths, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength, args.Detail, args.PathPrefix)
 	status := summarizeMultiRetrievalResults(args.ProviderProfileID, results)
 	text := formatMultiRetrievalResults(results, status)
 	structured := map[string]any{"multi_status": status}
@@ -682,6 +688,8 @@ func (s *Server) handleStartMultiRetrieval(ctx context.Context, id *json.RawMess
 	}
 	args.InformationRequest = strings.TrimSpace(args.InformationRequest)
 	args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
+	args.Detail = strings.TrimSpace(args.Detail)
+	args.PathPrefix = strings.TrimSpace(args.PathPrefix)
 	if args.InformationRequest == "" {
 		return toolError(id, "information_request is required")
 	}
@@ -700,6 +708,8 @@ func (s *Server) handleStartMultiRetrieval(ctx context.Context, id *json.RawMess
 		ProviderProfileID:  args.ProviderProfileID,
 		InformationRequest: args.InformationRequest,
 		MaxOutputLength:    args.MaxOutputLength,
+		Detail:             args.Detail,
+		PathPrefix:         args.PathPrefix,
 	})
 	if err != nil {
 		return toolError(id, err.Error())
@@ -925,7 +935,7 @@ func normalizeDirectoryPaths(paths []string) ([]string, error) {
 	return normalized, nil
 }
 
-func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerProfileID string, query string, maxOutputLen int) []multiRetrievalResult {
+func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerProfileID string, query string, maxOutputLen int, detail string, pathPrefix string) []multiRetrievalResult {
 	results := make([]multiRetrievalResult, len(paths))
 	var wg sync.WaitGroup
 	for i, path := range paths {
@@ -934,7 +944,7 @@ func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerP
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := s.retrieve(ctx, path, providerProfileID, query, maxOutputLen, "", "")
+			result, err := s.retrieve(ctx, path, providerProfileID, query, maxOutputLen, detail, pathPrefix)
 			if err != nil {
 				results[i].Error = err.Error()
 				return

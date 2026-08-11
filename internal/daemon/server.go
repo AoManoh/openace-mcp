@@ -580,7 +580,7 @@ func (s *Server) runTask(ctx context.Context, req TaskRequest) (engine.Result, e
 	case TaskKindRetrieve:
 		result, err = s.runRetrieve(ctx, req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength, req.Detail, req.PathPrefix)
 	case TaskKindMultiRetrieve:
-		result, err = s.runMultiRetrieve(ctx, req.DirectoryPaths, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength)
+		result, err = s.runMultiRetrieve(ctx, req.DirectoryPaths, req.ProviderProfileID, req.InformationRequest, req.MaxOutputLength, req.Detail, req.PathPrefix)
 	default:
 		return engine.Result{}, fmt.Errorf("unknown task kind: %s", req.Kind)
 	}
@@ -625,7 +625,7 @@ type multiRetrieveResult struct {
 	err           error
 }
 
-func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, providerProfileID string, query string, maxOutputLen int) (engine.Result, error) {
+func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, providerProfileID string, query string, maxOutputLen int, detail string, pathPrefix string) (engine.Result, error) {
 	results := make([]multiRetrieveResult, len(dirs))
 	var wg sync.WaitGroup
 	for i, dir := range dirs {
@@ -634,7 +634,7 @@ func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, providerPr
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := s.runRetrieve(ctx, dir, providerProfileID, query, maxOutputLen, "", "")
+			result, err := s.runRetrieve(ctx, dir, providerProfileID, query, maxOutputLen, detail, pathPrefix)
 			results[i].result = result
 			results[i].err = err
 		}()

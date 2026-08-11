@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -504,6 +505,75 @@ func TestMultiCodebaseRetrievalTool(t *testing.T) {
 	}
 	if !strings.Contains(out, "retrieved from /tmp/one") || !strings.Contains(out, "retrieved from /tmp/two") {
 		t.Fatalf("multi retrieval should include both results: %s", out)
+	}
+}
+
+// capturingMultiSyncer 记录每次 SearchRequest,用于断言 multi 链路参数透传
+// (P0:schema 公开 detail/path_prefix 但实现静默丢弃)。
+type capturingMultiSyncer struct {
+	mu       sync.Mutex
+	requests []engine.SearchRequest
+}
+
+func (c *capturingMultiSyncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.requests = append(c.requests, req)
+	return engine.Result{Text: "retrieved from " + req.Workspace.DirectoryPath, FileCount: 1}, nil
+}
+
+func (c *capturingMultiSyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
+	return engine.Result{CheckpointID: "checkpoint-" + req.Workspace.DirectoryPath, FileCount: 1}, nil
+}
+
+func TestMultiRetrievalForwardsDetailAndPathPrefix(t *testing.T) {
+	syncer := &capturingMultiSyncer{}
+	out := runMCP(t, NewServer(syncer), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"multi_codebase_retrieval","arguments":{"directory_paths":["/tmp/one","/tmp/two"],"information_request":"find shared auth code","detail":"paths","path_prefix":"internal/"}}}`)
+	if !strings.Contains(out, "retrieved from /tmp/one") {
+		t.Fatalf("multi retrieval should succeed: %s", out)
+	}
+	syncer.mu.Lock()
+	defer syncer.mu.Unlock()
+	if len(syncer.requests) != 2 {
+		t.Fatalf("expected 2 search requests, got %d", len(syncer.requests))
+	}
+	for _, req := range syncer.requests {
+		if req.Detail != "paths" {
+			t.Fatalf("declared detail must reach per-workspace search, got %q (workspace %s)", req.Detail, req.Workspace.DirectoryPath)
+		}
+		if req.PathPrefix != "internal/" {
+			t.Fatalf("declared path_prefix must reach per-workspace search, got %q (workspace %s)", req.PathPrefix, req.Workspace.DirectoryPath)
+		}
+	}
+}
+
+// capturingTasker 记录 StartTask 请求,断言 start_multi 入口透传 detail/path_prefix。
+type capturingTasker struct {
+	fakeTasker
+	mu   sync.Mutex
+	last daemon.TaskRequest
+}
+
+func (c *capturingTasker) StartTask(ctx context.Context, req daemon.TaskRequest) (daemon.TaskSnapshot, error) {
+	c.mu.Lock()
+	c.last = req
+	c.mu.Unlock()
+	return daemon.TaskSnapshot{ID: "task-1", Kind: req.Kind, State: daemon.TaskStateQueued, DirectoryPaths: append([]string(nil), req.DirectoryPaths...)}, nil
+}
+
+func TestStartMultiRetrievalForwardsDetailAndPathPrefix(t *testing.T) {
+	tasker := &capturingTasker{}
+	out := runMCP(t, NewServer(tasker), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"start_multi_codebase_retrieval","arguments":{"directory_paths":["/tmp/one","/tmp/two"],"information_request":"find task code","detail":"paths","path_prefix":"cmd/"}}}`)
+	if !strings.Contains(out, "task-1") {
+		t.Fatalf("start multi retrieval should submit task: %s", out)
+	}
+	tasker.mu.Lock()
+	defer tasker.mu.Unlock()
+	if tasker.last.Detail != "paths" {
+		t.Fatalf("declared detail must reach task request, got %q", tasker.last.Detail)
+	}
+	if tasker.last.PathPrefix != "cmd/" {
+		t.Fatalf("declared path_prefix must reach task request, got %q", tasker.last.PathPrefix)
 	}
 }
 
