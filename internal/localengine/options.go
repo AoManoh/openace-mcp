@@ -48,9 +48,12 @@ const (
 )
 
 // defaultQueryBuildWait 是查询有界等待的默认上界(P2,灰度反馈
-// 2026-08-06):须小于 wrapper 工具超时(默认 110s),使引擎的可行动
-// 错误(带构建进度与 env 名)先于裸传输超时到达调用方。
-const defaultQueryBuildWait = 90 * time.Second
+// 2026-08-06;2026-08-11 收紧):必须小于**最严格主流 MCP 客户端**的
+// 请求超时,不只我们自家 wrapper(110s)——Cursor 约 60s 即发 -32001
+// 杀请求(外部灰度 F:/BA-Dev 实报),90s 预算下引擎的可行动错误(带
+// 构建进度与 env 名)永远送不到调用方。40s 给大仓的每请求新鲜度
+// 检查(实测 Windows 50K 文件 ~27s)留出余量后仍先于客户端超时返回。
+const defaultQueryBuildWait = 40 * time.Second
 
 // Options 是 local-hybrid 引擎的完整构造配置；零值 = Stage 2 行为
 // （semantic off、rerank off、降级 allow）。
