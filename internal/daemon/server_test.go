@@ -437,6 +437,54 @@ func TestServerMultiRetrieveRegistersWatchDiagnostics(t *testing.T) {
 	}
 }
 
+// capturingSearchSyncer 记录每仓 SearchRequest,断言 multi task 执行链
+// 把 TaskRequest 的 detail/path_prefix 透传到每个 workspace 检索。
+type capturingSearchSyncer struct {
+	mu       sync.Mutex
+	requests []engine.SearchRequest
+}
+
+func (c *capturingSearchSyncer) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
+	return engine.Result{CheckpointID: "checkpoint", FileCount: 1}, nil
+}
+
+func (c *capturingSearchSyncer) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	c.mu.Lock()
+	c.requests = append(c.requests, req)
+	c.mu.Unlock()
+	return engine.Result{Text: "retrieved " + req.Workspace.DirectoryPath, FileCount: 1}, nil
+}
+
+func TestServerMultiRetrieveForwardsDetailAndPathPrefix(t *testing.T) {
+	useTempTaskStore(t)
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
+	syncer := &capturingSearchSyncer{}
+	server := newDaemonHTTPTestServer(t, syncer)
+
+	task := postTask(t, server.URL, TaskRequest{
+		Kind:               TaskKindMultiRetrieve,
+		DirectoryPaths:     []string{"/tmp/one", "/tmp/two"},
+		InformationRequest: "find shared code",
+		Detail:             "paths",
+		PathPrefix:         "internal/",
+	})
+	pollHTTPTask(t, server.URL, task.ID, TaskStateCompleted)
+
+	syncer.mu.Lock()
+	defer syncer.mu.Unlock()
+	if len(syncer.requests) != 2 {
+		t.Fatalf("expected 2 search requests, got %d", len(syncer.requests))
+	}
+	for _, req := range syncer.requests {
+		if req.Detail != "paths" {
+			t.Fatalf("task detail must reach per-workspace search, got %q (workspace %s)", req.Detail, req.Workspace.DirectoryPath)
+		}
+		if req.PathPrefix != "internal/" {
+			t.Fatalf("task path_prefix must reach per-workspace search, got %q (workspace %s)", req.PathPrefix, req.Workspace.DirectoryPath)
+		}
+	}
+}
+
 func TestServerCompletesMultiRetrieveTask(t *testing.T) {
 	useTempTaskStore(t)
 	t.Setenv("OPENACE_DAEMON_TOKEN", "off") // M5 后空值=默认 token 档,off 才是显式关闭
