@@ -46,10 +46,13 @@ const (
 	defaultDimension     = 1024
 	defaultBatchSize     = 128
 	// defaultConcurrency 4→8(灰度反馈 2026-08-07:索引吞吐 450-780
-	// chunks/min 太慢)。嵌入是纯 I/O 等待,worker 数不受 GOMAXPROCS
-	// 约束;付费档 provider(如 Voyage 2000 RPM)吞吐随并发近线性,
-	// 免费档由 provider RPM 限速+429 退避兜底,提并发不改变计费总量。
-	defaultConcurrency = 8
+	// chunks/min 太慢)→16(2026-08-12 用户批示:高吞吐自部署 provider
+	// 下索引效率应默认拉满)。嵌入是纯 I/O 等待,worker 数不受
+	// GOMAXPROCS 约束;付费档 provider(如 Voyage 2000 RPM)与自部署
+	// 模型吞吐随并发近线性,免费档由 provider RPM 限速+429 退避兜底,
+	// 提并发不改变计费总量。自部署高吞吐环境可经
+	// OPENACE_EMBEDDING_MAX_CONCURRENCY 进一步调大(如 64)。
+	defaultConcurrency = 16
 	// maxBatchSize 是单批条数硬上限（Voyage 官方 ≤1000 条）。
 	maxBatchSize = 1000
 )

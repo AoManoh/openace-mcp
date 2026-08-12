@@ -188,7 +188,7 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 |------|------|
 | `OPENACE_EMBEDDING_PROVIDER` | 语义路端点类型:`openai`(OpenAI-compatible)/ `voyage` / `off`。默认 `voyage` 且未提供 key 时语义路保持关闭、词法照常——即**不配置就是纯词法** |
 | `OPENACE_EMBEDDING_BASE_URL` `_API_KEY` `_MODEL` `_DIMENSION` | 模型服务身份四项(`openai` 类型必填 base_url 与 model);`voyage` 类型 key 为空时回退读 `VOYAGE_API_KEY`;任一身份变化触发平行索引全量重建 |
-| `OPENACE_EMBEDDING_BATCH_SIZE` `_MAX_CONCURRENCY` `_RPM_BUDGET` `_TPM_BUDGET` | 索引期调用参数(默认 128 / 8 / 不限 / 不限)。索引吞吐通常由 provider 限速决定:免费档 RPM 低时提并发只会触发 429 退避(无害),付费档吞吐随并发近线性 |
+| `OPENACE_EMBEDDING_BATCH_SIZE` `_MAX_CONCURRENCY` `_RPM_BUDGET` `_TPM_BUDGET` | 索引期调用参数(默认 128 / 16 / 不限 / 不限)。索引吞吐通常由 provider 限速决定:免费档 RPM 低时提并发只会触发 429 退避(无害);付费档与自部署高吞吐模型吞吐随并发近线性——自部署资源充足时把 `_MAX_CONCURRENCY` 调到 32-64 可数倍缩短索引时间,`_RPM_BUDGET`/`_TPM_BUDGET` 可按服务额度设硬顶 |
 | `OPENACE_RERANK_PROVIDER` | 可选精排:`tei` / `voyage` / `off`;默认 `voyage` 且缺 key 即关闭。`_BASE_URL`/`_API_KEY`/`_MODEL`/`_MAX_TOKENS` 语义同上 |
 | `OPENACE_RETRIEVAL_DEGRADE` / `OPENACE_RERANK_DEGRADE` | 语义路/精排失败策略:`allow`(默认,放行并标 `[DEGRADED]`)/ `deny`(返回可行动错误) |
 | `OPENACE_QUALITY_STRICT` | `on` = 质量严格档:语义链路任一缺口(覆盖 <100%、查询嵌入失败、已配置的 rerank 未生效等)直接报错;要求已配置 embedding。默认 `off`。结构化结果携带 `rerank_sent`/`query_embed_failed`/`embedding_profile` |
@@ -210,7 +210,7 @@ daemon 只监听 loopback,不要直接暴露公网。引擎固定为 local-hybri
 ## 排障提示
 
 - **某个目录整体检索不到**:文件选择遵循逐目录的 `.gitignore` / `.ignore` / `.openaceignore`(内置敏感文件 denylist 先于一切)。最常见形态:根 `.gitignore` 忽略了 `docs/` 之类目录(git 惯例把私有/生成内容排除在版本库外),索引随之跳过。要索引被 gitignore 的路径,在 `.openaceignore` 里加 `!docs/` 形式的 re-include;`workspace_status` 的 `top_level_file_counts` 按顶层目录给出计数——预期目录缺失或为 0 即被排除,无需对照实验。
-- **索引速度慢**:嵌入吞吐通常由 provider 限速决定(免费档 RPM 很低)。`workspace_status`/`task_status` 进度带 `rate/eta`;付费档可调大 `OPENACE_EMBEDDING_MAX_CONCURRENCY`(默认 8)。
+- **索引速度慢**:嵌入吞吐通常由 provider 限速决定(免费档 RPM 很低)。`workspace_status`/`task_status` 进度带 `rate/eta`;付费档/自部署高吞吐模型可调大 `OPENACE_EMBEDDING_MAX_CONCURRENCY`(默认 16,自部署可到 64)。
 - **客户端找不到命令**:`command` 写绝对路径(`~/go/bin/openace-mcp` 等);IDE 启动子进程不经过 shell,环境变量占位符不展开。
 - **升级不生效**:重新 `go install` 后必须重启 MCP 会话;运行中的 daemon 不热更新。
 - **改了 provider env 没反应**:确认重启了 MCP 会话;`daemon_status` 可查当前 daemon 的 build 与配置指纹。
