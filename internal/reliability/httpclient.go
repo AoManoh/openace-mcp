@@ -25,6 +25,9 @@ func NewHTTPClient() *http.Client {
 		transport.TLSClientConfig = &tls.Config{}
 	}
 	transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
-	transport.MaxIdleConnsPerHost = 16
+	// 64:空闲连接池上限须覆盖最高常用嵌入并发(默认 16,自部署高吞吐
+	// 可调到 64),否则超出部分每请求重建 TCP+TLS,高并发下握手开销
+	// 侵蚀吞吐。仅影响连接复用效率,不构成并发上限。
+	transport.MaxIdleConnsPerHost = 64
 	return &http.Client{Transport: transport}
 }
