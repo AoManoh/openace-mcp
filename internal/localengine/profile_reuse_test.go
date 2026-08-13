@@ -28,8 +28,8 @@ func TestProfileUpgradeAutomaticallyReusesSiblingVectors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e6.profile.Version = "6"
-	e6.storeProfile = strings.Replace(e6.storeProfile, "default-v7", "default-v6", 1)
+	e6.profile.Version = "7"
+	e6.storeProfile = strings.Replace(e6.storeProfile, "default-v8", "default-v7", 1)
 	first, err := e6.Sync(context.Background(), syncRequest(root))
 	if err != nil || first.SemanticCoverage != "100%" {
 		t.Fatalf("v6 首建失败: %+v err=%v", first, err)
@@ -97,7 +97,7 @@ func TestProfileUpgradeSkipsCorruptSiblingForHealthyOlderProfile(t *testing.T) {
 			t.Fatal(err)
 		}
 		e.profile.Version = version
-		e.storeProfile = strings.Replace(e.storeProfile, "default-v7", "default-v"+version, 1)
+		e.storeProfile = strings.Replace(e.storeProfile, "default-v8", "default-v"+version, 1)
 		if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
 			t.Fatal(err)
 		}
@@ -173,8 +173,8 @@ func TestVectorRepairReusesHealthySiblingProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e6.profile.Version = "6"
-	e6.storeProfile = strings.Replace(e6.storeProfile, "default-v7", "default-v6", 1)
+	e6.profile.Version = "7"
+	e6.storeProfile = strings.Replace(e6.storeProfile, "default-v8", "default-v7", 1)
 	if _, err := e6.Sync(context.Background(), syncRequest(root)); err != nil {
 		t.Fatal(err)
 	}
@@ -262,8 +262,8 @@ func TestProfileUpgradeRejectsSiblingWithDifferentEmbeddingIdentity(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	old.profile.Version = "6"
-	old.storeProfile = strings.Replace(old.storeProfile, "default-v7", "default-v6", 1)
+	old.profile.Version = "7"
+	old.storeProfile = strings.Replace(old.storeProfile, "default-v8", "default-v7", 1)
 	if _, err := old.Sync(context.Background(), syncRequest(root)); err != nil {
 		t.Fatal(err)
 	}
