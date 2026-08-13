@@ -108,7 +108,7 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 }
 ```
 
-接入后查询自动升级为 BM25 + 向量双路召回、RRF 融合;可选再配 `OPENACE_RERANK_*` 对头部候选精排(支持 `tei` 与 `voyage` 形状端点)。召回质量取决于你所选模型——请选用面向代码检索、性能可靠的 embedding/rerank 模型。
+接入后查询自动升级为 BM25 + 向量双路召回、RRF 融合 + 头部候选精排(rerank,支持 `tei` 与 `voyage` 形状端点;12 仓 720 查询评测中 essential-R@5 相对 RRF +12.8pp,质量至上默认启用)。配置了 embedding 而未配置 rerank 时,结果会携带 `rerank-unconfigured` 提示——补配 `OPENACE_RERANK_API_KEY`(voyage 形状可直接复用 `VOYAGE_API_KEY`)或显式 `OPENACE_RERANK_PROVIDER=off` 确认放弃精排。召回质量取决于你所选模型——请选用面向代码检索、性能可靠的 embedding/rerank 模型。
 
 ### 行为与边界(如实声明)
 
@@ -189,7 +189,7 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 | `OPENACE_EMBEDDING_PROVIDER` | 语义路端点类型:`openai`(OpenAI-compatible)/ `voyage` / `off`。默认 `voyage` 且未提供 key 时语义路保持关闭、词法照常——即**不配置就是纯词法** |
 | `OPENACE_EMBEDDING_BASE_URL` `_API_KEY` `_MODEL` `_DIMENSION` | 模型服务身份四项(`openai` 类型必填 base_url 与 model);`voyage` 类型 key 为空时回退读 `VOYAGE_API_KEY`;任一身份变化触发平行索引全量重建 |
 | `OPENACE_EMBEDDING_BATCH_SIZE` `_MAX_CONCURRENCY` `_RPM_BUDGET` `_TPM_BUDGET` | 索引期调用参数(默认 128 / 16 / 不限 / 不限)。索引吞吐通常由 provider 限速决定:免费档 RPM 低时提并发只会触发 429 退避(无害);付费档与自部署高吞吐模型吞吐随并发近线性——自部署资源充足时把 `_MAX_CONCURRENCY` 调到 32-64 可数倍缩短索引时间,`_RPM_BUDGET`/`_TPM_BUDGET` 可按服务额度设硬顶 |
-| `OPENACE_RERANK_PROVIDER` | 可选精排:`tei` / `voyage` / `off`;默认 `voyage` 且缺 key 即关闭。`_BASE_URL`/`_API_KEY`/`_MODEL`/`_MAX_TOKENS` 语义同上 |
+| `OPENACE_RERANK_PROVIDER` | 精排(质量至上默认档):`tei` / `voyage` / `off`;默认 `voyage`,key 缺省回退 `VOYAGE_API_KEY`。配置即启用;语义已配而精排缺配置时结果携带 `rerank-unconfigured` 提示(`OPENACE_QUALITY_STRICT=on` 下升级为报错),显式 `off` 视为确认放弃。`_BASE_URL`/`_API_KEY`/`_MODEL`/`_MAX_TOKENS` 语义同上 |
 | `OPENACE_RETRIEVAL_DEGRADE` / `OPENACE_RERANK_DEGRADE` | 语义路/精排失败策略:`allow`(默认,放行并标 `[DEGRADED]`)/ `deny`(返回可行动错误) |
 | `OPENACE_QUALITY_STRICT` | `on` = 质量严格档:语义链路任一缺口(覆盖 <100%、查询嵌入失败、已配置的 rerank 未生效等)直接报错;要求已配置 embedding。默认 `off`。结构化结果携带 `rerank_sent`/`query_embed_failed`/`embedding_profile` |
 | `OPENACE_QUERY_BUILD_WAIT` | 查询等待在建索引的上界,**默认 `40s`**(先于主流 MCP 客户端的请求超时,冷仓首建期间的同步检索返回带构建进度的可行动错误,而非裸超时):超时后有旧索引按 allow/deny 降级,无旧索引返回带进度的错误;显式 `0` = 等到构建完成 |

@@ -638,7 +638,8 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		planLabel += "path_prefix=" + pathPrefix
 	}
 
-	// 可选精排：只重排已召回候选头部，失败绝不丢候选（D7/D8(b)）。
+	// 精排（R03 促升裁决 2026-08-13:配置即默认启用,质量至上）:只重排
+	// 已召回候选头部，失败绝不丢候选（D7/D8(b)）。
 	rerankApplied := false
 	rerankSent := 0
 	if e.rerankClient != nil && len(ordered) > 0 {
@@ -658,6 +659,13 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		if rerankReason != "" {
 			reasons = append(reasons, rerankReason)
 		}
+	} else if e.semanticEnabled() && !e.rerankCfg.Enabled && e.rerankCfg.ProviderType != rerank.ProviderOff {
+		// 促升裁决的显式提示面:语义链路已配置而 rerank 缺配置(非显式
+		// off)时,结果不得静默按 RRF 序放行——reason 进 [DEGRADED] 横幅,
+		// strict 档(OPENACE_QUALITY_STRICT)经既有闸升级为显式报错。
+		// 显式 off 是配置形态(config.go Enabled 注释),不在此列;纯词法
+		// 零凭据路径不受影响(semanticEnabled=false,红线 D2)。
+		reasons = append(reasons, "rerank-unconfigured(quality-first default; set "+rerank.EnvAPIKey+" or VOYAGE_API_KEY, or "+rerank.EnvProvider+"=off to opt out)")
 	}
 	// 碎片门 spike(候选 (l)):只在程序化 Options opt-in 时过滤
 	// fallback 的纯日期/纯符号碎片;默认关闭,零行为变化。放在
