@@ -15,6 +15,7 @@ import (
 
 	"github.com/AoManoh/openace-mcp/internal/embedding"
 	"github.com/AoManoh/openace-mcp/internal/localengine"
+	"github.com/AoManoh/openace-mcp/internal/rerank"
 )
 
 // semanticFixtureGo 的 establishUserSession 是"语义命中目标"：查询与其
@@ -75,11 +76,17 @@ func newSemanticFakeProvider(t *testing.T, dim int, failQuery *atomic.Bool, call
 	return ts
 }
 
+// semanticOptions 的 Rerank 显式 off:本测试族演练纯语义路径(配置形态
+// 意义上的 opt-out);促升裁决(2026-08-13)后缺配置(非 off)会携带
+// rerank-unconfigured 提示,详见 localengine/rerank_default_notice_test.go。
 func semanticOptions(url string, dim int) localengine.Options {
 	return localengine.Options{Embedding: embedding.Config{
 		Enabled: true, ProviderType: embedding.ProviderOpenAI, BaseURL: url,
 		Model: "fake-model", Dimension: dim, BatchSize: 16, MaxConcurrency: 2,
 		Timeout: 2 * time.Second, MaxRetries: 0,
+	}, Rerank: rerank.Config{
+		Enabled: false, ProviderType: rerank.ProviderOff,
+		DisabledReason: "rerank provider is off",
 	}}
 }
 

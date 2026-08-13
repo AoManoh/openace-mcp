@@ -17,6 +17,7 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/embedding"
 	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/index"
+	"github.com/AoManoh/openace-mcp/internal/rerank"
 	"github.com/AoManoh/openace-mcp/internal/vector"
 )
 
@@ -107,11 +108,17 @@ func (s *embedServer) setFailWhen(fn func([]string) bool) {
 }
 
 // embedOptions 构造指向 fake server 的语义配置（openai 形状、keyless）。
+// Rerank 显式 off:这些测试演练纯语义路径;促升裁决(2026-08-13)后
+// "语义 on + rerank 缺配置"会携带 rerank-unconfigured 提示,测试场景
+// 属有意关闭的配置形态,按 off 声明(与生产 opt-out 同语义)。
 func embedOptions(url string, dim int, batch int, model string) Options {
 	return Options{Embedding: embedding.Config{
 		Enabled: true, ProviderType: embedding.ProviderOpenAI, BaseURL: url,
 		Model: model, Dimension: dim, BatchSize: batch, MaxConcurrency: 2,
 		Timeout: 2 * time.Second, MaxRetries: 0,
+	}, Rerank: rerank.Config{
+		Enabled: false, ProviderType: rerank.ProviderOff,
+		DisabledReason: "rerank provider is off",
 	}}
 }
 
