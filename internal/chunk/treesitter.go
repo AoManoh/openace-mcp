@@ -15,10 +15,14 @@ import (
 // 独立 chunk）。Go 保留标准库 go/ast 切分器；任何解析失败都回退行窗口
 // 并如实上报 capability=fallback（§9.2 门禁 3/4 的失败语义）。
 
-// parseTimeoutMicros 是单文件解析超时（暗坑 K60）。workspace 内容门禁
-// 上限 1MiB，实测 500KB 合成源解析约 200ms，2s 覆盖病理输入后仍有界；
-// 超时经 ParseStrict 显式报错，整文件回退行窗口。
-const parseTimeoutMicros = 2_000_000
+// 单文件解析不设壁钟超时（v8,P1 确定性修复）。chunk 身份必须是
+// (content, profile) 的纯函数:历史 2s 壁钟对真实语料贴线(aspnetcore
+// 191KB C# 测试文件空载解析 ≈1.9s),负载抖动使同一文件跨扫描在 AST/
+// 行窗口两种切分间漂移,内容哈希键漂移曾在 R03b 导入对账撞出
+// UnknownKey 509+59 与单进程内两次扫描不一致(2026-08-13 dogfooding)。
+// 病理输入的有界性(暗坑 K60)由库内确定性预算兜底:节点预算
+// (parseNodeLimit,源长比例)与内存预算随内容定界、不随负载变化,
+// ParseStrict 对 budget 早停同样报错→整文件确定性回退行窗口。
 
 // DrainParserPools 释放 tree-sitter 运行时的包级 arena 池（M4）。池内
 // arena 是强 Go 引用，GC 不会自行回收；上游要求批量扫描结束后排水。
@@ -113,7 +117,9 @@ func (p Profile) splitTreeSitter(file File, language string, grammarName string)
 		return nil, false
 	}
 	parser := gotreesitter.NewParser(lang)
-	parser.SetTimeoutMicros(parseTimeoutMicros)
+	// 0=显式关闭壁钟超时(见文件头 v8 注释):身份确定性 > 单文件扫描延迟;
+	// 有界性由库内容比例预算(节点/内存)确定性保证。
+	parser.SetTimeoutMicros(0)
 	// parseBytes 默认即原文；rust 走两段等长规范化：frontmatter 掩码
 	// （cargo-script RFC 3503，pinned grammar 不识别）与 primitive! 宏名
 	// 改写（rustNormalizeMacroBangs）。变换严格保长，树的行/字节几何与

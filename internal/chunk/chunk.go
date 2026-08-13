@@ -82,10 +82,17 @@ type Profile struct {
 // 名误报 ERROR,okio 实测 33/313 文件,坏顶层节点匿名兜底);ruby/php
 // 严格语义。门禁语料 AST 覆盖率:okio 94.2%、sinatra 100%、monolog
 // 98.6%。依 K5 升版本,未变语言按纯内容 hash 复用向量零重嵌(K61)。
+// Version 8（P1 确定性修复,2026-08-13 dogfooding）：去除 tree-sitter
+// 单文件 2s 壁钟解析超时(treesitter.go)——chunk 身份必须是
+// (content, profile) 的纯函数,壁钟使贴线慢解析文件(实测 aspnetcore
+// 191KB C# 空载 ≈1.9s)随负载在 AST/行窗口间漂移。行为变化面=历史上
+// "偶发超时"的慢解析文件从行窗口稳定升为 AST(病理输入仍由库内容
+// 比例预算确定性回退),依 K5 升版本;未变文件 chunk 内容不变,向量按
+// ContentHash 复用零重嵌(K61)。
 func DefaultProfile() Profile {
 	return Profile{
 		ID:             "default",
-		Version:        "7",
+		Version:        "8",
 		MaxChunkBytes:  2048,
 		WindowLines:    60,
 		OverlapLines:   10,
