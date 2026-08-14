@@ -284,7 +284,7 @@ func (c *Client) validateServedBy(served *runtimeinfo.ServedBy) error {
 	if mismatch == "" {
 		return nil
 	}
-	return fmt.Errorf("daemon identity changed during this MCP session: %s; restart the MCP session or restore the expected daemon", mismatch)
+	return fmt.Errorf("%s: %s; restart the MCP session or restore the expected daemon", engine.DaemonIdentityChangedMarker, mismatch)
 }
 
 func (c *Client) validateDecodedIdentity(out any) error {

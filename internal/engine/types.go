@@ -7,6 +7,11 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/runtimeinfo"
 )
 
+// DaemonIdentityChangedMarker 是 wrapper/daemon 身份冲突硬错的文本契约
+// 单点(internal/daemon.validateServedBy 构造,internal/mcp 升级自愈
+// handoff 识别;known-issue #13/T2)。
+const DaemonIdentityChangedMarker = "daemon identity changed during this MCP session"
+
 // IndexStage 表示工作区索引生命周期所处阶段。
 type IndexStage string
 
