@@ -2,6 +2,7 @@ package managed
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -39,7 +40,7 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 	if err := reusable(ctx, client, requestedEngine, expectedProfile); err == nil {
 		attachRecoverHook(client, managedAddr, requestedEngine, expectedProfile)
 		return client, nil
-	} else if healthy(ctx, client) {
+	} else if healthy(ctx, client) && !takeoverCandidate(err) {
 		return nil, err
 	}
 	managedClient := daemon.NewClient(managedAddr)
@@ -47,14 +48,14 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 		if err := reusable(ctx, managedClient, requestedEngine, expectedProfile); err == nil {
 			attachRecoverHook(managedClient, managedAddr, requestedEngine, expectedProfile)
 			return managedClient, nil
-		} else if healthy(ctx, managedClient) {
+		} else if healthy(ctx, managedClient) && !takeoverCandidate(err) {
 			return nil, err
 		}
 	}
 	if err := reusable(ctx, managedClient, requestedEngine, expectedProfile); err == nil {
 		attachRecoverHook(managedClient, managedAddr, requestedEngine, expectedProfile)
 		return managedClient, nil
-	} else if healthy(ctx, managedClient) {
+	} else if healthy(ctx, managedClient) && !takeoverCandidate(err) {
 		return nil, err
 	}
 	releaseLock, err := acquireStartupLock(ctx, managedAddr, startupTimeout())
@@ -72,7 +73,13 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 		attachRecoverHook(managedClient, managedAddr, requestedEngine, expectedProfile)
 		return managedClient, nil
 	} else if healthy(ctx, managedClient) {
-		return nil, err
+		// T5(外部灰度 08-14 形态):wrapper 升级后旧 daemon 占位,此前
+		// 只能报错等人工清场。build 级不匹配且 wrapper 不旧于 daemon
+		// 时,在启动锁内优雅接管(SIGTERM→有界等退出),随后走既有
+		// startDaemon 路径;接管不适用/失败则保持原错误语义。
+		if takeoverErr := takeoverOutdatedDaemon(ctx, managedClient, err); takeoverErr != nil {
+			return nil, err
+		}
 	}
 	logPath, err := startDaemon(managedAddr)
 	if err != nil {
@@ -135,7 +142,9 @@ func reusable(ctx context.Context, client *daemon.Client, requestedEngine string
 		return fmt.Errorf("openACE daemon at %s does not advertise runtime_identity; restart it with a current openACE build", client.Endpoint())
 	}
 	if err := compatibleDaemonBuild(buildinfo.Current(), status.Build); err != nil {
-		return fmt.Errorf("openACE daemon at %s is not compatible with this MCP wrapper: %w", client.Endpoint(), err)
+		// T5:携带 pid 的可复制修复指引——自动接管不适用(平台/顺序门/
+		// 手工模式)时,用户至少拿到一条确定的手工出路。
+		return fmt.Errorf("openACE daemon at %s is not compatible with this MCP wrapper: %w; fix: stop the outdated daemon (kill %d) and retry", client.Endpoint(), err, status.PID)
 	}
 	if err := compatibleEngine(requestedEngine, status.Engine); err != nil {
 		return fmt.Errorf("openACE daemon at %s is not compatible with this MCP wrapper: %w", client.Endpoint(), err)
@@ -176,12 +185,17 @@ func compatibleEngineProfile(requestedEngine string, expected string, daemonProf
 	return nil
 }
 
+// errDaemonBuildMismatch 标记 wrapper/daemon 构建不一致(T5 接管判据:
+// 只有 build 级不匹配才考虑自动接管;engine/profile 不匹配语义不同,
+// 不在接管范围)。
+var errDaemonBuildMismatch = errors.New("daemon build mismatch")
+
 func compatibleDaemonBuild(wrapper buildinfo.Info, daemonBuild buildinfo.Info) error {
 	if wrapper.VCSRevision != "" && daemonBuild.VCSRevision != "" && wrapper.VCSRevision != daemonBuild.VCSRevision {
-		return fmt.Errorf("wrapper revision %s != daemon revision %s", wrapper.VCSRevision, daemonBuild.VCSRevision)
+		return fmt.Errorf("%w: wrapper revision %s != daemon revision %s", errDaemonBuildMismatch, wrapper.VCSRevision, daemonBuild.VCSRevision)
 	}
 	if wrapper.Version != "" && daemonBuild.Version != "" && wrapper.Version != "(devel)" && daemonBuild.Version != "(devel)" && wrapper.Version != daemonBuild.Version {
-		return fmt.Errorf("wrapper version %s != daemon version %s", wrapper.Version, daemonBuild.Version)
+		return fmt.Errorf("%w: wrapper version %s != daemon version %s", errDaemonBuildMismatch, wrapper.Version, daemonBuild.Version)
 	}
 	return nil
 }
@@ -253,6 +267,13 @@ func safeLockName(value string) string {
 		return "default"
 	}
 	return value
+}
+
+// takeoverCandidate 判定错误是否属于可尝试自动接管的类别(T5:仅 build
+// 级不匹配)。候选错误不在预锁分支提前返回,而是落入启动锁流程,由锁内
+// takeoverOutdatedDaemon 统一执行安全门与接管(并发下恰一执行者)。
+func takeoverCandidate(err error) bool {
+	return errors.Is(err, errDaemonBuildMismatch)
 }
 
 func daemonAddrFromEnv() string {

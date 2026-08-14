@@ -165,7 +165,7 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 | `direct` | 小仓库 smoke test、排障 | 不启动 daemon,每个 MCP 进程自己扫描检索 |
 | `manual-daemon` | 高级运维、固定服务 | 你自己管理 daemon 生命周期 |
 
-`auto` 只复用 build revision 与 provider 配置指纹一致的 daemon,不一致会明确报错而非静默复用;daemon 响应携带 `served_by` 便于多 IDE/WSL 混用时排查。
+`auto` 只复用 build revision 与 provider 配置指纹一致的 daemon;build 过期的 daemon 在 Unix 上被自动接管替换,配置指纹不一致则明确报错而非静默复用。daemon 响应携带 `served_by` 便于多 IDE/WSL 混用时排查。
 
 ## 索引范围与安全边界
 
@@ -205,16 +205,24 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 | `OPENACE_TASK_WORKERS` | daemon 异步任务 worker 数(默认 `4`) |
 | `OPENACE_TOOL_TIMEOUT` | 同步 MCP 工具超时(默认 `110s`) |
 
-daemon 只监听 loopback,不要直接暴露公网。引擎固定为 local-hybrid(历史 `OPENACE_ENGINE=ace` 已在 Stage 7 退役,设置会得到明确报错);修改 provider/降级 env 后 wrapper 按配置指纹拒绝复用旧 daemon 并自动拉起匹配的新 daemon。
+daemon 只监听 loopback,不要直接暴露公网。引擎固定为 local-hybrid(历史 `OPENACE_ENGINE=ace` 已在 Stage 7 退役,设置会得到明确报错);wrapper 与 daemon 的一致性按两层维护:**build 过期的 daemon 会被升级后的 wrapper 在连接时自动接管**(Unix:优雅停旧拉新,嵌入进度有断点日志保护;Windows 保持显式报错并附带含 pid 的修复命令);**修改 provider/降级 env** 属配置意图变更,wrapper 按配置指纹拒绝复用并显式报错,按提示重启 daemon 生效。
 
 **升级不打断 IDE 会话**(Unix):openace 升级(替换二进制+重启 daemon)后,IDE 里既有 MCP 会话的下一次调用会自动完成 wrapper 原地重生(exec 磁盘上的新版自身,pid 与会话保持,在途请求重放不丢),随后照常应答;版本强校验语义不变——自愈失败(如磁盘二进制反而旧于 daemon)时按原样返回可行动硬错,30s 冷却防循环。Windows 无 exec 语义,保持"重启 MCP 会话"提示。
+
+## 按场景选配置
+
+环境变量的完整语义见上表;这里只给三组常用组合:
+
+- **结果完整性优先**(审计、事实核查类任务,宁可报错不要部分结果):`OPENACE_RETRIEVAL_DEGRADE=deny`(任何降级改为显式报错),或更严格的 `OPENACE_QUALITY_STRICT=on`(语义链路任一缺口即报错)。默认档是"降级放行+首行 [DEGRADED] 横幅",调用方必须检查横幅/结构化字段再下结论。
+- **大仓高频查询**(每次查询的内联新鲜度扫描随文件数线性增长):`OPENACE_FRESHNESS_WINDOW=30s` 让窗口内的查询跳过重扫(时效上界=窗口时长,自行取舍)。
+- **候选被噪声目录淹没**(原始日志、生成产物、实验残留):用 `.openaceignore` 逐目录排除,需要时以 `!pattern` 精确放行;这些规则决定索引面,比查询期过滤更省预算。
 
 ## 排障提示
 
 - **某个目录整体检索不到**:文件选择遵循逐目录的 `.gitignore` / `.ignore` / `.openaceignore`(内置敏感文件 denylist 先于一切)。最常见形态:根 `.gitignore` 忽略了 `docs/` 之类目录(git 惯例把私有/生成内容排除在版本库外),索引随之跳过。要索引被 gitignore 的路径,在 `.openaceignore` 里加 `!docs/` 形式的 re-include;`workspace_status` 的 `top_level_file_counts` 按顶层目录给出计数——预期目录缺失或为 0 即被排除,无需对照实验。
 - **索引速度慢**:嵌入吞吐通常由 provider 限速决定(免费档 RPM 很低)。`workspace_status`/`task_status` 进度带 `rate/eta`;付费档/自部署高吞吐模型可调大 `OPENACE_EMBEDDING_MAX_CONCURRENCY`(默认 16,自部署可到 64)。
 - **客户端找不到命令**:`command` 写绝对路径(`~/go/bin/openace-mcp` 等);IDE 启动子进程不经过 shell,环境变量占位符不展开。
-- **升级不生效**:重新 `go install` 后必须重启 MCP 会话;运行中的 daemon 不热更新。
+- **升级不生效**:Unix 上重新 `go install` 后无需手动干预——既有 IDE 会话的下一次调用自动完成 wrapper 原地重生与旧 daemon 接管;Windows 仍需重启 MCP 会话并手动重启 daemon。
 - **改了 provider env 没反应**:确认重启了 MCP 会话;`daemon_status` 可查当前 daemon 的 build 与配置指纹。
 - **WSL/Windows 混用**:WSL 里复用 Windows daemon 时传 `D:\project` 或 `/mnt/d/project` 均可(自动规范化);非 WSL 的 POSIX 路径会被拒绝,避免产生无效 workspace 身份。
 - **`provider_profile_id` 报错**:该参数属已退役 legacy 引擎,删除即可。
