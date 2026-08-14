@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -492,8 +493,13 @@ func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.Workspace
 		}
 		waitCtx, cancel := context.WithTimeout(ctx, slice)
 		res, err := e.syncWorkspaceDetachable(waitCtx, ref, false)
+		// T3 修正:必须在 cancel() 前取 waitCtx.Err()——cancel 后恒为
+		// Canceled(非 nil),原写法把"非超时的真实构建错误"也吞进重试
+		// 环,直至预算耗尽后以 index-building 语言包装(坏路径 40s 白等
+		// 实录,docs/tasks/T3;与本注释声明的语义相悖)。
+		waitExpired := waitCtx.Err() != nil
 		cancel()
-		if err == nil || ctx.Err() != nil || waitCtx.Err() == nil {
+		if err == nil || ctx.Err() != nil || !waitExpired {
 			// 真结果 / 调用方取消 / 非超时的真实构建错误:原样返回。
 			return res, err
 		}
@@ -604,6 +610,16 @@ func (e *Engine) freshnessShortcut(ref engine.WorkspaceRef) (engine.Result, bool
 func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.WorkspaceRef, cancelOnLeave bool) (engine.Result, error) {
 	if err := rejectProfileID(ref); err != nil {
 		return engine.Result{}, err
+	}
+	// T3(docs/tasks/T3):不存在/非目录路径入口即错——此前坏路径落进
+	// 构建失败+有界等待,用户白等 40s 后得到 index-building 语言的 502,
+	// 真实原因(路径不存在)被吞进 stage=failed。os.Stat 跟随符号链接
+	// (链接指向不存在同口径);权限不可读目录 stat 可过,保持既有扫描
+	// fatal 语义不吞并。
+	if info, statErr := os.Stat(ref.DirectoryPath); statErr != nil {
+		return engine.Result{}, engine.AsInvalidRequest(fmt.Errorf("workspace directory does not exist: %s", ref.DirectoryPath))
+	} else if !info.IsDir() {
+		return engine.Result{}, engine.AsInvalidRequest(fmt.Errorf("workspace path is not a directory: %s", ref.DirectoryPath))
 	}
 	root, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
 	if err != nil {

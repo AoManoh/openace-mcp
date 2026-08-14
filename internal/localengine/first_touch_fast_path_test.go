@@ -257,3 +257,41 @@ func TestUnchangedWorkspaceSyncIsNoOp(t *testing.T) {
 		t.Fatalf("未变更工作区重复 sync 不得发新版: %s -> %s", first.IndexRevision, second.IndexRevision)
 	}
 }
+
+// TestBadWorkspacePathFailsFastWithPlainError 回归 T3(docs/tasks/T3):
+// 不存在/非目录路径必须入口即错(直白文案含路径),不得经 queryBuildWait
+// 白等后以 index-building 语言包装(实录:单仓坏路径 40.0s→502
+// index-building,multi 面同病)。
+func TestBadWorkspacePathFailsFastWithPlainError(t *testing.T) {
+	opts := Options{QueryBuildWait: 3 * time.Second}
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	t.Setenv("OPENACE_CACHE_NAMESPACE", "t3")
+	e, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close(context.Background()) })
+
+	begin := time.Now()
+	_, searchErr := e.Search(context.Background(), searchRequest("/nonexistent/t3-path", "anything"))
+	elapsed := time.Since(begin)
+	if searchErr == nil || !strings.Contains(searchErr.Error(), "does not exist") {
+		t.Fatalf("坏路径必须直白报错(含真实原因),实际: %v", searchErr)
+	}
+	if strings.Contains(searchErr.Error(), "index still building") {
+		t.Fatalf("坏路径不得以 index-building 语言包装: %v", searchErr)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("坏路径必须立即返回,实际 %s", elapsed)
+	}
+
+	// 非目录边界:指向文件同样直白。
+	file := filepath.Join(t.TempDir(), "plain.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, fileErr := e.Search(context.Background(), searchRequest(file, "anything"))
+	if fileErr == nil || !strings.Contains(fileErr.Error(), "not a directory") {
+		t.Fatalf("非目录路径必须直白报错: %v", fileErr)
+	}
+}
