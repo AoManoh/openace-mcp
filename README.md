@@ -207,6 +207,8 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 
 daemon 只监听 loopback,不要直接暴露公网。引擎固定为 local-hybrid(历史 `OPENACE_ENGINE=ace` 已在 Stage 7 退役,设置会得到明确报错);修改 provider/降级 env 后 wrapper 按配置指纹拒绝复用旧 daemon 并自动拉起匹配的新 daemon。
 
+**升级不打断 IDE 会话**(Unix):openace 升级(替换二进制+重启 daemon)后,IDE 里既有 MCP 会话的下一次调用会自动完成 wrapper 原地重生(exec 磁盘上的新版自身,pid 与会话保持,在途请求重放不丢),随后照常应答;版本强校验语义不变——自愈失败(如磁盘二进制反而旧于 daemon)时按原样返回可行动硬错,30s 冷却防循环。Windows 无 exec 语义,保持"重启 MCP 会话"提示。
+
 ## 排障提示
 
 - **某个目录整体检索不到**:文件选择遵循逐目录的 `.gitignore` / `.ignore` / `.openaceignore`(内置敏感文件 denylist 先于一切)。最常见形态:根 `.gitignore` 忽略了 `docs/` 之类目录(git 惯例把私有/生成内容排除在版本库外),索引随之跳过。要索引被 gitignore 的路径,在 `.openaceignore` 里加 `!docs/` 形式的 re-include;`workspace_status` 的 `top_level_file_counts` 按顶层目录给出计数——预期目录缺失或为 0 即被排除,无需对照实验。
