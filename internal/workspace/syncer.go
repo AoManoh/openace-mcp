@@ -356,6 +356,16 @@ func readIndexableContent(ctx context.Context, path string, maxBytes int64, text
 	if looksBinary(content) || !utf8.Valid(content) {
 		return nil, false, false, nil
 	}
+	// 纯空白/空文件剔除(T1-churn,2026-08-14):此类内容 chunker 必然零
+	// 产出(splitLines/splitTreeSitter 对 TrimSpace=="" 一律 nil),进资产
+	// 集只会造成"扫描见之、manifest 无之"的永真 assetsChanged——每次
+	// sync 都判变更、每次都重建发版(gradle 真实仓 1 字节换行文件实证,
+	// docs/tasks/T1)。资产集与 manifest 必须同一可索引口径;内容→空白
+	// 的既有文件在下一次扫描按"消失"走删除/tombstone 语义(与
+	// whitespace-wipe 测试族行为一致)。
+	if len(bytes.TrimSpace(content)) == 0 {
+		return nil, false, false, nil
+	}
 	return content, true, false, nil
 }
 

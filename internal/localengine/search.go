@@ -716,6 +716,11 @@ func (e *Engine) acquireQueryHandle(ctx context.Context, ref engine.WorkspaceRef
 		if errors.Is(syncErr, errQueryBuildWait) {
 			reason, label = "index-building", "index still building"
 		}
+		if errors.Is(syncErr, errFirstTouchRefresh) {
+			// T1 首触快路径:旧 revision 立即服务,后台同步在途——显式
+			// 新鲜度披露而非失败语义(deny/strict 已在入口排除)。
+			reason, label = "index-refreshing", "first-touch refresh in background"
+		}
 		if e.retrievalDegrade == DegradeDeny {
 			e.releaseHandle(handle)
 			return nil, "", engine.Result{}, nil, degradeDeniedError(label, syncErr, EnvRetrievalDegrade)
