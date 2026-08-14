@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -51,6 +52,11 @@ type Server struct {
 	// managed Connect(含 daemon spawn),不能每调用都做。
 	reconnect   func() (engine.Service, error)
 	reconnectAt time.Time
+	// selfExec 是升级自愈 handoff 的 exec 目标(T2,known-issue #13):
+	// 空=禁用(保持既有硬错)。handoffResumedAt 是 resume 时刻,冷却窗
+	// 内再次触发不再 exec(防 daemon 比磁盘 binary 更新时的 exec 循环)。
+	selfExec         string
+	handoffResumedAt time.Time
 }
 
 // reconnectTTL 是不可用形态重探测的最小间隔。
@@ -237,11 +243,31 @@ func (s *Server) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 	if _, _, err := resolveToolFace(); err != nil {
 		return err
 	}
+	// 升级自愈 resume(T2):exec 重生后恢复在途请求与 stdin 残余。
+	// pending 行最先重放(此时 service 已指向新 daemon);残余字节前置于
+	// 真实 stdin,管线化客户端零丢失。
+	var pendingLines []string
+	if state := loadHandoffState(); state != nil {
+		s.handoffResumedAt = state.At
+		if strings.TrimSpace(state.PendingLine) != "" {
+			pendingLines = append(pendingLines, state.PendingLine)
+		}
+		if len(state.StdinRest) > 0 {
+			in = io.MultiReader(bytes.NewReader(state.StdinRest), in)
+		}
+	}
 	reader := bufio.NewReaderSize(in, 64*1024)
 	enc := json.NewEncoder(out)
 
 	for {
-		line, tooLong, readErr := readInputLine(reader, maxInputLineBytes)
+		var line string
+		var tooLong bool
+		var readErr error
+		if len(pendingLines) > 0 {
+			line, pendingLines = pendingLines[0], pendingLines[1:]
+		} else {
+			line, tooLong, readErr = readInputLine(reader, maxInputLineBytes)
+		}
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			return readErr
 		}
@@ -263,6 +289,13 @@ func (s *Server) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 				s.handleNotification(req)
 			} else {
 				resp := s.handle(ctx, req)
+				// T2 升级自愈:identity 冲突响应在编码前拦截,exec 自身
+				// (成功不返回,pid 与 stdio 保持);任何失败回落原硬错。
+				if identityChangedResponse(resp) {
+					if handoffErr := s.tryUpgradeHandoff(line, reader); handoffErr != nil {
+						fmt.Fprintf(os.Stderr, "openace-mcp: upgrade handoff unavailable: %v\n", handoffErr)
+					}
+				}
 				if err := enc.Encode(resp); err != nil {
 					return err
 				}
@@ -272,6 +305,20 @@ func (s *Server) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 			return nil
 		}
 	}
+}
+
+// identityChangedResponse 判定工具响应是否为 daemon identity 冲突硬错
+// (文本契约与 internal/daemon.validateServedBy 同源,engine 包常量单点)。
+func identityChangedResponse(resp rpcResponse) bool {
+	result, ok := resp.Result.(map[string]any)
+	if !ok || result["isError"] != true {
+		return false
+	}
+	content, ok := result["content"].([]map[string]string)
+	if !ok || len(content) == 0 {
+		return false
+	}
+	return strings.Contains(content[0]["text"], engine.DaemonIdentityChangedMarker)
 }
 
 // readInputLine 读取一行(上限 limit 字节,含换行符);超限时丢弃该行

@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -42,12 +44,15 @@ func main() {
 		// 并按 TTL 惰性重探测(灰度反馈三 C.4),daemon 修好后本会话自愈。
 		fmt.Fprintf(os.Stderr, "openace-mcp: %v\n", err)
 		reconnect := func() (engine.Service, error) { return buildService(ctx) }
-		if runErr := mcp.NewUnavailableServer(err, reconnect).Run(ctx, os.Stdin, os.Stdout); runErr != nil {
+		unavailable := mcp.NewUnavailableServer(err, reconnect)
+		unavailable.EnableUpgradeHandoff(selfExecPath())
+		if runErr := unavailable.Run(ctx, os.Stdin, os.Stdout); runErr != nil {
 			fmt.Fprintf(os.Stderr, "openace-mcp: %v\n", runErr)
 		}
 		os.Exit(1)
 	}
 	server := mcp.NewServer(service)
+	server.EnableUpgradeHandoff(selfExecPath())
 
 	runErr := server.Run(ctx, os.Stdin, os.Stdout)
 	// direct 模式下引擎持有本地句柄，退出前有序释放（review S7，
@@ -145,4 +150,28 @@ func runDaemon() {
 		fmt.Fprintf(os.Stderr, "openace-daemon: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// selfExecPath 解析自身可执行文件的稳定路径(T2 升级自愈 exec 目标)。
+// 不用 /proc/self/exe:binary 被升级替换后其指向已删除的旧 inode;
+// 以启动 argv[0] 的路径语义解析(绝对/相对/PATH 查找),升级后同路径
+// 即新版。解析失败返回空=自愈禁用,保持既有硬错。
+func selfExecPath() string {
+	argv0 := os.Args[0]
+	if strings.ContainsRune(argv0, os.PathSeparator) {
+		abs, err := filepath.Abs(argv0)
+		if err != nil {
+			return ""
+		}
+		return abs
+	}
+	resolved, err := exec.LookPath(argv0)
+	if err != nil {
+		return ""
+	}
+	abs, err := filepath.Abs(resolved)
+	if err != nil {
+		return ""
+	}
+	return abs
 }
