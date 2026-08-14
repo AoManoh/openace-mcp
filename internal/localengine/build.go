@@ -569,6 +569,27 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 		return engine.Result{}, err
 	}
 	records := delta.records
+	// 空 delta 防发版护栏(T1-churn 防御纵深):变更集全部零 chunk 产出、
+	// 无删除、且这些路径本就不在 manifest(即 manifest 内容不可能变化)
+	// 时,发版只会制造 revision churn(GC 压力/journal 增长/重建风暴的
+	// 温床)。扫描层已按同口径剔除零 chunk 内容,此处兜未来回归。
+	if len(records) == 0 && len(removed) == 0 {
+		touchesManifest := false
+		for _, asset := range changed {
+			if _, ok := previous.Files[asset.RelPath]; ok {
+				touchesManifest = true
+				break
+			}
+		}
+		if !touchesManifest {
+			status.ready(previous, revisionCount(store, previous))
+			return engine.Result{
+				Engine:        EngineID,
+				IndexRevision: previous.Revision,
+				FileCount:     previous.Counts.Files,
+			}, nil
+		}
+	}
 
 	// 语义路：只嵌入 delta 记录（复用按纯 content hash，D2）。
 	var prior priorVectors

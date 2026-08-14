@@ -104,6 +104,8 @@ type Engine struct {
 	// statCaches 每 workspace 一个扫描 stat 短路缓存(T11;构建持写锁
 	// 串行,缓存自身另有锁自卫)。
 	statCaches map[string]*workspace.StatCache
+	// firstTouchKicks 是首触快路径(T1)的每 workspace 后台同步单飞位。
+	firstTouchKicks sync.Map
 	// lastSyncOK 是每 workspace 最近一次成功同步完成时刻(freshness
 	// 窗口判据;仅成功路径刷新)。
 	lastSyncOK map[string]time.Time
@@ -410,6 +412,39 @@ type buildCall struct {
 // 后台推进,调用方按 revision 有无决定降级或报错。
 var errQueryBuildWait = errors.New("query wait for index build exceeded")
 
+// errFirstTouchRefresh 标记首触快路径(T1):磁盘 revision 立即可服务,
+// 真实同步已在后台单飞推进;上层以 index-refreshing reason 服务旧索引。
+var errFirstTouchRefresh = errors.New("first touch refresh in background")
+
+// firstTouchFastPath 判定并踢出首触后台同步(T1)。返回 (sentinel, true)
+// 表示走快路径;后台同步 goroutine 每 workspace 单飞(firstTouchKicks),
+// 完成后清位——若同步失败,下一次查询会再次踢(重试语义与内联失败一致,
+// 失败原因经 status/last_error 可见,不静默永久陈旧)。
+func (e *Engine) firstTouchFastPath(ref engine.WorkspaceRef) (error, bool) {
+	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
+	if err != nil {
+		return nil, false
+	}
+	e.mu.Lock()
+	_, synced := e.lastSyncOK[workspaceKey]
+	e.mu.Unlock()
+	if synced || !e.hasServableRevision(ref) {
+		return nil, false
+	}
+	if _, running := e.firstTouchKicks.LoadOrStore(workspaceKey, struct{}{}); !running {
+		go func() {
+			defer e.firstTouchKicks.Delete(workspaceKey)
+			defer func() {
+				// 后台 goroutine 不得因引擎关闭等竞态拖垮进程;失败留给
+				// status/下次查询重踢,这里只兜 panic。
+				_ = recover()
+			}()
+			_, _ = e.syncWorkspaceDetachable(context.Background(), ref, false)
+		}()
+	}
+	return errFirstTouchRefresh, true
+}
+
 // syncWorkspaceForQuery 是查询路径的同步入口:配置了 QueryBuildWait 时
 // 以其为上界等待在建构建;超界即脱离等待(不取消构建,phantom waiter
 // 保证后续 leave 也不会取消),错误带构建进度与 env 名(可行动)。
@@ -419,6 +454,22 @@ func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.Workspace
 	if e.freshnessWindow > 0 {
 		if res, ok := e.freshnessShortcut(ref); ok {
 			return res, nil
+		}
+	}
+	// 首触快路径(T1,2026-08-14):进程重启后 lastSyncOK 清空,而磁盘上
+	// 的 published revision 依旧可服务——现状是首查内联全量扫描,大仓
+	// 实测阻塞 40s+ 后才 stale-serve 本就在盘上的 revision(gradle 29K
+	// files 43.6s,docs/tasks/T1)。此处改为:本 daemon 生命周期内该
+	// workspace 尚无成功同步且存在可服务 revision 时,立即以 sentinel
+	// 错误交上层按既有 stale-serve 机制服务旧 revision(reason=
+	// index-refreshing,进 [DEGRADED] 横幅),同时单飞踢一次后台真实
+	// 同步;收敛后 lastSyncOK 置位,本路径自动失效。边界(与 task 文档
+	// 一致):显式 Sync 不经此路(F2);真冷仓无 revision 不适用;deny=
+	// 正确性优先不适用;strict 会把任何降级 reason 判违规,走快路径
+	// 只会必然报错,故同样不适用。
+	if e.retrievalDegrade != DegradeDeny && !e.qualityStrict {
+		if err, ok := e.firstTouchFastPath(ref); ok {
+			return engine.Result{}, err
 		}
 	}
 	if e.queryBuildWait <= 0 {

@@ -259,3 +259,40 @@ func TestScanFileSkipDispositionClassification(t *testing.T) {
 		})
 	}
 }
+
+// TestScanSkipsWhitespaceOnlyFiles 回归 T1-churn(docs/tasks/T1,2026-08-14):
+// 纯空白/空文件可通过文本门禁但 chunker 必然零产出,收入资产集会造成
+// "扫描见之、manifest 无之"的永真 assetsChanged→每次 sync 全都重建发版
+// (gradle 真实仓 1 字节换行文件实证)。资产集与 manifest 的可索引判定
+// 必须同一口径:零 chunk 内容在扫描层剔除。
+func TestScanSkipsWhitespaceOnlyFiles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "real.go"), []byte("package a\n\nfunc A() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "newline.gradle"), []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "empty.txt"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "spaces.md"), []byte("  \n\t\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assets, err := FileAssetSource{}.Load(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := map[string]bool{}
+	for _, asset := range assets {
+		paths[asset.RelPath] = true
+	}
+	if !paths["real.go"] {
+		t.Fatalf("真实文件必须在资产集: %v", paths)
+	}
+	for _, ws := range []string{"newline.gradle", "empty.txt", "spaces.md"} {
+		if paths[ws] {
+			t.Fatalf("纯空白文件 %s 不得进入资产集(零 chunk 必然造成 manifest 永真差异)", ws)
+		}
+	}
+}
