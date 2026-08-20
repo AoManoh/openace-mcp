@@ -81,9 +81,15 @@ func newFakeBulkProvider(t *testing.T, dim int) *fakeBulkProvider {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		var req struct {
-			InputFileID string `json:"input_file_id"`
+			InputFileID   string         `json:"input_file_id"`
+			RequestParams map[string]any `json:"request_params"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.RequestParams["model"] == nil || req.RequestParams["input_type"] == nil {
+			// 真实契约(2026-08-20 真 422 实测):request_params 必填。
+			http.Error(w, `{"detail":[{"type":"missing","loc":["body","request_params"]}]}`, http.StatusUnprocessableEntity)
+			return
+		}
 		p.jobsCreated++
 		id := fmt.Sprintf("job-%d", p.jobsCreated)
 		p.jobs[id] = req.InputFileID
@@ -117,7 +123,7 @@ func newFakeBulkProvider(t *testing.T, dim int) *fakeBulkProvider {
 	})
 	// content 端点:302 重定向到签名 URL(下载面与真实行为一致)。
 	mux.HandleFunc("GET /files/{id}/content", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, p.ts.URL+"/signed/"+r.PathValue("id"), http.StatusFound)
+		http.Redirect(w, r, p.ts.URL+"/signed/"+r.PathValue("id"), http.StatusTemporaryRedirect)
 	})
 	mux.HandleFunc("GET /signed/{id}", func(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
@@ -128,10 +134,13 @@ func newFakeBulkProvider(t *testing.T, dim int) *fakeBulkProvider {
 			vec := make([]float32, p.dim)
 			vec[0] = float32(len(texts[i])%7 + 1) // 非零可归一化
 			line := map[string]any{
-				"custom_id": key, "status_code": 200,
+				"custom_id": key,
 				"response": map[string]any{
-					"data":  []map[string]any{{"embedding": vec, "index": 0}},
-					"usage": map[string]int{"total_tokens": len(texts[i]) / 4},
+					"status_code": 200,
+					"body": map[string]any{
+						"data":  []map[string]any{{"embedding": vec, "index": 0}},
+						"usage": map[string]int{"total_tokens": len(texts[i]) / 4},
+					},
 				},
 			}
 			_ = json.NewEncoder(w).Encode(line)

@@ -70,7 +70,7 @@ type BulkJobStatus struct {
 // Terminal 报告作业是否到达终态。
 func (s BulkJobStatus) Terminal() bool {
 	switch s.Status {
-	case "completed", "failed", "expired", "cancelled":
+	case "completed", "partially_completed", "failed", "expired", "cancelled":
 		return true
 	}
 	return false
@@ -100,12 +100,7 @@ func (c *Client) BulkSubmit(ctx context.Context, keys []string, texts []string) 
 	for i, key := range keys {
 		line := map[string]any{
 			"custom_id": key,
-			"body": map[string]any{
-				"input":            []string{texts[i]},
-				"model":            c.cfg.Model,
-				"input_type":       string(InputDocument),
-				"output_dimension": c.cfg.Dimension,
-			},
+			"body":      map[string]any{"input": []string{texts[i]}},
 		}
 		if err := enc.Encode(line); err != nil {
 			return BulkJob{}, fmt.Errorf("bulk submit: encode line: %w", err)
@@ -137,10 +132,18 @@ func (c *Client) BulkSubmit(ctx context.Context, keys []string, texts []string) 
 		return BulkJob{}, fmt.Errorf("bulk submit: provider 未返回文件 id")
 	}
 	// 3) 创建作业。
+	// voyage 真实形状(2026-08-20 真实 422 实测+119M 实跑驱动器口径):
+	// 模型/输入类型/维度在**作业级** request_params,不在 JSONL 行内。
 	createBody, err := json.Marshal(map[string]any{
 		"input_file_id":     uploaded.ID,
 		"endpoint":          "/v1/embeddings",
 		"completion_window": "12h",
+		"request_params": map[string]any{
+			"model":            c.cfg.Model,
+			"input_type":       string(InputDocument),
+			"output_dimension": c.cfg.Dimension,
+		},
+		"metadata": map[string]string{"tool": "openace-bulk-lane"},
 	})
 	if err != nil {
 		return BulkJob{}, err
@@ -193,8 +196,8 @@ type BulkResult struct {
 // (来自持久化的 BulkJob.Keys):未知键、维度不符、非 200 行、缺失键都
 // 显式记入拒绝明细——绝不静默丢行。
 func (c *Client) BulkFetchResults(ctx context.Context, status BulkJobStatus, expected []string) (BulkResult, error) {
-	if status.Status != "completed" {
-		return BulkResult{}, fmt.Errorf("bulk fetch: 作业 %s 状态 %s 非 completed", status.ID, status.Status)
+	if status.Status != "completed" && status.Status != "partially_completed" {
+		return BulkResult{}, fmt.Errorf("bulk fetch: 作业 %s 状态 %s 不可回收", status.ID, status.Status)
 	}
 	if status.OutputFileID == "" {
 		return BulkResult{}, fmt.Errorf("bulk fetch: 作业 %s 无输出文件", status.ID)
@@ -220,17 +223,21 @@ func (c *Client) BulkFetchResults(ctx context.Context, status BulkJobStatus, exp
 			if len(bytes.TrimSpace(line)) == 0 {
 				continue
 			}
+			// 行形状为实跑驱动器核实的 voyage 口径:状态码在 response 层,
+			// 数据在 response.body 层;单输入行使 data 恰 1 条,天然规避
+			// "data[].index 是服务端全局偏移"的历史陷阱(2026-08-05 实测)。
 			var row struct {
-				CustomID   string `json:"custom_id"`
-				StatusCode int    `json:"status_code"`
-				Error      any    `json:"error"`
-				Response   struct {
-					Data []struct {
-						Embedding []float32 `json:"embedding"`
-					} `json:"data"`
-					Usage struct {
-						TotalTokens int `json:"total_tokens"`
-					} `json:"usage"`
+				CustomID string `json:"custom_id"`
+				Response struct {
+					StatusCode int `json:"status_code"`
+					Body       struct {
+						Data []struct {
+							Embedding []float32 `json:"embedding"`
+						} `json:"data"`
+						Usage struct {
+							TotalTokens int `json:"total_tokens"`
+						} `json:"usage"`
+					} `json:"body"`
 				} `json:"response"`
 			}
 			if err := json.Unmarshal(line, &row); err != nil {
@@ -242,19 +249,23 @@ func (c *Client) BulkFetchResults(ctx context.Context, status BulkJobStatus, exp
 				result.RejectReason[row.CustomID] = "unknown custom_id"
 				continue
 			}
-			if row.StatusCode != 0 && row.StatusCode != http.StatusOK {
+			if row.Response.StatusCode != 0 && row.Response.StatusCode != http.StatusOK {
 				result.RejectedKeys = append(result.RejectedKeys, row.CustomID)
-				result.RejectReason[row.CustomID] = fmt.Sprintf("status_code=%d", row.StatusCode)
+				result.RejectReason[row.CustomID] = fmt.Sprintf("status_code=%d", row.Response.StatusCode)
 				continue
 			}
-			if len(row.Response.Data) != 1 || len(row.Response.Data[0].Embedding) != c.cfg.Dimension {
+			data := row.Response.Body.Data
+			if len(data) != 1 || len(data[0].Embedding) != c.cfg.Dimension {
+				dim := 0
+				if len(data) > 0 {
+					dim = len(data[0].Embedding)
+				}
 				result.RejectedKeys = append(result.RejectedKeys, row.CustomID)
-				result.RejectReason[row.CustomID] = fmt.Sprintf("bad shape: data=%d dim=%d want=%d",
-					len(row.Response.Data), embeddingDim(row.Response.Data), c.cfg.Dimension)
+				result.RejectReason[row.CustomID] = fmt.Sprintf("bad shape: data=%d dim=%d want=%d", len(data), dim, c.cfg.Dimension)
 				continue
 			}
-			result.Vectors[row.CustomID] = row.Response.Data[0].Embedding
-			result.UsageTokens += row.Response.Usage.TotalTokens
+			result.Vectors[row.CustomID] = data[0].Embedding
+			result.UsageTokens += row.Response.Body.Usage.TotalTokens
 		}
 		return scanner.Err()
 	}
@@ -276,15 +287,6 @@ func (c *Client) BulkFetchResults(ctx context.Context, status BulkJobStatus, exp
 		}
 	}
 	return result, nil
-}
-
-func embeddingDim(data []struct {
-	Embedding []float32 `json:"embedding"`
-}) int {
-	if len(data) == 0 {
-		return 0
-	}
-	return len(data[0].Embedding)
 }
 
 // bulkCall 执行一次批控制面请求(上传/建作业/查状态),统一鉴权、错误
@@ -321,9 +323,12 @@ func (c *Client) bulkCall(ctx context.Context, method, path, contentType string,
 	return nil
 }
 
-// bulkDownload 下载结果文件内容。voyage 的 content 端点以 302 重定向到
-// 签名 URL(2026-08-03 实测):Go 默认跟随重定向,且跨域时自动剥除
-// Authorization 头——签名 URL 不需要鉴权,这个行为恰好正确。
+// bulkDownload 下载结果文件内容。voyage 的 content 端点以 307 重定向到
+// GCS 签名 URL(约 15 分钟时效;2026-08-05 实测):Go 默认跟随重定向,
+// 且跨域自动剥除 Authorization 头——签名 URL 不需要鉴权,行为恰好正确。
+// 已知边界:GCS 单连接限速明显,GB 级结果文件应并行分段下载(评测驱动
+// 器已验证该优化);产品侧当前按串行整取,10 万行以内量级足够,更大
+// 规模列为后续优化项(任务文档遗留)。
 func (c *Client) bulkDownload(ctx context.Context, fileID string) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.BaseURL+"/files/"+fileID+"/content", nil)
 	if err != nil {
