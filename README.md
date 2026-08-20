@@ -114,10 +114,11 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 
 - **词法路径永远可用**:无 key、断网、模型服务故障时 BM25 检索继续完整工作;未配置模型服务时与纯词法模式完全一致,不出现降级标记。
 - **降级完全显式,由你支配**:语义路/精排失败或索引覆盖不完整时,结果首行出现 `[DEGRADED] <原因>; mode=...; semantic_coverage=...` 横幅,结构化字段同步携带 `retrieval_mode`/`degraded_reason`/`semantic_coverage`;`OPENACE_RETRIEVAL_DEGRADE=deny` / `OPENACE_RERANK_DEGRADE=deny` 可改为直接返回可行动错误(默认 `allow` 放行词法结果)。不存在静默降级。
-- **成本边界**:embedding/rerank 的调用与计费发生在你自己的模型服务上。索引期按变更内容付费——未变更 chunk 跨 revision 复用向量,不重复付费;查询期每次消耗一次 query embedding(启用 rerank 时另加一次精排调用)。预算护栏建议设在你的服务/账户侧。
+- **成本边界**:embedding/rerank 的调用与计费发生在你自己的模型服务上。索引期按变更内容付费——未变更 chunk 跨 revision 复用向量,不重复付费;查询期每次消耗一次 query embedding(启用 rerank 时另加一次精排调用)。预算护栏建议设在你的服务/账户侧。大额首建(万级 chunk 以上)可开 `OPENACE_EMBEDDING_BATCH_API=voyage` 走批作业:同样的向量,费用少三分之一,代价是服务端排队(上限 12 小时,实测通常快得多);排队期间词法检索照常可用,daemon 重启会接着等同一个作业,不会重复交钱。
 - **数据边界**:索引在本机 cache 目录保存被索引文件的明文片段副本(权限仅当前用户);启用 embedding 时 chunk 内容会发送到你配置的模型服务。使用任何**托管**服务前请自行核实其数据保留与训练条款(多数托管服务默认可将数据用于训练,需显式退出);自部署端点无此顾虑。`.openaceignore` 与内置敏感文件 denylist 先于一切生效。
 - **向量身份隔离**:模型/维度/端点、内置嵌入模板版本或切分器版本(如新增 AST 语言批次)任一变化,创建平行索引子树并全量重建(一次 corpus 全量嵌入费用,旧子树保留可回退);换 key 不触发重建。
 - **增量索引**:首建后编辑只重建变更文件,删除/重命名立即从结果消失;嵌入费用有界于变更量。delta 链自动本地合并(compaction,零模型调用);索引只保留最近两个 revision,内容按需读取不常驻内存。
+- **索引不挤兑查询,限流不停摆**:交互查询与索引批各持独立熔断——大仓索引撞 429 风暴时,你正在敲的检索照常 hybrid。风暴本身由治理器消化:先按 Retry-After 降速续跑(而不是熔断停摆),速率压到地板仍被拒才全停保护费用。自部署服务没有 429,治理器改看延迟:短窗延迟明显偏离基线就收并发窗口,恢复平稳再逐步放开。
 - **中断不丢付费进度**:每批嵌入成功即写本地 journal;超时/取消/进程被杀后,下次 sync 复用已付费向量只补缺口。进度经 `workspace_status` 实时可见。
 - **崩溃与多进程安全**:任意时刻杀进程,重启自动恢复、无重复付费;同一索引子树写路径跨进程互斥,持锁进程崩溃后自动接管;只读检索无锁。索引 immutable、发布原子切换,数据损坏自动回退上一 revision 并自愈。
 - **重启不用重新等**:daemon 重启后,第一次查询直接用磁盘上已发布的索引即刻应答,结果标 `index-refreshing`,后台自动对账收敛。三万文件的真实仓实测 1.6 秒拿到结果,而不是白等一轮 43 秒的全量重扫。
@@ -189,7 +190,10 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 |------|------|
 | `OPENACE_EMBEDDING_PROVIDER` | 语义路端点类型:`openai`(OpenAI-compatible)/ `voyage` / `off`。默认 `voyage` 且未提供 key 时语义路保持关闭、词法照常——即**不配置就是纯词法** |
 | `OPENACE_EMBEDDING_BASE_URL` `_API_KEY` `_MODEL` `_DIMENSION` | 模型服务身份四项(`openai` 类型必填 base_url 与 model);`voyage` 类型 key 为空时回退读 `VOYAGE_API_KEY`;任一身份变化触发平行索引全量重建 |
-| `OPENACE_EMBEDDING_BATCH_SIZE` `_MAX_CONCURRENCY` `_RPM_BUDGET` `_TPM_BUDGET` | 索引期调用参数(默认 128 / 16 / 不限 / 不限)。索引吞吐通常由 provider 限速决定:免费档 RPM 低时提并发只会触发 429 退避(无害);付费档与自部署高吞吐模型吞吐随并发近线性——自部署资源充足时把 `_MAX_CONCURRENCY` 调到 32-64 可数倍缩短索引时间,`_RPM_BUDGET`/`_TPM_BUDGET` 可按服务额度设硬顶 |
+| `OPENACE_EMBEDDING_BATCH_SIZE` `_MAX_CONCURRENCY` `_RPM_BUDGET` `_TPM_BUDGET` | 索引期调用参数(默认 128 / 16 / 不限 / 不限)。`_MAX_CONCURRENCY` 是并发**上限**:治理器在其内自动寻优,知道自己服务底细就把上限设准(自部署 32-64,免费档 4);`_RPM_BUDGET`/`_TPM_BUDGET` 是治理器不可逾越的硬顶 |
+| `OPENACE_THROUGHPUT_GOVERNOR` | 吞吐治理器与车道分离的逃生门:默认 `on`——索引 429 自动降速续跑(尊重 Retry-After,乘性减/加性增),自部署按延迟梯度自动收放并发,交互查询与索引各持独立熔断互不拖累;`off` 回到固定并发+共用熔断的旧行为 |
+| `OPENACE_EMBEDDING_BATCH_API` | 离线批车道:`voyage` = 大额嵌入改走 voyage Batch API(费用 -33%,服务端 12h 完成窗,崩溃后续作业不重复付费);默认 `off`。要求 provider 就是 voyage,其他组合启动即报错 |
+| `OPENACE_EMBEDDING_BATCH_MIN_CHUNKS` | 批车道触发阈值(默认 `2000`):缺失量低于此走同步车道——几百个 chunk 分钟级就完了,不值得排 12h 窗 |
 | `OPENACE_RERANK_PROVIDER` | 精排(质量至上默认档):`tei` / `voyage` / `off`;默认 `voyage`,key 缺省回退 `VOYAGE_API_KEY`。配置即启用;语义已配而精排缺配置时结果携带 `rerank-unconfigured` 提示(`OPENACE_QUALITY_STRICT=on` 下升级为报错),显式 `off` 视为确认放弃。`_BASE_URL`/`_API_KEY`/`_MODEL`/`_MAX_TOKENS` 语义同上 |
 | `OPENACE_RETRIEVAL_DEGRADE` / `OPENACE_RERANK_DEGRADE` | 语义路/精排失败策略:`allow`(默认,放行并标 `[DEGRADED]`)/ `deny`(返回可行动错误) |
 | `OPENACE_QUALITY_STRICT` | `on` = 质量严格档:语义链路任一缺口(覆盖 <100%、查询嵌入失败、已配置的 rerank 未生效等)直接报错;要求已配置 embedding。默认 `off`。结构化结果携带 `rerank_sent`/`query_embed_failed`/`embedding_profile` |
