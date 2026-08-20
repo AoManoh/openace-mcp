@@ -34,13 +34,13 @@ type wsStatus struct {
 	permissionSkipped int
 	// oversizeSkipped 是扫描期因超过文本上限被跳过的文件数(2026-08-10
 	// 大文件修复配套,K6)。
-	oversizeSkipped int
-	capabilities      map[string]string
-	lastError         string
-	skippedRevisions  []string
-	startedAt         *time.Time
-	finishedAt        *time.Time
-	updatedAt         time.Time
+	oversizeSkipped  int
+	capabilities     map[string]string
+	lastError        string
+	skippedRevisions []string
+	startedAt        *time.Time
+	finishedAt       *time.Time
+	updatedAt        time.Time
 
 	// 语义路状态（Stage 3）：covered 来自 active manifest（暗坑 K31），
 	// rejected/embedError 来自最近一次构建的 provider 交互。
@@ -50,10 +50,20 @@ type wsStatus struct {
 	// 构建期 embedding 进度（Stage 4 D8）：按批更新，构建结束归零。
 	embedPending int
 	embedDone    int
+	// bulkJob 是离线批车道在途作业标签(T8 可观测:"voyage:<id> <state>
+	// <done>/<total>");空=无在途批作业。
+	bulkJob string
 	// embedStartedAt 是本次构建嵌入阶段起点(灰度反馈 2026-08-07:
 	// 大仓预热只见 pending 无速率/ETA,"在推进"与"多久能好"无从判断),
 	// 供速率与 ETA 估算;构建结束随进度一并归零。
 	embedStartedAt *time.Time
+}
+
+// setBulkJob 更新离线批车道在途作业标签(T8;空串=清除)。
+func (s *wsStatus) setBulkJob(label string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bulkJob = label
 }
 
 // setEmbedProgress 按批更新构建期 embedding 进度（D8/G2 可见性）。
@@ -322,6 +332,7 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 			semantic.PendingChunks = tracker.embedPending
 			semantic.EmbeddedChunks = tracker.embedDone
 			semantic.EmbedRatePerMin, semantic.EmbedETASeconds = tracker.embedRateETALocked(time.Now().UTC())
+			semantic.BulkJob = tracker.bulkJob
 			tracker.mu.Unlock()
 			// journal 条数（D4 可见性）：已打开的暂存区实时读取。
 			e.mu.Lock()

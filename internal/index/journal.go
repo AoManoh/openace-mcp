@@ -79,6 +79,10 @@ func OpenJournal(store *Store, dimension int) (*Journal, error) {
 	return j, nil
 }
 
+// Dir 暴露 journal 所在目录:离线批车道(T8)的作业状态文件与 journal
+// 同目录同生命周期(同一 workspace 子树,发布后一并清理语义由各自负责)。
+func (j *Journal) Dir() string { return j.dir }
+
 func (j *Journal) vectorsPath() string  { return filepath.Join(j.dir, journalFileName) }
 func (j *Journal) rejectedPath() string { return filepath.Join(j.dir, rejectedFileName) }
 

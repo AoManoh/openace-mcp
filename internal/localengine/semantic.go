@@ -238,6 +238,16 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	// 串行会把构建吞吐钉死在单请求延迟上）；每批 all-or-nothing 与
 	// journal 落盘语义不变，journal 自身持锁。
 	status.setEmbedProgress(len(missingHashes), 0)
+	// 离线批车道(T8):显式 opt-in + 缺失量达阈值时,大额嵌入改走
+	// provider 批作业(-33% 费用,服务端 12h 窗;崩溃安全与失败纪律见
+	// semantic_bulk.go)。回收产物写入同一 journal/reuse,批与同步两条
+	// 车道共享下方步骤 4 的组装逻辑,产物等价。
+	if len(missingHashes) > 0 && e.bulkEligible(len(missingHashes)) {
+		if err := e.bulkEmbedMissing(ctx, journal, status, missingHashes, missingTexts, reuse, &out); err != nil {
+			return out, err
+		}
+		return e.assembleSemanticOutcome(records, reuse, activeUsable, out), nil
+	}
 	batchSize := e.embedCfg.BatchSize
 	if batchSize < 1 {
 		// 程序化构造 Options 传 0 的防呆(L5):env 路径有下限校验,
@@ -363,9 +373,14 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		return out, err
 	}
 
-	// 4) 对齐 records 组装行集（同 embedKey 多行共享同一向量值;Entry
-	// 的 ContentHash 字段自本版本起承载 embedKey——子树按模板版本平行
-	// 隔离,单一子树内键语义恒一致）。
+	return e.assembleSemanticOutcome(records, reuse, activeUsable, out), nil
+}
+
+// assembleSemanticOutcome 是嵌入产物的统一组装(原 embedRecords 步骤 4,
+// 同步与批两条车道共享):对齐 records 生成向量行集,同 embedKey 多行
+// 共享同一向量值;Entry 的 ContentHash 字段承载 embedKey——子树按模板
+// 版本平行隔离,单一子树内键语义恒一致。
+func (e *Engine) assembleSemanticOutcome(records []chunkRecord, reuse map[string][]float32, activeUsable map[string]bool, out semanticOutcome) semanticOutcome {
 	for _, record := range records {
 		key := embedKey(record)
 		vec, ok := reuse[key]
@@ -379,5 +394,5 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 			out.coveredByActive++
 		}
 	}
-	return out, nil
+	return out
 }

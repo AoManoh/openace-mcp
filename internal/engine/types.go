@@ -202,6 +202,10 @@ type SemanticStatus struct {
 	// 参考。
 	EmbedRatePerMin int `json:"embed_rate_per_min,omitempty"`
 	EmbedETASeconds int `json:"embed_eta_seconds,omitempty"`
+	// BulkJob 是离线批车道在途作业标签(T8,加性 omitempty):形如
+	// "voyage:<job-id> in_progress 1200/5000"。服务端 12h 完成窗内构建
+	// 保持 in_flight,调用方经此判断"在排队"而非"卡死"。
+	BulkJob string `json:"bulk_job,omitempty"`
 
 	// ProviderState 是 embedding circuit 状态：healthy/backoff/candidate；
 	// backoff 时 BackoffUntil 指明恢复探测时间（§15）。
