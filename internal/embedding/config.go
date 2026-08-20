@@ -35,6 +35,12 @@ const (
 	EnvDimension      = "OPENACE_EMBEDDING_DIMENSION"
 	EnvBatchSize      = "OPENACE_EMBEDDING_BATCH_SIZE"
 	EnvMaxConcurrency = "OPENACE_EMBEDDING_MAX_CONCURRENCY"
+	// EnvThroughputGovernor 是 T6 逃生门:off 关闭治理器与车道分离。
+	EnvThroughputGovernor = "OPENACE_THROUGHPUT_GOVERNOR"
+	// EnvBatchAPI 选择离线批车道 adapter:目前仅 voyage;默认关闭。
+	EnvBatchAPI = "OPENACE_EMBEDDING_BATCH_API"
+	// EnvBatchMinChunks 是批车道触发阈值(缺失 chunk 数)。
+	EnvBatchMinChunks = "OPENACE_EMBEDDING_BATCH_MIN_CHUNKS"
 	EnvRPMBudget      = "OPENACE_EMBEDDING_RPM_BUDGET"
 	EnvTPMBudget      = "OPENACE_EMBEDDING_TPM_BUDGET"
 )
@@ -53,6 +59,9 @@ const (
 	// 提并发不改变计费总量。自部署高吞吐环境可经
 	// OPENACE_EMBEDDING_MAX_CONCURRENCY 进一步调大(如 64)。
 	defaultConcurrency = 16
+	// defaultBatchMinChunks:批车道触发阈值缺省。2000 chunks≈0.6M tokens,
+	// 同步车道分钟级即可完成——低于此走批只会平白多等服务端排队。
+	defaultBatchMinChunks = 2000
 	// maxBatchSize 是单批条数硬上限（Voyage 官方 ≤1000 条）。
 	maxBatchSize = 1000
 )
@@ -93,6 +102,24 @@ type Config struct {
 	// localengine.embedTemplateVersion,由引擎构造期注入(参与
 	// ProfileHash;M9② 单一化,禁止本包再设常量)。
 	TemplateVersion string
+
+	// GovernorDisabled 关闭吞吐治理器与车道分离(T6 逃生门,env
+	// OPENACE_THROUGHPUT_GOVERNOR=off):回到共用单熔断+固定并发的
+	// 旧行为。运行时参数,不参与 ProfileHash。
+	GovernorDisabled bool
+
+	// BatchAPIMode 是离线批车道(T8):""=关闭(默认),"voyage"=大额
+	// document 嵌入改走 voyage Batch API(-33% 费用,服务端 12h 窗)。
+	// 行为模式,参与引擎指纹(localengine.Fingerprint)但不参与
+	// ProfileHash——批与实时 API 产出同模型同维度的等价向量
+	// (2026-08-03 实测余弦=1.000000),索引子树身份不变。
+	BatchAPIMode string
+	// BatchMinChunks 是走批车道的缺失量阈值,低于此走同步车道
+	// (小活不值得 12h 完成窗)。
+	BatchMinChunks int
+	// BulkPollInterval 是批作业轮询间隔(仅程序化覆盖,测试用;0=默认
+	// 30s。轮询是纯只读状态查询,不计费)。
+	BulkPollInterval time.Duration
 }
 
 // ConfigFromEnv 解析 embedding 配置；配置错误在启动即报（fail-fast），
@@ -137,6 +164,28 @@ func ConfigFromEnv() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.MaxRetries, err = reliability.MaxRetriesFromEnv(); err != nil {
+		return Config{}, err
+	}
+	switch governor := strings.TrimSpace(strings.ToLower(os.Getenv(EnvThroughputGovernor))); governor {
+	case "", "on":
+	case "off":
+		cfg.GovernorDisabled = true
+	default:
+		return Config{}, fmt.Errorf("invalid %s %q: use \"on\" or \"off\"", EnvThroughputGovernor, governor)
+	}
+	switch batchAPI := strings.TrimSpace(strings.ToLower(os.Getenv(EnvBatchAPI))); batchAPI {
+	case "", "off":
+	case "voyage":
+		// 批车道要求 provider 就是 voyage:不支持的组合 fail-fast,
+		// 绝不静默忽略(用户裁决 2026-08-20:错误显式外抛)。
+		if provider != ProviderVoyage {
+			return Config{}, fmt.Errorf("%s=voyage requires %s=voyage (got %q)", EnvBatchAPI, EnvProvider, provider)
+		}
+		cfg.BatchAPIMode = ProviderVoyage
+	default:
+		return Config{}, fmt.Errorf("invalid %s %q: use \"voyage\" or \"off\"", EnvBatchAPI, batchAPI)
+	}
+	if cfg.BatchMinChunks, err = reliability.IntEnv(EnvBatchMinChunks, defaultBatchMinChunks, 1); err != nil {
 		return Config{}, err
 	}
 

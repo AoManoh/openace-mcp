@@ -192,13 +192,23 @@ func (o Options) Fingerprint() string {
 	if o.QualityStrict {
 		strictComponent = "strict-on"
 	}
+	// T8:离线批车道是构建行为模式(daemon 执行构建),wrapper 与 daemon
+	// 必须同模式——不入指纹会静默按先启动者的模式执行,违反"配置意图
+	// 变更显式生效"的既有语义(与 degrade/strict 同类)。批车道不改向量
+	// 身份(同模型同维度,批与实时 API 实测余弦=1.000000),ProfileHash
+	// 与索引子树不变。指纹版本升 v3。
+	bulkComponent := "bulk-off"
+	if o.Embedding.BatchAPIMode != "" {
+		bulkComponent = "bulk-" + o.Embedding.BatchAPIMode
+	}
 	sum := sha256.Sum256([]byte(strings.Join([]string{
-		"engine-profile-v2",
+		"engine-profile-v3",
 		embedComponent,
 		rerankComponent,
 		string(normalizeDegrade(o.RetrievalDegrade)),
 		string(normalizeDegrade(o.RerankDegrade)),
 		strictComponent,
+		bulkComponent,
 	}, "\x00")))
 	return hex.EncodeToString(sum[:])[:12]
 }

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"syscall"
+	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/reliability"
 )
@@ -27,15 +28,24 @@ const (
 // maxResponseBytes 限制响应体读取（1000 条 × 2048 维的极限批约 30MB，留足余量）。
 const maxResponseBytes = 256 << 20
 
-// Client 是 embedding provider 的 HTTP 客户端。circuit/limiter/并发槽
-// 挂在实例上，实例必须为 daemon 级单例共享（暗坑 K36）。
+// Client 是 embedding provider 的 HTTP 客户端。熔断/限流/并发状态挂在
+// 实例上，实例必须为 daemon 级单例共享（暗坑 K36）。
+//
+// 车道分离(T6):索引车道(document 批)与查询车道(query)各持独立熔断——
+// 变更前共用一个熔断器,索引 429 风暴会把交互查询一起打进词法降级
+// (架构分析 2026-08-20 事实 F5)。索引车道另受吞吐治理器准入(429 学
+// 速率、延迟学窗口);查询车道直通治理器与并发槽:交互请求一次一条,
+// 不该排在几十个索引批后面。逃生门 OPENACE_THROUGHPUT_GOVERNOR=off
+// 回到共用单熔断+无治理器的旧行为。
 type Client struct {
-	cfg        Config
-	httpClient *http.Client
-	circuit    *reliability.Circuit
-	limiter    *reliability.RateLimiter
-	sem        chan struct{}
-	retry      reliability.RetryPolicy
+	cfg          Config
+	httpClient   *http.Client
+	circuitIndex *reliability.Circuit
+	circuitQuery *reliability.Circuit
+	governor     *reliability.Governor
+	limiter      *reliability.RateLimiter
+	sem          chan struct{}
+	retry        reliability.RetryPolicy
 }
 
 // NewClient 创建客户端；未启用的配置直接报错（调用方应先判 Enabled）。
@@ -46,18 +56,26 @@ func NewClient(cfg Config) (*Client, error) {
 	if cfg.MaxConcurrency < 1 {
 		cfg.MaxConcurrency = 1
 	}
-	return &Client{
+	client := &Client{
 		cfg: cfg,
 		// 超时由每次尝试的 context 控制（取消需即时关闭请求，暗坑 K26）；
 		// 传输层禁 h2 走 HTTP/1.1 连接池（F3：单连接复用会挤兑超时）。
 		// MaxConcurrency 已在上方钳位:0 会使 sem 退化为无缓冲 channel,
 		// 全部调用悬挂到超时(L6)。
-		httpClient: reliability.NewHTTPClient(),
-		circuit:    reliability.NewCircuit(),
-		limiter:    reliability.NewRateLimiter(cfg.RPMBudget, cfg.TPMBudget),
-		sem:        make(chan struct{}, cfg.MaxConcurrency),
-		retry:      reliability.DefaultRetryPolicy(cfg.MaxRetries),
-	}, nil
+		httpClient:   reliability.NewHTTPClient(),
+		circuitIndex: reliability.NewCircuit(),
+		limiter:      reliability.NewRateLimiter(cfg.RPMBudget, cfg.TPMBudget),
+		sem:          make(chan struct{}, cfg.MaxConcurrency),
+		retry:        reliability.DefaultRetryPolicy(cfg.MaxRetries),
+	}
+	if cfg.GovernorDisabled {
+		// 逃生门:单熔断共用、无治理器——与治理器引入前逐字节同行为。
+		client.circuitQuery = client.circuitIndex
+	} else {
+		client.circuitQuery = reliability.NewCircuit()
+		client.governor = reliability.NewGovernor(cfg.MaxConcurrency)
+	}
+	return client, nil
 }
 
 // Config 返回创建时的配置（不含可变状态）。
@@ -65,9 +83,24 @@ func (c *Client) Config() Config {
 	return c.cfg
 }
 
-// CircuitSnapshot 返回 provider 健康视图（进入状态上报）。
+// CircuitSnapshot 返回索引车道健康视图（构建路径的状态上报口径:
+// 构建 no-op 判定与语义补齐都看索引车道;查询车道故障经每次查询的
+// 显式降级原因外露,不进此视图）。
 func (c *Client) CircuitSnapshot() reliability.CircuitSnapshot {
-	return c.circuit.Snapshot()
+	return c.circuitIndex.Snapshot()
+}
+
+// GovernorSnapshot 返回吞吐治理状态（可观测;逃生门 off 时为零值）。
+func (c *Client) GovernorSnapshot() reliability.GovernorSnapshot {
+	return c.governor.Snapshot()
+}
+
+// laneCircuit 按输入类型选车道熔断。
+func (c *Client) laneCircuit(inputType InputType) *reliability.Circuit {
+	if inputType == InputQuery {
+		return c.circuitQuery
+	}
+	return c.circuitIndex
 }
 
 // EmbedQuery 嵌入单条查询文本。
@@ -90,12 +123,13 @@ func (c *Client) EmbedBatch(ctx context.Context, texts []string, inputType Input
 	if len(texts) == 0 {
 		return nil, nil
 	}
-	if err := c.circuit.Gate(); err != nil {
+	circuit := c.laneCircuit(inputType)
+	if err := circuit.Gate(); err != nil {
 		return nil, err
 	}
 	vectors, err := c.embedOnce(ctx, texts, inputType)
 	if err == nil {
-		c.circuit.RecordSuccess()
+		circuit.RecordSuccess()
 		return vectors, nil
 	}
 	// 取消优先：不把调用方取消计为 provider 失败（暗坑 K26）。
@@ -125,24 +159,50 @@ func (c *Client) EmbedBatch(ctx context.Context, texts []string, inputType Input
 		}
 		return append(left, right...), nil
 	}
-	c.circuit.RecordFailure(callErr)
+	if inputType == InputDocument && c.governor != nil &&
+		callErr.Class == reliability.ClassRateLimit && !c.governor.AtRateFloor() {
+		// T6 层次:治理器是油门,熔断是保险丝。429 已由治理器降速+暂停,
+		// 未到速率地板就不熔断——变更前这里直接进退避,索引风暴期吞吐
+		// 归零且(共用熔断时代)殃及查询。本批失败如实上抛,覆盖缺口由
+		// 既有部分成功语义与下次 semantic-fill 收敛,不静默。
+		return nil, callErr
+	}
+	circuit.RecordFailure(callErr)
 	return nil, callErr
 }
 
-// embedOnce 执行一次（含策略内重试的）批调用：limiter → 并发槽 → HTTP。
+// embedOnce 执行一次（含策略内重试的）批调用：limiter → 车道准入 → HTTP。
+// 索引车道:并发槽(硬上限)+治理器(速率令牌与动态窗口,每次真实 HTTP
+// 尝试都过闸并回报观测——重试也是真实请求,消耗同样的上游配额)。
+// 查询车道:直通并发槽与治理器——交互查询一次一条,不排在索引批后面;
+// 其上限由查询到达率天然约束。用户 RPM/TPM 预算(limiter)对两车道都是
+// 不可逾越的硬顶,语义与引入治理器前一致。
 func (c *Client) embedOnce(ctx context.Context, texts []string, inputType InputType) ([][]float32, error) {
-	if err := c.limiter.Acquire(ctx, 1, estimateTokens(texts)); err != nil {
+	tokens := estimateTokens(texts)
+	if err := c.limiter.Acquire(ctx, 1, tokens); err != nil {
 		return nil, err
 	}
-	select {
-	case c.sem <- struct{}{}:
-		defer func() { <-c.sem }()
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	indexLane := inputType == InputDocument
+	if indexLane {
+		select {
+		case c.sem <- struct{}{}:
+			defer func() { <-c.sem }()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	var vectors [][]float32
 	err := c.retry.Do(ctx, func(ctx context.Context) error {
+		if indexLane && c.governor != nil {
+			if err := c.governor.AcquireIndex(ctx, tokens); err != nil {
+				return err
+			}
+		}
+		start := time.Now()
 		got, err := c.doRequest(ctx, texts, inputType)
+		if indexLane && c.governor != nil {
+			c.governor.Observe(governorOutcome(err), tokens, time.Since(start), retryAfterOf(err))
+		}
 		if err != nil {
 			return err
 		}
@@ -153,6 +213,35 @@ func (c *Client) embedOnce(ctx context.Context, texts []string, inputType InputT
 		return nil, err
 	}
 	return vectors, nil
+}
+
+// governorOutcome 把调用结果映射为治理器观测分类:429→速率信号,
+// 暂态(5xx/超时/断流)→容量过载信号,其余(认证/额度/永久/拆批)不属于
+// 吞吐问题,治理器不动作、由既有分类外抛。
+func governorOutcome(err error) reliability.GovernorOutcome {
+	if err == nil {
+		return reliability.OutcomeSuccess
+	}
+	callErr := asCallError(err)
+	if callErr == nil {
+		return reliability.OutcomeOther
+	}
+	switch callErr.Class {
+	case reliability.ClassRateLimit:
+		return reliability.OutcomeRateLimited
+	case reliability.ClassTransient:
+		return reliability.OutcomeOverload
+	default:
+		return reliability.OutcomeOther
+	}
+}
+
+// retryAfterOf 提取 429 的 Retry-After(无则 0,治理器用缺省冷却)。
+func retryAfterOf(err error) time.Duration {
+	if callErr := asCallError(err); callErr != nil {
+		return callErr.RetryAfter
+	}
+	return 0
 }
 
 // doRequest 发送单次 HTTP 请求并解析、校验响应。

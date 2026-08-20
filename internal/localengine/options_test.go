@@ -93,6 +93,16 @@ func TestFingerprintSensitivity(t *testing.T) {
 	if deny.Fingerprint() == fp {
 		t.Fatalf("降级开关必须改变指纹")
 	}
+	bulk := base
+	bulk.Embedding.BatchAPIMode = embedding.ProviderVoyage
+	if bulk.Fingerprint() == fp {
+		t.Fatalf("批车道模式必须改变指纹(T8:构建行为模式,daemon/wrapper 必须同模式)")
+	}
+	governorOff := base
+	governorOff.Embedding.GovernorDisabled = true
+	if governorOff.Fingerprint() != fp {
+		t.Fatalf("治理器逃生门是运行时参数,不得影响指纹")
+	}
 }
 
 // TestCloseCancelsInflightBuild 是 review S6：Close 取消在飞构建并等待
