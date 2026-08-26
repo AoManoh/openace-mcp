@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -27,6 +29,8 @@ type fakeBulkProvider struct {
 	// 行为旋钮
 	holdJobs     bool   // true=作业停留 in_progress(演练轮询与断点)
 	terminalFail string // 非空=作业直接进入该终态(failed/expired)
+	partialKeep  int    // >0=作业终态 partially_completed,输出只含前 N 行(已计费)
+	failCreate   bool   // true=POST /batches 返回 500(上传成功后创建失败/失联)
 	// 观测计数
 	uploads     int
 	jobsCreated int
@@ -90,6 +94,10 @@ func newFakeBulkProvider(t *testing.T, dim int) *fakeBulkProvider {
 			http.Error(w, `{"detail":[{"type":"missing","loc":["body","request_params"]}]}`, http.StatusUnprocessableEntity)
 			return
 		}
+		if p.failCreate {
+			http.Error(w, "create unavailable", http.StatusInternalServerError)
+			return
+		}
 		p.jobsCreated++
 		id := fmt.Sprintf("job-%d", p.jobsCreated)
 		p.jobs[id] = req.InputFileID
@@ -112,11 +120,16 @@ func newFakeBulkProvider(t *testing.T, dim int) *fakeBulkProvider {
 		if p.terminalFail != "" {
 			status = p.terminalFail
 		}
+		completed := len(p.files[fileID])
+		if p.partialKeep > 0 {
+			status = "partially_completed"
+			completed = p.partialKeep
+		}
 		resp := map[string]any{
 			"id": jobID, "status": status,
-			"request_counts": map[string]int{"total": len(p.files[fileID]), "completed": len(p.files[fileID])},
+			"request_counts": map[string]int{"total": len(p.files[fileID]), "completed": completed},
 		}
-		if status == "completed" {
+		if status == "completed" || status == "partially_completed" {
 			resp["output_file_id"] = "out-" + fileID
 		}
 		_ = json.NewEncoder(w).Encode(resp)
@@ -130,6 +143,9 @@ func newFakeBulkProvider(t *testing.T, dim int) *fakeBulkProvider {
 		defer p.mu.Unlock()
 		outID := strings.TrimPrefix(r.PathValue("id"), "out-")
 		keys, texts := p.files[outID], p.texts[outID]
+		if p.partialKeep > 0 && p.partialKeep < len(keys) {
+			keys, texts = keys[:p.partialKeep], texts[:p.partialKeep]
+		}
 		for i, key := range keys {
 			vec := make([]float32, p.dim)
 			vec[0] = float32(len(texts[i])%7 + 1) // 非零可归一化
@@ -335,6 +351,136 @@ func TestBulkTerminalFailureExplicit(t *testing.T) {
 	if syncEmbeds != 0 {
 		t.Fatalf("终态失败不得静默回落同步车道双付: syncEmbeds=%d", syncEmbeds)
 	}
+}
+
+// TestBulkPartiallyCompletedRecoversPaidRows(A4,2026-08-26 裁决):
+// partially_completed 终态里已产出的行是已计费向量,必须先回收入 journal
+// 再显式失败;重跑只对缺口重新提交——绝不整段重付。
+func TestBulkPartiallyCompletedRecoversPaidRows(t *testing.T) {
+	provider := newFakeBulkProvider(t, 8)
+	provider.mu.Lock()
+	provider.partialKeep = 1 // 服务端只完成 1 行即进入 partially_completed
+	provider.mu.Unlock()
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	t.Setenv("OPENACE_CACHE_NAMESPACE", "t8partial")
+	root := newFixtureWorkspace(t)
+	e, err := New(bulkOptions(provider.ts.URL, 8, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close(context.Background()) })
+	_, syncErr := e.Sync(context.Background(), syncRequest(root))
+	if syncErr == nil {
+		t.Fatal("partially_completed 必须让构建显式失败(缺口如实暴露)")
+	}
+	if !strings.Contains(syncErr.Error(), "已回收 1 条") {
+		t.Fatalf("失败信息必须说明已回收的已计费行数: %v", syncErr)
+	}
+	totalKeys := 0
+	provider.mu.Lock()
+	for _, keys := range provider.files {
+		totalKeys = len(keys)
+	}
+	provider.partialKeep = 0 // 服务端恢复正常
+	provider.mu.Unlock()
+	if totalKeys < 2 {
+		t.Fatalf("fixture 应产生至少 2 个唯一输入: %d", totalKeys)
+	}
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatalf("重跑应只对缺口重新提交并成功: %v", err)
+	}
+	provider.mu.Lock()
+	secondKeys := len(provider.files[fmt.Sprintf("file-%d", provider.uploads)])
+	uploads := provider.uploads
+	provider.mu.Unlock()
+	if uploads != 2 {
+		t.Fatalf("应恰好发生一次补缺提交: uploads=%d", uploads)
+	}
+	if want := totalKeys - 1; secondKeys != want {
+		t.Fatalf("重跑必须只提交缺口键(已回收行不得重付): got=%d want=%d", secondKeys, want)
+	}
+	manifest, _ := loadActiveManifest(t, e, root)
+	if !manifest.SemanticComplete() {
+		t.Fatal("补缺后必须语义完整")
+	}
+}
+
+// TestBulkPendingIntentBlocksResubmit(A5,2026-08-26 裁决):上传成功但
+// 创建失联时,提交意向留档;后续运行显式停在核对步,绝不自动重提双付。
+// 用户按错误指引清除意向后,重跑恢复正常提交。
+func TestBulkPendingIntentBlocksResubmit(t *testing.T) {
+	provider := newFakeBulkProvider(t, 8)
+	provider.mu.Lock()
+	provider.failCreate = true
+	provider.mu.Unlock()
+	cacheDir := t.TempDir()
+	t.Setenv("OPENACE_CACHE_DIR", cacheDir)
+	t.Setenv("OPENACE_CACHE_NAMESPACE", "t8intent")
+	root := newFixtureWorkspace(t)
+	e, err := New(bulkOptions(provider.ts.URL, 8, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close(context.Background()) })
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err == nil {
+		t.Fatal("创建失联必须显式失败")
+	}
+	// 服务端恢复,但引擎必须停在核对步而不是自动重提。
+	provider.mu.Lock()
+	provider.failCreate = false
+	provider.mu.Unlock()
+	_, retryErr := e.Sync(context.Background(), syncRequest(root))
+	if retryErr == nil || !strings.Contains(retryErr.Error(), "pending_intent") {
+		t.Fatalf("意向残留必须显式停在人工核对步: %v", retryErr)
+	}
+	uploads, jobs, _ := provider.counts()
+	if jobs != 0 {
+		t.Fatalf("核对前绝不自动重提(防双份计费): jobs=%d", jobs)
+	}
+	if uploads != 1 {
+		t.Fatalf("重试不应产生新上传: uploads=%d", uploads)
+	}
+	// 用户核对"服务端无作业"后清除意向 → 重跑正常提交并收口。
+	statePath := findBulkStatePath(t, cacheDir)
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state["pending_intent"] == nil {
+		t.Fatal("状态文件应留有 pending_intent 供核对")
+	}
+	delete(state, "pending_intent")
+	cleaned, _ := json.Marshal(state)
+	if err := os.WriteFile(statePath, cleaned, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatalf("清除意向后重跑应正常: %v", err)
+	}
+	manifest, _ := loadActiveManifest(t, e, root)
+	if !manifest.SemanticComplete() {
+		t.Fatal("收口后必须语义完整")
+	}
+}
+
+// findBulkStatePath 在缓存树中定位批作业状态文件(测试辅助)。
+func findBulkStatePath(t *testing.T, cacheDir string) string {
+	t.Helper()
+	var found string
+	_ = filepath.WalkDir(cacheDir, func(path string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && d.Name() == "bulk-jobs.json" {
+			found = path
+		}
+		return nil
+	})
+	if found == "" {
+		t.Fatal("未找到 bulk-jobs.json")
+	}
+	return found
 }
 
 // TestGovernedBuildRidesThrough429Storm(任务 T6 验收 G2 的引擎级钉住):
