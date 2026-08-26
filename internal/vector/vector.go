@@ -293,7 +293,13 @@ func (ix *Index) Search(ctx context.Context, query []float32, topK int) ([]Hit, 
 
 // SearchFiltered 同 Search,allow 非 nil 时只在谓词放行的条目中选 topK
 // (P-gray-02 前缀下推:被海量无关子树淹没时,受限深度的全局 topK 再过滤
-// 会漏掉目标子树;谓词在选择阶段生效,评分全量不变)。
+// 会漏掉目标子树;谓词在选择阶段生效,放行行的评分与无谓词时逐位相同)。
+// allow 会被多个评分 worker 并发调用,必须是并发安全的纯函数(包内唯一
+// 实现 chunkPrefixPredicate 只读不可变 map,满足)。
+//
+// 选择用每 worker 有界堆+单线程归并取代全量排序:临时内存从 O(行数)
+// 降到 O(topK×workers),行序遍历/逐行求和序/全序比较器均与全排版一致,
+// 结果逐位等价(等价性由 referenceTopK 对照测试锁定)。
 func (ix *Index) SearchFiltered(ctx context.Context, query []float32, topK int, allow func(id string) bool) ([]Hit, error) {
 	if len(query) != ix.dimension {
 		return nil, fmt.Errorf("查询维度 %d 与索引 %d 不符", len(query), ix.dimension)
@@ -305,7 +311,6 @@ func (ix *Index) SearchFiltered(ctx context.Context, query []float32, topK int, 
 		return nil, fmt.Errorf("查询向量非法: %w", err)
 	}
 	count := ix.Count()
-	scores := make([]float64, count)
 
 	workers := runtime.GOMAXPROCS(0)
 	if workers > 8 {
@@ -315,6 +320,7 @@ func (ix *Index) SearchFiltered(ctx context.Context, query []float32, topK int, 
 		workers = 1
 	}
 	chunkRows := (count + workers - 1) / workers
+	locals := make([][]topKCandidate, workers)
 	var wg sync.WaitGroup
 	cancelled := false
 	var cancelMu sync.Mutex
@@ -328,9 +334,14 @@ func (ix *Index) SearchFiltered(ctx context.Context, query []float32, topK int, 
 			continue
 		}
 		wg.Add(1)
-		go func(start, end int) {
+		go func(w, start, end int) {
 			defer wg.Done()
 			dim := ix.dimension
+			capacity := topK
+			if rows := end - start; capacity > rows {
+				capacity = rows
+			}
+			local := topKSelector{ix: ix, capacity: capacity}
 			for row := start; row < end; row++ {
 				if (row-start)%cancelCheckRows == 0 && ctx.Err() != nil {
 					cancelMu.Lock()
@@ -338,43 +349,111 @@ func (ix *Index) SearchFiltered(ctx context.Context, query []float32, topK int, 
 					cancelMu.Unlock()
 					return
 				}
+				if allow != nil && !allow(ix.entries[row].ID) {
+					continue
+				}
 				base := row * dim
 				var dot float64
 				for i := 0; i < dim; i++ {
 					dot += float64(ix.data[base+i]) * float64(query[i])
 				}
-				scores[row] = dot
+				local.push(topKCandidate{row: row, score: dot})
 			}
-		}(start, end)
+			locals[w] = local.items
+		}(w, start, end)
 	}
 	wg.Wait()
 	if cancelled || ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
 
-	order := make([]int, count)
-	for i := range order {
-		order[i] = i
+	total := 0
+	for _, items := range locals {
+		total += len(items)
 	}
-	sort.Slice(order, func(a, b int) bool {
-		ra, rb := order[a], order[b]
-		if scores[ra] != scores[rb] {
-			return scores[ra] > scores[rb]
+	merged := make([]topKCandidate, 0, total)
+	for _, items := range locals {
+		merged = append(merged, items...)
+	}
+	sort.Slice(merged, func(a, b int) bool {
+		if merged[a].score != merged[b].score {
+			return merged[a].score > merged[b].score
 		}
-		return ix.entries[ra].ID < ix.entries[rb].ID
+		return ix.entries[merged[a].row].ID < ix.entries[merged[b].row].ID
 	})
-	if topK > count {
-		topK = count
+	if topK > len(merged) {
+		topK = len(merged)
 	}
 	hits := make([]Hit, 0, topK)
-	for _, row := range order {
-		if allow != nil && !allow(ix.entries[row].ID) {
-			continue
-		}
-		hits = append(hits, Hit{ID: ix.entries[row].ID, ContentHash: ix.entries[row].ContentHash, Score: scores[row]})
-		if len(hits) >= topK {
-			break
-		}
+	for _, cand := range merged[:topK] {
+		entry := ix.entries[cand.row]
+		hits = append(hits, Hit{ID: entry.ID, ContentHash: entry.ContentHash, Score: cand.score})
 	}
 	return hits, nil
+}
+
+// topKCandidate 是选择阶段的行级候选;ID 经 row 间接取 entries,避免
+// 每候选复制字符串。
+type topKCandidate struct {
+	row   int
+	score float64
+}
+
+// topKSelector 维护"目前最优的 ≤capacity 个"候选:数组式二叉堆,堆顶=
+// 集合内 (score desc, ID asc) 全序的末位(最差者),新候选优于堆顶时替换
+// 下沉。分数与 ID 构成全序(段内 ID 唯一),无并列歧义。
+type topKSelector struct {
+	ix       *Index
+	capacity int
+	items    []topKCandidate
+}
+
+// worse 判断 a 是否排序在 b 之后,与归并/全排比较器同式取反。
+func (s *topKSelector) worse(a, b topKCandidate) bool {
+	if a.score != b.score {
+		return a.score < b.score
+	}
+	return s.ix.entries[a.row].ID > s.ix.entries[b.row].ID
+}
+
+func (s *topKSelector) push(cand topKCandidate) {
+	if len(s.items) < s.capacity {
+		s.items = append(s.items, cand)
+		s.up(len(s.items) - 1)
+		return
+	}
+	if s.worse(cand, s.items[0]) {
+		return
+	}
+	s.items[0] = cand
+	s.down(0)
+}
+
+func (s *topKSelector) up(i int) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if !s.worse(s.items[i], s.items[parent]) {
+			return
+		}
+		s.items[i], s.items[parent] = s.items[parent], s.items[i]
+		i = parent
+	}
+}
+
+func (s *topKSelector) down(i int) {
+	n := len(s.items)
+	for {
+		worst := i
+		if left := 2*i + 1; left < n && s.worse(s.items[left], s.items[worst]) {
+			worst = left
+		}
+		if right := 2*i + 2; right < n && s.worse(s.items[right], s.items[worst]) {
+			worst = right
+		}
+		if worst == i {
+			return
+		}
+		s.items[i], s.items[worst] = s.items[worst], s.items[i]
+		i = worst
+	}
 }

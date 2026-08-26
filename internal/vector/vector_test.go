@@ -76,6 +76,23 @@ func referenceTopK(entries []Entry, vectors [][]float32, query []float32, topK i
 	return hits[:topK]
 }
 
+// referenceTopKFiltered 是带放行谓词的参考实现：全量评分排序后，在
+// 放行子序列中取前 topK（与"放行集内 topK"语义等价，独立于生产实现）。
+func referenceTopKFiltered(entries []Entry, vectors [][]float32, query []float32, topK int, allow func(id string) bool) []Hit {
+	all := referenceTopK(entries, vectors, query, len(vectors))
+	hits := make([]Hit, 0, topK)
+	for _, hit := range all {
+		if allow != nil && !allow(hit.ID) {
+			continue
+		}
+		hits = append(hits, hit)
+		if len(hits) >= topK {
+			break
+		}
+	}
+	return hits
+}
+
 // TestSearchMatchesBruteForceGolden 是 §11.2 的 exact 一致性验收。
 func TestSearchMatchesBruteForceGolden(t *testing.T) {
 	const count, dim, topK = 500, 16, 10
@@ -123,6 +140,71 @@ func TestSearchDeterministic(t *testing.T) {
 		}
 		if !reflect.DeepEqual(got, first) {
 			t.Fatalf("第 %d 次结果与首次不一致", round)
+		}
+	}
+}
+
+// TestSearchFilteredMatchesReference 用随机谓词/边界 K 值对照参考实现，
+// 锁定"放行集内 topK"语义与 (score desc, ID asc) 全序在选择替换后不漂移。
+func TestSearchFilteredMatchesReference(t *testing.T) {
+	const count, dim = 500, 16
+	entries, vectors := makeVectors(t, count, dim, 11)
+	ix := writeAndLoad(t, entries, vectors, dim)
+	rng := rand.New(rand.NewSource(12))
+	predicates := map[string]func(id string) bool{
+		"nil":    nil,
+		"half":   func(id string) bool { return id[len(id)-1]%2 == 0 },
+		"sparse": func(id string) bool { return strings.HasSuffix(id, "7") },
+		"none":   func(id string) bool { return false },
+		"all":    func(id string) bool { return true },
+	}
+	for name, allow := range predicates {
+		for _, topK := range []int{1, 10, count - 1, count, count + 50} {
+			for round := 0; round < 5; round++ {
+				query := make([]float32, dim)
+				for j := range query {
+					query[j] = float32(rng.NormFloat64())
+				}
+				want := referenceTopKFiltered(entries, vectors, query, topK, allow)
+				q := make([]float32, dim)
+				copy(q, query)
+				got, err := ix.SearchFiltered(context.Background(), q, topK, allow)
+				if err != nil {
+					t.Fatalf("%s topK=%d: %v", name, topK, err)
+				}
+				if len(got) == 0 && len(want) == 0 {
+					continue
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("%s topK=%d round=%d 与参考不一致:\ngot=%v\nwant=%v", name, topK, round, got, want)
+				}
+			}
+		}
+	}
+}
+
+// TestSearchAllTiedScores 全并列分数下 topK 必须严格按 ID 升序截取。
+func TestSearchAllTiedScores(t *testing.T) {
+	const dim, count = 4, 64
+	unit := []float32{0, 1, 0, 0}
+	entries := make([]Entry, count)
+	vectors := make([][]float32, count)
+	for i := range entries {
+		entries[i] = Entry{ID: fmt.Sprintf("id-%03d", count-1-i)} // 逆序写入
+		vectors[i] = append([]float32{}, unit...)
+	}
+	ix := writeAndLoad(t, entries, vectors, dim)
+	got, err := ix.Search(context.Background(), []float32{0, 1, 0, 0}, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 7 {
+		t.Fatalf("topK=7 应返回 7 条: %d", len(got))
+	}
+	for i, hit := range got {
+		want := fmt.Sprintf("id-%03d", i)
+		if hit.ID != want {
+			t.Fatalf("全并列第 %d 位应为 %s: %s", i, want, hit.ID)
 		}
 	}
 }
