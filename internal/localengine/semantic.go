@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 
 	"github.com/AoManoh/openace-mcp/internal/embedding"
@@ -91,14 +92,15 @@ type priorVectors struct {
 	// activeIDs 是 active revision 中已持久化向量的 chunk ID 集
 	// （delta 构建计算未触及 chunk 覆盖时使用，暗坑 K51）。
 	activeIDs map[string]bool
-	// indexes 是各哈希表值切片所指向数据的属主(map 值是 Row 子切片,
-	// 数据可能驻留 mmap 页):构建方用完 prior 后必须 release,否则映射
-	// /堆数据泄漏到进程退出。
-	indexes []*vector.Index
+	// indexes 是底层数据属主(整段装载=*vector.Index,map 值是 Row 子
+	// 切片可能指向 mmap 页;按行选读=*vector.RowReader,map 值是独立
+	// 拷贝):构建方用完 prior 后必须 release,否则映射/句柄泄漏到进程
+	// 退出。
+	indexes []io.Closer
 }
 
-// release 关闭全部底层向量索引(幂等)。调用后各 byHash 表的值切片一律
-// 失效,禁止再读。
+// release 关闭全部底层向量索引(幂等)。调用后各 byHash 表中来自整段
+// 装载的值切片一律失效,禁止再读。
 func (p *priorVectors) release() {
 	for _, ix := range p.indexes {
 		_ = ix.Close()
@@ -109,7 +111,15 @@ func (p *priorVectors) release() {
 // loadPriorVectors 装载 active（hop 0）与其 previous（hop 1）全部 segment
 // 的向量。GC 保留恰好这两个 revision；损坏的向量文件被跳过，由后续
 // 新嵌入补齐（K25 自愈路径）。
-func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest) priorVectors {
+//
+// needed 控制装载策略:nil=整段装载(全文件 checksum 强校验;full/
+// compaction/sibling 复用≈全部行的路径);非 nil=按行选读(只物化命中
+// needed 的行——delta 构建实际复用行数≈变更 chunk 数,为几十行整读
+// GiB 级段不成比例。按行路径的完整性口径=idx 强校验+行范数探针,
+// 数据文件不做全文件 checksum,弱化显式记录于 vector.RowReader)。
+// 两种策略下 activeLoadedRows/activeLoadedSegments 口径一致:段结构
+// 校验通过即计入全段可寻址行(完整性判定语义,不是物化行数)。
+func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest, needed map[string]bool) priorVectors {
 	prior := priorVectors{
 		activeByHash:       map[string][]float32{},
 		olderByHash:        map[string][]float32{},
@@ -141,6 +151,10 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest) 
 				if remaining <= 0 {
 					break
 				}
+			}
+			if needed != nil {
+				loadedRows = e.loadPriorRowsSelective(&prior, store, segment, dimension, hop, needed, limit, loadedRows)
+				continue
 			}
 			ix, err := vector.Load(store.SegmentPathFor(segment.ID), dimension,
 				segment.VectorsChecksum, segment.VectorsIndexChecksum, remaining)
@@ -175,6 +189,48 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest) 
 		manifest = older
 	}
 	return prior
+}
+
+// loadPriorRowsSelective 按行选读单个 segment 的命中向量(loadPriorVectors
+// 的 needed 模式段处理)。返回累计物化行数;段打开失败按 K25 同构跳过
+// (缺口由新嵌补齐),损坏行同理逐行跳过。
+func (e *Engine) loadPriorRowsSelective(prior *priorVectors, store *index.Store, segment index.SegmentRef, dimension int, hop int, needed map[string]bool, limit int, loadedRows int) int {
+	reader, err := vector.OpenRowReader(store.SegmentPathFor(segment.ID), dimension, segment.VectorsIndexChecksum)
+	if err != nil {
+		return loadedRows
+	}
+	prior.indexes = append(prior.indexes, reader)
+	entries := reader.Entries()
+	if hop == 0 {
+		prior.activeLoadedRows += len(entries)
+		prior.activeLoadedSegments++
+	}
+	for i, entry := range entries {
+		if hop == 0 {
+			prior.activeIDs[entry.ID] = true
+		}
+		if !needed[entry.ContentHash] {
+			continue
+		}
+		target := prior.activeByHash
+		if hop != 0 {
+			target = prior.olderByHash
+		}
+		if _, ok := target[entry.ContentHash]; ok {
+			continue
+		}
+		if limit > 0 && loadedRows >= limit {
+			break
+		}
+		row, err := reader.ReadRow(i)
+		if err != nil {
+			continue
+		}
+		target[entry.ContentHash] = row
+		loadedRows++
+		prior.loadedRows = loadedRows
+	}
+	return loadedRows
 }
 
 // embedRecords 组装 records（全量或 delta）的向量集：先按纯 content hash

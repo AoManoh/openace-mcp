@@ -61,7 +61,7 @@ func (e *Engine) mergeSiblingProfileVectors(current *index.Store, root pathutil.
 		return candidates[i].manifest.ActivatedAt.After(candidates[j].manifest.ActivatedAt)
 	})
 	for _, candidate := range candidates {
-		loaded := e.loadPriorVectors(candidate.store, candidate.manifest)
+		loaded := e.loadPriorVectors(candidate.store, candidate.manifest, nil)
 		// 候选 active 物理载入必须覆盖 manifest 宣称的全部向量；部分
 		// 损坏候选不能因"尚存一条"就阻止后续健康 sibling 参与。
 		if loaded.activeLoadedSegments != loaded.activeExpectedSegments || loaded.activeLoadedSegments == 0 {

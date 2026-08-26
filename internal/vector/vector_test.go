@@ -426,6 +426,86 @@ func TestMappedModeRejectsCorruption(t *testing.T) {
 	}
 }
 
+// TestRowReaderMatchesLoadBits 按行读取必须与整读装载位级一致(复用
+// 拷贝的位保真依据),且行拷贝在 Close 后仍有效。
+func TestRowReaderMatchesLoadBits(t *testing.T) {
+	const count, dim = 32, 8
+	entries, vectors := makeVectors(t, count, dim, 31)
+	dir := t.TempDir()
+	dataSum, idxSum, err := Write(dir, dim, entries, vectors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ix, err := Load(dir, dim, dataSum, idxSum, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ix.Close()
+	reader, err := OpenRowReader(dir, dim, idxSum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(reader.Entries(), ix.Entries()) {
+		t.Fatal("行映射应与整读一致")
+	}
+	rows := make([][]float32, count)
+	for i := 0; i < count; i++ {
+		row, err := reader.ReadRow(i)
+		if err != nil {
+			t.Fatalf("ReadRow(%d): %v", i, err)
+		}
+		if !reflect.DeepEqual(row, ix.Row(i)) {
+			t.Fatalf("第 %d 行按行读取与整读位模式不一致", i)
+		}
+		rows[i] = row
+	}
+	if _, err := reader.ReadRow(count); err == nil {
+		t.Fatal("越界行号应拒绝")
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ReadRow(0); err == nil {
+		t.Fatal("Close 后读取应返回显式错误")
+	}
+	// 行拷贝独立于 reader 生命周期。
+	if !reflect.DeepEqual(rows[0], ix.Row(0)) {
+		t.Fatal("行拷贝应在 Close 后仍有效")
+	}
+}
+
+// TestRowReaderRejectsCorruptedRow 范数探针必须拦截损坏行(按行路径
+// 没有全文件 checksum,这是它的显式完整性底线)。
+func TestRowReaderRejectsCorruptedRow(t *testing.T) {
+	const count, dim = 4, 8
+	entries, vectors := makeVectors(t, count, dim, 32)
+	dir := t.TempDir()
+	_, idxSum, err := Write(dir, dim, entries, vectors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 把第 2 行全部清零(范数 0,必被探针拒绝);其余行不受影响。
+	dataPath := filepath.Join(dir, DataFileName)
+	raw, _ := os.ReadFile(dataPath)
+	for b := dim * 4 * 2; b < dim*4*3; b++ {
+		raw[b] = 0
+	}
+	if err := os.WriteFile(dataPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := OpenRowReader(dir, dim, idxSum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if _, err := reader.ReadRow(2); err == nil {
+		t.Fatal("损坏行应被范数探针拒绝")
+	}
+	if _, err := reader.ReadRow(1); err != nil {
+		t.Fatalf("健康行不应受损坏行影响: %v", err)
+	}
+}
+
 // TestCloseThenDeleteAndUseAfterClose 钉住生命周期秩序:Close 后段目录
 // 可删除(Windows 上已映射文件不可删,先 munmap 再删是 GC/compaction 的
 // 必要顺序);Close 后检索返回显式错误而非脏读,重复 Close 幂等。

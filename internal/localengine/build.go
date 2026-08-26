@@ -498,7 +498,7 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 	defer func() { prior.release() }()
 	if e.semanticEnabled() {
 		if previous != nil {
-			prior = e.loadPriorVectors(store, previous)
+			prior = e.loadPriorVectors(store, previous, nil)
 		}
 		// 兼容旧 chunk profile 子树是最低优先级 prior；当前 active/
 		// previous 始终优先。完整现役 revision 无需再载入兄弟大向量集
@@ -594,11 +594,17 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 		}
 	}
 
-	// 语义路：只嵌入 delta 记录（复用按纯 content hash，D2）。
+	// 语义路：只嵌入 delta 记录（复用按纯 content hash，D2）。prior
+	// 按行选读:delta 实际复用行数≈变更 chunk 数,不再为其整读全部
+	// prior 段(needed=变更记录的 embedKey 集)。
 	var prior priorVectors
 	defer func() { prior.release() }()
 	if e.semanticEnabled() {
-		prior = e.loadPriorVectors(store, previous)
+		needed := make(map[string]bool, len(records))
+		for _, record := range records {
+			needed[embedKey(record)] = true
+		}
+		prior = e.loadPriorVectors(store, previous, needed)
 	}
 	seman, err := e.embedRecords(ctx, store, workspaceKey, prior, records, status)
 	if err != nil {

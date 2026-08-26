@@ -161,7 +161,7 @@ func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *ind
 	var prior priorVectors
 	defer func() { prior.release() }()
 	if previous != nil {
-		prior = e.loadPriorVectors(store, previous)
+		prior = e.loadPriorVectors(store, previous, nil)
 	}
 	journal, err := e.journalFor(workspaceKey, store)
 	if err != nil {

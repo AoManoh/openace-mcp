@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -239,13 +240,69 @@ func TestLoadPriorVectorsDeduplicatesSharedSegments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	prior := e.loadPriorVectors(store, manifest)
+	prior := e.loadPriorVectors(store, manifest, nil)
 	defer prior.release()
 	if prior.activeLoadedRows != manifest.VectorCount {
 		t.Fatalf("active 载入行数=%d want=%d", prior.activeLoadedRows, manifest.VectorCount)
 	}
 	if prior.loadedRows != prior.activeLoadedRows {
 		t.Fatalf("previous 共享 segment 被重复载入: total=%d active=%d", prior.loadedRows, prior.activeLoadedRows)
+	}
+}
+
+// 按行选读(delta 构建路径):只物化命中 needed 的行;完整性口径
+// (activeIDs/activeLoadedRows/activeLoadedSegments)保持全段语义,与
+// 整段装载一致——否则 sibling 合并条件会把选读误判成物理损坏。
+func TestLoadPriorVectorsSelectiveMaterializesOnlyNeededRows(t *testing.T) {
+	const dim = 8
+	server := newEmbedServer(t, dim)
+	defer server.ts.Close()
+	e := newTestEngineWith(t, embedOptions(server.ts.URL, dim, 8, "same-model"))
+	root := newFixtureWorkspace(t)
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatal(err)
+	}
+	_, key, err := e.resolveRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := e.storeFor(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, _, err := store.ResolveUsable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := e.loadPriorVectors(store, manifest, nil)
+	defer full.release()
+	if len(full.activeByHash) < 2 {
+		t.Fatalf("夹具应有至少 2 个唯一向量键: %d", len(full.activeByHash))
+	}
+	var pickKey string
+	var pickVec []float32
+	for key, vec := range full.activeByHash {
+		pickKey, pickVec = key, vec
+		break
+	}
+
+	selective := e.loadPriorVectors(store, manifest, map[string]bool{pickKey: true})
+	defer selective.release()
+	if len(selective.activeByHash) != 1 {
+		t.Fatalf("选读应只物化命中行: got=%d", len(selective.activeByHash))
+	}
+	if got := selective.activeByHash[pickKey]; !reflect.DeepEqual(got, pickVec) {
+		t.Fatalf("选读行应与整段装载位级一致")
+	}
+	if len(selective.activeIDs) != len(full.activeIDs) {
+		t.Fatalf("activeIDs 必须保持全段口径: selective=%d full=%d", len(selective.activeIDs), len(full.activeIDs))
+	}
+	if selective.activeLoadedRows != full.activeLoadedRows || selective.activeLoadedSegments != full.activeLoadedSegments {
+		t.Fatalf("完整性口径不得随选读改变: rows %d/%d segments %d/%d",
+			selective.activeLoadedRows, full.activeLoadedRows, selective.activeLoadedSegments, full.activeLoadedSegments)
+	}
+	if selective.loadedRows != 1 {
+		t.Fatalf("物化行数应=命中数: %d", selective.loadedRows)
 	}
 }
 

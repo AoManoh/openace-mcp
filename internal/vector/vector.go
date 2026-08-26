@@ -381,6 +381,103 @@ func (ix *Index) Mapped() bool {
 	return ix.mapped != nil
 }
 
+// RowReader 按行读取向量文件:只整读并校验 vectors.idx(行映射),
+// vectors.dat 不整读、不做全文件 checksum——为"delta 构建只需极少数
+// prior 行"的场景省去整段装载。
+//
+// 完整性口径(显式弱化,与 Load 不同):数据文件只做尺寸校验+每行读取
+// 时的范数合理性探针(写路径强制单位范数,norm² 偏离 1 即拒绝该行)。
+// 范数探针能拦截错位/截断/大面积损坏,不能拦截保范数的位翻转;需要
+// 全文件强校验的路径(查询索引/整段复用)继续走 Load。
+type RowReader struct {
+	dimension int
+	entries   []Entry
+	file      *os.File
+	closed    atomic.Bool
+}
+
+// OpenRowReader 打开按行读取器;idx 校验语义与 Load 一致(checksum/
+// schema/维度/count/数据尺寸对齐)。
+func OpenRowReader(dir string, wantDimension int, wantIndexChecksum string) (*RowReader, error) {
+	idxBytes, err := os.ReadFile(filepath.Join(dir, IndexFileName))
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s: %w", IndexFileName, err)
+	}
+	if wantIndexChecksum != "" && checksumBytes(idxBytes) != wantIndexChecksum {
+		return nil, fmt.Errorf("%s checksum 不符（文件损坏）", IndexFileName)
+	}
+	var header indexHeader
+	if err := json.Unmarshal(idxBytes, &header); err != nil {
+		return nil, fmt.Errorf("解析 %s: %w", IndexFileName, err)
+	}
+	if header.SchemaVersion != indexSchemaVersion {
+		return nil, fmt.Errorf("%s schema version %d 不受支持（期望 %d）", IndexFileName, header.SchemaVersion, indexSchemaVersion)
+	}
+	if header.Dimension != wantDimension {
+		return nil, fmt.Errorf("向量维度 %d 与当前 profile %d 不符（禁止混用，K24）", header.Dimension, wantDimension)
+	}
+	if header.Count != len(header.Entries) {
+		return nil, fmt.Errorf("%s count %d 与条目数 %d 不符", IndexFileName, header.Count, len(header.Entries))
+	}
+	dataPath := filepath.Join(dir, DataFileName)
+	info, err := os.Stat(dataPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s: %w", DataFileName, err)
+	}
+	if wantBytes := int64(header.Count) * int64(header.Dimension) * 4; info.Size() != wantBytes {
+		return nil, fmt.Errorf("%s 尺寸 %d 与 count×dim×4=%d 不符（K24）", DataFileName, info.Size(), wantBytes)
+	}
+	f, err := os.Open(dataPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s: %w", DataFileName, err)
+	}
+	return &RowReader{dimension: header.Dimension, entries: header.Entries, file: f}, nil
+}
+
+// Entries 返回行映射(调用方不得修改)。
+func (r *RowReader) Entries() []Entry {
+	return r.entries
+}
+
+// ReadRow 读取第 i 行向量(pread+小端解码+范数探针);返回的切片为
+// 独立拷贝,不随 Close 失效。
+func (r *RowReader) ReadRow(i int) ([]float32, error) {
+	if r.closed.Load() {
+		return nil, errors.New("row reader 已关闭")
+	}
+	if i < 0 || i >= len(r.entries) {
+		return nil, fmt.Errorf("行号 %d 越界(count=%d)", i, len(r.entries))
+	}
+	buf := make([]byte, r.dimension*4)
+	if _, err := r.file.ReadAt(buf, int64(i)*int64(r.dimension)*4); err != nil {
+		return nil, fmt.Errorf("读取第 %d 行: %w", i, err)
+	}
+	row := make([]float32, r.dimension)
+	var sum float64
+	for j := range row {
+		value := math.Float32frombits(binary.LittleEndian.Uint32(buf[j*4:]))
+		f := float64(value)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil, fmt.Errorf("第 %d 行含非有限分量(疑似损坏)", i)
+		}
+		sum += f * f
+		row[j] = value
+	}
+	// 写路径强制单位范数(writeVectorData);读出偏离即结构性损坏。
+	if math.Abs(sum-1) > 0.01 {
+		return nil, fmt.Errorf("第 %d 行范数异常(norm²=%.4f,疑似错位/损坏)", i, sum)
+	}
+	return row, nil
+}
+
+// Close 关闭数据文件句柄(幂等)。
+func (r *RowReader) Close() error {
+	if !r.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	return r.file.Close()
+}
+
 // Count 返回向量行数。
 func (ix *Index) Count() int {
 	return len(ix.entries)
