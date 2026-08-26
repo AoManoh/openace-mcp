@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -100,32 +101,48 @@ func probeOnce(t *testing.T, rows, dim int) {
 		}
 		latencies = append(latencies, time.Since(start))
 	}
-	p50, max := latencies[queries/2], latencies[0]
-	for _, d := range latencies {
-		if d > max {
-			max = d
-		}
-	}
-	t.Logf("rows=%d dim=%d dat=%.1fMiB idx=%.1fMiB write=%.1fs load=%.2fs heap_live_delta=%.2fGiB rss_delta=%.2fGiB rss_after=%.2fGiB search_p50=%s search_max=%s (n=%d topK=60)",
+	sorted := append([]time.Duration(nil), latencies...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	p50, max := sorted[len(sorted)/2], sorted[len(sorted)-1]
+	t.Logf("rows=%d dim=%d dat=%.1fMiB idx=%.1fMiB write=%.1fs load=%.2fs heap_live_delta=%.2fGiB rss_delta=%.2fGiB rss_anon_delta=%.2fGiB rss_file_delta=%.2fGiB rss_after=%.2fGiB search_p50=%s search_max=%s (n=%d topK=60)",
 		rows, dim, float64(datSize)/(1<<20), float64(idxSize)/(1<<20), writeWall.Seconds(), loadWall.Seconds(),
-		float64(after.HeapAlloc-before.HeapAlloc)/(1<<30), (rssAfter-rssBefore)/1024, rssAfter/1024, p50, max, len(latencies))
+		float64(after.HeapAlloc-before.HeapAlloc)/(1<<30),
+		(rssAfter.rss-rssBefore.rss)/1024, (rssAfter.anon-rssBefore.anon)/1024, (rssAfter.file-rssBefore.file)/1024,
+		rssAfter.rss/1024, p50, max, len(latencies))
 	runtime.KeepAlive(ix)
 }
 
-func vmRSSMiB(t *testing.T) float64 {
+// rssSample 拆分 /proc 口径：anon=匿名页(Go heap 等)、file=文件后备页
+// (page cache 映射,mmap 路径的主要驻留形态)。mmap 前后对照必须分栏读,
+// 只看 VmRSS 会把"可回收的文件页"误读成"不可回收的常驻"。
+type rssSample struct {
+	rss, anon, file float64 // MiB;非 Linux 平台全 -1
+}
+
+func vmRSSMiB(t *testing.T) rssSample {
 	t.Helper()
+	sample := rssSample{rss: -1, anon: -1, file: -1}
 	raw, err := os.ReadFile("/proc/self/status")
 	if err != nil {
-		return -1 // 非 Linux 平台探针仍可运行,RSS 记 -1
+		return sample // 非 Linux 平台探针仍可运行,RSS 记 -1
+	}
+	parse := func(line string) float64 {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			kb, _ := strconv.ParseFloat(fields[1], 64)
+			return kb / 1024
+		}
+		return -1
 	}
 	for _, line := range strings.Split(string(raw), "\n") {
-		if strings.HasPrefix(line, "VmRSS:") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				kb, _ := strconv.ParseFloat(fields[1], 64)
-				return kb / 1024
-			}
+		switch {
+		case strings.HasPrefix(line, "VmRSS:"):
+			sample.rss = parse(line)
+		case strings.HasPrefix(line, "RssAnon:"):
+			sample.anon = parse(line)
+		case strings.HasPrefix(line, "RssFile:"):
+			sample.file = parse(line)
 		}
 	}
-	return -1
+	return sample
 }
