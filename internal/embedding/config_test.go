@@ -13,6 +13,7 @@ func clearEnv(t *testing.T) {
 	for _, name := range []string{
 		EnvProvider, EnvBaseURL, EnvAPIKey, EnvVoyageAPIKey, EnvModel,
 		EnvDimension, EnvBatchSize, EnvMaxConcurrency, EnvRPMBudget, EnvTPMBudget,
+		EnvThroughputGovernor, EnvBatchAPI, EnvBatchMinChunks,
 		"OPENACE_PROVIDER_TIMEOUT", "OPENACE_PROVIDER_MAX_RETRIES",
 	} {
 		t.Setenv(name, "")
