@@ -2,6 +2,7 @@ package index
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -98,6 +99,62 @@ func TestJournalCompactAfterPublish(t *testing.T) {
 	reopened := openTestJournal(t, store, 2)
 	if got := reopened.Snapshot(); len(got) != 1 || got["pending"] == nil {
 		t.Fatalf("压实应持久化: %v", got)
+	}
+}
+
+// TestJournalReopenNeverDropsPaidEntries 是 2026-08-26 裁决的核心行为:
+// journal 里的每一条都是已付费向量,重开时无论规模多大都必须完整保留,
+// 不允许任何"超上限压实丢最旧"的静默丢弃(丢弃=下轮重新付费)。
+// 用小维度(4)把 40 万+条目的文件压到 ~15MB,直打旧默认上限路径。
+func TestJournalReopenNeverDropsPaidEntries(t *testing.T) {
+	if testing.Short() {
+		t.Skip("40 万条重开用例在 -short 下跳过")
+	}
+	store := newV2TestStore(t)
+	journal := openTestJournal(t, store, 4)
+	const total = 401_000
+	batch := make(map[string][]float32, 10_000)
+	for i := 0; i < total; i++ {
+		batch[fmt.Sprintf("h%06d", i)] = []float32{1, 0, 0, 0}
+		if len(batch) == 10_000 || i == total-1 {
+			if err := journal.Append(batch); err != nil {
+				t.Fatal(err)
+			}
+			batch = make(map[string][]float32, 10_000)
+		}
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := openTestJournal(t, store, 4)
+	if got := len(reopened.Snapshot()); got != total {
+		t.Fatalf("重开后已付费条目被丢弃: got=%d want=%d", got, total)
+	}
+}
+
+// TestJournalAppendRespectsConfiguredByteBudget 是预算语义(opt-in):
+// 预算只在"付费前拦截"新增,绝不丢弃既有条目;拦截必须显式报错。
+func TestJournalAppendRespectsConfiguredByteBudget(t *testing.T) {
+	store := newV2TestStore(t)
+	journal := openTestJournal(t, store, 4)
+	first := map[string][]float32{"paid-1": {1, 0, 0, 0}}
+	if err := journal.Append(first); err != nil {
+		t.Fatal(err)
+	}
+	journal.LimitBytes(journal.bytes + 10) // 预算只够现有条目,容不下下一批
+	err := journal.Append(map[string][]float32{"paid-2": {0, 1, 0, 0}})
+	if err == nil {
+		t.Fatal("超预算追加必须显式报错,不得静默接受或丢弃")
+	}
+	if got := journal.Snapshot(); len(got) != 1 || got["paid-1"] == nil {
+		t.Fatalf("拦截不得影响既有已付费条目: %v", got)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := openTestJournal(t, store, 4)
+	if got := reopened.Snapshot(); len(got) != 1 || got["paid-1"] == nil {
+		t.Fatalf("拦截批不得部分落盘: %v", got)
 	}
 }
 

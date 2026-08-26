@@ -16,7 +16,13 @@ import (
 // Journal 是 per-profile 的 embedding 断点续嵌暂存区（阶段计划 D4）：
 // 每批嵌入成功即 append 落盘，构建被取消/超时/kill 后已付费向量不丢失；
 // revision 发布后清除已入盘条目。它不是长期缓存——向量事实源始终是
-// revision（暗坑 K41），journal 只在"已付费未发布"窗口存在且有界。
+// revision（暗坑 K41），journal 只在"已付费未发布"窗口存在。
+//
+// 规模政策（2026-08-26 用户裁决）：journal 里每一条都是已付费向量，
+// 默认没有条数/字节上限，重开时永不压实丢弃——丢弃等于下轮重新付费。
+// 资源受限环境经 LimitBytes 注入 opt-in 字节预算（引擎从
+// OPENACE_VECTOR_MEMORY_BUDGET 派生），预算语义是"付费前拦截新增"，
+// 永不作用于既有条目；磁盘/重开内存代价见 A&Q 文档。
 //
 // vectors.journal 记录格式（小端）：
 //
@@ -33,18 +39,17 @@ type Journal struct {
 	entries   map[string][]float32
 	rejected  map[string]bool
 	bytes     int64
+	// maxBytes 是 opt-in 字节预算(0=不限,默认)。历史上这里是一对写死的
+	// 400K 条/2GiB 上限(K40 时代随 envelope 上调),超限重开时压实丢最旧
+	// ——那会静默丢弃已付费向量。2026-08-26 裁决后默认无上限,预算改由
+	// 引擎按用户配置注入,且只拦截新增付费,见 LimitBytes。
+	maxBytes int64
 }
 
 const (
 	journalDirName   = "journal"
 	journalFileName  = "vectors.journal"
 	rejectedFileName = "rejected.list"
-	// journalMaxEntries/journalMaxBytes 是孤儿条目双上限（受测常数，K40）：
-	// 打开与发布后压实时执行，保留最新条目。随 envelope 上调（250K→
-	// 400K,2026-08-01 选项 B）同步放大——首建 400K chunk 工作区的断点
-	// 保护需容纳全量未发布向量（400K × ~4.3KB ≈ 1.7GB,字节上限 2GB）。
-	journalMaxEntries = 400_000
-	journalMaxBytes   = 2048 << 20
 	// rejectedMaxEntries 限制拒绝集规模（病理内容计数级别）。
 	rejectedMaxEntries = 10_000
 )
@@ -86,7 +91,9 @@ func (j *Journal) Dir() string { return j.dir }
 func (j *Journal) vectorsPath() string  { return filepath.Join(j.dir, journalFileName) }
 func (j *Journal) rejectedPath() string { return filepath.Join(j.dir, rejectedFileName) }
 
-// loadVectors 顺序读取记录，坏尾截断（K40）；超上限时压实保留最新。
+// loadVectors 顺序读取记录，坏尾截断（K40）。已付费条目无论规模全部
+// 保留（2026-08-26 裁决）——历史上这里有超上限压实（含 M8 修过的字节环
+// 缺陷），因其本质是静默丢弃已付费向量而整体移除。
 func (j *Journal) loadVectors() error {
 	file, err := os.Open(j.vectorsPath())
 	if err != nil {
@@ -98,18 +105,12 @@ func (j *Journal) loadVectors() error {
 	defer file.Close()
 	reader := bufio.NewReaderSize(file, 1<<20)
 	var goodOffset int64
-	order := make([]string, 0, 1024)
-	sizes := make(map[string]int64, 1024)
 	for {
 		hash, vector, recordLen, err := readJournalRecord(reader, j.dimension)
 		if err != nil {
 			break
 		}
-		if _, seen := j.entries[hash]; !seen {
-			order = append(order, hash)
-		}
 		j.entries[hash] = vector
-		sizes[hash] = recordLen
 		goodOffset += recordLen
 	}
 	info, err := os.Stat(j.vectorsPath())
@@ -123,33 +124,7 @@ func (j *Journal) loadVectors() error {
 		}
 	}
 	j.bytes = goodOffset
-	if len(j.entries) > journalMaxEntries || j.bytes > journalMaxBytes {
-		keep := journalRetention(order, sizes, journalMaxEntries, journalMaxBytes)
-		for hash := range j.entries {
-			if !keep[hash] {
-				delete(j.entries, hash)
-			}
-		}
-		return j.rewriteLocked()
-	}
 	return nil
-}
-
-// journalRetention 计算压实保留集:从最新往旧保留,条数与字节双上限
-// 同时生效。历史缺陷(M8,诊断报告 2026-08-03):保留环只按条数截断,
-// 高维向量场景字节条件恒成立→每次打开全量重写 GB 级文件。
-func journalRetention(order []string, sizes map[string]int64, maxEntries int, maxBytes int64) map[string]bool {
-	keep := make(map[string]bool, maxEntries)
-	var keptBytes int64
-	for i := len(order) - 1; i >= 0 && len(keep) < maxEntries; i-- {
-		hash := order[i]
-		if keptBytes+sizes[hash] > maxBytes {
-			break
-		}
-		keep[hash] = true
-		keptBytes += sizes[hash]
-	}
-	return keep
 }
 
 // readJournalRecord 读取单条记录；任何不一致返回错误（调用方截断）。
@@ -236,6 +211,11 @@ func (j *Journal) Append(vectors map[string][]float32) error {
 	if len(buf) == 0 {
 		return nil
 	}
+	if j.maxBytes > 0 && j.bytes+int64(len(buf)) > j.maxBytes {
+		// 预算拦截发生在写盘与付费链路继续之前:上层收到错误即停止
+		// 继续调用 provider,既有已付费条目原样保留(绝不丢弃)。
+		return fmt.Errorf("journal 字节预算耗尽: 现有 %d + 本批 %d 超过预算 %d;停止继续嵌入,提高 OPENACE_VECTOR_MEMORY_BUDGET 或等待发布压实后重试", j.bytes, len(buf), j.maxBytes)
+	}
 	if _, err := j.file.Write(buf); err != nil {
 		return err
 	}
@@ -249,6 +229,15 @@ func (j *Journal) Append(vectors map[string][]float32) error {
 	}
 	j.bytes += int64(len(buf))
 	return nil
+}
+
+// LimitBytes 设置 journal 字节预算(0=不限,默认不限)。引擎在用户配置
+// OPENACE_VECTOR_MEMORY_BUDGET 时注入;预算只做"付费前拦截"(Append 报错
+// 停止新付费),永不触发对既有已付费条目的丢弃。
+func (j *Journal) LimitBytes(max int64) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.maxBytes = max
 }
 
 // Snapshot 返回当前条目视图（复用源；调用方不得修改向量）。
@@ -280,24 +269,61 @@ func (j *Journal) CompactAfterPublish(published map[string]bool) error {
 	return j.rewriteLocked()
 }
 
-// rewriteLocked 以 temp+rename 原子重写 journal（调用方持锁）。
+// rewriteLocked 以 temp+rename 原子重写 journal（调用方持锁）。逐条流式
+// 写入(1MiB 缓冲):历史实现先在内存拼出完整文件字节,400K×1024 维时
+// 单块缓冲可达 ~1.6GiB,低内存环境重写即 OOM 风险(2026-08-26 裁决修复)。
 func (j *Journal) rewriteLocked() error {
 	if j.file != nil {
 		_ = j.file.Close()
+		j.file = nil
 	}
-	var buf []byte
-	for hash, vector := range j.entries {
-		buf = append(buf, encodeJournalRecord(hash, vector)...)
-	}
-	if err := writeFileAtomic(j.vectorsPath(), buf); err != nil {
+	path := j.vectorsPath()
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-journal-*")
+	if err != nil {
 		return err
 	}
-	file, err := os.OpenFile(j.vectorsPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, filePerm)
+	tmpName := tmp.Name()
+	cleanup := func() {
+		tmp.Close()
+		os.Remove(tmpName)
+	}
+	writer := bufio.NewWriterSize(tmp, 1<<20)
+	var total int64
+	for hash, vector := range j.entries {
+		record := encodeJournalRecord(hash, vector)
+		if _, err := writer.Write(record); err != nil {
+			cleanup()
+			return err
+		}
+		total += int64(len(record))
+	}
+	if err := writer.Flush(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, filePerm); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := renameWithRetry(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	syncDirBestEffort(filepath.Dir(path))
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, filePerm)
 	if err != nil {
 		return err
 	}
 	j.file = file
-	j.bytes = int64(len(buf))
+	j.bytes = total
 	return nil
 }
 
