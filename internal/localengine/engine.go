@@ -24,7 +24,6 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/lexical"
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
 	"github.com/AoManoh/openace-mcp/internal/rerank"
-	"github.com/AoManoh/openace-mcp/internal/vector"
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
@@ -92,9 +91,14 @@ type Engine struct {
 	handles  map[string]*revisionHandle
 	// vectorSegments 是 Engine 级 immutable segment 向量缓存；active/
 	// previous revision 共享 segment 时只常驻一份,按 handle 引用计数释放。
-	vectorMu          sync.Mutex
-	vectorSegments    map[string]*sharedVectorIndex
+	vectorMu       sync.Mutex
+	vectorSegments map[string]*sharedVectorIndex
+	// vectorMaxResident 是常驻向量行数上限;0=不限(默认,2026-08-26 裁决:
+	// 能力默认不设限,资源约束由用户显式配置)。>0 时来自
+	// OPENACE_VECTOR_MEMORY_BUDGET 字节预算按维度折算。
 	vectorMaxResident int
+	// vectorMemoryBudget 是用户配置的原始字节预算(journal 同预算封顶)。
+	vectorMemoryBudget int64
 	// repair 记录查询期发现向量不可用的工作区，下次 sync 强制重建自愈
 	// （暗坑 K25；键为 workspaceKey，构建开始时消费）。
 	repair map[string]bool
@@ -137,7 +141,6 @@ func New(opts Options) (*Engine, error) {
 		stores:            make(map[string]*index.Store),
 		handles:           make(map[string]*revisionHandle),
 		vectorSegments:    make(map[string]*sharedVectorIndex),
-		vectorMaxResident: vector.DefaultMaxResidentVectors,
 		repair:            make(map[string]bool),
 		journals:          make(map[string]*index.Journal),
 		statCaches:        make(map[string]*workspace.StatCache),
@@ -168,6 +171,17 @@ func New(opts Options) (*Engine, error) {
 	// 落地,升级用户本就经历一次平行重建,无额外迁移成本。
 	opts.Embedding.TemplateVersion = embedTemplateVersion
 	e.embedCfg = opts.Embedding
+	// 常驻向量默认不限(2026-08-26 裁决)。配置字节预算时按维度折算行数
+	// 上限(只计 float 数据 rows×dim×4;条目/元数据开销与实测内存见
+	// A&Q 文档),同一预算在 journalFor 里同步封顶 journal 字节。
+	if opts.VectorMemoryBudget > 0 && opts.Embedding.Dimension > 0 {
+		rows := opts.VectorMemoryBudget / int64(opts.Embedding.Dimension*4)
+		if rows < 1 {
+			rows = 1
+		}
+		e.vectorMaxResident = int(rows)
+		e.vectorMemoryBudget = opts.VectorMemoryBudget
+	}
 	if opts.Embedding.Enabled {
 		client, err := embedding.NewClient(opts.Embedding)
 		if err != nil {
@@ -256,6 +270,11 @@ func (e *Engine) journalFor(workspaceKey string, store *index.Store) (*index.Jou
 	journal, err := index.OpenJournal(store, e.embedCfg.Dimension)
 	if err != nil {
 		return nil, err
+	}
+	if e.vectorMemoryBudget > 0 {
+		// journal 与常驻向量共用同一字节预算(付费前拦截;每条记录另有
+		// ~78B 头部,可容条数略低于 revision 常驻,保守方向)。
+		journal.LimitBytes(e.vectorMemoryBudget)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()

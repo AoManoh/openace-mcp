@@ -45,6 +45,14 @@ const (
 	// (原因 index-building)、无 revision → 可行动错误(带构建进度)」
 	// 返回;空/0 = 现状(等到构建完成)。显式 sync 与后台任务不受约束。
 	EnvQueryBuildWait = "OPENACE_QUERY_BUILD_WAIT"
+	// EnvVectorMemoryBudget 是常驻向量的 opt-in 字节预算(2026-08-26 用户
+	// 裁决:能力默认不设限——历史 400K 默认硬限会让大仓失去语义检索;
+	// 资源受限环境自行配置)。约束粒度是单个 revision 的向量数据
+	// (rows×dimension×4B)、构建期 prior 复用加载与 journal 字节,不是
+	// 引擎全局总量。空/0=不限(默认)。超限行为全部显式:查询路降级
+	// vector-envelope-exceeded,构建路在调用 provider 付费前拦截。规模
+	// 对应的实测内存/延迟数据见 A&Q 文档。
+	EnvVectorMemoryBudget = "OPENACE_VECTOR_MEMORY_BUDGET"
 )
 
 // defaultQueryBuildWait 是查询有界等待的默认上界(P2,灰度反馈
@@ -75,6 +83,9 @@ type Options struct {
 	QualityStrict bool
 	// QueryBuildWait 是查询等待在建索引的上界;0 = 无界(现状)。
 	QueryBuildWait time.Duration
+	// VectorMemoryBudget 是常驻向量字节预算;0 = 不限(默认)。
+	// 运维参数,不参与 Fingerprint(不改变检索语义,只决定资源上限)。
+	VectorMemoryBudget int64
 	// DisableLexicalFirst 关闭冷仓 lexical-first 中间发布;仅测试/
 	// 诊断程序化覆盖,无环境变量,生产默认 false(即启用)。
 	DisableLexicalFirst bool
@@ -127,17 +138,22 @@ func OptionsFromEnv() (Options, error) {
 			buildWait = parsed
 		}
 	}
+	vectorBudget, err := reliability.IntEnv(EnvVectorMemoryBudget, 0, 0)
+	if err != nil {
+		return Options{}, err
+	}
 	// 模板版本注入(M9②):env 路径与引擎构造双点注入同一常量,保证
 	// wrapper/daemon 的 Fingerprint 与引擎侧 ProfileHash 同源。
 	embedCfg.TemplateVersion = embedTemplateVersion
 	return Options{
-		Embedding:        embedCfg,
-		Rerank:           rerankCfg,
-		RetrievalDegrade: retrievalDegrade,
-		RerankDegrade:    rerankDegrade,
-		FreshnessWindow:  freshness,
-		QualityStrict:    strict,
-		QueryBuildWait:   buildWait,
+		Embedding:          embedCfg,
+		Rerank:             rerankCfg,
+		RetrievalDegrade:   retrievalDegrade,
+		RerankDegrade:      rerankDegrade,
+		FreshnessWindow:    freshness,
+		QualityStrict:      strict,
+		QueryBuildWait:     buildWait,
+		VectorMemoryBudget: int64(vectorBudget),
 	}, nil
 }
 

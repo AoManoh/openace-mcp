@@ -144,7 +144,7 @@ func (e *Engine) acquireVectorSegment(dir string, dimension int, dataChecksum st
 			e.releaseVectorSegments([]string{key})
 			return nil, "", shared.err
 		}
-		if shared.ix.Count() > maxVectors {
+		if maxVectors > 0 && shared.ix.Count() > maxVectors {
 			e.releaseVectorSegments([]string{key})
 			return nil, "", fmt.Errorf("%w: %d > %d", vector.ErrEnvelopeExceeded, shared.ix.Count(), maxVectors)
 		}
@@ -188,8 +188,9 @@ func (e *Engine) releaseVectorSegments(keys []string) {
 
 // vectorIndexes 懒加载本 revision 全部 segment 的向量索引；任一校验失败
 // 只降级语义路，不影响词法可用性（暗坑 K25）。Engine 级 segment cache
-// 让 active/previous 共享不可变段；每段加载前传剩余累计 envelope，禁止
-// "全部分配后才发现超 400K"。
+// 让 active/previous 共享不可变段。常驻规模默认不限（2026-08-26 裁决）；
+// 用户配置字节预算时每段加载前传剩余累计行数，禁止"全部分配后才发现
+// 超预算"。
 func (h *revisionHandle) vectorIndexes(dimension int) ([]*vector.Index, error) {
 	h.vecOnce.Do(func() {
 		if !h.manifest.HasVectors() {
@@ -197,8 +198,8 @@ func (h *revisionHandle) vectorIndexes(dimension int) ([]*vector.Index, error) {
 			return
 		}
 		total := 0
-		limit := vector.DefaultMaxResidentVectors
-		if h.engine != nil && h.engine.vectorMaxResident > 0 {
+		limit := 0 // 0 = 不限(默认);>0 来自 OPENACE_VECTOR_MEMORY_BUDGET 折算。
+		if h.engine != nil {
 			limit = h.engine.vectorMaxResident
 		}
 		indexes := make([]*vector.Index, 0, len(h.manifest.Segments))
@@ -207,10 +208,13 @@ func (h *revisionHandle) vectorIndexes(dimension int) ([]*vector.Index, error) {
 			if segment.VectorsChecksum == "" {
 				continue
 			}
-			remaining := limit - total
-			if remaining <= 0 {
-				h.vecErr = fmt.Errorf("%w: cumulative segment rows exceed %d", vector.ErrEnvelopeExceeded, limit)
-				break
+			remaining := 0
+			if limit > 0 {
+				remaining = limit - total
+				if remaining <= 0 {
+					h.vecErr = fmt.Errorf("%w: cumulative segment rows exceed %d", vector.ErrEnvelopeExceeded, limit)
+					break
+				}
 			}
 			var ix *vector.Index
 			var key string

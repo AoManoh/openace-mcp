@@ -181,6 +181,42 @@ func TestSyncEmbedsAllChunks(t *testing.T) {
 	}
 }
 
+// TestVectorBudgetInterceptsBeforeProvider 是 2026-08-26 裁决的付费前
+// 拦截:配置 OPENACE_VECTOR_MEMORY_BUDGET 且投影行数超预算时,一次
+// provider 调用都不许发生(绝不"先付费,查询期才发现装不下");词法路
+// 照常发布,语义缺口显式留在状态里。
+func TestVectorBudgetInterceptsBeforeProvider(t *testing.T) {
+	const dim = 8
+	server := newEmbedServer(t, dim)
+	opts := embedOptions(server.ts.URL, dim, 16, "fake-model")
+	opts.VectorMemoryBudget = int64(dim * 4) // 折算行数=1,fixture 仓 chunk 数远超
+	e := newTestEngineWith(t, opts)
+	root := newFixtureWorkspace(t)
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatal(err)
+	}
+	if calls := server.callCount(); calls != 0 {
+		t.Fatalf("超预算必须在任何 provider 调用之前拦截,实际发生 %d 次调用", calls)
+	}
+	status, err := e.WorkspaceStatus(context.Background(), engineRef(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Stage != "ready" {
+		t.Fatalf("词法路必须照常可用: stage=%s", status.Stage)
+	}
+	semantic := status.Semantic
+	if semantic == nil || !semantic.Enabled {
+		t.Fatalf("语义块应存在且 enabled: %+v", status)
+	}
+	if semantic.CoveredChunks != 0 {
+		t.Fatalf("超预算不应产生任何新覆盖: %+v", semantic)
+	}
+	if !strings.Contains(semantic.LastError, "budget") {
+		t.Fatalf("缺口原因必须显式指向预算: %q", semantic.LastError)
+	}
+}
+
 // TestIncrementalEmbedOnlyChangedContent 是 D4/K5 费用承诺：
 // 未变更内容永不重复付费。
 func TestIncrementalEmbedOnlyChangedContent(t *testing.T) {

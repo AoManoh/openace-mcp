@@ -20,11 +20,31 @@ func clearProviderEnv(t *testing.T) {
 		embedding.EnvProvider, embedding.EnvBaseURL, embedding.EnvAPIKey, embedding.EnvVoyageAPIKey,
 		embedding.EnvModel, embedding.EnvDimension, embedding.EnvBatchSize, embedding.EnvMaxConcurrency,
 		embedding.EnvRPMBudget, embedding.EnvTPMBudget,
+		embedding.EnvThroughputGovernor, embedding.EnvBatchAPI, embedding.EnvBatchMinChunks,
 		rerank.EnvProvider, rerank.EnvBaseURL, rerank.EnvAPIKey, rerank.EnvModel, rerank.EnvMaxTokens,
-		EnvRetrievalDegrade, EnvRerankDegrade,
+		EnvRetrievalDegrade, EnvRerankDegrade, EnvVectorMemoryBudget,
 		"OPENACE_PROVIDER_TIMEOUT", "OPENACE_PROVIDER_MAX_RETRIES",
 	} {
 		t.Setenv(name, "")
+	}
+}
+
+// TestOptionsFromEnvVectorMemoryBudget(A2',2026-08-26 裁决):字节预算
+// 解析——空=0=不限(默认),正整数生效,负数显式报错。
+func TestOptionsFromEnvVectorMemoryBudget(t *testing.T) {
+	clearProviderEnv(t)
+	opts, err := OptionsFromEnv()
+	if err != nil || opts.VectorMemoryBudget != 0 {
+		t.Fatalf("默认应为 0(不限): budget=%d err=%v", opts.VectorMemoryBudget, err)
+	}
+	t.Setenv(EnvVectorMemoryBudget, "1638400000")
+	opts, err = OptionsFromEnv()
+	if err != nil || opts.VectorMemoryBudget != 1_638_400_000 {
+		t.Fatalf("预算解析: budget=%d err=%v", opts.VectorMemoryBudget, err)
+	}
+	t.Setenv(EnvVectorMemoryBudget, "-1")
+	if _, err := OptionsFromEnv(); err == nil || !strings.Contains(err.Error(), EnvVectorMemoryBudget) {
+		t.Fatalf("负值必须显式报错: %v", err)
 	}
 }
 

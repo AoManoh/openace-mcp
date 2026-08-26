@@ -17,7 +17,7 @@ func TestLargeVectorLoadMemoryProbe(t *testing.T) {
 	runtime.GC()
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	ix, err := Load(dir, 1024, "", "", DefaultMaxResidentVectors)
+	ix, err := Load(dir, 1024, "", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

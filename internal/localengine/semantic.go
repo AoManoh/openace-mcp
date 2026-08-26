@@ -107,6 +107,7 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest) 
 	manifest := previous
 	seenSegments := make(map[string]bool)
 	loadedRows := 0
+	limit := e.vectorMaxResident // 0 = 不限(默认,2026-08-26 裁决)
 	if previous != nil {
 		prior.activeExpectedRows = previous.VectorCount
 		for _, segment := range previous.Segments {
@@ -121,9 +122,12 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest) 
 				continue
 			}
 			seenSegments[segment.ID] = true
-			remaining := vector.DefaultMaxResidentVectors - loadedRows
-			if remaining <= 0 {
-				break
+			remaining := 0
+			if limit > 0 {
+				remaining = limit - loadedRows
+				if remaining <= 0 {
+					break
+				}
 			}
 			ix, err := vector.Load(store.SegmentPathFor(segment.ID), dimension,
 				segment.VectorsChecksum, segment.VectorsIndexChecksum, remaining)
@@ -147,7 +151,7 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest) 
 				}
 			}
 		}
-		if manifest.PreviousRevision == "" || loadedRows >= vector.DefaultMaxResidentVectors {
+		if manifest.PreviousRevision == "" || (limit > 0 && loadedRows >= limit) {
 			break
 		}
 		older, err := store.LoadManifest(manifest.PreviousRevision)
@@ -210,6 +214,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	// 防止 watcher 周期对病理内容反复付费。
 	var missingHashes []string
 	var missingTexts []string
+	reusedRows := 0
 	seen := make(map[string]bool, len(records))
 	for _, record := range records {
 		key := embedKey(record)
@@ -218,6 +223,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		}
 		seen[key] = true
 		if _, ok := reuse[key]; ok {
+			reusedRows++
 			if crossUsable[key] {
 				out.crossProfileReused++
 			}
@@ -229,6 +235,20 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		}
 		missingHashes = append(missingHashes, key)
 		missingTexts = append(missingTexts, embedDocText(record))
+	}
+
+	// 付费前预算拦截(2026-08-26 裁决;仅在用户配置 OPENACE_VECTOR_MEMORY_
+	// BUDGET 时生效,默认不限):本次发布常驻向量行数投影 = 已复用行 +
+	// 待新嵌行。超预算即在任何 provider 调用前停止新增付费——已复用部分
+	// 照常入盘发布,缺口行如实保持未覆盖并给出显式原因;绝不"先付费、
+	// 发布后才在查询期发现装不下"。delta 场景物理段行数可能高于本投影
+	// (死行在 compaction 阈值前保留),查询侧的累计预算校验兜底。
+	if limit := e.vectorMaxResident; limit > 0 && len(missingHashes) > 0 {
+		if projected := reusedRows + len(missingHashes); projected > limit {
+			out.lastError = fmt.Sprintf("vector memory budget exceeded before embedding: projected %d rows > budget %d rows (%s); missing chunks left uncovered explicitly", projected, limit, EnvVectorMemoryBudget)
+			status.setEmbedProgress(len(missingHashes), 0)
+			return e.assembleSemanticOutcome(records, reuse, activeUsable, out), nil
+		}
 	}
 
 	// 3) 分批嵌入：单批失败记录并继续（部分成功入盘，D10）；circuit

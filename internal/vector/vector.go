@@ -33,20 +33,19 @@ const (
 	IndexFileName = "vectors.idx"
 	// indexSchemaVersion 随 idx 结构不兼容变化而递增。
 	indexSchemaVersion = 1
-	// DefaultMaxResidentVectors 是 exact 路径常驻内存的已验证 envelope
-	// （§18：超出必须显式降级词法，禁止靠 OOM/超时兜底）。
-	// Stage 5 复审定值：250K（2026-07-31,270,373 条真实向量 p50=86ms）→
-	// 400K（2026-08-01 用户批准选项 B,kubernetes 全量语料需求）：
-	// 线性外推 p50≈128ms(0.32ms/K 实测斜率),常驻 400K×1024×4B≈1.6GB;
-	// 定值以 k8s 全量嵌入后 annbench 实测复核(sealed 报告记录),
-	// 超出仍显式降级。
-	DefaultMaxResidentVectors = 400_000
 	// cancelCheckRows 是并行扫描的取消检查粒度。
 	cancelCheckRows = 2048
 )
 
-// ErrEnvelopeExceeded 表示向量规模超出已验证 envelope，语义路应显式降级。
-var ErrEnvelopeExceeded = errors.New("vector index exceeds verified exact-search envelope")
+// ErrEnvelopeExceeded 表示向量行数超出用户配置的内存预算
+// （OPENACE_VECTOR_MEMORY_BUDGET 折算的行数上限），语义路应显式降级。
+//
+// 历史：这里曾有写死的 DefaultMaxResidentVectors 默认上限（250K→400K，
+// annbench 实测 p50 86→~128ms、常驻 ≈1.6GB，记录在 sealed 报告），超限
+// 一律降级词法。2026-08-26 用户裁决移除默认上限：仓库越大反而失去语义
+// 检索与产品目标矛盾，能力默认不设限；资源受限环境自行配置预算，规模
+// 对应的内存/延迟实测数据见 A&Q 文档。
+var ErrEnvelopeExceeded = errors.New("vector index exceeds configured memory budget")
 
 // Entry 是一行向量对应的 chunk 身份；ContentHash 是历史字段名，当前
 // 子树承载 localengine embedKey(模板/path/symbol/language/content hash)，
@@ -197,11 +196,10 @@ type Index struct {
 }
 
 // Load 读取并校验向量文件（暗坑 K24/K25）：checksum、schema、尺寸对齐、
-// envelope。任何校验失败返回错误，由调用方决定语义路降级。
+// 可选内存预算。maxVectors ≤ 0 = 不限（默认，2026-08-26 裁决：上限只
+// 来自用户配置的字节预算折算）；>0 且行数超出时返回 ErrEnvelopeExceeded。
+// 任何校验失败返回错误，由调用方决定语义路降级。
 func Load(dir string, wantDimension int, wantDataChecksum string, wantIndexChecksum string, maxVectors int) (*Index, error) {
-	if maxVectors <= 0 {
-		maxVectors = DefaultMaxResidentVectors
-	}
 	idxBytes, err := os.ReadFile(filepath.Join(dir, IndexFileName))
 	if err != nil {
 		return nil, fmt.Errorf("读取 %s: %w", IndexFileName, err)
@@ -222,7 +220,7 @@ func Load(dir string, wantDimension int, wantDataChecksum string, wantIndexCheck
 	if header.Count != len(header.Entries) {
 		return nil, fmt.Errorf("%s count %d 与条目数 %d 不符", IndexFileName, header.Count, len(header.Entries))
 	}
-	if header.Count > maxVectors {
+	if maxVectors > 0 && header.Count > maxVectors {
 		return nil, fmt.Errorf("%w: %d > %d", ErrEnvelopeExceeded, header.Count, maxVectors)
 	}
 	dataPath := filepath.Join(dir, DataFileName)
