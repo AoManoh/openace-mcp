@@ -68,6 +68,14 @@ func TestStatusSemanticCoverageAndCircuit(t *testing.T) {
 	if semantic.ProviderState != "healthy" {
 		t.Fatalf("零向量拒绝不是 circuit 失败: %q", semantic.ProviderState)
 	}
+	// C3(2026-08-26):查询车道熔断与治理器窗口必须独立可见,否则
+	// "构建慢"在状态面不可判因。
+	if semantic.QueryProviderState != "healthy" {
+		t.Fatalf("查询车道熔断态应独立可见: %q", semantic.QueryProviderState)
+	}
+	if semantic.GovernorWindow == 0 || semantic.GovernorMaxWindow == 0 {
+		t.Fatalf("治理器窗口视图应可见: window=%d max=%d", semantic.GovernorWindow, semantic.GovernorMaxWindow)
+	}
 }
 
 // TestStatusBackoffVisibility：provider 故障后状态给出退避与脱敏错误。

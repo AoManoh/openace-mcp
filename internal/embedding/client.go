@@ -95,6 +95,13 @@ func (c *Client) GovernorSnapshot() reliability.GovernorSnapshot {
 	return c.governor.Snapshot()
 }
 
+// QueryCircuitSnapshot 返回查询车道健康视图(C3,2026-08-26):车道分离后
+// 查询熔断独立于索引车道,状态面需要能区分"索引风暴降速"与"查询路
+// 故障"。逃生门 off 时两车道同一实例,视图相同。
+func (c *Client) QueryCircuitSnapshot() reliability.CircuitSnapshot {
+	return c.circuitQuery.Snapshot()
+}
+
 // laneCircuit 按输入类型选车道熔断。
 func (c *Client) laneCircuit(inputType InputType) *reliability.Circuit {
 	if inputType == InputQuery {

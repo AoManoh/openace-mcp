@@ -356,6 +356,19 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 		if semantic.LastError == "" && circuit.LastError != "" {
 			semantic.LastError = circuit.LastError
 		}
+		// C3(2026-08-26 裁决):查询车道熔断与治理器窗口/速率/暂停入状态
+		// ——否则"构建慢"在状态面不可判因,历史误判会引发人为重启 daemon。
+		semantic.QueryProviderState = e.embedClient.QueryCircuitSnapshot().State
+		governor := e.embedClient.GovernorSnapshot()
+		semantic.GovernorRateLearning = governor.RateLearning
+		semantic.GovernorTargetTPM = governor.TargetTokensPerMin
+		semantic.GovernorWindow = governor.Window
+		semantic.GovernorMaxWindow = governor.MaxWindow
+		semantic.GovernorInFlight = governor.InFlight
+		if !governor.PausedUntil.IsZero() {
+			paused := governor.PausedUntil
+			semantic.GovernorPausedUntil = &paused
+		}
 	} else if embedConfigured {
 		semantic.DisabledReason = e.embedCfg.DisabledReason
 	}
