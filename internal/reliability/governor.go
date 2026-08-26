@@ -153,9 +153,21 @@ func (g *Governor) AcquireIndex(ctx context.Context, tokens int) error {
 		// 2) 速率令牌(仅在学习态,即见过 429 之后)。
 		if g.rateLearning {
 			g.refillLocked(now)
-			if g.bucketTokens < float64(tokens) {
+			// 超大请求债务模型(2026-08-26 用户批准的 P0 修复):单请求估算
+			// 可以超过一分钟目标额度——默认满批 128 条×2KB 顶格 chunk 估算
+			// ≈65.5K tokens,而地板是 40K。桶封顶恰为一分钟额度,若按"攒够
+			// 才放行",这类批次永远凑不够票,构建 goroutine 无限等待且状态
+			// 面无线索。改为:准入需求封顶到桶容量,桶满即放行,超出部分记
+			// 负债(桶转负),后续请求按目标速率先还债再取票——长期平均速率
+			// 仍 ≤ 目标(Guava SmoothRateLimiter"当下放行、后来者还债"同型)。
+			need := float64(tokens)
+			if need > g.targetTokensPerMin {
+				need = g.targetTokensPerMin
+			}
+			if g.bucketTokens < need {
 				// 缺口按当前目标速率折算成等待时长;至少 50ms 防忙转。
-				deficit := float64(tokens) - g.bucketTokens
+				// 桶可能为负(存量债务),缺口=还债+本次需求,等待自然变长。
+				deficit := need - g.bucketTokens
 				wait := time.Duration(deficit / g.targetTokensPerMin * float64(time.Minute))
 				if wait < 50*time.Millisecond {
 					wait = 50 * time.Millisecond

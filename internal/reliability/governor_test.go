@@ -109,6 +109,51 @@ func TestGovernorRepeated429HitsFloor(t *testing.T) {
 	}
 }
 
+func TestGovernorOversizedRequestProgressesWithDebt(t *testing.T) {
+	g, clock := governed(4)
+	// 冷启动即 429(无实测吞吐):学习目标落到地板 40K/min。
+	if err := g.AcquireIndex(context.Background(), 1_000); err != nil {
+		t.Fatal(err)
+	}
+	g.Observe(OutcomeRateLimited, 1_000, 0, time.Millisecond)
+	if got := g.Snapshot().TargetTokensPerMin; got != governorRateFloorTokens {
+		t.Fatalf("冷启动 429 后学习目标应为地板 %d, 得到 %d", governorRateFloorTokens, got)
+	}
+	// 单批估算 65,536 tokens > 地板:桶封顶=一分钟额度,按"攒够才放行"永远
+	// 凑不够票(构建死等)。债务模型要求:桶满即放行,超出部分转负债。
+	// 止损:虚拟睡眠累计超 10 分钟仍未放行即取消,判死等。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var simulated time.Duration
+	g.sleep = func(sleepCtx context.Context, d time.Duration) error {
+		_ = clock.sleep(sleepCtx, d)
+		simulated += d
+		if simulated > 10*time.Minute {
+			cancel()
+			return sleepCtx.Err()
+		}
+		return nil
+	}
+	start := clock.now()
+	if err := g.AcquireIndex(ctx, 65_536); err != nil {
+		t.Fatalf("超大批次必须在桶满后放行并转负债,而不是无限等待: %v", err)
+	}
+	g.Observe(OutcomeSuccess, 65_536, time.Second, 0)
+	if waited := clock.now().Sub(start); waited > 2*time.Minute {
+		t.Fatalf("放行等待应为攒满一分钟额度的量级,实际 %s", waited)
+	}
+	// 负债偿还:下一个 1,000 token 请求须先还超发的 25,536,
+	// 等待 ≈(25,536+1,000)/40,000×60s≈40s——长期平均速率不超目标。
+	before := clock.now()
+	if err := g.AcquireIndex(context.Background(), 1_000); err != nil {
+		t.Fatal(err)
+	}
+	g.Observe(OutcomeSuccess, 1_000, time.Second, 0)
+	if repaid := clock.now().Sub(before); repaid < 30*time.Second || repaid > 90*time.Second {
+		t.Fatalf("负债偿还等待不在预期量级(≈40s): %s", repaid)
+	}
+}
+
 func TestGovernorSuccessRaisesLearnedRate(t *testing.T) {
 	g, _ := governed(2)
 	if err := g.AcquireIndex(context.Background(), 1_000); err != nil {
