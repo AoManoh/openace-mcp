@@ -34,13 +34,17 @@ type wsStatus struct {
 	permissionSkipped int
 	// oversizeSkipped 是扫描期因超过文本上限被跳过的文件数(2026-08-10
 	// 大文件修复配套,K6)。
-	oversizeSkipped  int
-	capabilities     map[string]string
-	lastError        string
-	skippedRevisions []string
-	startedAt        *time.Time
-	finishedAt       *time.Time
-	updatedAt        time.Time
+	oversizeSkipped int
+	// gcFailedRevisions 是最近一次 revision GC 中删除失败的 revision 数
+	// (Windows 上被占用的映射/句柄可阻止删除;失败静默会积累磁盘泄漏,
+	// 下次启动孤儿清理兜底,但长驻 daemon 需要可见)。成功归零。
+	gcFailedRevisions int
+	capabilities      map[string]string
+	lastError         string
+	skippedRevisions  []string
+	startedAt         *time.Time
+	finishedAt        *time.Time
+	updatedAt         time.Time
 
 	// 语义路状态（Stage 3）：covered 来自 active manifest（暗坑 K31），
 	// rejected/embedError 来自最近一次构建的 provider 交互。
@@ -64,6 +68,14 @@ func (s *wsStatus) setBulkJob(label string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.bulkJob = label
+}
+
+// setGCFailures 记录最近一次 revision GC 的删除失败数(0=全部成功)。
+func (s *wsStatus) setGCFailures(failed int) {
+	s.mu.Lock()
+	s.gcFailedRevisions = failed
+	s.updatedAt = time.Now().UTC()
+	s.mu.Unlock()
 }
 
 // setEmbedProgress 按批更新构建期 embedding 进度（D8/G2 可见性）。
@@ -272,8 +284,8 @@ func (s *wsStatus) snapshot() engine.WorkspaceStatus {
 		updated := s.updatedAt
 		status.UpdatedAt = &updated
 	}
-	if len(s.capabilities) > 0 || s.revisionCount > 0 || len(s.skippedRevisions) > 0 || s.skippedFiles > 0 || s.permissionSkipped > 0 || s.oversizeSkipped > 0 {
-		status.UpstreamStatus = capabilitySummary(s.capabilities, s.revisionCount, s.skippedFiles, s.permissionSkipped, s.oversizeSkipped, s.skippedRevisions)
+	if len(s.capabilities) > 0 || s.revisionCount > 0 || len(s.skippedRevisions) > 0 || s.skippedFiles > 0 || s.permissionSkipped > 0 || s.oversizeSkipped > 0 || s.gcFailedRevisions > 0 {
+		status.UpstreamStatus = capabilitySummary(s.capabilities, s.revisionCount, s.skippedFiles, s.permissionSkipped, s.oversizeSkipped, s.gcFailedRevisions, s.skippedRevisions)
 	}
 	return status
 }
@@ -281,7 +293,7 @@ func (s *wsStatus) snapshot() engine.WorkspaceStatus {
 // capabilitySummary 把 chunker 能力、revision 保留数、内容门禁跳过数
 // 与损坏回退信息压缩为一行可读文本（Stage 2 复用现有 UpstreamStatus
 // 字段承载本地引擎详情，避免提前扩表；Stage 3 状态扩展时再字段化）。
-func capabilitySummary(capabilities map[string]string, revisions int, skippedFiles int, permissionSkipped int, oversizeSkipped int, skippedRevisions []string) string {
+func capabilitySummary(capabilities map[string]string, revisions int, skippedFiles int, permissionSkipped int, oversizeSkipped int, gcFailed int, skippedRevisions []string) string {
 	parts := make([]string, 0, len(capabilities)+3)
 	languages := make([]string, 0, len(capabilities))
 	for language := range capabilities {
@@ -302,6 +314,9 @@ func capabilitySummary(capabilities map[string]string, revisions int, skippedFil
 	}
 	if oversizeSkipped > 0 {
 		parts = append(parts, "oversize_skipped="+strconv.Itoa(oversizeSkipped))
+	}
+	if gcFailed > 0 {
+		parts = append(parts, "gc_failed="+strconv.Itoa(gcFailed))
 	}
 	if len(skippedRevisions) > 0 {
 		parts = append(parts, "skipped="+strings.Join(skippedRevisions, ","))

@@ -246,7 +246,7 @@ func (s *Store) RemoveRevision(revision string) error {
 		if referenced[segment.ID] {
 			continue
 		}
-		if err := os.RemoveAll(s.SegmentPathFor(segment.ID)); err != nil {
+		if err := removeAllWithRetry(s.SegmentPathFor(segment.ID)); err != nil {
 			return err
 		}
 	}
@@ -326,7 +326,7 @@ func (s *Store) CleanupOrphanSegments() error {
 		if !entry.IsDir() || referenced[entry.Name()] {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(s.root, segmentsDir, entry.Name())); err != nil {
+		if err := removeAllWithRetry(filepath.Join(s.root, segmentsDir, entry.Name())); err != nil {
 			return err
 		}
 	}
@@ -384,6 +384,26 @@ func renameWithRetry(oldPath string, newPath string) error {
 	var err error
 	for attempt, delay := 0, 25*time.Millisecond; attempt < 3; attempt, delay = attempt+1, delay*2 {
 		err = os.Rename(oldPath, newPath)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, os.ErrPermission) && !isTransientRenameErr(err) {
+			return err
+		}
+		time.Sleep(delay)
+	}
+	return err
+}
+
+// removeAllWithRetry 对占用类瞬时失败做与 renameWithRetry 同款有界重试:
+// Windows 上已映射(mmap)或被 AV/索引器持有的文件删除报 access denied/
+// being used,向量段映射在引用归零 Close 后仍可能有毫秒级句柄尾巴。
+// 重试耗尽的失败由调用方决定呈现;孤儿目录由下次启动 CleanupOrphanSegments
+// 兜底回收。
+func removeAllWithRetry(path string) error {
+	var err error
+	for attempt, delay := 0, 25*time.Millisecond; attempt < 3; attempt, delay = attempt+1, delay*2 {
+		err = os.RemoveAll(path)
 		if err == nil {
 			return nil
 		}

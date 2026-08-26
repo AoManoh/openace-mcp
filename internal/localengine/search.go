@@ -168,12 +168,16 @@ func (e *Engine) acquireVectorSegment(dir string, dimension int, dataChecksum st
 	return ix, key, nil
 }
 
+// releaseVectorSegments 归还段引用;引用归零的段从缓存移除并 Close
+// (mmap 驻留形态在此 munmap+关句柄——这是 revision GC/compaction 删除
+// 段目录前的必要秩序,Windows 上已映射文件不可删)。Close 时不可能有
+// 在飞检索:检索期间调用方必经句柄 refcount 持有引用。
 func (e *Engine) releaseVectorSegments(keys []string) {
 	if e == nil || len(keys) == 0 {
 		return
 	}
+	var closable []*vector.Index
 	e.vectorMu.Lock()
-	defer e.vectorMu.Unlock()
 	for _, key := range keys {
 		shared, ok := e.vectorSegments[key]
 		if !ok {
@@ -182,7 +186,14 @@ func (e *Engine) releaseVectorSegments(keys []string) {
 		shared.refs--
 		if shared.refs <= 0 {
 			delete(e.vectorSegments, key)
+			if shared.ix != nil {
+				closable = append(closable, shared.ix)
+			}
 		}
+	}
+	e.vectorMu.Unlock()
+	for _, ix := range closable {
+		_ = ix.Close()
 	}
 }
 
@@ -239,6 +250,10 @@ func (h *revisionHandle) vectorIndexes(dimension int) ([]*vector.Index, error) {
 		if h.vecErr != nil {
 			if h.engine != nil {
 				h.engine.releaseVectorSegments(keys)
+			} else {
+				for _, ix := range indexes {
+					_ = ix.Close()
+				}
 			}
 			return
 		}
@@ -251,6 +266,12 @@ func (h *revisionHandle) vectorIndexes(dimension int) ([]*vector.Index, error) {
 func (h *revisionHandle) releaseVectorIndexes() {
 	if h.engine != nil {
 		h.engine.releaseVectorSegments(h.vecKeys)
+	} else {
+		// 无引擎缓存的直连加载(engine==nil 测试路径):句柄独占索引,
+		// 直接 Close 释放映射/堆数据。
+		for _, ix := range h.vecIxs {
+			_ = ix.Close()
+		}
 	}
 	h.vecKeys = nil
 	h.vecIxs = nil

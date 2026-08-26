@@ -65,6 +65,7 @@ func (e *Engine) mergeSiblingProfileVectors(current *index.Store, root pathutil.
 		// 候选 active 物理载入必须覆盖 manifest 宣称的全部向量；部分
 		// 损坏候选不能因"尚存一条"就阻止后续健康 sibling 参与。
 		if loaded.activeLoadedSegments != loaded.activeExpectedSegments || loaded.activeLoadedSegments == 0 {
+			loaded.release() // 落选候选立即释放,防映射/堆数据泄漏
 			continue
 		}
 		if prior.crossProfileByHash == nil {
@@ -78,6 +79,9 @@ func (e *Engine) mergeSiblingProfileVectors(current *index.Store, root pathutil.
 				prior.crossProfileByHash[key] = vec
 			}
 		}
+		// 采纳:crossProfileByHash 引用候选数据,索引属主转移给 prior,
+		// 随构建收尾统一释放。
+		prior.indexes = append(prior.indexes, loaded.indexes...)
 		return
 	}
 }

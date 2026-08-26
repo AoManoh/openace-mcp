@@ -145,7 +145,7 @@ func TestGCRevisionsReleasesVectorSegmentRefs(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 模拟该 revision 已退出 active/previous 保留链后的 GC。
-	e.gcRevisions(store, workspaceKey, "future-active", "future-previous")
+	e.gcRevisions(store, nil, workspaceKey, "future-active", "future-previous")
 
 	e.mu.Lock()
 	_, stillCached := e.handles[handleKey(workspaceKey, revision)]

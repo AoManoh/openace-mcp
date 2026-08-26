@@ -106,10 +106,13 @@ func probeOnce(t *testing.T, rows, dim int) {
 	p50, max := sorted[len(sorted)/2], sorted[len(sorted)-1]
 	t.Logf("rows=%d dim=%d dat=%.1fMiB idx=%.1fMiB write=%.1fs load=%.2fs heap_live_delta=%.2fGiB rss_delta=%.2fGiB rss_anon_delta=%.2fGiB rss_file_delta=%.2fGiB rss_after=%.2fGiB search_p50=%s search_max=%s (n=%d topK=60)",
 		rows, dim, float64(datSize)/(1<<20), float64(idxSize)/(1<<20), writeWall.Seconds(), loadWall.Seconds(),
-		float64(after.HeapAlloc-before.HeapAlloc)/(1<<30),
+		// mmap 形态 Load 不增 heap,delta 可为负(写入期分配被 GC 归还),
+		// 必须带符号计算——uint64 直减会回绕成天文数字。
+		float64(int64(after.HeapAlloc)-int64(before.HeapAlloc))/(1<<30),
 		(rssAfter.rss-rssBefore.rss)/1024, (rssAfter.anon-rssBefore.anon)/1024, (rssAfter.file-rssBefore.file)/1024,
 		rssAfter.rss/1024, p50, max, len(latencies))
 	runtime.KeepAlive(ix)
+	_ = ix.Close()
 }
 
 // rssSample 拆分 /proc 口径：anon=匿名页(Go heap 等)、file=文件后备页

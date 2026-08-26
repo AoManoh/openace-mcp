@@ -914,12 +914,14 @@ func dumpVectorsFromStore(root string, out string) error {
 			seen[entry.ContentHash] = true
 			line, err := json.Marshal(importResultLine{CustomID: entry.ContentHash, Embedding: ix.Row(i)})
 			if err != nil {
+				_ = ix.Close()
 				return err
 			}
 			writer.Write(line)
 			writer.WriteByte('\n')
 			count++
 		}
+		_ = ix.Close()
 	}
 	if err := writer.Flush(); err != nil {
 		return err

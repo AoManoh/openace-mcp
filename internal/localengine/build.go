@@ -357,7 +357,7 @@ func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKe
 		return engine.Result{}, fmt.Errorf("发布索引: %w", err)
 	}
 	e.retireHandles(workspaceKey, manifest.Revision, manifest.PreviousRevision)
-	e.gcRevisions(store, workspaceKey, manifest.Revision, manifest.PreviousRevision)
+	e.gcRevisions(store, status, workspaceKey, manifest.Revision, manifest.PreviousRevision)
 	// 已随 revision 入盘的向量从 journal 清除（D4/K41：发布即 GC；
 	// 失败不阻塞——上限截断兜底，下次发布重试）。
 	if seman.enabled && len(seman.entries) > 0 {
@@ -493,6 +493,9 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 
 	// 阶段 2.5：语义路（semantic off 时零开销直通，K32）。
 	var prior priorVectors
+	// 复用向量经映射页/堆数据被 prior 哈希表引用直到新段写盘完成,
+	// 构建返回时统一释放(含 no-op 提前返回与错误路径)。
+	defer func() { prior.release() }()
 	if e.semanticEnabled() {
 		if previous != nil {
 			prior = e.loadPriorVectors(store, previous)
@@ -593,6 +596,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 
 	// 语义路：只嵌入 delta 记录（复用按纯 content hash，D2）。
 	var prior priorVectors
+	defer func() { prior.release() }()
 	if e.semanticEnabled() {
 		prior = e.loadPriorVectors(store, previous)
 	}
@@ -876,13 +880,16 @@ func loadLiveChunkRecordsByFile(store *index.Store, manifest *index.Manifest) (m
 }
 
 // gcRevisions 回收 active/previous 之外的旧 revision（review B4，D5 修订）：
-// 有打开句柄（refs>0）的 revision 跳过，留给下一次 GC；GC 失败不阻塞发布。
-// segment 级共享由 store.RemoveRevision 的引用计数保证（Stage 4 K42）。
-func (e *Engine) gcRevisions(store *index.Store, workspaceKey string, activeRevision string, previousRevision string) {
+// 有打开句柄（refs>0）的 revision 跳过，留给下一次 GC；GC 失败不阻塞发布,
+// 但删除失败数记入状态(gc_failed;Windows 上被占用的映射/句柄可阻止删除,
+// 静默积累=磁盘泄漏)。segment 级共享由 store.RemoveRevision 的引用计数
+// 保证（Stage 4 K42）。
+func (e *Engine) gcRevisions(store *index.Store, status *wsStatus, workspaceKey string, activeRevision string, previousRevision string) {
 	revisions, err := store.ListRevisions()
 	if err != nil {
 		return
 	}
+	failed := 0
 	for _, revision := range revisions {
 		if revision == activeRevision || revision == previousRevision {
 			continue
@@ -903,7 +910,12 @@ func (e *Engine) gcRevisions(store *index.Store, workspaceKey string, activeRevi
 			handle.closeContentFiles()
 			handle.releaseVectorIndexes()
 		}
-		_ = store.RemoveRevision(revision)
+		if err := store.RemoveRevision(revision); err != nil {
+			failed++
+		}
+	}
+	if status != nil {
+		status.setGCFailures(failed)
 	}
 }
 

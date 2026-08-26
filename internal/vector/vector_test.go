@@ -34,7 +34,8 @@ func makeVectors(t *testing.T, count, dim int, seed int64) ([]Entry, [][]float32
 	return entries, vectors
 }
 
-// writeAndLoad 写入临时目录并载入。
+// writeAndLoad 写入临时目录并载入；索引随测试结束自动 Close（映射
+// 生命周期契约）。
 func writeAndLoad(t *testing.T, entries []Entry, vectors [][]float32, dim int) *Index {
 	t.Helper()
 	dir := t.TempDir()
@@ -46,6 +47,7 @@ func writeAndLoad(t *testing.T, entries []Entry, vectors [][]float32, dim int) *
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	t.Cleanup(func() { _ = ix.Close() })
 	return ix
 }
 
@@ -349,5 +351,106 @@ func TestRowReturnsStoredBits(t *testing.T) {
 		if !reflect.DeepEqual(ix.Row(i), vectors[i]) {
 			t.Fatalf("Row(%d) 应与写入位级一致（复用拷贝依据，D2）", i)
 		}
+	}
+}
+
+// TestMappedAndHeapModesBitIdentical 锁定两种驻留形态的位级等价:同一
+// 文件分别以 mmap 与 heap 解码载入,Row 位模式与检索结果必须逐位一致。
+func TestMappedAndHeapModesBitIdentical(t *testing.T) {
+	const count, dim, topK = 200, 8, 12
+	entries, vectors := makeVectors(t, count, dim, 21)
+	dir := t.TempDir()
+	dataSum, idxSum, err := Write(dir, dim, entries, vectors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapped, err := load(dir, dim, dataSum, idxSum, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mapped.Close()
+	heap, err := load(dir, dim, dataSum, idxSum, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer heap.Close()
+	if !mapped.Mapped() {
+		t.Fatal("mmap 形态应报告文件后备驻留")
+	}
+	if heap.Mapped() {
+		t.Fatal("heap 形态不应报告文件后备驻留")
+	}
+	for i := 0; i < count; i++ {
+		if !reflect.DeepEqual(mapped.Row(i), heap.Row(i)) {
+			t.Fatalf("第 %d 行两形态位模式不一致", i)
+		}
+	}
+	query := make([]float32, dim)
+	for j := range query {
+		query[j] = float32(j%3 + 1)
+	}
+	q1, q2 := make([]float32, dim), make([]float32, dim)
+	copy(q1, query)
+	copy(q2, query)
+	hitsMapped, err := mapped.Search(context.Background(), q1, topK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hitsHeap, err := heap.Search(context.Background(), q2, topK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(hitsMapped, hitsHeap) {
+		t.Fatalf("两形态检索结果不一致:\nmmap=%v\nheap=%v", hitsMapped, hitsHeap)
+	}
+}
+
+// TestMappedModeRejectsCorruption 映射形态必须保持整读 checksum 拒载
+// 语义(K25 自愈链依赖 Load 报错)。
+func TestMappedModeRejectsCorruption(t *testing.T) {
+	const dim = 4
+	entries, vectors := makeVectors(t, 8, dim, 22)
+	dir := t.TempDir()
+	dataSum, idxSum, err := Write(dir, dim, entries, vectors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataPath := filepath.Join(dir, DataFileName)
+	raw, _ := os.ReadFile(dataPath)
+	raw[len(raw)-1] ^= 0xFF
+	if err := os.WriteFile(dataPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := load(dir, dim, dataSum, idxSum, 0, true); err == nil || !strings.Contains(err.Error(), "checksum") {
+		t.Fatalf("映射形态篡改应被 checksum 拦截: %v", err)
+	}
+}
+
+// TestCloseThenDeleteAndUseAfterClose 钉住生命周期秩序:Close 后段目录
+// 可删除(Windows 上已映射文件不可删,先 munmap 再删是 GC/compaction 的
+// 必要顺序);Close 后检索返回显式错误而非脏读,重复 Close 幂等。
+func TestCloseThenDeleteAndUseAfterClose(t *testing.T) {
+	const dim = 4
+	entries, vectors := makeVectors(t, 6, dim, 23)
+	dir := t.TempDir()
+	dataSum, idxSum, err := Write(dir, dim, entries, vectors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ix, err := Load(dir, dim, dataSum, idxSum, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := ix.Close(); err != nil {
+		t.Fatalf("重复 Close 应幂等: %v", err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("Close 后段目录应可删除: %v", err)
+	}
+	if _, err := ix.Search(context.Background(), []float32{1, 0, 0, 0}, 3); err == nil {
+		t.Fatal("Close 后检索应返回显式错误")
 	}
 }

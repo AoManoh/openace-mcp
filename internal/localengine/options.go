@@ -45,13 +45,16 @@ const (
 	// (原因 index-building)、无 revision → 可行动错误(带构建进度)」
 	// 返回;空/0 = 现状(等到构建完成)。显式 sync 与后台任务不受约束。
 	EnvQueryBuildWait = "OPENACE_QUERY_BUILD_WAIT"
-	// EnvVectorMemoryBudget 是常驻向量的 opt-in 字节预算(2026-08-26 用户
+	// EnvVectorMemoryBudget 是可寻址向量的 opt-in 字节预算(2026-08-26 用户
 	// 裁决:能力默认不设限——历史 400K 默认硬限会让大仓失去语义检索;
 	// 资源受限环境自行配置)。约束粒度是单个 revision 的向量数据
 	// (rows×dimension×4B)、构建期 prior 复用加载与 journal 字节,不是
 	// 引擎全局总量。空/0=不限(默认)。超限行为全部显式:查询路降级
-	// vector-envelope-exceeded,构建路在调用 provider 付费前拦截。规模
-	// 对应的实测内存/延迟数据见 A&Q 文档。
+	// vector-envelope-exceeded,构建路在调用 provider 付费前拦截。
+	// 口径注意:约束对象是"可寻址向量字节",不是进程 RSS——默认 mmap
+	// 驻留形态(OPENACE_VECTOR_MMAP)下向量页是内核可回收的文件后备页,
+	// 实际常驻通常远低于预算值;heap 逃生形态下同字节数为不可回收
+	// 匿名内存。规模对应的实测内存/延迟数据见 A&Q 文档。
 	EnvVectorMemoryBudget = "OPENACE_VECTOR_MEMORY_BUDGET"
 )
 

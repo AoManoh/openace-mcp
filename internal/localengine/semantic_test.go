@@ -170,6 +170,7 @@ func TestSyncEmbedsAllChunks(t *testing.T) {
 	if err != nil || ix.Count() != manifest.VectorCount {
 		t.Fatalf("向量载入: count=%v err=%v", ix, err)
 	}
+	defer ix.Close()
 	// 批大小约束。
 	for i, texts := range server.perCall {
 		if len(texts) > 2 {
@@ -265,6 +266,7 @@ func TestVectorReuseBitExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer firstIx.Close()
 	firstByHash := map[string][]float32{}
 	for i, entry := range firstIx.Entries() {
 		firstByHash[entry.ContentHash] = firstIx.Row(i)
@@ -284,6 +286,7 @@ func TestVectorReuseBitExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer deltaIx.Close()
 	common := 0
 	for i, entry := range deltaIx.Entries() {
 		if old, ok := firstByHash[entry.ContentHash]; ok {

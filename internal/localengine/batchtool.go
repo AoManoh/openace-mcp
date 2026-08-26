@@ -159,6 +159,7 @@ func (e *Engine) planLiveRecords(ctx context.Context, workspaceKey string, root 
 // 拒绝集),pending 键回调 fn 导出待嵌任务。
 func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *index.Store, workspaceKey string, previous *index.Manifest, records []chunkRecord, fn func(EmbedJob) error) error {
 	var prior priorVectors
+	defer func() { prior.release() }()
 	if previous != nil {
 		prior = e.loadPriorVectors(store, previous)
 	}

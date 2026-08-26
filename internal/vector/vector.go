@@ -21,9 +21,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"unsafe"
 
 	"context"
+
+	mmap "github.com/blevesearch/mmap-go"
 )
 
 const (
@@ -188,18 +193,30 @@ func checksumBytes(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Index 是常驻内存的只读 exact 索引。
+// Index 是只读 exact 索引。向量数据默认经 mmap 映射为文件后备页(内核
+// 可按内存压力回收,不占 Go heap);entries 行映射仍常驻 heap。用完必须
+// Close(munmap+关文件句柄),否则映射泄漏、Windows 上段目录无法删除。
 type Index struct {
 	dimension int
 	entries   []Entry
 	data      []float32
+	closed    atomic.Bool
+	mapped    mmap.MMap // 非 nil = data 是映射页的别名视图
+	file      *os.File  // 映射期间必须存活的文件句柄
 }
 
 // Load 读取并校验向量文件（暗坑 K24/K25）：checksum、schema、尺寸对齐、
 // 可选内存预算。maxVectors ≤ 0 = 不限（默认，2026-08-26 裁决：上限只
 // 来自用户配置的字节预算折算）；>0 且行数超出时返回 ErrEnvelopeExceeded。
 // 任何校验失败返回错误，由调用方决定语义路降级。
+//
+// 数据驻留形态由进程级 OPENACE_VECTOR_MMAP 决定(默认 mmap;详见
+// loadUseMmap),两种形态的校验语义与检索结果逐位一致。
 func Load(dir string, wantDimension int, wantDataChecksum string, wantIndexChecksum string, maxVectors int) (*Index, error) {
+	return load(dir, wantDimension, wantDataChecksum, wantIndexChecksum, maxVectors, loadUseMmap())
+}
+
+func load(dir string, wantDimension int, wantDataChecksum string, wantIndexChecksum string, maxVectors int, useMmap bool) (*Index, error) {
 	idxBytes, err := os.ReadFile(filepath.Join(dir, IndexFileName))
 	if err != nil {
 		return nil, fmt.Errorf("读取 %s: %w", IndexFileName, err)
@@ -232,8 +249,52 @@ func Load(dir string, wantDimension int, wantDataChecksum string, wantIndexCheck
 	if info.Size() != wantBytes {
 		return nil, fmt.Errorf("%s 尺寸 %d 与 count×dim×4=%d 不符（K24）", DataFileName, info.Size(), wantBytes)
 	}
-	// 流式校验+解码:旧实现同时常驻完整 dataBytes 与 float32 data,
-	// 大仓单段瞬时约翻倍。现在仅保留最终 float32 与64KiB缓冲。
+	// 空集不建映射(零长度文件不可 mmap);data 为空切片。
+	if useMmap && hostLittleEndian && header.Count > 0 {
+		return loadMapped(dataPath, header, wantDataChecksum)
+	}
+	return loadHeap(dataPath, header, wantDataChecksum)
+}
+
+// loadMapped 把 vectors.dat 映射为只读文件后备页并整读校验 checksum
+// (校验语义与 heap 形态一致:损坏段在 Load 期拒载,保 K25 自愈链;顺序
+// 触读同时完成页预热,冷启动读盘量与 heap 形态相同)。磁盘格式为小端
+// float32,小端主机上直接把映射字节按主机序转 []float32 视图,零解码
+// 零 heap 拷贝;大端主机由调用方走 heap 解码路径。
+//
+// 崩溃面(与 bleve zap 词法段同姿态,不设 SetPanicOnFault):segment 文件
+// 随 revision 不可变、0600、进程锁纪律护住写路径;映射存活期间文件被
+// 外部截断在 Unix 上是 SIGBUS 进程崩溃,属部署红线而非可恢复错误。
+func loadMapped(dataPath string, header indexHeader, wantDataChecksum string) (*Index, error) {
+	f, err := os.Open(dataPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s: %w", DataFileName, err)
+	}
+	mapped, err := mmap.Map(f, mmap.RDONLY, 0)
+	if err != nil {
+		// 文件系统不支持映射(部分网络盘/特殊挂载):回退 heap 解码。
+		// 两形态检索结果逐位一致,不构成能力降级;驻留形态可经
+		// Mapped() 观测。
+		_ = f.Close()
+		return loadHeap(dataPath, header, wantDataChecksum)
+	}
+	if wantDataChecksum != "" {
+		hash := sha256.New()
+		_, _ = hash.Write(mapped)
+		if hex.EncodeToString(hash.Sum(nil)) != wantDataChecksum {
+			_ = mapped.Unmap()
+			_ = f.Close()
+			return nil, fmt.Errorf("%s checksum 不符（文件损坏）", DataFileName)
+		}
+	}
+	data := unsafe.Slice((*float32)(unsafe.Pointer(&mapped[0])), header.Count*header.Dimension)
+	return &Index{dimension: header.Dimension, entries: header.Entries, data: data, mapped: mapped, file: f}, nil
+}
+
+// loadHeap 流式校验+解码进 Go heap(mmap 之前的原始驻留形态,保留作
+// 逃生门与大端主机路径):旧实现同时常驻完整 dataBytes 与 float32 data,
+// 大仓单段瞬时约翻倍,现仅保留最终 float32 与 64KiB 缓冲。
+func loadHeap(dataPath string, header indexHeader, wantDataChecksum string) (*Index, error) {
 	f, err := os.Open(dataPath)
 	if err != nil {
 		return nil, fmt.Errorf("读取 %s: %w", DataFileName, err)
@@ -262,6 +323,62 @@ func Load(dir string, wantDimension int, wantDataChecksum string, wantIndexCheck
 		return nil, fmt.Errorf("%s checksum 不符（文件损坏）", DataFileName)
 	}
 	return &Index{dimension: header.Dimension, entries: header.Entries, data: data}, nil
+}
+
+// hostLittleEndian 在进程启动时判定主机字节序;磁盘格式固定小端,大端
+// 主机走 heap 解码保证正确性(目标发布平台 amd64/arm64 均为小端)。
+var hostLittleEndian = func() bool {
+	var probe uint16 = 1
+	return *(*byte)(unsafe.Pointer(&probe)) == 1
+}()
+
+// loadUseMmap 解析进程级驻留形态开关:OPENACE_VECTOR_MMAP 空或真值=
+// mmap(默认),假值(0/false/off/no)=heap 解码逃生门(mmap 语义异常的
+// 文件系统/内核环境用)。运维参数,不入 profile 指纹(对齐预算先例)。
+var loadModeOnce struct {
+	once sync.Once
+	mmap bool
+}
+
+func loadUseMmap() bool {
+	loadModeOnce.once.Do(func() {
+		raw := strings.TrimSpace(strings.ToLower(os.Getenv("OPENACE_VECTOR_MMAP")))
+		switch raw {
+		case "0", "false", "off", "no":
+			loadModeOnce.mmap = false
+		default:
+			loadModeOnce.mmap = true
+		}
+	})
+	return loadModeOnce.mmap
+}
+
+// Close 释放向量数据(幂等):映射形态 munmap 并关闭文件句柄,heap 形态
+// 仅断开引用交还 GC。调用方必须保证无在飞检索/Row 使用(引擎侧由段缓存
+// 引用计数与句柄 refcount 保证);Close 后 Search/SearchFiltered 返回
+// 显式错误,Row 对已释放数据 panic(契约违规,快速失败优于脏读)。
+func (ix *Index) Close() error {
+	if !ix.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	ix.data = nil
+	var err error
+	if ix.mapped != nil {
+		err = ix.mapped.Unmap()
+		ix.mapped = nil
+	}
+	if ix.file != nil {
+		if cerr := ix.file.Close(); err == nil {
+			err = cerr
+		}
+		ix.file = nil
+	}
+	return err
+}
+
+// Mapped 报告向量数据当前是否为文件后备驻留(诊断/探针用)。
+func (ix *Index) Mapped() bool {
+	return ix.mapped != nil
 }
 
 // Count 返回向量行数。
@@ -301,6 +418,9 @@ func (ix *Index) Search(ctx context.Context, query []float32, topK int) ([]Hit, 
 // 降到 O(topK×workers),行序遍历/逐行求和序/全序比较器均与全排版一致,
 // 结果逐位等价(等价性由 referenceTopK 对照测试锁定)。
 func (ix *Index) SearchFiltered(ctx context.Context, query []float32, topK int, allow func(id string) bool) ([]Hit, error) {
+	if ix.closed.Load() {
+		return nil, errors.New("vector index 已关闭(use-after-close 是调用方生命周期缺陷)")
+	}
 	if len(query) != ix.dimension {
 		return nil, fmt.Errorf("查询维度 %d 与索引 %d 不符", len(query), ix.dimension)
 	}

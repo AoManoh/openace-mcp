@@ -240,6 +240,7 @@ func TestLoadPriorVectorsDeduplicatesSharedSegments(t *testing.T) {
 		t.Fatal(err)
 	}
 	prior := e.loadPriorVectors(store, manifest)
+	defer prior.release()
 	if prior.activeLoadedRows != manifest.VectorCount {
 		t.Fatalf("active 载入行数=%d want=%d", prior.activeLoadedRows, manifest.VectorCount)
 	}

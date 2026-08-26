@@ -91,6 +91,19 @@ type priorVectors struct {
 	// activeIDs 是 active revision 中已持久化向量的 chunk ID 集
 	// （delta 构建计算未触及 chunk 覆盖时使用，暗坑 K51）。
 	activeIDs map[string]bool
+	// indexes 是各哈希表值切片所指向数据的属主(map 值是 Row 子切片,
+	// 数据可能驻留 mmap 页):构建方用完 prior 后必须 release,否则映射
+	// /堆数据泄漏到进程退出。
+	indexes []*vector.Index
+}
+
+// release 关闭全部底层向量索引(幂等)。调用后各 byHash 表的值切片一律
+// 失效,禁止再读。
+func (p *priorVectors) release() {
+	for _, ix := range p.indexes {
+		_ = ix.Close()
+	}
+	p.indexes = nil
 }
 
 // loadPriorVectors 装载 active（hop 0）与其 previous（hop 1）全部 segment
@@ -134,6 +147,7 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest) 
 			if err != nil {
 				continue
 			}
+			prior.indexes = append(prior.indexes, ix)
 			loadedRows += ix.Count()
 			prior.loadedRows = loadedRows
 			if hop == 0 {

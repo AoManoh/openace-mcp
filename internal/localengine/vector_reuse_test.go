@@ -51,6 +51,7 @@ func TestCrossStoreVectorReuse(t *testing.T) {
 				dumped[entry.ContentHash] = append([]float32(nil), ix.Row(i)...)
 			}
 		}
+		_ = ix.Close()
 	}
 	if len(dumped) == 0 {
 		t.Fatal("A 子树应有向量可导出")
