@@ -901,6 +901,7 @@ func (e *Engine) gcRevisions(store *index.Store, workspaceKey string, activeRevi
 		if ok {
 			_ = handle.lex.Close()
 			handle.closeContentFiles()
+			handle.releaseVectorIndexes()
 		}
 		_ = store.RemoveRevision(revision)
 	}
