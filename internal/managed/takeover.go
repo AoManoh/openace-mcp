@@ -12,7 +12,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/buildinfo"
@@ -33,6 +37,12 @@ var terminateProcess = defaultTerminateProcess
 func takeoverOutdatedDaemon(ctx context.Context, client *daemon.Client, mismatch error) error {
 	if !errors.Is(mismatch, errDaemonBuildMismatch) {
 		return fmt.Errorf("not a build mismatch")
+	}
+	// T5 边界 1(接管域=本机):SIGTERM 作用于本地 pid,status 报告的
+	// pid 只在 daemon 与 wrapper 同机时有意义;endpoint 指向他机时同号
+	// 本地进程与目标无关,任何探测/终止动作之前先拒绝。
+	if endpoint := client.Endpoint(); !loopbackEndpoint(endpoint) {
+		return fmt.Errorf("daemon endpoint %s is not loopback; refusing takeover of a possibly remote daemon", endpoint)
 	}
 	statusCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	status, err := client.DaemonStatus(statusCtx)
@@ -62,7 +72,7 @@ func takeoverOutdatedDaemon(ctx context.Context, client *daemon.Client, mismatch
 }
 
 // takeoverTarget 校验接管安全门并返回目标 pid:服务身份、pid 有效、
-// VCSTime 双方齐备且 wrapper 不旧于 daemon(旧 binary 无权拆新服务;
+// 构建时间双方可得且 wrapper 不旧于 daemon(旧 binary 无权拆新服务;
 // 无法排序=不动手)。
 func takeoverTarget(wrapper buildinfo.Info, status daemon.Status) (int, error) {
 	if status.Service != "openace-daemon" {
@@ -71,21 +81,72 @@ func takeoverTarget(wrapper buildinfo.Info, status daemon.Status) (int, error) {
 	if status.PID <= 0 {
 		return 0, fmt.Errorf("daemon pid unavailable")
 	}
-	if wrapper.VCSTime == "" || status.Build.VCSTime == "" {
-		return 0, fmt.Errorf("vcs time unavailable on wrapper or daemon; cannot order builds")
-	}
-	wrapperAt, err := time.Parse(time.RFC3339, wrapper.VCSTime)
+	wrapperAt, err := buildOrderTime(wrapper)
 	if err != nil {
-		return 0, fmt.Errorf("wrapper vcs time unparsable: %w", err)
+		return 0, fmt.Errorf("wrapper build time unknown (%v); cannot order builds", err)
 	}
-	daemonAt, err := time.Parse(time.RFC3339, status.Build.VCSTime)
+	daemonAt, err := buildOrderTime(status.Build)
 	if err != nil {
-		return 0, fmt.Errorf("daemon vcs time unparsable: %w", err)
+		return 0, fmt.Errorf("daemon build time unknown (%v); cannot order builds", err)
 	}
 	if wrapperAt.Before(daemonAt) {
-		return 0, fmt.Errorf("daemon build (%s) is newer than wrapper (%s); refusing takeover", status.Build.VCSTime, wrapper.VCSTime)
+		return 0, fmt.Errorf("daemon build (%s) is newer than wrapper (%s); refusing takeover", daemonAt.Format(time.RFC3339), wrapperAt.Format(time.RFC3339))
 	}
 	return status.PID, nil
+}
+
+// pseudoVersionTimestamp 匹配 Go 模块伪版本的时间戳段:
+// vX.0.0-yyyymmddhhmmss-hash / vX.Y.Z-pre.0.yyyymmddhhmmss-hash /
+// vX.Y.Z-0.yyyymmddhhmmss-hash,末段恒为 12 位十六进制提交前缀。
+var pseudoVersionTimestamp = regexp.MustCompile(`[.-](\d{14})-[0-9a-f]{12}$`)
+
+// buildOrderTime 提取可比较的构建时间:优先 vcs.time 戳(源码构建);
+// 缺失时回退解析伪版本时间戳——go install 模块构建无任何 vcs.* 戳
+// (模块 zip 不含 .git),而伪版本时间戳与 vcs.time 同源同刻度(提交
+// 时间 UTC)。T5 首版把缺 VCSTime 等同 devel 裸构建,导致其立项动机
+// 场景(@main 追新的外部消费者)恰好永不触发接管(2026-08-31 外部
+// 反馈实录)。两源皆缺(tag 发布版/devel 测试二进制)返回错误,调用方
+// 维持"无法排序就不动手"。
+func buildOrderTime(info buildinfo.Info) (time.Time, error) {
+	if info.VCSTime != "" {
+		at, err := time.Parse(time.RFC3339, info.VCSTime)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("vcs time unparsable: %w", err)
+		}
+		return at, nil
+	}
+	version := info.Version
+	// 源码构建可携带 +dirty 等 build metadata 后缀,先剥离再匹配。
+	if i := strings.IndexByte(version, '+'); i >= 0 {
+		version = version[:i]
+	}
+	match := pseudoVersionTimestamp.FindStringSubmatch(version)
+	if match == nil {
+		return time.Time{}, fmt.Errorf("no vcs stamp and version %q carries no pseudo-version timestamp", info.Version)
+	}
+	at, err := time.Parse("20060102150405", match[1])
+	if err != nil {
+		return time.Time{}, fmt.Errorf("pseudo-version timestamp unparsable: %w", err)
+	}
+	return at.UTC(), nil
+}
+
+// loopbackEndpoint 判定 endpoint 主机是否本机回环(daemon.Client 的
+// baseURL 恒带 scheme)。解析失败或主机非 loopback 一律按不可接管处理。
+func loopbackEndpoint(endpoint string) bool {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return false
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // defaultTerminateProcessPortable 供不支持信号语义的平台使用。

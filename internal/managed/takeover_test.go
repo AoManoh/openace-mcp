@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -124,5 +125,73 @@ func TestTakeoverSkipsNonBuildMismatch(t *testing.T) {
 	t.Cleanup(func() { terminateProcess = orig })
 	if err := takeoverOutdatedDaemon(context.Background(), client, errors.New("wrapper engine profile a != daemon engine profile b")); err == nil {
 		t.Fatal("非 build 不匹配必须拒绝接管")
+	}
+}
+
+// moduleBuildStatus 模拟 go install 模块构建的 daemon:模块 zip 无 .git,
+// 二进制没有任何 vcs.* 构建戳,身份只有伪版本(外部 @main 消费通道的
+// 常态,2026-08-31 外部反馈实录形态)。
+func moduleBuildStatus(version string, pid int) daemon.Status {
+	var status daemon.Status
+	status.Service = "openace-daemon"
+	status.PID = pid
+	status.Build = buildinfo.Info{Version: version}
+	return status
+}
+
+func TestTakeoverTargetOrdersModuleBuildsByPseudoVersion(t *testing.T) {
+	// T5 立项动机场景="使用 @main 追新的用户每次升级必撞",但该通道的
+	// 二进制无 VCSTime;伪版本时间戳(vX.Y.Z-yyyymmddhhmmss-hash)与
+	// vcs.time 同源同刻度(提交时间 UTC),必须可作排序回退。
+	newerModule := buildinfo.Info{Version: "v0.0.0-20260826103859-6b8b59b80877"}
+	olderModule := buildinfo.Info{Version: "v0.0.0-20260820075351-0b2f077945a6"}
+
+	if pid, err := takeoverTarget(newerModule, moduleBuildStatus(olderModule.Version, 4242)); err != nil || pid != 4242 {
+		t.Fatalf("双伪版本可排序且 wrapper 更新,应放行接管: pid=%d err=%v", pid, err)
+	}
+	if _, err := takeoverTarget(olderModule, moduleBuildStatus(newerModule.Version, 4242)); err == nil || !strings.Contains(err.Error(), "refusing takeover") {
+		t.Fatalf("wrapper 伪版本更旧必须拒绝: %v", err)
+	}
+	// 混合通道:一侧源码构建(VCS 戳)、一侧模块构建(伪版本),同刻度可比。
+	stamped := wrapperInfo("new", "2026-08-26T10:38:59Z")
+	if pid, err := takeoverTarget(stamped, moduleBuildStatus(olderModule.Version, 4242)); err != nil || pid != 4242 {
+		t.Fatalf("VCS 戳×伪版本混合应可排序: pid=%d err=%v", pid, err)
+	}
+	if _, err := takeoverTarget(olderModule, daemonStatusFixture("newer", "2026-08-26T10:38:59Z", 4242)); err == nil || !strings.Contains(err.Error(), "refusing takeover") {
+		t.Fatalf("伪版本 wrapper 旧于 VCS 戳 daemon 必须拒绝: %v", err)
+	}
+	// 源码构建带未提交变更的 +dirty 后缀不阻碍解析。
+	dirty := buildinfo.Info{Version: "v0.0.0-20260826103859-6b8b59b80877+dirty"}
+	if pid, err := takeoverTarget(dirty, moduleBuildStatus(olderModule.Version, 4242)); err != nil || pid != 4242 {
+		t.Fatalf("+dirty 伪版本应可排序: pid=%d err=%v", pid, err)
+	}
+	// tag 之后提交的伪版本形态(vX.Y.Z-0.yyyymmddhhmmss-hash,点前缀)。
+	tagBased := buildinfo.Info{Version: "v0.2.0-0.20260826103859-6b8b59b80877"}
+	if pid, err := takeoverTarget(tagBased, moduleBuildStatus(olderModule.Version, 4242)); err != nil || pid != 4242 {
+		t.Fatalf("tag 基底伪版本应可排序: pid=%d err=%v", pid, err)
+	}
+	// tag 发布版(无时间戳)不可排序:维持"无法排序就不动手"。
+	if _, err := takeoverTarget(buildinfo.Info{Version: "v0.1.0"}, moduleBuildStatus(olderModule.Version, 4242)); err == nil || !strings.Contains(err.Error(), "cannot order builds") {
+		t.Fatalf("tag 发布版无时间戳必须拒绝: %v", err)
+	}
+}
+
+func TestTakeoverRefusesNonLoopbackEndpoint(t *testing.T) {
+	// T5 边界 1 代码化:接管以 SIGTERM 本地 pid 实施,status 报告的 pid
+	// 只在 daemon 与 wrapper 同机时有意义;endpoint 指向他机(auto 模式
+	// 误配远程地址)时,同号本地进程与目标无关,必须在任何网络探测与
+	// 终止动作之前拒绝。192.0.2.1=TEST-NET-1 不可路由:守卫缺失时本测试
+	// 会走网络探测超时而非快速拒绝。
+	t.Setenv("OPENACE_DAEMON_TOKEN", "off")
+	client := daemon.NewClient("http://192.0.2.1:8765")
+	orig := terminateProcess
+	terminateProcess = func(pid int) error {
+		t.Fatal("非 loopback endpoint 不得触发本地终止")
+		return nil
+	}
+	t.Cleanup(func() { terminateProcess = orig })
+	err := takeoverOutdatedDaemon(context.Background(), client, fmt.Errorf("%w: test", errDaemonBuildMismatch))
+	if err == nil || !strings.Contains(err.Error(), "not loopback") {
+		t.Fatalf("非 loopback endpoint 必须拒绝接管: %v", err)
 	}
 }
