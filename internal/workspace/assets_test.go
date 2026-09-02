@@ -58,19 +58,19 @@ func TestFileAssetSourceMatchesLegacyScan(t *testing.T) {
 func TestFileAssetSourceMatchesLegacyScanForKnowledgeAssets(t *testing.T) {
 	root := t.TempDir()
 	writeAssetTestFiles(t, root, map[string]string{
-		".gitignore":                "/AGENTS.md\n/CLAUDE.md\n/guidelines.md\n/rules/\n/docs/\n/skills/\n",
-		".openaceignore":            "!AGENTS.md\n!CLAUDE.md\n!guidelines.md\n!rules/**/*.md\n!docs/**/*.md\n!skills/**/SKILL.md\n!skills/**/SPEC.md\n",
-		"AGENTS.md":                 "project instructions\n",
-		"CLAUDE.md":                 "claude instructions\n",
-		"guidelines.md":              "project guidelines\n",
-		"rules/project.md":           "project rule\n",
-		"rules/script.py":           "print('not included')\n",
-		"docs/decision.md":          "important project knowledge\n",
-		"docs/script.py":            "print('not included')\n",
-		"skills/local/SKILL.md":     "local skill knowledge\n",
-		"skills/local/SPEC.md":      "local skill spec\n",
-		"skills/local/README.md":    "not included\n",
-		"main.go":                   "package main\n",
+		".gitignore":             "/AGENTS.md\n/CLAUDE.md\n/guidelines.md\n/rules/\n/docs/\n/skills/\n",
+		".openaceignore":         "!AGENTS.md\n!CLAUDE.md\n!guidelines.md\n!rules/**/*.md\n!docs/**/*.md\n!skills/**/SKILL.md\n!skills/**/SPEC.md\n",
+		"AGENTS.md":              "project instructions\n",
+		"CLAUDE.md":              "claude instructions\n",
+		"guidelines.md":          "project guidelines\n",
+		"rules/project.md":       "project rule\n",
+		"rules/script.py":        "print('not included')\n",
+		"docs/decision.md":       "important project knowledge\n",
+		"docs/script.py":         "print('not included')\n",
+		"skills/local/SKILL.md":  "local skill knowledge\n",
+		"skills/local/SPEC.md":   "local skill spec\n",
+		"skills/local/README.md": "not included\n",
+		"main.go":                "package main\n",
 	})
 
 	wantFiles, err := scan(context.Background(), root)

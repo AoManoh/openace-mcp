@@ -132,20 +132,20 @@ var (
 // New 创建 local-hybrid 引擎；opts 零值 = Stage 2 词法行为（K32）。
 func New(opts Options) (*Engine, error) {
 	e := &Engine{
-		profile:           chunk.DefaultProfile(),
-		retrievalDegrade:  normalizeDegrade(opts.RetrievalDegrade),
-		rerankDegrade:     normalizeDegrade(opts.RerankDegrade),
-		lexWeights:        lexical.DefaultWeights(),
-		inflight:          make(map[string]*buildCall),
-		statuses:          make(map[string]*wsStatus),
-		stores:            make(map[string]*index.Store),
-		handles:           make(map[string]*revisionHandle),
-		vectorSegments:    make(map[string]*sharedVectorIndex),
-		repair:            make(map[string]bool),
-		journals:          make(map[string]*index.Journal),
-		statCaches:        make(map[string]*workspace.StatCache),
-		lastSyncOK:        make(map[string]time.Time),
-		locks:             make(map[string]*index.ProcessLock),
+		profile:          chunk.DefaultProfile(),
+		retrievalDegrade: normalizeDegrade(opts.RetrievalDegrade),
+		rerankDegrade:    normalizeDegrade(opts.RerankDegrade),
+		lexWeights:       lexical.DefaultWeights(),
+		inflight:         make(map[string]*buildCall),
+		statuses:         make(map[string]*wsStatus),
+		stores:           make(map[string]*index.Store),
+		handles:          make(map[string]*revisionHandle),
+		vectorSegments:   make(map[string]*sharedVectorIndex),
+		repair:           make(map[string]bool),
+		journals:         make(map[string]*index.Journal),
+		statCaches:       make(map[string]*workspace.StatCache),
+		lastSyncOK:       make(map[string]time.Time),
+		locks:            make(map[string]*index.ProcessLock),
 	}
 	if opts.LexicalWeights != nil {
 		e.lexWeights = *opts.LexicalWeights
