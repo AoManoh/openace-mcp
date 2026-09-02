@@ -114,3 +114,10 @@ $RECYCLE.BIN/
 
 # Local retrieval scope policy stays untracked (see README: manage locally).
 /.openaceignore
+
+# Root-level stray notes (external feedback drafts, discussion records) must not
+# reach the public repo or the self-hosted retrieval index; only README.md is a
+# tracked root-level Markdown file. Add an explicit `!/<name>.md` when a new
+# public root document is intended.
+/*.md
+!/README.md
