@@ -62,8 +62,9 @@ type Engine struct {
 	// lexWeights 是词法子句权重（T10a 受测常数；默认 DefaultWeights，
 	// 评测 harness 可经 Options 覆盖做权重扫描）。
 	lexWeights lexical.Weights
-	// fusion 是 RRF 融合参数（T10b 受测常数；默认 DefaultParams=现状
-	// 等权 k=60，评测 harness 可经 Options 覆盖做融合扫描）。
+	// fusion 是 RRF 融合参数;默认 fusion.DefaultParams()={K:20,
+	// LexWeight:0.15, DenseWeight:0.85}(2026-07-31 四语料评测后冻结),
+	// 评测 harness 可经 Options 覆盖做融合扫描。
 	fusion fusion.Params
 	// qualityStrict 开启质量严格档(方案④):语义链路任一缺口显式报错。
 	qualityStrict bool

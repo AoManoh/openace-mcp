@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/AoManoh/openace-mcp/internal/chunk"
 	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/fusion"
 	"github.com/AoManoh/openace-mcp/internal/index"
@@ -339,9 +340,20 @@ func loadLiveChunkMetas(manifest *index.Manifest, segmentDirs []string) (map[str
 
 // rankedHit 是进入渲染的最终排序候选；score 仅用于同文件合并后的
 // 跨块排序（"越大越靠前"），Stage 2 纯词法路径沿用真实 BM25 分数。
+// reranked/rerankScore/source 是逐条可观测字段(外部反馈 2026-09-02
+// F-03/F-04):此前 fusion.Fused.Source 与 rerank.Hit.Score 在进程内算出后
+// 即被丢弃,调用方只能拿到聚合值 rerank_sent,无法分辨第 51 位起的
+// 未精排尾部,也无法判断某条命中来自哪一路。
 type rankedHit struct {
 	id    string
 	score float64
+	// reranked 表示该候选进入精排窗口并被 provider 打分;rerankScore 为
+	// provider 返回的相关度(仅 reranked 时有意义)。
+	reranked    bool
+	rerankScore float64
+	// source 是融合来源(fusion.SourceLexical/SourceDense/SourceBoth);
+	// 纯词法模式恒为 lexical。
+	source string
 }
 
 // retrieval 是一次检索的核心产物（渲染前）；handle 由调用方负责释放。
@@ -797,7 +809,7 @@ func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *re
 	if !e.semanticEnabled() {
 		ordered := make([]rankedHit, 0, len(lexHits))
 		for _, hit := range lexHits {
-			ordered = append(ordered, rankedHit{id: hit.ID, score: hit.Score})
+			ordered = append(ordered, rankedHit{id: hit.ID, score: hit.Score, source: fusion.SourceLexical})
 		}
 		return ordered, "lexical", "", nil, nil
 	}
@@ -821,8 +833,10 @@ func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *re
 			}
 		}()
 		ids := make([]string, 0, len(fused))
+		sources := make(map[string]string, len(fused))
 		for _, f := range fused {
 			ids = append(ids, f.ID)
+			sources[f.ID] = f.Source
 		}
 		// 词法锚(T11 业务冒烟发现的边界):dense 路存活但语义失真
 		// (弱模型/错配)时,加权融合会把词法唯一强命中压出精排窗口。
@@ -833,8 +847,14 @@ func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *re
 			ids = anchorWithinWindow(ids, lexIDs[0], rerankHeadLimit)
 		}
 		ordered = rankByPosition(ids)
+		for i := range ordered {
+			ordered[i].source = sources[ordered[i].id]
+		}
 	} else {
 		ordered = rankByPosition(lexIDs)
+		for i := range ordered {
+			ordered[i].source = fusion.SourceLexical
+		}
 	}
 	coverage := coveragePercent(handle.manifest)
 	if !handle.manifest.SemanticComplete() {
@@ -1064,7 +1084,21 @@ func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query 
 		// 不得静默冒充完整精排。
 		reason = "rerank-partial-response"
 	}
-	return rankByPosition(ids), true, sent, reason, nil
+	// 逐条标记:ids 的前 len(hits) 项是 provider 实际打分并返回的候选,
+	// 其后为按原序补回/跟随的未精排项;融合来源随原候选带过。
+	sources := make(map[string]string, len(ordered))
+	for _, hit := range ordered {
+		sources[hit.id] = hit.source
+	}
+	final := rankByPosition(ids)
+	for i := range final {
+		final[i].source = sources[final[i].id]
+		if i < len(hits) {
+			final[i].reranked = true
+			final[i].rerankScore = hits[i].Score
+		}
+	}
+	return final, true, sent, reason, nil
 }
 
 // rerankAssembleOrder 组装精排最终序：重排命中 → 已送审但 provider 未
@@ -1322,11 +1356,29 @@ func (e *Engine) retireHandles(workspaceKey string, activeRevision string, _ str
 	}
 }
 
-// renderBlock 是渲染前的合并单元。
+// renderBlock 是渲染前的合并单元。reranked/rerankScore/source 随
+// rankedHit 带入并在合并时聚合(见 mergeBlocks)。
 type renderBlock struct {
-	record chunkRecord
-	score  float64
+	record      chunkRecord
+	score       float64
+	reranked    bool
+	rerankScore float64
+	source      string
 }
+
+// mergedBlockMaxLines 是同文件相邻块合并后的单块行数上限(两个代码
+// 行窗口)。外部反馈 2026-09-02 F-01:行窗口 fallback 的 40 行窗口/10 行
+// 重叠天然满足相邻条件,两路各 60 深度把同一文档多个相邻窗口都送进
+// 候选时,此前会被无上限合成整篇文档(实录 434 行)并以最高分占据高
+// 名次槽位,单块吞掉默认输出预算的三分之一。上限下 5 个文档窗口合成
+// 1-100 与 91-160 两块,代码窗口对(60+50=110)仍可合并。
+var mergedBlockMaxLines = 2 * chunk.DefaultProfile().WindowLines
+
+// rerankBoundaryMarker 是正文中精排头部与未精排尾部之间的边界行
+// (稳定文本,调用方可依赖;不以 "## " 开头,paths 模式的头行解析可
+// 直接跳过)。仅当本次检索执行了精排且正文同时包含精排块与未精排块
+// 时出现。
+const rerankBoundaryMarker = "-- results below were not reranked (fused order) --"
 
 // renderHits 把命中渲染为稳定文本格式（golden 锁定，暗坑 K13）：
 // 同文件重叠/相邻 chunk 合并，按最高分排序，MaxOutputLen 预算截断。
@@ -1379,7 +1431,7 @@ func renderHitsDetail(handle *revisionHandle, hits []rankedHit, maxOutputLen int
 		if err != nil {
 			return renderedResult{}, err
 		}
-		blocks = append(blocks, renderBlock{record: record, score: hit.score})
+		blocks = append(blocks, renderBlock{record: record, score: hit.score, reranked: hit.reranked, rerankScore: hit.rerankScore, source: hit.source})
 	}
 	if len(blocks) == 0 {
 		return renderedResult{text: noHitsText}, nil
@@ -1392,10 +1444,26 @@ func renderHitsDetail(handle *revisionHandle, hits []rankedHit, maxOutputLen int
 		budget = 20000
 	}
 	inventory := make([]engine.Hit, len(merged))
+	anyReranked := false
 	for i, block := range merged {
 		inventory[i] = engine.Hit{
 			Path: block.record.RelPath, StartLine: block.record.StartLine,
 			EndLine: block.record.EndLine, Symbol: block.record.Symbol, Rank: i + 1,
+			Reranked: block.reranked, RerankScore: block.rerankScore, Source: block.source,
+		}
+		anyReranked = anyReranked || block.reranked
+	}
+	// 精排边界标记:精排块的序分(1/(pos+1),pos<sent)恒大于未精排块,
+	// 合并块又取最高分,故排序后所有含精排内容的块必然位于未精排块之前;
+	// 标记插在首个实际展示的未精排块之前。
+	boundary := func(out *strings.Builder, block renderBlock, sawReranked *bool, marked *bool) {
+		if block.reranked {
+			*sawReranked = true
+			return
+		}
+		if anyReranked && *sawReranked && !*marked {
+			out.WriteString(rerankBoundaryMarker + "\n")
+			*marked = true
 		}
 	}
 
@@ -1406,12 +1474,18 @@ func renderHitsDetail(handle *revisionHandle, hits []rankedHit, maxOutputLen int
 		var out strings.Builder
 		shown := 0
 		truncated := false
+		sawReranked, marked := false, false
 		for i := range merged {
 			line := blockHeader(merged[i].record) + "\n"
-			if out.Len()+len(line) > budget {
+			extra := 0
+			if !merged[i].reranked && anyReranked && sawReranked && !marked {
+				extra = len(rerankBoundaryMarker) + 1
+			}
+			if out.Len()+extra+len(line) > budget {
 				truncated = true
 				break
 			}
+			boundary(&out, merged[i], &sawReranked, &marked)
 			out.WriteString(line)
 			inventory[i].Shown = true
 			shown++
@@ -1459,6 +1533,10 @@ func renderHitsDetail(handle *revisionHandle, hits []rankedHit, maxOutputLen int
 	// 行为与历史一致;展示顺序恒为分序,与选块顺序解耦。
 	selected := make([]bool, len(merged))
 	remaining := budget
+	if anyReranked && !merged[len(merged)-1].reranked {
+		// 正文可能出现精排边界标记行,预留其字节以守住预算口径。
+		remaining -= len(rerankBoundaryMarker) + 1
+	}
 	seenFile := make(map[string]bool, len(merged))
 	truncated := false
 	for pass := 0; pass < 2; pass++ {
@@ -1481,8 +1559,10 @@ func renderHitsDetail(handle *revisionHandle, hits []rankedHit, maxOutputLen int
 	}
 	var out strings.Builder
 	shown := 0
+	sawReranked, marked := false, false
 	for i := range merged {
 		if selected[i] {
+			boundary(&out, merged[i], &sawReranked, &marked)
 			out.WriteString(sections[i])
 			inventory[i].Shown = true
 			shown++
@@ -1561,6 +1641,9 @@ func truncationMarker(shown int, total int) string {
 
 // mergeBlocks 只合并同文件真正重叠或严格相邻的块（next.Start ≤ current.End+1），
 // 取最高分。禁止跨间隙合并：缺行会让 header 行区间与内容错位（review B1）。
+// 合并后单块行数不超过 mergedBlockMaxLines:超出时 next 另起一块(与
+// current 的重叠行在两块中各自完整保留,行区间与内容仍一一对应)。
+// reranked 取"或",rerankScore 取最大,source 跟随分数更高的一方。
 func mergeBlocks(blocks []renderBlock) []renderBlock {
 	byFile := make(map[string][]renderBlock)
 	for _, block := range blocks {
@@ -1571,14 +1654,24 @@ func mergeBlocks(blocks []renderBlock) []renderBlock {
 		sort.Slice(group, func(i, j int) bool { return group[i].record.StartLine < group[j].record.StartLine })
 		current := group[0]
 		for _, next := range group[1:] {
-			if next.record.StartLine <= current.record.EndLine+1 {
+			adjacent := next.record.StartLine <= current.record.EndLine+1
+			mergedEnd := current.record.EndLine
+			if next.record.EndLine > mergedEnd {
+				mergedEnd = next.record.EndLine
+			}
+			if adjacent && mergedEnd-current.record.StartLine+1 <= mergedBlockMaxLines {
 				if next.record.EndLine > current.record.EndLine {
 					current.record.Content = current.record.Content + "\n" + tailLines(next.record, current.record.EndLine)
 					current.record.EndLine = next.record.EndLine
 				}
 				if next.score > current.score {
 					current.score = next.score
+					current.source = next.source
 				}
+				if next.rerankScore > current.rerankScore {
+					current.rerankScore = next.rerankScore
+				}
+				current.reranked = current.reranked || next.reranked
 				if current.record.Symbol == "" {
 					current.record.Symbol = next.record.Symbol
 				}

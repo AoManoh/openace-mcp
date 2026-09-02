@@ -3,6 +3,7 @@ package localengine
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -259,4 +260,103 @@ func index0(s string, sub string) int {
 		}
 	}
 	return -1
+}
+
+// TestRenderMergeCapsSpan(外部反馈 2026-09-02 F-01):同文件相邻行窗口
+// 链此前无上限合并,整篇文档可合成一块(实录 434 行)并以最高分占据高
+// 名次槽位,吞掉默认输出预算的三分之一。合并后单块行数上限为两个代码
+// 窗口(2×WindowLines=120):5 个 40 行文档窗口(重叠 10 行)应合成
+// 1-100 与 91-160 两块,每块行区间与内容行数仍一致。
+func TestRenderMergeCapsSpan(t *testing.T) {
+	var records []chunkRecord
+	var hits []rankedHit
+	for i := 0; i < 5; i++ {
+		start := 1 + i*30
+		end := start + 39
+		lines := make([]string, 0, 40)
+		for n := start; n <= end; n++ {
+			lines = append(lines, "line "+strconv.Itoa(n))
+		}
+		id := "w" + strconv.Itoa(i)
+		records = append(records, chunkRecord{ID: id, RelPath: "doc.md", Language: "markdown", StartLine: start, EndLine: end, Content: strings.Join(lines, "\n")})
+		hits = append(hits, rankedHit{id: id, score: 1.0 / float64(i+1)})
+	}
+	handle := newRenderHandle(t, records...)
+	rendered, err := renderHitsDetail(handle, hits, 0, detailPaths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "## doc.md:1-100\n## doc.md:91-160"
+	if rendered.text != want {
+		t.Fatalf("合并块应受 120 行上限约束:\n--- want ---\n%s\n--- got ---\n%s", want, rendered.text)
+	}
+	full, err := renderHitsDetail(handle, hits, 0, "full")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, header := range []string{"## doc.md:1-100\n", "## doc.md:91-160\n"} {
+		if !strings.Contains(full.text, header) {
+			t.Fatalf("full 模式缺少合并块 %q:\n%s", header, full.text)
+		}
+	}
+	// 每块内容行数与 header 区间一致(合并不得产生缺行或重复行)。
+	first := full.text[strings.Index(full.text, "## doc.md:1-100"):strings.Index(full.text, "## doc.md:91-160")]
+	if got := strings.Count(first, "\nline "); got != 100 {
+		t.Fatalf("1-100 块应恰含 100 行内容,实际 %d", got)
+	}
+}
+
+// TestRenderMarksRerankBoundary(外部反馈 2026-09-02 F-03):精排只覆盖
+// 前 rerankHeadLimit 个候选,窗口外候选按融合原序附回。此前正文对二者
+// 同形输出,调用方无法分辨第 51 位起的质量断层。现在 hits[] 逐条携带
+// reranked/rerank_score/source,正文在最后一个精排块之后插入一行边界
+// 标记(paths 与 full 两种模式)。
+func TestRenderMarksRerankBoundary(t *testing.T) {
+	handle := newRenderHandle(t,
+		chunkRecord{ID: "a", RelPath: "a.go", Language: "go", StartLine: 1, EndLine: 1, Symbol: "A", Content: "alpha"},
+		chunkRecord{ID: "b", RelPath: "b.go", Language: "go", StartLine: 1, EndLine: 1, Symbol: "B", Content: "beta"},
+		chunkRecord{ID: "c", RelPath: "c.go", Language: "go", StartLine: 1, EndLine: 1, Symbol: "C", Content: "gamma"},
+	)
+	hits := []rankedHit{
+		{id: "a", score: 1, reranked: true, rerankScore: 0.91, source: "both"},
+		{id: "b", score: 0.5, reranked: true, rerankScore: 0.42, source: "dense"},
+		{id: "c", score: 0.33, source: "lexical"},
+	}
+	paths, err := renderHitsDetail(handle, hits, 0, detailPaths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPaths := "## a.go:1-1 A\n## b.go:1-1 B\n" + rerankBoundaryMarker + "\n## c.go:1-1 C"
+	if paths.text != wantPaths {
+		t.Fatalf("paths 模式应在精排边界插标记:\n--- want ---\n%s\n--- got ---\n%s", wantPaths, paths.text)
+	}
+	if !paths.hits[0].Reranked || paths.hits[0].RerankScore != 0.91 || paths.hits[0].Source != "both" ||
+		paths.hits[2].Reranked || paths.hits[2].RerankScore != 0 || paths.hits[2].Source != "lexical" {
+		t.Fatalf("hits 应逐条携带 reranked/rerank_score/source: %+v", paths.hits)
+	}
+	full, err := renderHitsDetail(handle, hits, 0, "full")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idxB := strings.Index(full.text, "## b.go:1-1 B")
+	idxMarker := strings.Index(full.text, rerankBoundaryMarker)
+	idxC := strings.Index(full.text, "## c.go:1-1 C")
+	if idxB < 0 || idxMarker < 0 || idxC < 0 || !(idxB < idxMarker && idxMarker < idxC) {
+		t.Fatalf("full 模式标记应位于最后一个精排块与首个未精排块之间:\n%s", full.text)
+	}
+	// 全部候选都经过精排(或没有任何精排)时不插标记。
+	allReranked, err := renderHitsDetail(handle, hits[:2], 0, detailPaths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(allReranked.text, rerankBoundaryMarker) {
+		t.Fatalf("无未精排候选时不应出现标记: %s", allReranked.text)
+	}
+	none, err := renderHitsDetail(handle, []rankedHit{{id: "a", score: 1}, {id: "c", score: 0.5}}, 0, detailPaths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(none.text, rerankBoundaryMarker) {
+		t.Fatalf("未启用精排时不应出现标记: %s", none.text)
+	}
 }

@@ -115,6 +115,14 @@ type Hit struct {
 	// 该块内容(paths 模式=头行已列出)。
 	Rank  int  `json:"rank"`
 	Shown bool `json:"shown"`
+	// Reranked 表示该块进入精排窗口并被 rerank provider 打分,
+	// RerankScore 是 provider 返回的相关度(仅 Reranked 时有值);
+	// Source 是融合来源(lexical/dense/both)。三者为逐条可观测字段,
+	// 让调用方分辨精排头部与按融合原序附回的尾部、判断单条命中的
+	// 置信来源;不参与排序。
+	Reranked    bool    `json:"reranked,omitempty"`
+	RerankScore float64 `json:"rerank_score,omitempty"`
+	Source      string  `json:"source,omitempty"`
 }
 
 // DisplayStats 是单次检索的展示完整性统计(框架 18.2)。
