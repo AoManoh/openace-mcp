@@ -3,8 +3,10 @@ package managed
 // T5(docs/tasks/T5-connect-time-daemon-takeover.md):connect 时旧 daemon
 // 自动接管。场景=wrapper 升级后,健康但 build 过期的 daemon 占住 managed
 // 地址,此前只能报错并等待人工清场(外部灰度 2026-08-14 实录)。接管仅在
-// 全部安全门通过时发生:managed 生命周期 + build 级不匹配 + 双方 VCSTime
-// 齐备且 wrapper 不旧于 daemon + 目标确为 openace-daemon 且 pid 可用。
+// 全部安全门通过时发生:managed 生命周期 + 目标地址为本机回环 + build 级
+// 不匹配 + 双方构建可排序且 wrapper 不旧于 daemon + 目标确为 openace-daemon
+// 且 pid 可用。排序依据按可得性依次为 vcs.time 构建戳、伪版本时间戳、
+// Go 模块版本序(发布 tag);任何一对无法可靠比较即拒绝接管。
 // 优雅退出(SIGTERM)+ 有界等待;超时不强杀(SIGKILL 可能打断 manifest
 // 原子发布窗口),回落原错误语义。
 
@@ -16,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -81,18 +84,106 @@ func takeoverTarget(wrapper buildinfo.Info, status daemon.Status) (int, error) {
 	if status.PID <= 0 {
 		return 0, fmt.Errorf("daemon pid unavailable")
 	}
-	wrapperAt, err := buildOrderTime(wrapper)
-	if err != nil {
-		return 0, fmt.Errorf("wrapper build time unknown (%v); cannot order builds", err)
+	wrapperAt, wrapperErr := buildOrderTime(wrapper)
+	daemonAt, daemonErr := buildOrderTime(status.Build)
+	if wrapperErr == nil && daemonErr == nil {
+		if wrapperAt.Before(daemonAt) {
+			return 0, fmt.Errorf("daemon build (%s) is newer than wrapper (%s); refusing takeover", daemonAt.Format(time.RFC3339), wrapperAt.Format(time.RFC3339))
+		}
+		return status.PID, nil
 	}
-	daemonAt, err := buildOrderTime(status.Build)
+	// 至少一方没有时间戳(发布 tag 的模块构建只有 vX.Y.Z),改按 Go 模块
+	// 版本序比较;比较不成立时报出两侧各自缺什么。
+	older, err := wrapperOlderByModuleVersion(wrapper.Version, status.Build.Version)
 	if err != nil {
-		return 0, fmt.Errorf("daemon build time unknown (%v); cannot order builds", err)
+		return 0, fmt.Errorf("%v (wrapper: %s; daemon: %s); cannot order builds", err, describeBuildOrder(wrapper, wrapperErr), describeBuildOrder(status.Build, daemonErr))
 	}
-	if wrapperAt.Before(daemonAt) {
-		return 0, fmt.Errorf("daemon build (%s) is newer than wrapper (%s); refusing takeover", daemonAt.Format(time.RFC3339), wrapperAt.Format(time.RFC3339))
+	if older {
+		return 0, fmt.Errorf("daemon build %s is newer than wrapper %s by module version; refusing takeover", status.Build.Version, wrapper.Version)
 	}
 	return status.PID, nil
+}
+
+// describeBuildOrder 给出一侧构建在排序上的可用信息,用于拒绝时的说明。
+func describeBuildOrder(info buildinfo.Info, timeErr error) string {
+	if timeErr == nil {
+		return "timestamp available, version " + strconv.Quote(info.Version)
+	}
+	return "no timestamp, version " + strconv.Quote(info.Version)
+}
+
+// moduleVersion 是 Go 模块版本串中参与排序的部分。
+type moduleVersion struct {
+	major, minor, patch int
+	// pseudo 表示伪版本(vX.Y.Z-0.<时间戳>-<hash> 及 pre-release 基底
+	// 变体):它排在 vX.Y.Z 之前、vX.Y.(Z-1) 之后。
+	pseudo bool
+}
+
+var releaseVersionPattern = regexp.MustCompile(`^v(\d+)\.(\d+)\.(\d+)(?:-(.+))?$`)
+
+// parseModuleVersion 只接受两种可排序形态:正式发布 tag vX.Y.Z,以及带
+// 时间戳的伪版本。rc/beta 等非伪版本的预发布串、(devel)、空串都返回
+// false,调用方按不可排序处理。+dirty 等 build metadata 先剥离。
+func parseModuleVersion(version string) (moduleVersion, bool) {
+	if i := strings.IndexByte(version, '+'); i >= 0 {
+		version = version[:i]
+	}
+	match := releaseVersionPattern.FindStringSubmatch(version)
+	if match == nil {
+		return moduleVersion{}, false
+	}
+	var parsed moduleVersion
+	for i, field := range []*int{&parsed.major, &parsed.minor, &parsed.patch} {
+		value, err := strconv.Atoi(match[i+1])
+		if err != nil {
+			return moduleVersion{}, false
+		}
+		*field = value
+	}
+	if match[4] != "" {
+		if !pseudoVersionTimestamp.MatchString(version) {
+			return moduleVersion{}, false
+		}
+		parsed.pseudo = true
+	}
+	return parsed, true
+}
+
+// wrapperOlderByModuleVersion 按 Go 模块版本序判断 wrapper 是否旧于
+// daemon。规则与 go 命令解析 @latest/@main 时的版本序一致:
+//   - 两个 tag 按 major/minor/patch 数值比较;
+//   - 伪版本 vX.Y.Z-0.<时间戳>-<hash> 是 tag vX.Y.(Z-1) 之后的提交,排在
+//     vX.Y.(Z-1) 之后、vX.Y.Z 之前;
+//   - 基底为 v0.0.0 的伪版本表示该提交可达范围内没有任何 tag,它与 tag
+//     之间没有可靠顺序(本仓库曾因历史改写让 v0.1.0 脱离 main 谱系,
+//     main 上更新的提交反而得到 v0.0.0 基底),这种组合拒绝比较;
+//   - 两个伪版本之间由时间戳比较负责,不进入本函数。
+func wrapperOlderByModuleVersion(wrapperVersion, daemonVersion string) (bool, error) {
+	wrapper, ok := parseModuleVersion(wrapperVersion)
+	if !ok {
+		return false, fmt.Errorf("wrapper version %q is neither a release tag nor a pseudo-version", wrapperVersion)
+	}
+	daemon, ok := parseModuleVersion(daemonVersion)
+	if !ok {
+		return false, fmt.Errorf("daemon version %q is neither a release tag nor a pseudo-version", daemonVersion)
+	}
+	for _, side := range []moduleVersion{wrapper, daemon} {
+		if side.pseudo && side.major == 0 && side.minor == 0 && side.patch == 0 {
+			return false, fmt.Errorf("a v0.0.0-based pseudo-version has no tag base and cannot be ordered against a release tag")
+		}
+	}
+	switch {
+	case wrapper.major != daemon.major:
+		return wrapper.major < daemon.major, nil
+	case wrapper.minor != daemon.minor:
+		return wrapper.minor < daemon.minor, nil
+	case wrapper.patch != daemon.patch:
+		return wrapper.patch < daemon.patch, nil
+	default:
+		// 同一 vX.Y.Z:伪版本是该正式发布之前的提交,比正式发布旧。
+		return wrapper.pseudo && !daemon.pseudo, nil
+	}
 }
 
 // pseudoVersionTimestamp 匹配 Go 模块伪版本的时间戳段:

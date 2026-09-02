@@ -176,6 +176,64 @@ func TestTakeoverTargetOrdersModuleBuildsByPseudoVersion(t *testing.T) {
 	}
 }
 
+func TestTakeoverTargetOrdersReleaseTagsByModuleVersion(t *testing.T) {
+	// 发布 tag 的模块构建(go install @v0.2.0)版本串没有时间戳,只能按 Go
+	// 模块版本序比较:tag 之间按 vX.Y.Z 数值;tag 之后的提交在模块代理中
+	// 得到 vX.Y.(Z+1)-0.<时间戳>-<hash> 形态的伪版本,排在 vX.Y.Z 之后、
+	// vX.Y.(Z+1) 之前。以 v0.0.0 为基底的伪版本(该提交可达范围内没有任何
+	// tag)与 tag 之间没有可靠顺序,必须拒绝。
+	tag := func(v string) buildinfo.Info { return buildinfo.Info{Version: v} }
+	pid := 4242
+
+	if got, err := takeoverTarget(tag("v0.2.0"), moduleBuildStatus("v0.1.0", pid)); err != nil || got != pid {
+		t.Fatalf("tag 更新的 wrapper 应放行: pid=%d err=%v", got, err)
+	}
+	if _, err := takeoverTarget(tag("v0.1.0"), moduleBuildStatus("v0.2.0", pid)); err == nil || !strings.Contains(err.Error(), "refusing takeover") {
+		t.Fatalf("tag 更旧的 wrapper 必须拒绝: %v", err)
+	}
+	if _, err := takeoverTarget(tag("v0.2.0"), moduleBuildStatus("v0.2.0", pid)); err != nil {
+		t.Fatalf("同 tag 不算更旧,放行由构建一致性检查决定: %v", err)
+	}
+	// tag 之后的伪版本(基底 v0.2.0)相对 tag v0.2.0 更新;相对其后续正式
+	// 发布 v0.2.1 更旧。
+	after := tag("v0.2.1-0.20260901120000-0123456789ab")
+	if got, err := takeoverTarget(after, moduleBuildStatus("v0.2.0", pid)); err != nil || got != pid {
+		t.Fatalf("tag 之后的伪版本相对该 tag 应放行: pid=%d err=%v", got, err)
+	}
+	if got, err := takeoverTarget(tag("v0.2.1"), moduleBuildStatus(after.Version, pid)); err != nil || got != pid {
+		t.Fatalf("正式发布相对其前置伪版本应放行: pid=%d err=%v", got, err)
+	}
+	if _, err := takeoverTarget(after, moduleBuildStatus("v0.2.1", pid)); err == nil || !strings.Contains(err.Error(), "refusing takeover") {
+		t.Fatalf("前置伪版本相对正式发布必须拒绝: %v", err)
+	}
+	if _, err := takeoverTarget(after, moduleBuildStatus("v0.3.0", pid)); err == nil || !strings.Contains(err.Error(), "refusing takeover") {
+		t.Fatalf("更高 minor 的 tag 更新,必须拒绝: %v", err)
+	}
+	// 源码构建在 tag 提交上带未提交改动:v0.2.0+dirty,剥离后按 tag 比较。
+	if got, err := takeoverTarget(tag("v0.2.0+dirty"), moduleBuildStatus("v0.1.0", pid)); err != nil || got != pid {
+		t.Fatalf("+dirty tag 版本应可比较: pid=%d err=%v", got, err)
+	}
+	// 无 tag 基底的伪版本与 tag 之间不可排序(两个方向都拒绝)。
+	orphan := "v0.0.0-20260826103859-6b8b59b80877"
+	if _, err := takeoverTarget(tag(orphan), moduleBuildStatus("v0.1.0", pid)); err == nil || !strings.Contains(err.Error(), "cannot order builds") {
+		t.Fatalf("v0.0.0 基底伪版本 vs tag 必须拒绝: %v", err)
+	}
+	if _, err := takeoverTarget(tag("v0.2.0"), moduleBuildStatus(orphan, pid)); err == nil || !strings.Contains(err.Error(), "cannot order builds") {
+		t.Fatalf("tag vs v0.0.0 基底伪版本必须拒绝: %v", err)
+	}
+	// 非伪版本的预发布 tag(rc 等)不在接受的形态内,拒绝。
+	if _, err := takeoverTarget(tag("v0.2.0-rc.1"), moduleBuildStatus("v0.1.0", pid)); err == nil || !strings.Contains(err.Error(), "cannot order builds") {
+		t.Fatalf("rc 预发布 tag 必须拒绝: %v", err)
+	}
+	// tag 构建与只有 vcs.time、版本串为 (devel) 的源码构建之间没有共同
+	// 比较口径,拒绝。
+	devel := daemonStatusFixture("dev", "2026-08-26T10:38:59Z", pid)
+	devel.Build.Version = "(devel)"
+	if _, err := takeoverTarget(tag("v0.2.0"), devel); err == nil || !strings.Contains(err.Error(), "cannot order builds") {
+		t.Fatalf("tag vs 仅 vcs.time 的 devel 构建必须拒绝: %v", err)
+	}
+}
+
 func TestTakeoverRefusesNonLoopbackEndpoint(t *testing.T) {
 	// T5 边界 1 代码化:接管以 SIGTERM 本地 pid 实施,status 报告的 pid
 	// 只在 daemon 与 wrapper 同机时有意义;endpoint 指向他机(auto 模式
