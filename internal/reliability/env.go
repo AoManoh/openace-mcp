@@ -1,8 +1,14 @@
-// Package reliability 提供 provider 调用的通用可靠性核心：共享 env 解析、
-// 重试策略、退避 circuit 与可选 RPM/TPM limiter。
+// Package reliability 提供 embedding 与 rerank 客户端共用的 provider
+// 调用控制逻辑：读取超时与重试次数环境变量、把一次失败归类为
+// CallError、在单次调用内按类别重试（RetryPolicy）、连续失败后暂停向
+// provider 发请求（Circuit，下称熔断器）、按用户显式配置的每分钟请求数
+// 与 token 数预算限速（RateLimiter），以及只作用于索引批嵌入请求的
+// 吞吐治理器（Governor）。
 //
-// 该包与 legacy internal/provider（ACE profile registry）无关（阶段计划 D9）；
-// embedding 与 rerank 客户端共用本包，状态挂在 daemon 级单例上（暗坑 K36）。
+// 本包对象一律挂在 daemon 级客户端单例上，由全部 workspace 的构建与
+// 查询共享，不按任务新建。原因：按任务各自实例化时，并发任务互不知情
+// 地同时发请求和重试，请求量随任务数成倍放大，上游按账户返回 429，
+// 所有任务一起失败。
 package reliability
 
 import (
@@ -14,36 +20,44 @@ import (
 )
 
 const (
-	// EnvProviderTimeout 是单次 provider HTTP 请求超时（embedding/rerank 共用）。
+	// EnvProviderTimeout 是单次 provider HTTP 请求的超时环境变量，
+	// embedding 与 rerank 共用。重试中的每次尝试各自计时。
 	EnvProviderTimeout = "OPENACE_PROVIDER_TIMEOUT"
-	// EnvProviderMaxRetries 是单批可重试错误的重试上限。
+	// EnvProviderMaxRetries 是一次调用内可重试类错误的最多重试次数。
+	// 值为 0 时只尝试一次。
 	EnvProviderMaxRetries = "OPENACE_PROVIDER_MAX_RETRIES"
-	// EnvQueryTimeout 是查询期 provider 调用(query embedding/rerank)的
-	// 独立超时(RS3):未设置时回落 EnvProviderTimeout(现状行为)。
-	// 构建期大批调优(如 120s+)不再放大查询期最坏等待。
+	// EnvQueryTimeout 是查询期 provider 调用（查询文本嵌入与 rerank）
+	// 单独使用的超时环境变量。未设置时调用方沿用 EnvProviderTimeout。
+	// 单独设置的原因：为构建期大批请求把 EnvProviderTimeout 调到
+	// 120s 以上时，交互查询最坏也要等同样久。分开配置后，交互查询的
+	// 最坏等待不随构建期超时变长。
 	EnvQueryTimeout = "OPENACE_QUERY_PROVIDER_TIMEOUT"
 
 	defaultTimeout    = 60 * time.Second
 	defaultMaxRetries = 5
 )
 
-// TimeoutFromEnv 解析 OPENACE_PROVIDER_TIMEOUT（默认 60s）。
+// TimeoutFromEnv 读取 OPENACE_PROVIDER_TIMEOUT。未设置时返回 60s。
 func TimeoutFromEnv() (time.Duration, error) {
 	return DurationEnv(EnvProviderTimeout, defaultTimeout)
 }
 
-// QueryTimeoutFromEnv 解析 OPENACE_QUERY_PROVIDER_TIMEOUT;零值表示
-// 未配置,调用方回落 TimeoutFromEnv(RS3 冻结:未配置=现状)。
+// QueryTimeoutFromEnv 读取 OPENACE_QUERY_PROVIDER_TIMEOUT。未设置时返回
+// 0，调用方据此改用 TimeoutFromEnv 的值，使未配置该变量的用户行为与
+// 引入该变量之前完全相同。
 func QueryTimeoutFromEnv() (time.Duration, error) {
 	return DurationEnv(EnvQueryTimeout, 0)
 }
 
-// MaxRetriesFromEnv 解析 OPENACE_PROVIDER_MAX_RETRIES（默认 5，0 表示不重试）。
+// MaxRetriesFromEnv 读取 OPENACE_PROVIDER_MAX_RETRIES。未设置时返回 5。
+// 允许为 0，表示失败后不重试。
 func MaxRetriesFromEnv() (int, error) {
 	return IntEnv(EnvProviderMaxRetries, defaultMaxRetries, 0)
 }
 
-// DurationEnv 解析时长型环境变量；空值返回默认，非法值显式报错。
+// DurationEnv 读取时长型环境变量 name：值为空或全为空白时返回 fallback。
+// 值不是 Go 时长格式（如 60s、2m）或不大于 0 时返回错误，错误文本带
+// 变量名与原始值，让用户能直接定位改哪个变量。
 func DurationEnv(name string, fallback time.Duration) (time.Duration, error) {
 	raw := strings.TrimSpace(os.Getenv(name))
 	if raw == "" {
@@ -59,7 +73,8 @@ func DurationEnv(name string, fallback time.Duration) (time.Duration, error) {
 	return value, nil
 }
 
-// IntEnv 解析整数型环境变量；空值返回默认，小于 min 或非法值显式报错。
+// IntEnv 读取整数型环境变量 name：值为空或全为空白时返回 fallback。
+// 值不是整数或小于 min 时返回错误，错误文本带变量名、原始值与下限。
 func IntEnv(name string, fallback int, min int) (int, error) {
 	raw := strings.TrimSpace(os.Getenv(name))
 	if raw == "" {

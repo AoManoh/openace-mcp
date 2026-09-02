@@ -7,8 +7,9 @@ import (
 	"time"
 )
 
-// 治理器单测(任务 T6/T7)。虚拟时钟:sleep 直接拨快 now,速率/暂停等待
-// 在测试里零真实耗时;窗口阻塞用真实小睡验证信号唤醒。
+// 本文件是 Governor 的单元测试。多数用例注入虚拟时钟：sleep 直接把 now
+// 拨快，速率与暂停的等待在测试里不消耗真实时间。窗口阻塞与唤醒的用例
+// 使用真实时钟和短暂的真实等待，因为要验证的是 goroutine 之间的信号。
 
 type governorClock struct {
 	mu  sync.Mutex
@@ -40,7 +41,8 @@ func governed(maxWindow int) (*Governor, *governorClock) {
 	return g, clock
 }
 
-// acquire 是测试便捷封装:成功时立即 Observe 成功归还槽位。
+// acquireRelease 是测试辅助函数：AcquireIndex 放行后立即以 OutcomeSuccess
+// 上报，归还窗口槽位。
 func acquireRelease(t *testing.T, g *Governor, tokens int, latency time.Duration) {
 	t.Helper()
 	if err := g.AcquireIndex(context.Background(), tokens); err != nil {
@@ -65,11 +67,12 @@ func TestGovernorPreLearningUnthrottled(t *testing.T) {
 
 func TestGovernor429EntersLearningAndPauses(t *testing.T) {
 	g, clock := governed(4)
-	// 先积累一分钟内 600K tokens 的实测吞吐。
+	// 先在一分钟内成功发出 12 批共 600K token，作为实测吞吐。
 	for i := 0; i < 12; i++ {
 		acquireRelease(t, g, 50_000, time.Second)
 	}
-	// 429(Retry-After=7s):进入学习态,初始目标=实测×0.5,硬暂停 7s。
+	// 收到带 Retry-After 7s 的 429：进入学习态（见过 429 后开始限速），
+	// 初始目标速率为实测吞吐乘 0.5，并暂停 7s。
 	if err := g.AcquireIndex(context.Background(), 50_000); err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +88,7 @@ func TestGovernor429EntersLearningAndPauses(t *testing.T) {
 		t.Fatalf("学习速率应为实测吞吐×%.1f 量级,得到 %d", governorRateMDFactor, snap.TargetTokensPerMin)
 	}
 	before := clock.now()
-	// 下一次准入要跨过 7s 硬暂停 + 令牌补充等待(桶从 0 起步)。
+	// 下一次 AcquireIndex 要先等 7s 暂停，再等令牌桶从 0 补到本次需求。
 	if err := g.AcquireIndex(context.Background(), 10_000); err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +114,7 @@ func TestGovernorRepeated429HitsFloor(t *testing.T) {
 
 func TestGovernorOversizedRequestProgressesWithDebt(t *testing.T) {
 	g, clock := governed(4)
-	// 冷启动即 429(无实测吞吐):学习目标落到地板 40K/min。
+	// 刚启动就收到 429，没有实测吞吐：学习目标落到下限 40K tokens/min。
 	if err := g.AcquireIndex(context.Background(), 1_000); err != nil {
 		t.Fatal(err)
 	}
@@ -119,9 +122,10 @@ func TestGovernorOversizedRequestProgressesWithDebt(t *testing.T) {
 	if got := g.Snapshot().TargetTokensPerMin; got != governorRateFloorTokens {
 		t.Fatalf("冷启动 429 后学习目标应为地板 %d, 得到 %d", governorRateFloorTokens, got)
 	}
-	// 单批估算 65,536 tokens > 地板:桶封顶=一分钟额度,按"攒够才放行"永远
-	// 凑不够票(构建死等)。债务模型要求:桶满即放行,超出部分转负债。
-	// 止损:虚拟睡眠累计超 10 分钟仍未放行即取消,判死等。
+	// 单批估算 65,536 token 大于下限 40K。桶的上限等于一分钟额度，若要求
+	// 余额攒够需求才放行，这一批的需求在任何时刻都大于余额，请求一直
+	// 等待。期望行为：桶满即放行，超出部分让余额转负。保护：虚拟等待累计
+	// 超过 10 分钟仍未放行就取消 ctx，让用例以失败结束而不是挂住。
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var simulated time.Duration
@@ -142,8 +146,9 @@ func TestGovernorOversizedRequestProgressesWithDebt(t *testing.T) {
 	if waited := clock.now().Sub(start); waited > 2*time.Minute {
 		t.Fatalf("放行等待应为攒满一分钟额度的量级,实际 %s", waited)
 	}
-	// 负债偿还:下一个 1,000 token 请求须先还超发的 25,536,
-	// 等待 ≈(25,536+1,000)/40,000×60s≈40s——长期平均速率不超目标。
+	// 余额为负后：下一个 1,000 token 请求要先等余额从 -25,536 补回 0，再
+	// 等到 1,000，等待约 (25,536+1,000)/40,000×60s ≈ 40s。长期平均速率
+	// 因此不超过目标。
 	before := clock.now()
 	if err := g.AcquireIndex(context.Background(), 1_000); err != nil {
 		t.Fatal(err)
@@ -171,14 +176,14 @@ func TestGovernorSuccessRaisesLearnedRate(t *testing.T) {
 
 func TestGovernorLatencyDivergenceShrinksWindow(t *testing.T) {
 	g, _ := governed(16)
-	// 建立 1s 基线(超过最小样本数)。
+	// 用 20 个 1s 延迟样本建立基线，样本数超过 governorMinSamplesForGradient。
 	for i := 0; i < 20; i++ {
 		acquireRelease(t, g, 1_000, time.Second)
 	}
 	if g.Snapshot().Window != 16 {
 		t.Fatalf("平稳期窗口不应收缩: %d", g.Snapshot().Window)
 	}
-	// 延迟陡增到 5s:短窗偏离长窗 → 乘性收窗。
+	// 延迟跳到 5s：短窗均值超过长窗均值的 1.5 倍，窗口应减半。
 	for i := 0; i < 6; i++ {
 		acquireRelease(t, g, 1_000, 5*time.Second)
 	}
@@ -195,7 +200,7 @@ func TestGovernorWindowRegrowsAfterCleanStreak(t *testing.T) {
 	if err := g.AcquireIndex(context.Background(), 1_000); err != nil {
 		t.Fatal(err)
 	}
-	g.Observe(OutcomeOverload, 1_000, 0, 0) // 503/超时:收窗
+	g.Observe(OutcomeOverload, 1_000, 0, 0) // 503 或超时：窗口应减半
 	shrunk := g.Snapshot().Window
 	if shrunk >= 8 {
 		t.Fatalf("过载必须收窗: %d", shrunk)
@@ -209,7 +214,7 @@ func TestGovernorWindowRegrowsAfterCleanStreak(t *testing.T) {
 }
 
 func TestGovernorWindowBlocksAndReleases(t *testing.T) {
-	g := NewGovernor(1) // 真实时钟:验证阻塞与信号唤醒
+	g := NewGovernor(1) // 真实时钟：验证阻塞与唤醒
 	if err := g.AcquireIndex(context.Background(), 10); err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +249,8 @@ func TestGovernorAcquireCancellable(t *testing.T) {
 	if err := g.AcquireIndex(ctx, 10); err == nil {
 		t.Fatal("窗口占满+ctx 超时必须返回错误")
 	}
-	// 取消的等待者出队后,释放仍能唤醒后续等待者(队列无死条目)。
+	// 取消的等待者已出队，之后释放槽位仍能放行新的 AcquireIndex，队列里
+	// 没有残留条目。
 	g.Observe(OutcomeSuccess, 10, time.Second, 0)
 	if err := g.AcquireIndex(context.Background(), 10); err != nil {
 		t.Fatalf("取消者出队后正常准入失败: %v", err)

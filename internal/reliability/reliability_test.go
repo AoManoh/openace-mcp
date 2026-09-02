@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// fakeClock 提供可推进的时间源。
+// fakeClock 是测试用时钟，时间只在测试调用 advance 时前进。
 type fakeClock struct{ at time.Time }
 
 func (f *fakeClock) now() time.Time            { return f.at }
@@ -36,7 +36,8 @@ func TestCircuitLifecycle(t *testing.T) {
 		t.Fatalf("应为 backoff 态: %+v", s)
 	}
 
-	// 到期只回到 candidate（§15），一次成功才 healthy。
+	// 退避（失败后暂停发请求的时段）到期只回到 candidate，一次成功请求后
+	// 才回到 healthy。
 	clock.advance(31 * time.Second)
 	if err := c.Gate(); err != nil {
 		t.Fatalf("candidate 应放行探测: %v", err)
@@ -135,7 +136,7 @@ func TestRetryPolicyStopsOnNonRetryable(t *testing.T) {
 			t.Fatalf("%s 不应重试: attempts=%d err=%v", class, attempts, err)
 		}
 	}
-	// 非 CallError 同样不重试。
+	// 不是 CallError 的错误同样不重试，原样返回。
 	attempts := 0
 	plain := errors.New("plain")
 	if err := policy.Do(context.Background(), func(context.Context) error { attempts++; return plain }); err != plain || attempts != 1 {
@@ -189,7 +190,7 @@ func TestRateLimiterBlocksOverBudget(t *testing.T) {
 	slept := 0
 	l.sleep = func(ctx context.Context, d time.Duration) error {
 		slept++
-		clock.advance(d) // 模拟等到窗口结束
+		clock.advance(d) // 把虚拟时钟推到窗口结束
 		return ctx.Err()
 	}
 	ctx := context.Background()
@@ -208,11 +209,12 @@ func TestRateLimiterOversizedBurstAllowedInEmptyWindow(t *testing.T) {
 	l := NewRateLimiter(0, 1000)
 	l.now = clock.now
 	l.sleep = func(ctx context.Context, d time.Duration) error { clock.advance(d); return ctx.Err() }
-	// 单次超预算：空窗直接放行（交由上游 429 裁决），避免死锁。
+	// 单笔 5000 token 超过预算 1000：窗口内还没有用量时直接放行，由上游用
+	// 429 裁决。不放行的话，这笔请求在任何一个窗口都通不过，会一直等待。
 	if err := l.Acquire(context.Background(), 1, 5000); err != nil {
 		t.Fatalf("空窗超额单次应放行: %v", err)
 	}
-	// 非空窗则等待。
+	// 窗口内已有用量时要等到下一窗口再放行。
 	if err := l.Acquire(context.Background(), 1, 5000); err != nil {
 		t.Fatalf("等待新窗口后应放行: %v", err)
 	}

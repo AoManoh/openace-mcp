@@ -13,28 +13,41 @@ import (
 	"unicode/utf8"
 )
 
-// Class 是 provider 调用失败的类别（决策 11 可行动错误的分类基础，暗坑 K33）。
+// Class 是 provider 调用失败的类别。重试策略（RetryPolicy）据此决定是否
+// 再试，熔断器（Circuit，连续失败后暂停向 provider 发请求）据此决定
+// 暂停多久，错误文本据此告诉用户下一步该做什么，而不是只报"请求失败"。
 type Class string
 
 const (
-	// ClassRateLimit 上游 429 限流。
+	// ClassRateLimit：上游返回 429，单位时间内请求数或 token 数超过配额。
+	// 可重试，等待时长优先取上游的 Retry-After。
 	ClassRateLimit Class = "rate-limit"
-	// ClassAuth 401/403 认证失败（key 无效或权限不足）。
+	// ClassAuth：上游返回 401 或 403，key 无效或权限不足。重试结果不变，
+	// 需要用户更换 key。
 	ClassAuth Class = "auth"
-	// ClassQuota 402 或欠费类失败。
+	// ClassQuota：上游返回 402，或 401/403 的正文写明余额、账单问题。
+	// 重试结果不变，需要用户充值或调整 provider 侧预算。
 	ClassQuota Class = "quota"
-	// ClassTransient 5xx/超时/连接错误，可重试。
+	// ClassTransient：5xx、408、单次尝试超时、连接失败等短暂故障。可重试。
 	ClassTransient Class = "transient"
-	// ClassPermanent 4xx 等不可重试失败（请求本身不被接受）。
+	// ClassPermanent：请求本身不被接受，例如其余 4xx、证书验证失败、
+	// 响应内容通不过校验。重试结果不变，也不拆批。
 	ClassPermanent Class = "permanent"
-	// ClassBatchTooLarge 批规模超上游限制，应拆批而非重试（暗坑 K23）。
+	// ClassBatchTooLarge：一批文本超过上游单批上限（413，或 Voyage 对
+	// token 超限返回的 400）。正确处理是把批次对半拆开重发，原样重试
+	// 仍会超限。
 	ClassBatchTooLarge Class = "batch-too-large"
-	// ClassBackoff circuit 处于退避期，调用未发出（D10 no-op 判定依据）。
+	// ClassBackoff：熔断器处于退避期（连续失败后暂停发请求的时段），请求
+	// 没有发出，本次没有消耗 provider 配额。构建流程收到该类别后停止投放
+	// 后续批，等退避到期再补齐缺失的向量。
 	ClassBackoff Class = "backoff"
 )
 
-// CallError 是分类后的 provider 调用错误；Message 已脱敏（不含 key，
-// 单行且长度封顶，暗坑 K21）。
+// CallError 是归类后的 provider 调用错误。Message 是单行、限长的文本：
+// 取自 provider 响应正文或底层错误的部分先经 SanitizeMessage 处理（正文
+// 最长 512 字节），其余为固定格式。API key 只出现在请求头构造处，从不
+// 进入 Message，所以 Message 可以直接进入日志、workspace_status 和给
+// 用户的错误。
 type CallError struct {
 	Class      Class
 	StatusCode int
@@ -42,7 +55,8 @@ type CallError struct {
 	Message    string
 }
 
-// Error 实现 error。
+// Error 返回 "provider <类别> (HTTP <状态码>): <消息>"。没有状态码的
+// 错误（传输失败、退避期拒绝）省略括号部分。
 func (e *CallError) Error() string {
 	if e.StatusCode > 0 {
 		return fmt.Sprintf("provider %s (HTTP %d): %s", e.Class, e.StatusCode, e.Message)
@@ -50,14 +64,19 @@ func (e *CallError) Error() string {
 	return fmt.Sprintf("provider %s: %s", e.Class, e.Message)
 }
 
-// Retryable 报告该错误是否值得同一调用内重试。
+// Retryable 报告该错误是否值得在同一次调用内重试。只有 ClassTransient
+// 与 ClassRateLimit 返回真。ClassAuth、ClassQuota、ClassPermanent 重试
+// 结果不变。ClassBatchTooLarge 由调用方拆批而不是原样重试。ClassBackoff
+// 表示请求没有发出，无从重试。
 func (e *CallError) Retryable() bool {
 	return e.Class == ClassTransient || e.Class == ClassRateLimit
 }
 
-// SanitizeMessage 把任意文本收敛为单行、长度封顶的错误消息。
-// 截断回退到 rune 边界(L10,诊断 2026-08-03):按字节硬切会把多字节
-// UTF-8 字符切成非法序列。
+// SanitizeMessage 把任意文本压成一条单行错误消息：连续空白（含换行、
+// 制表符）合并为一个空格。正文超过 512 字节时截到 512 字节以内并追加
+// "…"。截断点回退到 UTF-8 字符的起始字节。原因：按字节数硬切会把一个
+// 多字节字符切成非法序列，消息不再是合法 UTF-8，日志和 JSON 状态面里
+// 出现乱码。
 func SanitizeMessage(text string) string {
 	text = strings.Join(strings.Fields(text), " ")
 	const maxLen = 512
@@ -71,7 +90,10 @@ func SanitizeMessage(text string) string {
 	return text
 }
 
-// ParseRetryAfter 解析 Retry-After 头（秒数或 HTTP-date）。
+// ParseRetryAfter 解析 Retry-After 头的两种合法写法：非负整数秒数，或
+// HTTP-date 绝对时刻（取从现在到该时刻的剩余时长）。头为空、负数、
+// 格式不合法或时刻已过去时都返回 0，调用方按"上游没有声明"处理，改用
+// 自己的默认等待时长。
 func ParseRetryAfter(header string) time.Duration {
 	header = strings.TrimSpace(header)
 	if header == "" {
@@ -91,21 +113,38 @@ func ParseRetryAfter(header string) time.Duration {
 	return 0
 }
 
-// 退避参数（受测常数，§14 原则：无真实运维需求不开 env）。
+// 熔断器的退避时长常数。它们是经测试固定下来的值，没有对应环境变量：
+// 项目约定并发、超时、批次这类参数先用测试过的常量，只有出现真实运维
+// 需求时才增加环境变量。
 const (
-	// maxBackoff 封顶所有退避（含上游 Retry-After 声明）。
+	// maxBackoff 是除 ClassAuth、ClassQuota 之外各类退避的上限，上游
+	// Retry-After 声明的时长（熔断器退避与 RetryPolicy.Do 的等待）也受它
+	// 约束。这样即使上游声明很长的等待，探测请求也最迟 5 分钟后发出
+	// 一次，恢复不会被无限推后。
 	maxBackoff = 5 * time.Minute
-	// authBackoff 是认证/欠费失败的长退避：重试无意义，需用户行动（K33）。
+	// authBackoff 是 ClassAuth 与 ClassQuota 失败后的退避时长。这两类
+	// 失败在用户换 key 或充值之前重试结果不变，所以退避远长于 maxBackoff，
+	// 避免每隔几分钟就用注定失败的请求打上游。
 	authBackoff = 15 * time.Minute
-	// defaultRateLimitBackoff 是无 Retry-After 头时的 429 冷却（对齐 ace client）。
+	// defaultRateLimitBackoff 是 429 没有携带 Retry-After 时的退避时长。
+	// 吞吐治理器（Governor）同场景的 governorPauseFallback 取同一值。
 	defaultRateLimitBackoff = 30 * time.Second
-	// transientBackoffBase 是暂态失败的 circuit 指数退避基数。
+	// transientBackoffBase 是其他类别失败的指数退避起点：第 1 次连续失败
+	// 等 30s，之后每次翻倍，最多到 maxBackoff。
 	transientBackoffBase = 30 * time.Second
 )
 
-// Circuit 是 daemon 级共享的 provider 健康门（§15）：
-// healthy →（失败）backoff(until) →（到期）candidate →（一次成功）healthy。
-// 全部构建/查询共享同一实例，不按任务实例化（暗坑 K36）。
+// Circuit 是熔断器：记录一条 provider 调用路径最近连续失败的次数，在
+// 退避期内拒绝发出新请求。每个实例都挂在 daemon 级客户端单例上，由全部
+// workspace 的构建与查询共用，不按任务新建：embedding 客户端为索引批
+// 请求和查询请求各持一个，rerank 客户端持一个。按任务各建一个的话，
+// 并发任务会同时重试，请求量成倍放大。状态有三种：
+//
+//   - healthy：没有未恢复的失败，Gate 直接放行。
+//   - backoff：最近一次最终失败之后、backoffUntil 之前，Gate 拒绝请求。
+//   - candidate：退避到期但还没有一次成功请求证明恢复。Gate 放行请求
+//     作为探测。一次成功回到 healthy。再失败则连续失败次数加一，进入
+//     更长的退避。
 type Circuit struct {
 	mu                  sync.Mutex
 	consecutiveFailures int
@@ -116,13 +155,16 @@ type Circuit struct {
 	now                 func() time.Time
 }
 
-// NewCircuit 创建健康门。
+// NewCircuit 创建一个处于 healthy 状态、使用系统时钟的熔断器。
 func NewCircuit() *Circuit {
 	return &Circuit{now: time.Now}
 }
 
-// Gate 在退避期返回 ClassBackoff 错误（调用不发出），否则放行。
-// candidate 状态（退避到期但未证明恢复）放行探测请求。
+// Gate 在请求发出前调用。退避期内返回 ClassBackoff 的 CallError，其
+// RetryAfter 为距退避结束的时长，Message 带上次失败原因，调用方据此不发
+// 请求。healthy 与 candidate 状态返回 nil 放行。candidate 也放行的原因：
+// 熔断器只能靠一次真实请求确认 provider 已恢复，退避到期后放行的第一批
+// 请求就是这次探测。
 func (c *Circuit) Gate() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -137,7 +179,8 @@ func (c *Circuit) Gate() error {
 	return nil
 }
 
-// RecordSuccess 记录一次成功请求：回到 healthy。
+// RecordSuccess 记录一次成功请求：清零连续失败计数、退避截止时刻与上次
+// 错误文本，状态回到 healthy。
 func (c *Circuit) RecordSuccess() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -147,8 +190,19 @@ func (c *Circuit) RecordSuccess() {
 	c.lastSuccessAt = c.now()
 }
 
-// RecordFailure 记录一次最终失败（重试耗尽后），按类别设置退避窗口。
-// ClassBackoff（未发出的调用）与 ctx 取消不得进入本方法。
+// RecordFailure 记录一次最终失败（RetryPolicy 的重试已用完，或错误不可
+// 重试），连续失败计数加一，并按类别设置退避截止时刻：
+//
+//   - ClassAuth、ClassQuota：固定等 authBackoff（15 分钟），不受 maxBackoff
+//     约束。原因：换 key 或充值之前重试结果不变。
+//   - ClassRateLimit：等上游 Retry-After 声明的时长。没有声明时等
+//     defaultRateLimitBackoff（30s）。超过 maxBackoff 时按 maxBackoff。
+//   - 其他类别：指数退避，第 n 次连续失败等 transientBackoffBase 的
+//     2^(n-1) 倍，即 30s、60s、120s、240s，之后按 maxBackoff（5 分钟）。
+//
+// err 为 nil 或类别为 ClassBackoff 时不记录：ClassBackoff 表示请求没有
+// 发出，不是 provider 的一次失败。调用方取消返回的是 ctx 错误而不是
+// CallError，调用方不应把它传进来。
 func (c *Circuit) RecordFailure(err *CallError) {
 	if err == nil || err.Class == ClassBackoff {
 		return
@@ -162,7 +216,7 @@ func (c *Circuit) RecordFailure(err *CallError) {
 	var wait time.Duration
 	switch err.Class {
 	case ClassAuth, ClassQuota:
-		// 认证/欠费重试无意义，需用户行动：长退避不受通用封顶约束（K33）。
+		// 换 key 或充值之前重试结果不变，所以这里不套 maxBackoff。
 		wait = authBackoff
 	case ClassRateLimit:
 		wait = err.RetryAfter
@@ -173,7 +227,9 @@ func (c *Circuit) RecordFailure(err *CallError) {
 			wait = maxBackoff
 		}
 	default:
-		// 指数退避：30s、60s、120s……封顶 maxBackoff。
+		// shift 最多取 4：30s 左移 4 位是 480s，已经超过 maxBackoff，会被
+		// 下面封顶。不限制位移的话，连续失败几十次后左移会让 Duration
+		// 溢出成负数。
 		shift := c.consecutiveFailures - 1
 		if shift > 4 {
 			shift = 4
@@ -186,9 +242,12 @@ func (c *Circuit) RecordFailure(err *CallError) {
 	c.backoffUntil = c.now().Add(wait)
 }
 
-// CircuitSnapshot 是对外状态视图（进入 workspace/daemon status）。
+// CircuitSnapshot 是熔断器某一时刻的只读状态。它进入 workspace_status
+// 的 semantic 块，让用户看到 provider 现在是否可用、多久后恢复、上次为
+// 什么失败。构建流程也据此判断熔断器是否处于 backoff，处于 backoff 时
+// 内容未变的同步不再尝试补齐向量。
 type CircuitSnapshot struct {
-	// State 是 healthy / backoff / candidate（§15 判定）。
+	// State 是 healthy、backoff、candidate 之一，含义见 Circuit。
 	State               string
 	BackoffUntil        time.Time
 	LastError           string
@@ -197,7 +256,9 @@ type CircuitSnapshot struct {
 	LastFailureAt       time.Time
 }
 
-// Snapshot 生成当前健康视图。
+// Snapshot 返回当前状态。State 按顺序判定：连续失败计数为 0 是 healthy。
+// 否则当前时刻早于退避截止是 backoff，并填 BackoffUntil。否则是
+// candidate。
 func (c *Circuit) Snapshot() CircuitSnapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -219,25 +280,40 @@ func (c *Circuit) Snapshot() CircuitSnapshot {
 	return snapshot
 }
 
-// RetryPolicy 是单次调用内的重试策略：只重试 Retryable 类别，
-// 429 优先尊重 Retry-After，其余指数退避 + jitter。
+// RetryPolicy 是单次 provider 调用内的重试策略：只对 Retryable 为真的
+// CallError（ClassTransient、ClassRateLimit）重试。上游给了 Retry-After
+// 就等它声明的时长。否则从 BaseDelay 起每次翻倍、不超过 MaxDelay，再加
+// 随机抖动，避免多个 goroutine 同时失败后又在同一时刻重试。
 type RetryPolicy struct {
 	MaxRetries int
 	BaseDelay  time.Duration
 	MaxDelay   time.Duration
-	// Sleep 可注入以便测试；nil 时使用 ctx 感知的计时器。
+	// Sleep 是等待函数，测试注入它以免真实等待。nil 时使用 sleepContext：
+	// 等待中 ctx 结束即提前返回 ctx 错误。
 	Sleep func(context.Context, time.Duration) error
-	// Jitter 可注入；nil 时为 ±20% 随机。
+	// Jitter 给等待时长加随机抖动，测试注入恒等函数以得到确定的等待
+	// 序列。nil 时使用 defaultJitter（±20%）。
 	Jitter func(time.Duration) time.Duration
 }
 
-// DefaultRetryPolicy 返回默认策略（MaxRetries 来自配置）。
+// DefaultRetryPolicy 返回默认策略：BaseDelay 500ms、MaxDelay 30s。
+// maxRetries 由调用方从 OPENACE_PROVIDER_MAX_RETRIES 读取后传入。
 func DefaultRetryPolicy(maxRetries int) RetryPolicy {
 	return RetryPolicy{MaxRetries: maxRetries, BaseDelay: 500 * time.Millisecond, MaxDelay: 30 * time.Second}
 }
 
-// Do 执行 attempt，按策略重试。ctx 错误原样返回（不计为 provider 失败）；
-// 非 *CallError 的错误不重试。
+// Do 反复执行 attempt，直到成功、错误不可重试或重试次数用完，失败时返回
+// 最后一次的错误。attempt 最多执行 MaxRetries+1 次。各分支：
+//
+//   - 每次执行前检查 ctx，attempt 失败后再检查一次：ctx 已结束就原样
+//     返回 ctx 错误，不返回 attempt 的错误。原因：取消不是 provider
+//     故障，返回 CallError 会让调用方把它计入熔断器。
+//   - 错误不是 CallError（用 errors.As 判定，调用方以 %w 包装也能识别）、
+//     或 Retryable 为假、或已重试 MaxRetries 次：返回该错误。
+//   - 否则等待后再试。CallError.RetryAfter 大于 0 时等它，上限
+//     maxBackoff，不加抖动。等于 0 时等 BaseDelay 左移 try 位（try 最多
+//     按 10 计，防止位移溢出），不超过 MaxDelay，再加抖动。
+//   - 等待期间 ctx 结束：返回 ctx 错误。
 func (p RetryPolicy) Do(ctx context.Context, attempt func(context.Context) error) error {
 	sleep := p.Sleep
 	if sleep == nil {
@@ -257,11 +333,12 @@ func (p RetryPolicy) Do(ctx context.Context, attempt func(context.Context) error
 			return nil
 		}
 		if ctx.Err() != nil {
-			// 取消优先：不把取消误判为 provider 失败（暗坑 K26）。
+			// attempt 失败时 ctx 已结束，以取消为准：这次失败很可能就是
+			// 取消关闭连接造成的，不是 provider 故障。
 			return ctx.Err()
 		}
-		// errors.As 与包内其余判定一致(L9):调用方未来以 %w 包装时
-		// 裸断言会静默关闭重试。
+		// 用 errors.As 而不是类型断言：调用方若以 %w 包装 CallError，类型
+		// 断言会失败，重试被静默关闭且没有任何提示。
 		callErr := &CallError{}
 		if !errors.As(lastErr, &callErr) || !callErr.Retryable() || try >= p.MaxRetries {
 			return lastErr
@@ -300,12 +377,15 @@ func defaultJitter(d time.Duration) time.Duration {
 	if d <= 0 {
 		return d
 	}
-	// ±20%：0.8d + [0, 0.4d)。
+	// 结果落在 [0.8d, 1.2d)，即 ±20% 的随机抖动。
 	return time.Duration(float64(d) * (0.8 + 0.4*rand.Float64()))
 }
 
-// RateLimiter 是可选的客户端 RPM/TPM 固定分钟窗预算（决策 14：默认不设，
-// 仅用户显式配置时启用）。nil 接收者安全（= 不限）。
+// RateLimiter 按固定的一分钟窗口限制请求数（rpm）与 token 数（tpm）。
+// 默认不创建：只有用户显式设置 OPENACE_EMBEDDING_RPM_BUDGET 或
+// OPENACE_EMBEDDING_TPM_BUDGET 时 embedding 客户端才持有一个，作为用户
+// 给自己定的硬上限，与 provider 实际配额无关。nil 接收者的方法直接放行，
+// 调用方不必判 nil。
 type RateLimiter struct {
 	mu          sync.Mutex
 	rpm, tpm    int
@@ -316,7 +396,8 @@ type RateLimiter struct {
 	sleep       func(context.Context, time.Duration) error
 }
 
-// NewRateLimiter 创建 limiter；rpm/tpm 均为 0 时返回 nil（不限）。
+// NewRateLimiter 创建限速器。rpm 与 tpm 都不大于 0 时返回 nil，表示不限速。
+// 只设其中一项时，另一项不参与判定。
 func NewRateLimiter(rpm, tpm int) *RateLimiter {
 	if rpm <= 0 && tpm <= 0 {
 		return nil
@@ -324,8 +405,12 @@ func NewRateLimiter(rpm, tpm int) *RateLimiter {
 	return &RateLimiter{rpm: rpm, tpm: tpm, now: time.Now, sleep: sleepContext}
 }
 
-// Acquire 在当前分钟窗内登记 requests/tokens 用量，超预算时阻塞到下一窗口。
-// 单次用量本身超过预算时在空窗直接放行（交由上游 429 裁决），避免死锁。
+// Acquire 在当前一分钟窗口内登记 requests 个请求与 tokens 个 token。
+// 窗口从重置时刻起满一分钟即清零计数。加上本次后请求数或 token 数超出
+// 预算时，阻塞到窗口结束再重新判定，ctx 结束则返回 ctx 错误。例外：
+// 窗口内还没有任何用量，而本次单笔就超过预算时直接放行，由上游用 429
+// 裁决。原因：单笔需求大于预算时，任何一个空窗口都装不下它，不放行的
+// 话该请求会一直等待。
 func (l *RateLimiter) Acquire(ctx context.Context, requests, tokens int) error {
 	if l == nil {
 		return nil

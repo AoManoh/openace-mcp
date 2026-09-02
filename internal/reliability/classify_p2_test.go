@@ -12,11 +12,14 @@ import (
 	"unicode/utf8"
 )
 
-// P2 修复回归(诊断 2026-08-03 §6):L8 证书类永久错误分流、L10 截断
-// rune 边界安全。
+// 本文件固定两处缺陷修复后的行为：证书验证失败归为 ClassPermanent。
+// SanitizeMessage 截断时不切断多字节字符。
 
-// TestClassifyCertificateErrorsPermanent:x509 验证失败重试无意义,必须
-// 判 permanent(旧行为:一律 transient → 5 次重试+退避才见可行动错误)。
+// TestClassifyCertificateErrorsPermanent 断言三种 x509 错误类型、经
+// url.Error 包装的 x509 错误，以及只含 "x509:" 文本的错误都归为
+// ClassPermanent。修复前它们一律归为 ClassTransient，用户要等完默认
+// 5 次重试和退避（重试之间的等待）才看到证书问题。普通连接失败仍归为
+// ClassTransient，作为对照。
 func TestClassifyCertificateErrorsPermanent(t *testing.T) {
 	ctx := context.Background()
 	attempt, cancel := context.WithTimeout(ctx, time.Minute)
@@ -38,7 +41,7 @@ func TestClassifyCertificateErrorsPermanent(t *testing.T) {
 			t.Fatalf("证书类错误应 permanent,got %v for %v", callErr.Class, err)
 		}
 	}
-	// 普通连接错误保持 transient。
+	// 对照：普通连接失败仍归为 ClassTransient。
 	got := ClassifyTransportError(ctx, attempt, time.Minute, errors.New("dial tcp: connection refused"))
 	callErr := &CallError{}
 	if !errors.As(got, &callErr) || callErr.Class != ClassTransient {
@@ -46,9 +49,11 @@ func TestClassifyCertificateErrorsPermanent(t *testing.T) {
 	}
 }
 
-// TestSanitizeMessageRuneBoundary:512 字节截断不得切断多字节字符。
+// TestSanitizeMessageRuneBoundary 断言 900 字节的纯中文输入截断后仍是
+// 合法 UTF-8、以 "…" 结尾，且总长不超过 512 字节加 "…" 的长度。修复前
+// 按字节硬切会把一个三字节字符切开，产物不是合法 UTF-8。
 func TestSanitizeMessageRuneBoundary(t *testing.T) {
-	long := strings.Repeat("配", 300) // 3 字节/字 → 900 字节
+	long := strings.Repeat("配", 300) // 每字 3 字节，共 900 字节
 	got := SanitizeMessage(long)
 	if !utf8.ValidString(got) {
 		t.Fatalf("截断产物必须是合法 UTF-8: %q…", got[:24])
