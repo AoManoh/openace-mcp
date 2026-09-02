@@ -63,14 +63,23 @@ type SyncRequest struct {
 	Workspace WorkspaceRef
 }
 
+// DefaultFullResults 是 detail=full 时默认带正文返回的候选块数;其后的
+// 候选只返回 `path:start-end symbol` 头行。该值由使用者经 MCP 配置
+// (OPENACE_FULL_RESULTS)调整,不是调用方 AI 的逐次参数。
+const DefaultFullResults = 20
+
 // SearchRequest 描述一次工作区检索请求。
 type SearchRequest struct {
-	Workspace    WorkspaceRef
-	Query        string
-	MaxOutputLen int
-	// Detail 是输出详略(框架 18.2/S2 实验载体):""/"full"=内容块
-	// (现状);"paths"=只回 path:range 头行,内容由调用方按需 Read
-	// (token 经济与磁盘新鲜度换一轮往返,默认不变,实验裁决)。
+	Workspace WorkspaceRef
+	Query     string
+	// FullResults 是 detail=full 时带正文返回的候选块数上限(按排名取
+	// 前 N 个);其余候选以头行列出,不再按字节预算截断。0(零值,直接
+	// 构造请求的调用方常见)表示未指定,引擎按 DefaultFullResults 处理;
+	// 负值表示"一个都不带正文"(使用者配置 OPENACE_FULL_RESULTS=0 时由
+	// wrapper 翻译为负值传入)。
+	FullResults int
+	// Detail 是输出详略:""/"full"=前 FullResults 个候选带正文、其余头行;
+	// "paths"=全部只回 path:range 头行,内容由调用方按需 Read。
 	Detail string
 	// PathPrefix 可选索引相对路径前缀(如 internal/localengine):
 	// 融合后/rerank 前过滤候选,用于 repo_map 定向后的子树检索。

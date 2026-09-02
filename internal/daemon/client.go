@@ -166,7 +166,7 @@ func (c *Client) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 		DirectoryPath:      req.Workspace.DirectoryPath,
 		ProviderProfileID:  providerProfileID,
 		InformationRequest: req.Query,
-		MaxOutputLength:    req.MaxOutputLen,
+		FullResults:        req.FullResults,
 		Detail:             req.Detail,
 		PathPrefix:         req.PathPrefix,
 	}, &result)

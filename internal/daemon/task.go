@@ -56,7 +56,10 @@ type TaskRequest struct {
 	DirectoryPaths     []string `json:"directory_paths,omitempty"`
 	ProviderProfileID  string   `json:"provider_profile_id,omitempty"`
 	InformationRequest string   `json:"information_request,omitempty"`
-	MaxOutputLength    int      `json:"max_output_length,omitempty"`
+	// FullResults 是 detail=full 时带正文返回的前 N 个候选块数(其余只给
+	// 头行);由 wrapper 从使用者配置读取后随请求传入,负值=引擎默认。
+	// 字段恒序列化,0 是合法值(全部只给头行)。
+	FullResults int `json:"full_results"`
 	// Detail 是输出详略(框架 18.2,与同步检索同契约)。
 	Detail     string `json:"detail,omitempty"`
 	PathPrefix string `json:"path_prefix,omitempty"`
@@ -71,7 +74,7 @@ type TaskSnapshot struct {
 	DirectoryPaths     []string              `json:"directory_paths,omitempty"`
 	ProviderProfileID  string                `json:"provider_profile_id,omitempty"`
 	InformationRequest string                `json:"information_request,omitempty"`
-	MaxOutputLength    int                   `json:"max_output_length,omitempty"`
+	FullResults        int                   `json:"full_results"`
 	Detail             string                `json:"detail,omitempty"`
 	PathPrefix         string                `json:"path_prefix,omitempty"`
 	SubmittedAt        time.Time             `json:"submitted_at"`
@@ -219,7 +222,7 @@ func (s *TaskStore) Submit(req TaskRequest) (TaskSnapshot, error) {
 			DirectoryPaths:     append([]string(nil), normalized.DirectoryPaths...),
 			ProviderProfileID:  normalized.ProviderProfileID,
 			InformationRequest: normalized.InformationRequest,
-			MaxOutputLength:    normalized.MaxOutputLength,
+			FullResults:        normalized.FullResults,
 			Detail:             normalized.Detail,
 			PathPrefix:         normalized.PathPrefix,
 			SubmittedAt:        time.Now().UTC(),
@@ -809,7 +812,7 @@ func requestFromSnapshot(snapshot TaskSnapshot) TaskRequest {
 		DirectoryPaths:     append([]string(nil), snapshot.DirectoryPaths...),
 		ProviderProfileID:  snapshot.ProviderProfileID,
 		InformationRequest: snapshot.InformationRequest,
-		MaxOutputLength:    snapshot.MaxOutputLength,
+		FullResults:        snapshot.FullResults,
 		Detail:             snapshot.Detail,
 		PathPrefix:         snapshot.PathPrefix,
 	}
@@ -888,11 +891,6 @@ func normalizeTaskRequest(req TaskRequest) (TaskRequest, error) {
 		if req.InformationRequest == "" {
 			return TaskRequest{}, errors.New("information_request is required")
 		}
-		maxOutputLength, err := normalizeMaxOutputLength(req.MaxOutputLength)
-		if err != nil {
-			return TaskRequest{}, err
-		}
-		req.MaxOutputLength = maxOutputLength
 		return req, nil
 	}
 	if req.DirectoryPath == "" {
@@ -901,11 +899,6 @@ func normalizeTaskRequest(req TaskRequest) (TaskRequest, error) {
 	if req.Kind == TaskKindRetrieve && req.InformationRequest == "" {
 		return TaskRequest{}, errors.New("information_request is required")
 	}
-	maxOutputLength, err := normalizeMaxOutputLength(req.MaxOutputLength)
-	if err != nil {
-		return TaskRequest{}, err
-	}
-	req.MaxOutputLength = maxOutputLength
 	return req, nil
 }
 

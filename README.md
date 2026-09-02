@@ -176,7 +176,7 @@ MCP 客户端每次启动 agent 会话都会重新拉起 `command` 指定的进�
 
 小仓库直接 `codebase_retrieval`;大仓库预热或跨仓问题开完整面后用 `start_*` + `task_status`(进度携带速率与 ETA 估算)。
 
-`max_output_length` 默认 20000 字节且**质量优先**:除非明确要节省 token,不要传小值——小预算会截断结果、凭空拉低检索质量;截断时标记会注明"展示了 N/M 个结果块"与恢复方法。
+**检索结果没有字节预算,也没有 `max_output_length` 参数。**默认(`detail=full`)回复的形状是:按排名前 N 个候选带源码正文,其后的每个候选一行 `## 路径:起止行 符号`,中间用一行 `-- remaining results listed as paths only; Read a file to see its content --` 隔开;精排窗口(前 50 个候选)之外的候选前另有一行 `-- results below were not reranked (fused order) --`。任何候选都不会被丢掉,AI 看标题决定是否用自己的 Read 工具展开。N 由**你**在 MCP 配置里设置,不是 AI 的调用参数:`OPENACE_FULL_RESULTS`,默认 20;AI 反馈"结果太长被客户端截断"就调小,反馈"总要多 Read 一轮"就调大;设 0 则全部只给标题行(等价于每次 `detail=paths`)。`detail=paths` 仍可由 AI 按需选择,只回标题行。本机实测(一次检索 79 个候选):默认 N=20 约 30 KB,N=5 约 13 KB,N=0 约 4 KB。
 
 ## 运行模式
 
@@ -219,6 +219,7 @@ MCP 客户端每次启动 agent 会话都会重新拉起 `command` 指定的进�
 | `OPENACE_QUERY_BUILD_WAIT` | 查询等待在建索引的上界,**默认 `40s`**(先于主流 MCP 客户端的请求超时,冷仓首建期间的同步检索返回带构建进度的可行动错误,而非裸超时):超时后有旧索引按 allow/deny 降级,无旧索引返回带进度的错误;显式 `0` = 等到构建完成 |
 | `OPENACE_MCP_TOOLS` | MCP 工具面:未设 = 只暴露 `codebase_retrieval`;`all` = 完整能力面;或逗号清单指定 |
 | `OPENACE_RENDER_LINE_NUMBERS` | `1` = 检索结果围栏内逐行携带真实文件行号(`cat -n` 形状,Read-parity 试验面);默认关闭 |
+| `OPENACE_FULL_RESULTS` | `detail=full` 时带正文返回的候选块数(按排名取前 N 个,其余只给标题行),默认 `20`;`0`=全部只给标题行。这是使用者侧配置,不是 AI 的调用参数;改动后重启 MCP 会话生效,不需要重启 daemon |
 | `OPENACE_GRAY_FEEDBACK` | `1` = instructions 追加灰度反馈协议:调用 AI 每轮工具调用后输出多维诊断报告(事实/效果/体验/耗时/bug 复现),供测试者汇总回传。默认关闭 |
 | `OPENACE_PROVIDER_TIMEOUT` / `OPENACE_PROVIDER_MAX_RETRIES` | provider HTTP 超时(默认 `60s`)与单批重试上限(默认 `5`) |
 | `OPENACE_MODE` | `auto` / `direct` / `manual-daemon`(默认 `auto`) |

@@ -125,10 +125,13 @@ type Hit struct {
 	Source      string  `json:"source,omitempty"`
 }
 
-// DisplayStats 是单次检索的展示完整性统计(框架 18.2)。
+// DisplayStats 是单次检索的展示完整性统计(框架 18.2)。检索结果不再按
+// 字节预算截断:ShownBlocks 恒等于 CandidateBlocks,FullBlocks 是其中带
+// 正文的块数(其余只有头行);Truncated 仅 repo_map 的地图预算仍会置位。
 type DisplayStats struct {
 	CandidateBlocks int  `json:"candidate_blocks"`
 	ShownBlocks     int  `json:"shown_blocks"`
+	FullBlocks      int  `json:"full_blocks,omitempty"`
 	ShownFiles      int  `json:"shown_files"`
 	Truncated       bool `json:"truncated"`
 }

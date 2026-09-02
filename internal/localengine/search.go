@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/AoManoh/openace-mcp/internal/chunk"
 	"github.com/AoManoh/openace-mcp/internal/engine"
@@ -390,7 +389,7 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 		return engine.Result{}, err
 	}
 	renderStart := time.Now()
-	rendered, renderErr := renderHitsDetail(handle, out.ordered, req.MaxOutputLen, detail)
+	rendered, renderErr := renderHitsDetail(handle, out.ordered, req.FullResults, detail)
 	if renderErr != nil {
 		return engine.Result{}, renderErr
 	}
@@ -1409,16 +1408,28 @@ type renderedResult struct {
 }
 
 // renderHits 保持既有文本口径(detail=full)。
-func renderHits(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (string, error) {
-	rendered, err := renderHitsWithInventory(handle, hits, maxOutputLen)
+func renderHits(handle *revisionHandle, hits []rankedHit, fullResults int) (string, error) {
+	rendered, err := renderHitsWithInventory(handle, hits, fullResults)
 	return rendered.text, err
 }
 
-func renderHitsWithInventory(handle *revisionHandle, hits []rankedHit, maxOutputLen int) (renderedResult, error) {
-	return renderHitsDetail(handle, hits, maxOutputLen, detailFull)
+func renderHitsWithInventory(handle *revisionHandle, hits []rankedHit, fullResults int) (renderedResult, error) {
+	return renderHitsDetail(handle, hits, fullResults, detailFull)
 }
 
-func renderHitsDetail(handle *revisionHandle, hits []rankedHit, maxOutputLen int, detail string) (renderedResult, error) {
+// pathsOnlyMarker 是正文中"带正文的头部"与"只有头行的其余候选"之间的
+// 分隔行(稳定文本;不以 "## " 开头,按头行解析的调用方可跳过)。仅当
+// detail=full 且候选数超过 fullResults 时出现。
+const pathsOnlyMarker = "-- remaining results listed as paths only; Read a file to see its content --"
+
+// renderHitsDetail 把排序后的候选渲染为正文:同文件相邻块合并(有上限)、
+// 按分序排列、前 fullResults 个块带正文,其余只给 `## path:start-end symbol`
+// 头行(fullResults 的取值语义见 engine.SearchRequest.FullResults)。所有
+// 候选都出现在正文与 hits[] 中,不存在按字节预算丢弃的块——
+// 输出体量由使用者配置的 fullResults 决定,而不是由一个隐含的字节上限
+// 决定(2026-09-02 用户裁决:不因预算降低检索质量;需要更短回复的使用者
+// 调小 OPENACE_FULL_RESULTS,需要更少往返的调大)。
+func renderHitsDetail(handle *revisionHandle, hits []rankedHit, fullResults int, detail string) (renderedResult, error) {
 	if len(hits) == 0 {
 		return renderedResult{text: noHitsText}, nil
 	}
@@ -1439,145 +1450,58 @@ func renderHitsDetail(handle *revisionHandle, hits []rankedHit, maxOutputLen int
 	merged := mergeBlocks(blocks)
 	sort.SliceStable(merged, func(i, j int) bool { return merged[i].score > merged[j].score })
 
-	budget := maxOutputLen
-	if budget <= 0 {
-		budget = 20000
+	// 0=未指定→默认;负值=一个都不带正文;paths 模式恒为 0 个。
+	switch {
+	case detail == detailPaths:
+		fullResults = 0
+	case fullResults == 0:
+		fullResults = engine.DefaultFullResults
+	case fullResults < 0:
+		fullResults = 0
 	}
 	inventory := make([]engine.Hit, len(merged))
 	anyReranked := false
 	for i, block := range merged {
 		inventory[i] = engine.Hit{
 			Path: block.record.RelPath, StartLine: block.record.StartLine,
-			EndLine: block.record.EndLine, Symbol: block.record.Symbol, Rank: i + 1,
+			EndLine: block.record.EndLine, Symbol: block.record.Symbol, Rank: i + 1, Shown: true,
 			Reranked: block.reranked, RerankScore: block.rerankScore, Source: block.source,
 		}
 		anyReranked = anyReranked || block.reranked
 	}
-	// 精排边界标记:精排块的序分(1/(pos+1),pos<sent)恒大于未精排块,
-	// 合并块又取最高分,故排序后所有含精排内容的块必然位于未精排块之前;
-	// 标记插在首个实际展示的未精排块之前。
-	boundary := func(out *strings.Builder, block renderBlock, sawReranked *bool, marked *bool) {
-		if block.reranked {
-			*sawReranked = true
-			return
-		}
-		if anyReranked && *sawReranked && !*marked {
-			out.WriteString(rerankBoundaryMarker + "\n")
-			*marked = true
-		}
-	}
-
-	if detail == detailPaths {
-		// 路径+行号模式(用户候选):正文只有 header 行,内容由调用方
-		// 按需 Read——token 经济与磁盘新鲜度换一轮往返。预算仍适用
-		// (头行极小,实际几乎不截断)。
-		var out strings.Builder
-		shown := 0
-		truncated := false
-		sawReranked, marked := false, false
-		for i := range merged {
-			line := blockHeader(merged[i].record) + "\n"
-			extra := 0
-			if !merged[i].reranked && anyReranked && sawReranked && !marked {
-				extra = len(rerankBoundaryMarker) + 1
-			}
-			if out.Len()+extra+len(line) > budget {
-				truncated = true
-				break
-			}
-			boundary(&out, merged[i], &sawReranked, &marked)
-			out.WriteString(line)
-			inventory[i].Shown = true
-			shown++
-		}
-		if truncated {
-			out.WriteString(truncationMarker(shown, len(merged)))
-		}
-		return renderedResult{
-			text: strings.TrimRight(out.String(), "\n"),
-			hits: inventory,
-			display: engine.DisplayStats{
-				CandidateBlocks: len(merged), ShownBlocks: shown,
-				ShownFiles: countShownFiles(merged, inventory), Truncated: truncated,
-			},
-		}, nil
-	}
-
 	numbered := renderLineNumbersEnabled()
-	sections := make([]string, len(merged))
-	for i, block := range merged {
-		sections[i] = formatBlock(block.record, numbered)
-	}
-	// F3(review 2026-08-06):首块超预算硬截断到预算并打标——历史豁免
-	// 使 MaxOutputLen=200 也可能返回数 KB,静默打爆调用方的上下文预算
-	// 管理。按字节截断可能落在多字节字符中间,回退到最近的合法 UTF-8
-	// 边界。
-	if len(sections[0]) > budget {
-		cut := budget
-		for cut > 0 && !utf8.RuneStart(sections[0][cut]) {
-			cut--
-		}
-		inventory[0].Shown = true
-		return renderedResult{
-			text: strings.TrimRight(sections[0][:cut]+truncationMarker(1, len(merged)), "\n"),
-			hits: inventory,
-			display: engine.DisplayStats{
-				CandidateBlocks: len(merged), ShownBlocks: 1, ShownFiles: 1, Truncated: true,
-			},
-		}, nil
-	}
-	// 预算内选块(灰度反馈四 §6.2):先保证每个命中文件至少一个片段
-	// (按分序),再回填同文件的更多片段——此前纯分序填充会让单个
-	// 文件的多个片段吃光预算,调用方点名的其余目标文件整体消失
-	// (现场 33 块只回来 2 块且同文件)。预算充足时两轮合计=全量,
-	// 行为与历史一致;展示顺序恒为分序,与选块顺序解耦。
-	selected := make([]bool, len(merged))
-	remaining := budget
-	if anyReranked && !merged[len(merged)-1].reranked {
-		// 正文可能出现精排边界标记行,预留其字节以守住预算口径。
-		remaining -= len(rerankBoundaryMarker) + 1
-	}
-	seenFile := make(map[string]bool, len(merged))
-	truncated := false
-	for pass := 0; pass < 2; pass++ {
-		for i := range merged {
-			if selected[i] {
-				continue
-			}
-			firstOfFile := !seenFile[merged[i].record.RelPath]
-			if (pass == 0) != firstOfFile {
-				continue
-			}
-			if len(sections[i]) > remaining {
-				truncated = true
-				continue
-			}
-			selected[i] = true
-			seenFile[merged[i].record.RelPath] = true
-			remaining -= len(sections[i])
-		}
-	}
 	var out strings.Builder
-	shown := 0
-	sawReranked, marked := false, false
-	for i := range merged {
-		if selected[i] {
-			boundary(&out, merged[i], &sawReranked, &marked)
-			out.WriteString(sections[i])
-			inventory[i].Shown = true
-			shown++
+	sawReranked, markedBoundary := false, false
+	fullBlocks := 0
+	for i, block := range merged {
+		// 精排边界标记:精排块的序分(1/(pos+1),pos<sent)恒大于未精排块,
+		// 合并块又取最高分,故排序后所有含精排内容的块必然位于未精排块
+		// 之前;标记插在首个未精排块之前。
+		if block.reranked {
+			sawReranked = true
+		} else if anyReranked && sawReranked && !markedBoundary {
+			out.WriteString(rerankBoundaryMarker + "\n")
+			markedBoundary = true
 		}
+		if i < fullResults {
+			out.WriteString(formatBlock(block.record, numbered))
+			fullBlocks++
+			continue
+		}
+		if i == fullResults && detail != detailPaths {
+			out.WriteString(pathsOnlyMarker + "\n")
+		}
+		out.WriteString(blockHeader(block.record) + "\n")
 	}
-	if truncated {
-		out.WriteString(truncationMarker(shown, len(merged)))
-		out.WriteString(omittedFilesLine(merged, selected))
+	files := make(map[string]bool, len(merged))
+	for _, block := range merged {
+		files[block.record.RelPath] = true
 	}
 	return renderedResult{
 		text: strings.TrimRight(out.String(), "\n"),
 		hits: inventory,
 		display: engine.DisplayStats{
-			CandidateBlocks: len(merged), ShownBlocks: shown,
-			ShownFiles: countShownFiles(merged, inventory), Truncated: truncated,
+			CandidateBlocks: len(merged), ShownBlocks: len(merged), FullBlocks: fullBlocks, ShownFiles: len(files),
 		},
 	}, nil
 }
@@ -1589,54 +1513,6 @@ func blockHeader(record chunkRecord) string {
 		header += " " + record.Symbol
 	}
 	return header
-}
-
-// countShownFiles 统计实展文件数。
-func countShownFiles(merged []renderBlock, inventory []engine.Hit) int {
-	files := make(map[string]bool)
-	for i := range merged {
-		if inventory[i].Shown {
-			files[merged[i].record.RelPath] = true
-		}
-	}
-	return len(files)
-}
-
-// omittedFilesLine 列出零展示文件的最佳块引用(截断时随正文携带,
-// 弱 caller 无结构化访问也能定向 Read 续取;上限 10 条防自身膨胀)。
-func omittedFilesLine(merged []renderBlock, selected []bool) string {
-	shownFile := make(map[string]bool)
-	for i := range merged {
-		if selected[i] {
-			shownFile[merged[i].record.RelPath] = true
-		}
-	}
-	var refs []string
-	listed := make(map[string]bool)
-	for i := range merged {
-		path := merged[i].record.RelPath
-		if shownFile[path] || listed[path] {
-			continue
-		}
-		listed[path] = true
-		refs = append(refs, fmt.Sprintf("%s:%d-%d", path, merged[i].record.StartLine, merged[i].record.EndLine))
-		if len(refs) >= 10 {
-			break
-		}
-	}
-	if len(refs) == 0 {
-		return ""
-	}
-	return "omitted files: " + strings.Join(refs, ", ") + "\n"
-}
-
-// truncationMarkerPrefix 是输出预算截断标记的稳定前缀(golden/调用方
-// 可依赖);完整标记携带展示比例与恢复动作(灰度反馈+用户裁决
-// 2026-08-07:截断必须可行动——调用方要能一眼判断漏了多少、如何拿全)。
-const truncationMarkerPrefix = "\n[output truncated by max_output_length"
-
-func truncationMarker(shown int, total int) string {
-	return fmt.Sprintf("%s: %d of %d result blocks shown; omit or raise max_output_length for complete results]\n", truncationMarkerPrefix, shown, total)
 }
 
 // mergeBlocks 只合并同文件真正重叠或严格相邻的块（next.Start ≤ current.End+1），

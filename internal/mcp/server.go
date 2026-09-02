@@ -17,6 +17,7 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/buildinfo"
 	"github.com/AoManoh/openace-mcp/internal/daemon"
 	"github.com/AoManoh/openace-mcp/internal/engine"
+	"github.com/AoManoh/openace-mcp/internal/reliability"
 )
 
 const maxMultiWorkspacePaths = daemon.MaxMultiWorkspacePaths
@@ -57,6 +58,9 @@ type Server struct {
 	// 内再次触发不再 exec(防 daemon 比磁盘 binary 更新时的 exec 循环)。
 	selfExec         string
 	handoffResumedAt time.Time
+	// fullResults 是 detail=full 时带正文返回的候选块数,来自使用者的
+	// MCP 配置(EnvFullResults);未设=engine.DefaultFullResults。
+	fullResults int
 }
 
 // reconnectTTL 是不可用形态重探测的最小间隔。
@@ -67,7 +71,32 @@ const reconnectTTL = 10 * time.Second
 // "Failed to connect",两轮灰度反馈均卡在此排障。reconnect 可为 nil
 // (不重探测,始终返回 cause)。
 func NewUnavailableServer(cause error, reconnect func() (engine.Service, error)) *Server {
-	return &Server{unavailable: cause, reconnect: reconnect}
+	return &Server{unavailable: cause, reconnect: reconnect, fullResults: engine.DefaultFullResults}
+}
+
+// EnvFullResults 由使用者在 MCP 配置里设置:detail=full 时带正文返回的
+// 候选块数(0=全部只给头行)。它不是调用方 AI 的逐次参数——使用者按 AI
+// 的反馈(结果太长被客户端截断/往返太多)调整此值。
+const EnvFullResults = "OPENACE_FULL_RESULTS"
+
+// FullResultsFromEnv 解析 EnvFullResults;未设=engine.DefaultFullResults,
+// 非法值(非整数/负数)返回错误,启动期 fail-fast。
+func FullResultsFromEnv() (int, error) {
+	return reliability.IntEnv(EnvFullResults, engine.DefaultFullResults, 0)
+}
+
+// SetFullResults 覆盖 detail=full 的带正文块数(启动期由 main 按 env 设置)。
+// 使用者写 0 表示"一个都不带正文",按 engine.SearchRequest.FullResults 的
+// 约定翻译为负值传给引擎(引擎把 0 视为未指定→默认)。
+func (s *Server) SetFullResults(n int) {
+	switch {
+	case n == 0:
+		s.fullResults = -1
+	case n < 0:
+		s.fullResults = engine.DefaultFullResults
+	default:
+		s.fullResults = n
+	}
 }
 
 // attachService 装配服务与能力面(NewServer 与不可用形态自愈共用)。
@@ -132,10 +161,11 @@ type retrievalArgs struct {
 	InformationRequest string `json:"information_request"`
 	DirectoryPath      string `json:"directory_path"`
 	ProviderProfileID  string `json:"provider_profile_id,omitempty"`
-	MaxOutputLength    int    `json:"max_output_length,omitempty"`
-	// Detail 是输出详略(框架 18.2/S2,用户候选"路径+行号优先"的
-	// 实验载体):full(默认,内容块)/paths(只回 path:range 头行,
-	// 内容由调用方按需 Read)。
+	// Detail 是输出详略:full(默认,前 N 个候选带正文、其余头行,N 由
+	// 使用者经 OPENACE_FULL_RESULTS 配置)/paths(全部只回 path:range
+	// 头行,内容由调用方按需 Read)。调用方不再传输出预算:2026-09-02
+	// 用户裁决"不因预算降低检索质量",max_output_length 参数已移除,
+	// 旧调用方仍传该字段时按未知字段忽略。
 	Detail     string `json:"detail,omitempty"`
 	PathPrefix string `json:"path_prefix,omitempty"`
 }
@@ -144,7 +174,6 @@ type multiRetrievalArgs struct {
 	InformationRequest string   `json:"information_request"`
 	DirectoryPaths     []string `json:"directory_paths"`
 	ProviderProfileID  string   `json:"provider_profile_id,omitempty"`
-	MaxOutputLength    int      `json:"max_output_length,omitempty"`
 	// Detail/PathPrefix 与单仓 retrievalArgs 同契约,应用到每个 workspace
 	// (P0 修复:schema 一直公开这两个参数,实现却静默丢弃)。
 	Detail     string `json:"detail,omitempty"`
@@ -171,7 +200,7 @@ type listTasksArgs struct {
 }
 
 func NewServer(service engine.Service) *Server {
-	server := &Server{}
+	server := &Server{fullResults: engine.DefaultFullResults}
 	// P9(review 2026-08-06):inspector 注册不再以 tasker 存在为前提——
 	// 该前提源于"与 legacy direct 对齐",legacy 已在 Stage 7 删除。
 	// direct 模式恢复 workspace_status/list_workspaces 只读状态面,
@@ -482,7 +511,7 @@ func (s *Server) handleRetrieval(ctx context.Context, id *json.RawMessage, rawAr
 	}
 	toolCtx, cancel := toolTimeoutContext(ctx)
 	defer cancel()
-	result, err := s.retrieve(toolCtx, args.DirectoryPath, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength, args.Detail, args.PathPrefix)
+	result, err := s.retrieve(toolCtx, args.DirectoryPath, args.ProviderProfileID, args.InformationRequest, args.Detail, args.PathPrefix)
 	if err != nil {
 		return toolError(id, err.Error())
 	}
@@ -557,8 +586,12 @@ func retrievalDiagnosticsText(result engine.Result) string {
 	}
 	if result.Display != nil {
 		d := result.Display
-		parts = append(parts, fmt.Sprintf("display[candidates=%d shown=%d files=%d truncated=%t]",
-			d.CandidateBlocks, d.ShownBlocks, d.ShownFiles, d.Truncated))
+		if d.FullBlocks > 0 || !d.Truncated {
+			parts = append(parts, fmt.Sprintf("display[candidates=%d full=%d files=%d]", d.CandidateBlocks, d.FullBlocks, d.ShownFiles))
+		} else {
+			parts = append(parts, fmt.Sprintf("display[candidates=%d shown=%d files=%d truncated=%t]",
+				d.CandidateBlocks, d.ShownBlocks, d.ShownFiles, d.Truncated))
+		}
 	}
 	if len(parts) == 0 {
 		return ""
@@ -632,16 +665,13 @@ func (s *Server) handleMultiRetrieval(ctx context.Context, id *json.RawMessage, 
 	if args.InformationRequest == "" {
 		return toolError(id, "information_request is required")
 	}
-	if err := validateMaxOutputLength(args.MaxOutputLength); err != nil {
-		return toolError(id, err.Error())
-	}
 	paths, err := normalizeDirectoryPaths(args.DirectoryPaths)
 	if err != nil {
 		return toolError(id, err.Error())
 	}
 	toolCtx, cancel := toolTimeoutContext(ctx)
 	defer cancel()
-	results := s.retrieveMultiple(toolCtx, paths, args.ProviderProfileID, args.InformationRequest, args.MaxOutputLength, args.Detail, args.PathPrefix)
+	results := s.retrieveMultiple(toolCtx, paths, args.ProviderProfileID, args.InformationRequest, args.Detail, args.PathPrefix)
 	status := summarizeMultiRetrievalResults(args.ProviderProfileID, results)
 	text := formatMultiRetrievalResults(results, status)
 	structured := map[string]any{"multi_status": status}
@@ -715,7 +745,7 @@ func (s *Server) handleStartRetrieval(ctx context.Context, id *json.RawMessage, 
 		DirectoryPath:      args.DirectoryPath,
 		ProviderProfileID:  args.ProviderProfileID,
 		InformationRequest: args.InformationRequest,
-		MaxOutputLength:    args.MaxOutputLength,
+		FullResults:        s.fullResults,
 		Detail:             args.Detail,
 		PathPrefix:         args.PathPrefix,
 	})
@@ -740,9 +770,6 @@ func (s *Server) handleStartMultiRetrieval(ctx context.Context, id *json.RawMess
 	if args.InformationRequest == "" {
 		return toolError(id, "information_request is required")
 	}
-	if err := validateMaxOutputLength(args.MaxOutputLength); err != nil {
-		return toolError(id, err.Error())
-	}
 	paths, err := normalizeDirectoryPaths(args.DirectoryPaths)
 	if err != nil {
 		return toolError(id, err.Error())
@@ -754,7 +781,7 @@ func (s *Server) handleStartMultiRetrieval(ctx context.Context, id *json.RawMess
 		DirectoryPaths:     paths,
 		ProviderProfileID:  args.ProviderProfileID,
 		InformationRequest: args.InformationRequest,
-		MaxOutputLength:    args.MaxOutputLength,
+		FullResults:        s.fullResults,
 		Detail:             args.Detail,
 		PathPrefix:         args.PathPrefix,
 	})
@@ -914,16 +941,16 @@ type multiRetrievalResult struct {
 	SemanticCoverage string
 }
 
-func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID string, query string, maxOutputLen int, detail string, pathPrefix string) (engine.Result, error) {
+func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID string, query string, detail string, pathPrefix string) (engine.Result, error) {
 	return s.service.Search(ctx, engine.SearchRequest{
 		Workspace: engine.WorkspaceRef{
 			DirectoryPath:     dir,
 			ProviderProfileID: strings.TrimSpace(providerProfileID),
 		},
-		Query:        query,
-		MaxOutputLen: maxOutputLen,
-		Detail:       detail,
-		PathPrefix:   pathPrefix,
+		Query:       query,
+		FullResults: s.fullResults,
+		Detail:      detail,
+		PathPrefix:  pathPrefix,
 	})
 }
 
@@ -951,7 +978,7 @@ func normalizeRetrievalArgs(args *retrievalArgs) error {
 	if args.DirectoryPath == "" {
 		return fmt.Errorf("directory_path is required")
 	}
-	return validateMaxOutputLength(args.MaxOutputLength)
+	return nil
 }
 
 func validateMaxOutputLength(value int) error {
@@ -982,7 +1009,7 @@ func normalizeDirectoryPaths(paths []string) ([]string, error) {
 	return normalized, nil
 }
 
-func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerProfileID string, query string, maxOutputLen int, detail string, pathPrefix string) []multiRetrievalResult {
+func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerProfileID string, query string, detail string, pathPrefix string) []multiRetrievalResult {
 	results := make([]multiRetrievalResult, len(paths))
 	var wg sync.WaitGroup
 	for i, path := range paths {
@@ -991,7 +1018,7 @@ func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerP
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := s.retrieve(ctx, path, providerProfileID, query, maxOutputLen, detail, pathPrefix)
+			result, err := s.retrieve(ctx, path, providerProfileID, query, detail, pathPrefix)
 			if err != nil {
 				results[i].Error = err.Error()
 				return
@@ -1133,13 +1160,12 @@ const pathPrefixDescription = "Optional indexed relative path prefix (for exampl
 
 // detailDescription 是输出详略契约(框架 18.2/S2;业界"默认小、按需大"
 // 光谱的参数化位:Anthropic response_format enum 同型)。
-const detailDescription = "Output detail: \"full\" (default) returns source content blocks; \"paths\" returns only `## path:start-end symbol` header lines so you can Read the files yourself — fresher (reads hit the live disk) and far cheaper in tokens, at the cost of one more round trip."
+const detailDescription = "Output detail: \"full\" (default) returns the top-ranked results with source content and lists every remaining candidate as a `## path:start-end symbol` header line (how many get content is a user-side setting, OPENACE_FULL_RESULTS, default 20); \"paths\" returns header lines only so you can Read the files yourself — fresher (reads hit the live disk) and far cheaper in tokens, at the cost of one more round trip. Nothing is truncated by a byte budget in either mode."
 
-// maxOutputLengthDescription 是 max_output_length 参数契约(灰度反馈:
-// 该参数此前无描述,调用方盲传小值致结果被截断、检索质量凭空劣化,
-// review P5 附带项;用户裁决 2026-08-07:质量优先,非明确要省 token
-// 不应设限)。
-const maxOutputLengthDescription = "Optional output budget in BYTES (default 20000, max 1000000). OMIT this unless the user explicitly wants to cap token spend: small values truncate results and silently degrade retrieval quality. When output is truncated a marker reports how many result blocks were shown."
+// maxOutputLengthDescription 是 repo_map 的 max_output_length 参数契约。
+// 检索工具已不再有输出字节预算(2026-09-02 用户裁决);repo_map 的地图
+// 体量仍按字节预算裁剪,截断时正文携带标记与 focus 续取提示。
+const maxOutputLengthDescription = "Optional map size budget in BYTES (default 20000, max 1000000). OMIT this unless the user explicitly wants a smaller map: when the map is truncated a marker reports how many files were shown and suggests focus for a subtree."
 
 const informationRequestDescription = "A complete, specific description of what to find. Include: (1) the purpose or behavior you seek, in a full sentence; (2) exact identifiers if known (function/class/config key names, keep original casing); (3) artifact type hints when relevant (config file, test, docs). Preserve distinctive terms from the user's request verbatim; do not translate identifiers. Good: \"where is the retry backoff policy for embedding provider requests implemented\". Bad: \"retry\"."
 
@@ -1153,7 +1179,6 @@ func retrievalTool() map[string]any {
 				"information_request": map[string]any{"type": "string", "description": informationRequestDescription},
 				"directory_path":      map[string]any{"type": "string", "description": "Absolute path of the workspace root to search."},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
-				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
 				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
 				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
 			},
@@ -1175,7 +1200,6 @@ func multiRetrievalTool() map[string]any {
 					"items": map[string]any{"type": "string"},
 				},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
-				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
 				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
 				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
 			},
@@ -1209,7 +1233,6 @@ func startRetrievalTool() map[string]any {
 				"information_request": map[string]any{"type": "string", "description": informationRequestDescription},
 				"directory_path":      map[string]any{"type": "string"},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
-				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
 				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
 				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
 			},
@@ -1231,7 +1254,6 @@ func startMultiRetrievalTool() map[string]any {
 					"items": map[string]any{"type": "string"},
 				},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
-				"max_output_length":   map[string]any{"type": "integer", "description": maxOutputLengthDescription},
 				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
 				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
 			},

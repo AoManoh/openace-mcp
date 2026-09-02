@@ -115,54 +115,44 @@ func TestRenderMergesAdjacentChunks(t *testing.T) {
 	}
 }
 
-// TestRenderBudgetTruncation 预算截断保留完整块并声明截断。
-func TestRenderBudgetTruncation(t *testing.T) {
-	handle := newRenderHandle(t,
-		chunkRecord{ID: "a", RelPath: "a.go", Language: "go", StartLine: 1, EndLine: 1, Content: "alpha"},
-		chunkRecord{ID: "b", RelPath: "b.go", Language: "go", StartLine: 1, EndLine: 1, Content: "beta"},
-	)
-	got := mustRender(t, handle, []rankedHit{{id: "a", score: 2}, {id: "b", score: 1}}, 30)
-	// b.go 的内容不得出现;其路径引用可经 omitted 清单合法携带(18.2)。
-	if !containsAll(got, "a.go", "[output truncated by max_output_length: 1 of 2 result blocks shown") || contains(got, "beta") {
-		t.Fatalf("预算截断行为错误: %q", got)
-	}
-}
-
-// TestRenderBudgetPrioritizesFileCoverage(灰度反馈四 §6.2):预算不足时
-// 先保证每个命中文件至少一个片段,再回填同文件更多片段——此前纯分序
-// 填充让单文件多片段吃光预算,其余点名文件整体消失(现场 33 块只回
-// 2 块且同文件)。
-func TestRenderBudgetPrioritizesFileCoverage(t *testing.T) {
+// TestRenderFullResultsThenPaths(2026-09-02 用户裁决:检索结果不再按字节
+// 预算截断):按排名前 fullResults 个块带正文,其余全部以头行列出并以
+// 固定分隔行隔开;任何候选都不会被隐藏。fullResults=0(零值)取引擎默认
+// 20,fullResults<0 全部只给头行。
+func TestRenderFullResultsThenPaths(t *testing.T) {
 	handle := newRenderHandle(t,
 		chunkRecord{ID: "a1", RelPath: "a.go", Language: "go", StartLine: 1, EndLine: 1, Content: "alpha one"},
 		chunkRecord{ID: "a2", RelPath: "a.go", Language: "go", StartLine: 10, EndLine: 10, Content: "alpha two"},
 		chunkRecord{ID: "b1", RelPath: "b.go", Language: "go", StartLine: 1, EndLine: 1, Content: "beta one"},
 		chunkRecord{ID: "c1", RelPath: "c.go", Language: "go", StartLine: 1, EndLine: 1, Content: "gamma one"},
 	)
-	// a.go 两块分数最高;预算只够 3 块——旧行为回 a1+a2+b1(c.go 消失),
-	// 新行为回 a1+b1+c1(每文件先保一块)。
 	hits := []rankedHit{{id: "a1", score: 4}, {id: "a2", score: 3}, {id: "b1", score: 2}, {id: "c1", score: 1}}
-	got := mustRender(t, handle, hits, 100)
-	if !containsAll(got, "a.go", "b.go", "c.go") {
-		t.Fatalf("每个命中文件应至少一个片段: %q", got)
+	got := mustRender(t, handle, hits, 2)
+	want := "## a.go:1-1\n```go\nalpha one\n```\n\n## a.go:10-10\n```go\nalpha two\n```\n\n" + pathsOnlyMarker + "\n## b.go:1-1\n## c.go:1-1"
+	if got != want {
+		t.Fatalf("前 2 名应带正文、其余只给头行:\n--- want ---\n%s\n--- got ---\n%s", want, got)
 	}
-	if contains(got, "alpha two") {
-		t.Fatalf("同文件第二片段应让位于未展示文件: %q", got)
+	// 同文件第二名不再为"未露面的文件"让位:严格按排名。
+	if strings.Index(got, "alpha two") > strings.Index(got, "## b.go") {
+		t.Fatalf("第 2 名必须排在第 3 名之前: %q", got)
 	}
-	if !contains(got, "[output truncated by max_output_length: 3 of 4 result blocks shown") {
-		t.Fatalf("截断标记应如实计数: %q", got)
+	all := mustRender(t, handle, hits, 0)
+	if !containsAll(all, "alpha one", "alpha two", "beta one", "gamma one") || contains(all, pathsOnlyMarker) {
+		t.Fatalf("候选数不超过默认 20 时应全部带正文且无分隔行: %q", all)
 	}
-	// 预算充足时全量返回,行为与历史一致。
-	full := mustRender(t, handle, hits, 0)
-	if !containsAll(full, "alpha one", "alpha two", "beta one", "gamma one") || contains(full, "[output truncated") {
-		t.Fatalf("预算充足应全量: %q", full)
+	none := mustRender(t, handle, hits, -1)
+	if contains(none, "alpha one") || !containsAll(none, "## a.go:1-1", "## a.go:10-10", "## b.go:1-1", "## c.go:1-1") {
+		t.Fatalf("fullResults<0 应全部只给头行: %q", none)
+	}
+	if !strings.HasPrefix(none, pathsOnlyMarker) {
+		t.Fatalf("fullResults<0 的 full 模式应以分隔行开头: %q", none)
 	}
 }
 
 // TestRenderProducesHitInventory(框架 18.2/S2):渲染同时产出结构化
-// hits 清单(path/行区间/symbol/rank/shown)与展示统计——"候选存在但
-// 调用方看不到"从此机器可读(cross-file 缺口 19/39 卡 rank6-10、灰度
-// 33 块只回 2 块,同源问题)。
+// hits 清单(path/行区间/symbol/rank/shown)与展示统计。不再有字节预算
+// 后,每个候选都在正文中出现(带正文或头行),shown 恒为 true;
+// display.full_blocks 记录带正文的块数,truncated 恒为 false。
 func TestRenderProducesHitInventory(t *testing.T) {
 	handle := newRenderHandle(t,
 		chunkRecord{ID: "a1", RelPath: "a.go", Language: "go", StartLine: 1, EndLine: 3, Symbol: "Alpha", Content: "alpha one\nl2\nl3"},
@@ -170,8 +160,7 @@ func TestRenderProducesHitInventory(t *testing.T) {
 		chunkRecord{ID: "c1", RelPath: "c.go", Language: "go", StartLine: 5, EndLine: 5, Content: "gamma one"},
 	)
 	hits := []rankedHit{{id: "a1", score: 3}, {id: "b1", score: 2}, {id: "c1", score: 1}}
-	// 预算只够 1 块:inventory 仍覆盖全部候选,shown 如实。
-	rendered, err := renderHitsWithInventory(handle, hits, 60)
+	rendered, err := renderHitsWithInventory(handle, hits, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,27 +171,20 @@ func TestRenderProducesHitInventory(t *testing.T) {
 	if first.Path != "a.go" || first.StartLine != 1 || first.EndLine != 3 || first.Symbol != "Alpha" || first.Rank != 1 || !first.Shown {
 		t.Fatalf("首条 hit 元数据错误: %+v", first)
 	}
-	shown := 0
 	for _, h := range rendered.hits {
-		if h.Shown {
-			shown++
+		if !h.Shown {
+			t.Fatalf("无预算截断后每个候选都应 shown: %+v", h)
 		}
 	}
-	if shown != rendered.display.ShownBlocks || !rendered.display.Truncated {
-		t.Fatalf("展示统计与 inventory 不一致: shown=%d display=%+v", shown, rendered.display)
+	d := rendered.display
+	if d.CandidateBlocks != 3 || d.ShownBlocks != 3 || d.FullBlocks != 1 || d.ShownFiles != 3 || d.Truncated {
+		t.Fatalf("展示统计错误: %+v", d)
 	}
-	if rendered.display.CandidateBlocks != 3 || rendered.display.ShownFiles != shown {
-		t.Fatalf("统计字段错误: %+v", rendered.display)
-	}
-	// 截断时正文尾部列出未展示文件(弱 caller 无结构化访问也能续取)。
-	if !strings.Contains(rendered.text, "omitted files:") || !strings.Contains(rendered.text, "b.go:1-1") {
-		t.Fatalf("截断应附未展示文件清单: %q", rendered.text)
+	if !strings.Contains(rendered.text, "alpha one") || strings.Contains(rendered.text, "beta one") || !strings.Contains(rendered.text, "## b.go:1-1 Beta") || !strings.Contains(rendered.text, "## c.go:5-5") {
+		t.Fatalf("前 1 名带正文、其余头行: %q", rendered.text)
 	}
 }
 
-// TestRenderPathsDetailMode(用户候选:路径+行号优先返回,agent 自行
-// Read):detail=paths 时正文只有 header 行(零代码围栏),预算约束
-// 依旧;inventory/统计照常。
 func TestRenderPathsDetailMode(t *testing.T) {
 	handle := newRenderHandle(t,
 		chunkRecord{ID: "a1", RelPath: "a.go", Language: "go", StartLine: 1, EndLine: 3, Symbol: "Alpha", Content: "alpha one\nl2\nl3"},

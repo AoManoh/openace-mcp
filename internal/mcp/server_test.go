@@ -406,14 +406,65 @@ func TestCodebaseRetrievalRejectsWhitespaceArguments(t *testing.T) {
 	}
 }
 
-func TestRetrievalToolsValidateMaxOutputLength(t *testing.T) {
-	out := runMCP(t, NewServer(fakeTasker{}), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"start_codebase_retrieval","arguments":{"directory_path":"/tmp/workspace","information_request":"find code","max_output_length":-1}}}`)
-	if !strings.Contains(out, "max_output_length must be non-negative") || !strings.Contains(out, `"isError":true`) {
-		t.Fatalf("negative max output should be rejected: %s", out)
+// TestRetrievalToolsCarryUserFullResultsNotCallerBudget(2026-09-02 用户裁决):
+// 调用方 AI 不再传输出预算——工具 schema 不再暴露 max_output_length,旧
+// 调用方仍传该字段时按未知字段忽略而不报错;带正文的候选块数来自使用者
+// 的 MCP 配置(OPENACE_FULL_RESULTS → SetFullResults),随每次检索请求与
+// 异步任务请求传给引擎。
+func TestRetrievalToolsCarryUserFullResultsNotCallerBudget(t *testing.T) {
+	syncer := &capturingMultiSyncer{}
+	server := NewServer(syncer)
+	server.SetFullResults(7)
+	out := runMCP(t, server, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"/tmp/workspace","information_request":"find code","max_output_length":-1}}}`)
+	if strings.Contains(out, `"isError":true`) {
+		t.Fatalf("已移除的 max_output_length 应被忽略而非报错: %s", out)
 	}
-	out = runMCP(t, NewServer(fakeSyncer{}), `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"/tmp/workspace","information_request":"find code","max_output_length":1000001}}}`)
-	if !strings.Contains(out, "max_output_length must be") || !strings.Contains(out, "1000000") || !strings.Contains(out, `"isError":true`) {
-		t.Fatalf("huge max output should be rejected: %s", out)
+	if len(syncer.requests) != 1 || syncer.requests[0].FullResults != 7 {
+		t.Fatalf("检索请求应携带使用者配置的 fullResults=7: %+v", syncer.requests)
+	}
+	for _, tool := range []map[string]any{retrievalTool(), multiRetrievalTool(), startRetrievalTool(), startMultiRetrievalTool()} {
+		raw, _ := json.Marshal(tool)
+		if strings.Contains(string(raw), "max_output_length") {
+			t.Fatalf("检索工具 %v 的 schema 不应再暴露 max_output_length", tool["name"])
+		}
+	}
+	if raw, _ := json.Marshal(repoMapTool()); !strings.Contains(string(raw), "max_output_length") {
+		t.Fatal("repo_map 的地图预算参数应保留")
+	}
+	// 默认(未调用 SetFullResults)为 engine.DefaultFullResults;使用者配置 0
+	// ("一个都不带正文")按引擎约定以负值传入。
+	syncer2 := &capturingMultiSyncer{}
+	runMCP(t, NewServer(syncer2), `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"/tmp/workspace","information_request":"find code"}}}`)
+	if len(syncer2.requests) != 1 || syncer2.requests[0].FullResults != engine.DefaultFullResults {
+		t.Fatalf("未配置时应为默认 %d: %+v", engine.DefaultFullResults, syncer2.requests)
+	}
+	syncer3 := &capturingMultiSyncer{}
+	server3 := NewServer(syncer3)
+	server3.SetFullResults(0)
+	runMCP(t, server3, `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"/tmp/workspace","information_request":"find code"}}}`)
+	if len(syncer3.requests) != 1 || syncer3.requests[0].FullResults >= 0 {
+		t.Fatalf("使用者配置 0 应以负值传给引擎: %+v", syncer3.requests)
+	}
+}
+
+func TestFullResultsFromEnv(t *testing.T) {
+	t.Setenv(EnvFullResults, "")
+	if n, err := FullResultsFromEnv(); err != nil || n != engine.DefaultFullResults {
+		t.Fatalf("未设应为默认: n=%d err=%v", n, err)
+	}
+	t.Setenv(EnvFullResults, "0")
+	if n, err := FullResultsFromEnv(); err != nil || n != 0 {
+		t.Fatalf("0 合法(全部只给头行): n=%d err=%v", n, err)
+	}
+	t.Setenv(EnvFullResults, "35")
+	if n, err := FullResultsFromEnv(); err != nil || n != 35 {
+		t.Fatalf("显式值应透传: n=%d err=%v", n, err)
+	}
+	for _, bad := range []string{"-1", "abc"} {
+		t.Setenv(EnvFullResults, bad)
+		if _, err := FullResultsFromEnv(); err == nil {
+			t.Fatalf("非法值 %q 应报错", bad)
+		}
 	}
 }
 

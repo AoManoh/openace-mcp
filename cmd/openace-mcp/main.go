@@ -36,6 +36,14 @@ func main() {
 
 	ctx := context.Background()
 
+	// 使用者侧输出形态配置:detail=full 时带正文返回的候选块数。非法值
+	// 在启动期报错退出,而不是静默回落默认值。
+	fullResults, err := mcp.FullResultsFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "openace-mcp: %v\n", err)
+		os.Exit(1)
+	}
+
 	service, err := buildService(ctx)
 	if err != nil {
 		// 灰度反馈一号 P1-3:启动失败不再 exit(1) 了事——多数 MCP 客户端
@@ -45,6 +53,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "openace-mcp: %v\n", err)
 		reconnect := func() (engine.Service, error) { return buildService(ctx) }
 		unavailable := mcp.NewUnavailableServer(err, reconnect)
+		unavailable.SetFullResults(fullResults)
 		unavailable.EnableUpgradeHandoff(selfExecPath())
 		if runErr := unavailable.Run(ctx, os.Stdin, os.Stdout); runErr != nil {
 			fmt.Fprintf(os.Stderr, "openace-mcp: %v\n", runErr)
@@ -52,6 +61,7 @@ func main() {
 		os.Exit(1)
 	}
 	server := mcp.NewServer(service)
+	server.SetFullResults(fullResults)
 	server.EnableUpgradeHandoff(selfExecPath())
 
 	runErr := server.Run(ctx, os.Stdin, os.Stdout)
