@@ -18,19 +18,30 @@ Linux / macOS / WSL:
 
 ```bash
 go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript,grammar_subset_java,grammar_subset_rust,grammar_subset_c,grammar_subset_cpp,grammar_subset_c_sharp,grammar_subset_kotlin,grammar_subset_ruby,grammar_subset_php" \
-  github.com/AoManoh/openace-mcp/cmd/openace-mcp@main
+  github.com/AoManoh/openace-mcp/cmd/openace-mcp@latest
 ```
 
 Windows PowerShell:
 
 ```powershell
-go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript,grammar_subset_java,grammar_subset_rust,grammar_subset_c,grammar_subset_cpp,grammar_subset_c_sharp,grammar_subset_kotlin,grammar_subset_ruby,grammar_subset_php" github.com/AoManoh/openace-mcp/cmd/openace-mcp@main
+go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript,grammar_subset_tsx,grammar_subset_javascript,grammar_subset_java,grammar_subset_rust,grammar_subset_c,grammar_subset_cpp,grammar_subset_c_sharp,grammar_subset_kotlin,grammar_subset_ruby,grammar_subset_php" github.com/AoManoh/openace-mcp/cmd/openace-mcp@latest
 ```
 
 网络受限时在命令前加 `GOPROXY=https://goproxy.cn,direct GOSUMDB=sum.golang.google.cn`(PowerShell 用 `$env:GOPROXY=...` 形式)。
 
 > `-tags` 选择内嵌的 Tree-sitter 语法子集(当前 AST 支持的十三种语言,二进制约 30MB)。省略 `-tags` 功能完全一致,但内嵌全部 206 种语法(约 49MB)——切分行为不变,只是体积更大。
-> **版本优先钉精确 commit**:把 `@main` 换成 `@<commit>`。`@main` 经 Go module proxy(尤其镜像代理)可能解析到缓存的旧提交而非远端最新——装完用 `openace-mcp version` 核对实际构建。升级就一步:重跑安装命令。Unix 上旧 daemon 会被下一个新会话自动接管,开着的 IDE 会话也会在下次调用时自己跟上,不用动任何东西;Windows 需要手动收尾——`pkill -f 'openace-mcp daemon'` 停掉旧 daemon,再重启 MCP 会话。
+
+#### 选版本:`@latest`、`@main` 还是 `@<commit>`
+
+三种写法装出来的二进制用法完全相同,区别只在"拿到哪一份代码"和"什么时候会变":
+
+| 写法 | 解析到 | 版本号形态(`openace-mcp version` / `daemon_status`) | 什么时候变化 | 适合 |
+|---|---|---|---|---|
+| `@latest` | 最新正式发布 tag(GitHub Releases 有对应发布说明) | `v0.2.0` | 只在打出新 tag 时 | 日常使用;想知道"这版改了什么"时看发布说明 |
+| `@main` | 主分支最新提交,含尚未发布的修复与变更 | `v0.2.1-0.20260901120000-<12位提交hash>`,中段是提交时间(UTC) | 每次重跑安装都可能变 | 跟进最新修复、参与灰度反馈 |
+| `@<commit>` | 指定提交 | 同上形态,时间与 hash 为该提交 | 从不 | 复现问题、锁定构建 |
+
+`@main` 经 Go module proxy(尤其镜像代理)可能解析到代理缓存的稍旧提交而非远端最新,装完用 `openace-mcp version` 核对。升级就一步:重跑同一条安装命令。Unix 上旧 daemon 会被下一个新会话自动接管,开着的 IDE 会话也会在下次调用时自己跟上;Windows 需要手动收尾——停掉旧的 `openace-mcp daemon` 进程,再重启 MCP 会话。
 
 ### 第 2 步:把配置贴进你的 MCP 客户端
 
@@ -70,16 +81,24 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 
 到这里就可用了:让 AI 调 `codebase_retrieval` 工具、传入你的项目目录,即得纯词法检索(零凭据、零出网)。要开语义混合检索,继续看下一节。
 
-### 免安装变体(客户端经 `go run` 启动)
+### 启动方式:预装二进制,还是每次启动时解析(`go run`)
 
-不想预装时,`command` 换成 `go`:
+MCP 客户端每次启动 agent 会话都会重新拉起 `command` 指定的进程。`command` 写成预装的二进制,还是写成 `go run …@latest` / `go run …@main`,决定了每一次启动时发生什么:
+
+| `command` 写法 | 每次启动 MCP 时发生什么 | 版本什么时候变 | 代价 |
+|---|---|---|---|
+| `openace-mcp`(预装二进制,上文第 1 步) | 直接执行本机二进制,不访问网络 | 只在你重跑 `go install` 时 | 无;升级需要你主动执行一次安装命令 |
+| `go run …@latest` | 先向 Go module proxy 查询当前最新 tag(本机实测 0.65 秒,该版本已编译过时),有新 tag 后的第一次启动现场下载并编译(本机实测 13–38 秒) | 每次有新正式发布,下一次启动自动换上 | 每次启动都需要网络与 Go 工具链;新版本首次启动慢,可能撞上客户端的 MCP 启动超时 |
+| `go run …@main` | 同上,但查询的是主分支最新提交;主分支每前进一次,下一次启动就重新编译 | 每次主分支有新提交 | 同上且更频繁;会拿到尚未发布的变更 |
+
+`go run` 形态的配置(把 `@latest` 换成 `@main` 即跟主分支):
 
 ```json
 {
   "mcpServers": {
     "openace": {
       "command": "go",
-      "args": ["run", "github.com/AoManoh/openace-mcp/cmd/openace-mcp@main"],
+      "args": ["run", "github.com/AoManoh/openace-mcp/cmd/openace-mcp@latest"],
       "env": {
         "GOPROXY": "https://goproxy.cn,direct",
         "GOSUMDB": "sum.golang.google.cn",
@@ -90,7 +109,7 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 }
 ```
 
-首次启动会现场拉取编译(较慢,且为全语法体积);日常使用推荐预装二进制。Windows 下客户端找不到 `go` 时,把 `command` 写成 `go.exe` 绝对路径。
+两点须知:`args` 里不加 `-tags` 时编译的是全语法体积(约 49MB),加上第 1 步那串 `-tags` 参数可缩小体积、缩短编译;`go run` 模式下会话中途的版本跟随不生效——新版本只在下一次启动 MCP 时换上,连接时对旧 daemon 的自动接管照常工作。日常使用推荐预装二进制;Windows 下客户端找不到 `go` 时,把 `command` 写成 `go.exe` 绝对路径。
 
 ## 开启语义混合检索(模型自备)
 
@@ -214,7 +233,7 @@ daemon 只监听 loopback,不要直接暴露公网。引擎固定为 local-hybri
 
 wrapper 与 daemon 的一致性分两层,行为刻意不同:
 
-- **build 过期**:升级后的 wrapper 在连接时自动接管旧 daemon——SIGTERM 请求优雅停机,等它退出,再拉起新的,全程实测 0.1 秒;嵌入进度有断点日志,付过费的向量一条不丢。Windows 没有对应的信号语义,保持显式报错,错误文本里带着旧 daemon 的 pid 和一条可复制的修复命令。
+- **build 过期**:升级后的 wrapper 在连接时自动接管旧 daemon——SIGTERM 请求优雅停机,等它退出,再启动新的,全程实测 0.1 秒;嵌入进度有断点日志,付过费的向量一条不丢。接管前先判断谁新谁旧:源码构建比较 vcs 提交时间,`go install` 装的模块构建比较伪版本里的提交时间或正式 tag 的版本序;两边判断不出先后(例如 `v0.2.0` 之前装的 `@main` 二进制,版本号以 `v0.0.0-` 开头,对上 tag 版本的新 wrapper)就不接管,错误文本给出旧 daemon 的 pid,手动停一次即可。Windows 没有对应的信号语义,保持显式报错,错误文本里同样带 pid 和一条可复制的修复命令。
 - **provider/降级 env 变了**:这是你改了配置意图,不是版本过期,wrapper 不会替你猜。它按配置指纹拒绝复用并明确报错,按提示重启 daemon 即生效。
 
 **升级不打断 IDE 会话**(Unix)。升级后,开着的 MCP 会话在下一次调用时发现 daemon 已换代,wrapper 就原地 exec 磁盘上的新版自身:进程号不变,标准流不断,触发的那条请求被保存下来由新进程重放,管线里排队的请求也一并带过去。你看到的只是一次正常应答。自愈失败时——比如磁盘二进制反而旧于 daemon——按原样返回可行动硬错,30 秒冷却防止 exec 打转。Windows 无 exec 语义,保持"重启 MCP 会话"提示。
