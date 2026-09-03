@@ -104,6 +104,51 @@ func takeoverTarget(wrapper buildinfo.Info, status daemon.Status) (int, error) {
 	return status.PID, nil
 }
 
+// wrapperOlderThanDaemon 判断 wrapper 构建是否旧于 daemon 构建,排序来源与
+// takeoverTarget 一致(先 vcs/伪版本时间戳,再 Go 模块版本序)。known=false
+// 表示两种来源都无法比较(如 v0.0.0 基底伪版本对正式 tag)。
+func wrapperOlderThanDaemon(wrapper buildinfo.Info, daemonBuild buildinfo.Info) (older bool, known bool) {
+	wrapperAt, wrapperErr := buildOrderTime(wrapper)
+	daemonAt, daemonErr := buildOrderTime(daemonBuild)
+	if wrapperErr == nil && daemonErr == nil {
+		return wrapperAt.Before(daemonAt), true
+	}
+	older, err := wrapperOlderByModuleVersion(wrapper.Version, daemonBuild.Version)
+	if err != nil {
+		return false, false
+	}
+	return older, true
+}
+
+// buildMismatchGuidance 是 wrapper/daemon 构建不一致且自动接管未发生时给
+// 用户的手工出路。外部反馈 2026-09-03(P16):旧 wrapper 连上刚升级的 daemon
+// 时,此前一律写"kill <daemon pid>",照做会打掉新 daemon、拖垮其他会话。
+// 指引按方向给:wrapper 更旧→重启会话或重装 wrapper,明确禁止停 daemon;
+// wrapper 更新→保留 kill 指引(接管不可用时的确定出路);无法排序→先重启
+// 会话(本机可能已装新 wrapper),同一错误在新会话复现才把 daemon 当旧方。
+func buildMismatchGuidance(wrapper buildinfo.Info, daemonBuild buildinfo.Info, pid int) string {
+	older, known := wrapperOlderThanDaemon(wrapper, daemonBuild)
+	switch {
+	case known && older:
+		return fmt.Sprintf("this MCP wrapper (%s) is older than the daemon (%s): restart the MCP session or reinstall openace-mcp so a current wrapper starts; do not stop the daemon, other sessions may depend on it", describeVersion(wrapper), describeVersion(daemonBuild))
+	case known:
+		return fmt.Sprintf("fix: stop the outdated daemon (kill %d) and retry", pid)
+	default:
+		return fmt.Sprintf("fix: restart the MCP session first (a newer wrapper may already be installed; wrapper %s, daemon %s cannot be ordered); if the error persists in a fresh session the daemon is the outdated side: stop it (kill %d) and retry", describeVersion(wrapper), describeVersion(daemonBuild), pid)
+	}
+}
+
+// describeVersion 给出一侧构建的可读标识(版本串,缺失时用 vcs 修订)。
+func describeVersion(info buildinfo.Info) string {
+	if info.Version != "" && info.Version != "(devel)" {
+		return info.Version
+	}
+	if info.VCSRevision != "" {
+		return info.VCSRevision
+	}
+	return "unknown build"
+}
+
 // describeBuildOrder 给出一侧构建在排序上的可用信息,用于拒绝时的说明。
 func describeBuildOrder(info buildinfo.Info, timeErr error) string {
 	if timeErr == nil {

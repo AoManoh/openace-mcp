@@ -143,8 +143,9 @@ func reusable(ctx context.Context, client *daemon.Client, requestedEngine string
 	}
 	if err := compatibleDaemonBuild(buildinfo.Current(), status.Build); err != nil {
 		// T5:携带 pid 的可复制修复指引——自动接管不适用(平台/顺序门/
-		// 手工模式)时,用户至少拿到一条确定的手工出路。
-		return fmt.Errorf("openACE daemon at %s is not compatible with this MCP wrapper: %w; fix: stop the outdated daemon (kill %d) and retry", client.Endpoint(), err, status.PID)
+		// 手工模式)时,用户至少拿到一条确定的手工出路;指引按谁新谁旧
+		// 给(buildMismatchGuidance),旧 wrapper 不得被指引去停新 daemon。
+		return fmt.Errorf("openACE daemon at %s is not compatible with this MCP wrapper: %w; %s", client.Endpoint(), err, buildMismatchGuidance(buildinfo.Current(), status.Build, status.PID))
 	}
 	if err := compatibleEngine(requestedEngine, status.Engine); err != nil {
 		return fmt.Errorf("openACE daemon at %s is not compatible with this MCP wrapper: %w", client.Endpoint(), err)

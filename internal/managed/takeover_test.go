@@ -253,3 +253,49 @@ func TestTakeoverRefusesNonLoopbackEndpoint(t *testing.T) {
 		t.Fatalf("非 loopback endpoint 必须拒绝接管: %v", err)
 	}
 }
+
+// TestBuildMismatchGuidanceFollowsDirection(外部反馈 2026-09-03 P16):
+// 旧 wrapper(go run @main 的 08-26 伪版本)连上刚升级的 v0.3.0 daemon 时,
+// 此前的文案一律写"kill <daemon pid>"——照做会打掉新 daemon,其他会话
+// 跟着失效。指引必须按谁新谁旧给:wrapper 更旧→只说重启会话/升级
+// wrapper,禁止建议停 daemon;wrapper 更新→保留 kill 指引(自动接管
+// 不可用时的手工出路);无法排序→先重启会话,复现后才把 daemon 当旧方。
+func TestBuildMismatchGuidanceFollowsDirection(t *testing.T) {
+	newer := buildinfo.Info{Version: "v0.0.0-20260902100000-cccccccccccc", VCSRevision: "ccc", VCSTime: "2026-09-02T10:00:00Z"}
+	older := buildinfo.Info{Version: "v0.0.0-20260826103859-6b8b59b80877", VCSRevision: "6b8", VCSTime: "2026-08-26T10:38:59Z"}
+	cases := []struct {
+		name         string
+		wrapper      buildinfo.Info
+		daemon       buildinfo.Info
+		wantContains []string
+		wantAbsent   []string
+	}{
+		{"wrapper older by vcs time", older, newer,
+			[]string{"older than the daemon", "restart the MCP session", "do not stop the daemon"}, []string{"kill 4242"}},
+		{"wrapper older by module version (v0.2.0 tag vs v0.3.0 tag)", buildinfo.Info{Version: "v0.2.0"}, buildinfo.Info{Version: "v0.3.0"},
+			[]string{"older than the daemon", "restart the MCP session", "do not stop the daemon"}, []string{"kill 4242"}},
+		{"wrapper newer by vcs time", newer, older,
+			[]string{"kill 4242"}, []string{"older than the daemon"}},
+		{"unorderable: v0.0.0 pseudo wrapper vs tag daemon (mailing 2026-09-03)", buildinfo.Info{Version: "v0.0.0-20260826103859-6b8b59b80877"}, buildinfo.Info{Version: "v0.3.0"},
+			[]string{"restart the MCP session first", "if the error persists", "kill 4242"}, []string{"older than the daemon"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildMismatchGuidance(tc.wrapper, tc.daemon, 4242)
+			for _, want := range tc.wantContains {
+				if !strings.Contains(got, want) {
+					t.Fatalf("指引缺少 %q:\n%s", want, got)
+				}
+			}
+			for _, absent := range tc.wantAbsent {
+				if strings.Contains(got, absent) {
+					t.Fatalf("指引不应包含 %q:\n%s", absent, got)
+				}
+			}
+			if strings.Contains(got, "kill 4242") && strings.Contains(got, "restart the MCP session first") &&
+				strings.Index(got, "restart the MCP session first") > strings.Index(got, "kill 4242") {
+				t.Fatalf("无法排序时重启会话必须排在 kill 之前:\n%s", got)
+			}
+		})
+	}
+}
