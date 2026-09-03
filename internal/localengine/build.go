@@ -60,6 +60,37 @@ func garbageRatio(manifest *index.Manifest) float64 {
 	return float64(dead) / float64(total)
 }
 
+// projectedGarbageRatio 投影"在 previous 之上做 delta 发布后"的死 chunk
+// 占比:死量 = previous 既有死 chunk + 本次被删除文件(含被 ignore 规则新
+// 排除的文件)的全部 chunk,分母仍是既有 segment 总 chunk 数。
+//
+// 为什么按结果而非按 previous 裁决(2026-09-03 评测观察):.openaceignore
+// 变更让 57% 已索引文件出局,该次构建没有任何新增 chunk,garbageRatio
+// (previous)=0 于是走 delta,发布出"旧单段 + 33,009 tombstone"(垃圾
+// 57.1%)却不触发 compaction;查询按段取 top-N 后再过滤死 chunk 且不回填,
+// 有效召回深度随之缩水,直到某次内容变更才碰巧合并。纯删除构建不新增段,
+// 本投影即精确结果;removed 为空时与 garbageRatio(previous) 相等,既有
+// 裁决语义不变。变更文件的旧版 chunk 与新 chunk 在切分前不可知,一律不
+// 计入,与既有口径一致。
+func projectedGarbageRatio(previous *index.Manifest, removed []string) float64 {
+	total := 0
+	for _, segment := range previous.Segments {
+		total += segment.Counts.Chunks
+	}
+	if total == 0 {
+		return 0
+	}
+	live := previous.Counts.Chunks
+	for _, path := range removed {
+		live -= previous.Files[path].ChunkCount
+	}
+	dead := total - live
+	if dead <= 0 {
+		return 0
+	}
+	return float64(dead) / float64(total)
+}
+
 // runBuild 执行一次索引构建：按 D1/D3 在 delta（变更量成本，G1）与
 // full（首建/自愈/compaction）两条路径间裁决。全程在 staging 内进行，
 // 任何失败/取消都丢弃 staging（暗坑 K2/K16）。
@@ -133,16 +164,24 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 
 	// 模式裁决（D1/D3）：delta 仅用于 v2 前身之上的内容变更；首建、
 	// 自愈（词法/向量）、语义补齐（fill）与 compaction 走全量路径。
+	// 垃圾占比按本次 delta 发布后的结果投影(含被删除文件的 chunk),
+	// 纯删除构建越阈同样合并——只看 previous 会让它永不触发
+	// (2026-09-03 评测观察,见 projectedGarbageRatio)。
+	garbage := 0.0
+	if previous != nil {
+		_, removed, _ := diffDeltaAssets(previous, assets)
+		garbage = projectedGarbageRatio(previous, removed)
+	}
 	useDelta := previous != nil && contentChanged &&
 		previous.SchemaVersion == index.ManifestSchemaV2 &&
 		!needsLexicalRebuild && !repairRequested &&
 		len(previous.Segments) < compactSegmentThreshold &&
-		garbageRatio(previous) < compactGarbageRatio
+		garbage < compactGarbageRatio
 	if useDelta {
 		return e.buildDelta(ctx, store, status, root, workspaceKey, previous, assets)
 	}
 	return e.buildFull(ctx, store, status, root, workspaceKey, previous, assets, contentChanged, needsLexicalRebuild,
-		fullBuildReason(previous, contentChanged, needsLexicalRebuild, repairRequested))
+		fullBuildReason(previous, contentChanged, needsLexicalRebuild, repairRequested, garbage))
 }
 
 // publishLexicalInterim 发布冷仓词法中间 revision:与最终发布同一
@@ -195,8 +234,9 @@ func (e *Engine) publishLexicalInterim(ctx context.Context, store *index.Store, 
 // fullBuildReason 给出全量路径的成因标签(灰度反馈四 §6.1:构建原因
 // 不可见时,delta 报表异常会被解读成"升级触发全量重嵌"级别的虚惊;
 // 原因随 Result.BuildMode 外显,调用方无需从进度条反猜)。判定顺序与
-// runBuild 的 useDelta 条件评估语义一致。
-func fullBuildReason(previous *index.Manifest, contentChanged bool, needsLexicalRebuild bool, repairRequested bool) string {
+// runBuild 的 useDelta 条件评估语义一致;garbage 是 runBuild 已算出的
+// 结果投影占比(projectedGarbageRatio),纯删除越阈同样标为 compaction。
+func fullBuildReason(previous *index.Manifest, contentChanged bool, needsLexicalRebuild bool, repairRequested bool, garbage float64) string {
 	switch {
 	case previous == nil:
 		return "full:first-build"
@@ -208,7 +248,7 @@ func fullBuildReason(previous *index.Manifest, contentChanged bool, needsLexical
 		return "full:schema-upgrade"
 	case contentChanged && len(previous.Segments) >= compactSegmentThreshold:
 		return "full:compaction-segments"
-	case contentChanged && garbageRatio(previous) >= compactGarbageRatio:
+	case contentChanged && garbage >= compactGarbageRatio:
 		return "full:compaction-garbage"
 	case !contentChanged:
 		return "full:semantic-fill"

@@ -62,12 +62,14 @@ func TestCompactionAtSegmentThreshold(t *testing.T) {
 	}
 }
 
-// TestCompactionOnGarbageRatio 是 D3 第二触发条件：删除让死 chunk 占比
-// 超阈值后，下一次内容变更走全量合并。
+// TestCompactionOnGarbageRatio 是 D3 第二触发条件：previous 死 chunk 占比
+// 已越阈时，下一次内容变更走全量合并。越阈状态经"阈下删除 + 改写"累积:
+// 纯删除一步越阈的构建自身即触发 compaction(见
+// TestCompactionOnDeletionOnlyBuild),不再留下越阈的 revision。
 func TestCompactionOnGarbageRatio(t *testing.T) {
 	e := newTestEngine(t)
 	root := newFixtureWorkspace(t)
-	// 追加三个可删除文件，撑大基段。
+	// 追加三个可删除文件，撑大基段（共 8 chunk）。
 	for i := 0; i < 3; i++ {
 		writeFixture(t, root, fmt.Sprintf("extra%d.py", i), fmt.Sprintf("def extra%d():\n    return %d\n", i, i))
 	}
@@ -79,8 +81,8 @@ func TestCompactionOnGarbageRatio(t *testing.T) {
 		t.Fatalf("首建单段: %d", len(base.Segments))
 	}
 
-	// 删除大部分文件（manifest-only delta）→ 垃圾占比越阈。
-	for _, name := range []string{"extra0.py", "extra1.py", "extra2.py", "README.md", "util.py"} {
+	// 阈下删除（3/8，manifest-only delta，留下 tombstone）。
+	for _, name := range []string{"extra0.py", "extra1.py", "extra2.py"} {
 		if err := os.Remove(rootJoin(root, name)); err != nil {
 			t.Fatal(err)
 		}
@@ -88,15 +90,27 @@ func TestCompactionOnGarbageRatio(t *testing.T) {
 	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
 		t.Fatal(err)
 	}
-	afterDelete, _ := loadActiveManifest(t, e, root)
-	if garbageRatio(afterDelete) < compactGarbageRatio {
-		t.Fatalf("场景应超垃圾阈值: %.2f", garbageRatio(afterDelete))
+	// 改写两个单 chunk 文件：旧版成死 chunk，累计 5/10 越阈（本次构建按
+	// previous 口径 37.5% 仍走 delta）。
+	writeFixture(t, root, "README.md", "# Demo App\n\nRewritten documentation.\n")
+	writeFixture(t, root, "util.py", "def parse_config(path):\n    return None  # rewritten\n")
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatal(err)
+	}
+	overThreshold, _ := loadActiveManifest(t, e, root)
+	if garbageRatio(overThreshold) < compactGarbageRatio || len(overThreshold.Segments) != 2 || len(overThreshold.Tombstones) != 3 {
+		t.Fatalf("场景应超垃圾阈值且仍为 delta 链: garbage=%.2f segments=%d tombstones=%v",
+			garbageRatio(overThreshold), len(overThreshold.Segments), overThreshold.Tombstones)
 	}
 
 	// 下一次内容变更：应走全量而非 delta。
 	writeFixture(t, root, "main.go", fixtureMainGo+"\n// trigger compaction\n")
-	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
+	result, err := e.Sync(context.Background(), syncRequest(root))
+	if err != nil {
 		t.Fatal(err)
+	}
+	if result.BuildMode != "full:compaction-garbage" {
+		t.Fatalf("成因应外显为垃圾占比 compaction: %q", result.BuildMode)
 	}
 	compacted, _ := loadActiveManifest(t, e, root)
 	if len(compacted.Segments) != 1 {
