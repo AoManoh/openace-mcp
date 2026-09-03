@@ -121,3 +121,6 @@ $RECYCLE.BIN/
 # public root document is intended.
 /*.md
 !/README.md
+
+# Devin CLI skills adapter directory: local tool configuration, never public.
+/.devin/
