@@ -84,6 +84,14 @@ type SearchRequest struct {
 	// PathPrefix 可选索引相对路径前缀(如 internal/localengine):
 	// 融合后/rerank 前过滤候选,用于 repo_map 定向后的子树检索。
 	PathPrefix string
+	// ArtifactKind 是调用方明示的产物类型:""/"any"=不分组(现行为);
+	// "code"/"tests"/"docs"=精排之后把该类型候选按原相对顺序排到最前,其余
+	// 候选原序跟随,不丢弃任何候选。类型按路径机械规则判定(见
+	// localengine.artifactKind),不做意图推断。非法取值按请求类错误拒绝。
+	// 依据:2026-09-03 D1 H1 实验——django 400 条"找实现"查询,精排把测试/
+	// 文档排在实现之上,前五命中率因此低 8.75pp;伤害在精排窗口之内,只需
+	// 输出层按类型分组即可拿回。
+	ArtifactKind string
 }
 
 // RepoMapRequest 是仓库地图请求(repo_map R1,D4):快照只读,冷仓

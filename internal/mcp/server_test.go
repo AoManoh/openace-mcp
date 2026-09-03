@@ -775,3 +775,39 @@ func runMCP(t *testing.T, server *Server, line string) string {
 	}
 	return out.String()
 }
+
+// TestArtifactKindReachesEngineAndRejectsUnknown(D1 H1 2026-09-03):调用方
+// 明示 artifact_kind 时四个检索工具都把它透传给引擎(同步经 SearchRequest,
+// 异步经 TaskRequest);非法取值在 wrapper 侧即拒绝;schema 以 enum 公开且
+// 默认 any。
+func TestArtifactKindReachesEngineAndRejectsUnknown(t *testing.T) {
+	syncer := &capturingMultiSyncer{}
+	runMCP(t, NewServer(syncer), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"/tmp/workspace","information_request":"find code","artifact_kind":"code"}}}`)
+	runMCP(t, NewServer(syncer), `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"multi_codebase_retrieval","arguments":{"directory_paths":["/tmp/one","/tmp/two"],"information_request":"find code","artifact_kind":"docs"}}}`)
+	syncer.mu.Lock()
+	kinds := make([]string, 0, len(syncer.requests))
+	for _, req := range syncer.requests {
+		kinds = append(kinds, req.ArtifactKind)
+	}
+	syncer.mu.Unlock()
+	if strings.Join(kinds, ",") != "code,docs,docs" {
+		t.Fatalf("artifact_kind 应逐请求透传: %v", kinds)
+	}
+	out := runMCP(t, NewServer(fakeSyncer{}), `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"directory_path":"/tmp/workspace","information_request":"find code","artifact_kind":"documentation"}}}`)
+	if !strings.Contains(out, "invalid artifact_kind") || !strings.Contains(out, `"isError":true`) {
+		t.Fatalf("非法 artifact_kind 应在 wrapper 侧拒绝: %s", out)
+	}
+	out = runMCP(t, NewServer(fakeTasker{}), `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"start_multi_codebase_retrieval","arguments":{"directory_paths":["/tmp/one"],"information_request":"find code","artifact_kind":"TESTS"}}}`)
+	if !strings.Contains(out, "invalid artifact_kind") || !strings.Contains(out, `"isError":true`) {
+		t.Fatalf("异步工具的非法 artifact_kind 应在提交时拒绝: %s", out)
+	}
+	for _, tool := range []map[string]any{retrievalTool(), multiRetrievalTool(), startRetrievalTool(), startMultiRetrievalTool()} {
+		raw, _ := json.Marshal(tool)
+		if !strings.Contains(string(raw), `"artifact_kind"`) || !strings.Contains(string(raw), `"enum":["any","code","tests","docs"]`) {
+			t.Fatalf("检索工具 %v 的 schema 应以 enum 公开 artifact_kind: %s", tool["name"], raw)
+		}
+	}
+	if !strings.Contains(informationRequestDescription, "ONLY when the user is explicitly after one artifact type") || !strings.Contains(informationRequestDescription, "artifact_kind") {
+		t.Fatalf("information_request 描述应给出按意图加限定的规则并指向 artifact_kind: %s", informationRequestDescription)
+	}
+}

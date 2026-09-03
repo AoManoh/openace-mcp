@@ -169,6 +169,7 @@ func (c *Client) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 		FullResults:        req.FullResults,
 		Detail:             req.Detail,
 		PathPrefix:         req.PathPrefix,
+		ArtifactKind:       req.ArtifactKind,
 	}, &result)
 	return result, err
 }

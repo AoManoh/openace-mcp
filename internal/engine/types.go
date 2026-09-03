@@ -123,6 +123,9 @@ type Hit struct {
 	Reranked    bool    `json:"reranked,omitempty"`
 	RerankScore float64 `json:"rerank_score,omitempty"`
 	Source      string  `json:"source,omitempty"`
+	// Kind 是按路径规则判定的产物类型(code/tests/docs),让调用方看见
+	// SearchRequest.ArtifactKind 分组所依据的分类结果;误分只影响分组次序。
+	Kind string `json:"kind,omitempty"`
 }
 
 // DisplayStats 是单次检索的展示完整性统计(框架 18.2)。检索结果不再按

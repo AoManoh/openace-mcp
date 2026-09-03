@@ -60,6 +60,8 @@ type retrieveRequest struct {
 	InformationRequest string `json:"information_request"`
 	// FullResults 见 TaskRequest.FullResults;恒序列化,0 合法。
 	FullResults int `json:"full_results"`
+	// ArtifactKind 见 TaskRequest.ArtifactKind。
+	ArtifactKind string `json:"artifact_kind,omitempty"`
 	// Detail 是输出详略(框架 18.2/S2):""/"full"=内容块;"paths"=
 	// 只回 path:range 头行。非法值由引擎按请求类错误拒绝(400)。
 	Detail     string `json:"detail,omitempty"`
@@ -313,7 +315,7 @@ func (s *Server) retrieve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "information_request is required")
 		return
 	}
-	result, err := s.runRetrieve(r.Context(), req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, req.FullResults, req.Detail, req.PathPrefix)
+	result, err := s.runRetrieve(r.Context(), req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, req.FullResults, req.Detail, req.PathPrefix, req.ArtifactKind)
 	if err != nil {
 		writeUpstreamError(w, err)
 		return
@@ -574,9 +576,9 @@ func (s *Server) runTask(ctx context.Context, req TaskRequest) (engine.Result, e
 	case TaskKindSync:
 		result, err = s.runSync(ctx, req.DirectoryPath, req.ProviderProfileID)
 	case TaskKindRetrieve:
-		result, err = s.runRetrieve(ctx, req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, req.FullResults, req.Detail, req.PathPrefix)
+		result, err = s.runRetrieve(ctx, req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, req.FullResults, req.Detail, req.PathPrefix, req.ArtifactKind)
 	case TaskKindMultiRetrieve:
-		result, err = s.runMultiRetrieve(ctx, req.DirectoryPaths, req.ProviderProfileID, req.InformationRequest, req.FullResults, req.Detail, req.PathPrefix)
+		result, err = s.runMultiRetrieve(ctx, req.DirectoryPaths, req.ProviderProfileID, req.InformationRequest, req.FullResults, req.Detail, req.PathPrefix, req.ArtifactKind)
 	default:
 		return engine.Result{}, fmt.Errorf("unknown task kind: %s", req.Kind)
 	}
@@ -595,17 +597,18 @@ func (s *Server) runSync(ctx context.Context, dir string, providerProfileID stri
 	}})
 }
 
-func (s *Server) runRetrieve(ctx context.Context, dir string, providerProfileID string, query string, fullResults int, detail string, pathPrefix string) (engine.Result, error) {
+func (s *Server) runRetrieve(ctx context.Context, dir string, providerProfileID string, query string, fullResults int, detail string, pathPrefix string, artifactKind string) (engine.Result, error) {
 	s.observeWorkspace(dir, providerProfileID)
 	return s.service.Search(ctx, engine.SearchRequest{
 		Workspace: engine.WorkspaceRef{
 			DirectoryPath:     dir,
 			ProviderProfileID: strings.TrimSpace(providerProfileID),
 		},
-		Query:       query,
-		FullResults: fullResults,
-		Detail:      detail,
-		PathPrefix:  pathPrefix,
+		Query:        query,
+		FullResults:  fullResults,
+		Detail:       detail,
+		PathPrefix:   pathPrefix,
+		ArtifactKind: artifactKind,
 	})
 }
 
@@ -621,7 +624,7 @@ type multiRetrieveResult struct {
 	err           error
 }
 
-func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, providerProfileID string, query string, fullResults int, detail string, pathPrefix string) (engine.Result, error) {
+func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, providerProfileID string, query string, fullResults int, detail string, pathPrefix string, artifactKind string) (engine.Result, error) {
 	results := make([]multiRetrieveResult, len(dirs))
 	var wg sync.WaitGroup
 	for i, dir := range dirs {
@@ -630,7 +633,7 @@ func (s *Server) runMultiRetrieve(ctx context.Context, dirs []string, providerPr
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := s.runRetrieve(ctx, dir, providerProfileID, query, fullResults, detail, pathPrefix)
+			result, err := s.runRetrieve(ctx, dir, providerProfileID, query, fullResults, detail, pathPrefix, artifactKind)
 			results[i].result = result
 			results[i].err = err
 		}()

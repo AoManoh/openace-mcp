@@ -168,6 +168,9 @@ type retrievalArgs struct {
 	// 旧调用方仍传该字段时按未知字段忽略。
 	Detail     string `json:"detail,omitempty"`
 	PathPrefix string `json:"path_prefix,omitempty"`
+	// ArtifactKind 是调用方明示的产物类型(any/code/tests/docs):精排之后把
+	// 该类型候选排前、其余原序跟随,不丢弃;省略=any。不做意图推断。
+	ArtifactKind string `json:"artifact_kind,omitempty"`
 }
 
 type multiRetrievalArgs struct {
@@ -176,8 +179,9 @@ type multiRetrievalArgs struct {
 	ProviderProfileID  string   `json:"provider_profile_id,omitempty"`
 	// Detail/PathPrefix 与单仓 retrievalArgs 同契约,应用到每个 workspace
 	// (P0 修复:schema 一直公开这两个参数,实现却静默丢弃)。
-	Detail     string `json:"detail,omitempty"`
-	PathPrefix string `json:"path_prefix,omitempty"`
+	Detail       string `json:"detail,omitempty"`
+	PathPrefix   string `json:"path_prefix,omitempty"`
+	ArtifactKind string `json:"artifact_kind,omitempty"`
 }
 
 type repoMapArgs struct {
@@ -511,7 +515,7 @@ func (s *Server) handleRetrieval(ctx context.Context, id *json.RawMessage, rawAr
 	}
 	toolCtx, cancel := toolTimeoutContext(ctx)
 	defer cancel()
-	result, err := s.retrieve(toolCtx, args.DirectoryPath, args.ProviderProfileID, args.InformationRequest, args.Detail, args.PathPrefix)
+	result, err := s.retrieve(toolCtx, args.DirectoryPath, args.ProviderProfileID, args.InformationRequest, args.Detail, args.PathPrefix, args.ArtifactKind)
 	if err != nil {
 		return toolError(id, err.Error())
 	}
@@ -662,8 +666,12 @@ func (s *Server) handleMultiRetrieval(ctx context.Context, id *json.RawMessage, 
 	args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
 	args.Detail = strings.TrimSpace(args.Detail)
 	args.PathPrefix = strings.TrimSpace(args.PathPrefix)
+	args.ArtifactKind = strings.TrimSpace(args.ArtifactKind)
 	if args.InformationRequest == "" {
 		return toolError(id, "information_request is required")
+	}
+	if err := validateArtifactKind(args.ArtifactKind); err != nil {
+		return toolError(id, err.Error())
 	}
 	paths, err := normalizeDirectoryPaths(args.DirectoryPaths)
 	if err != nil {
@@ -671,7 +679,7 @@ func (s *Server) handleMultiRetrieval(ctx context.Context, id *json.RawMessage, 
 	}
 	toolCtx, cancel := toolTimeoutContext(ctx)
 	defer cancel()
-	results := s.retrieveMultiple(toolCtx, paths, args.ProviderProfileID, args.InformationRequest, args.Detail, args.PathPrefix)
+	results := s.retrieveMultiple(toolCtx, paths, args.ProviderProfileID, args.InformationRequest, args.Detail, args.PathPrefix, args.ArtifactKind)
 	status := summarizeMultiRetrievalResults(args.ProviderProfileID, results)
 	text := formatMultiRetrievalResults(results, status)
 	structured := map[string]any{"multi_status": status}
@@ -748,6 +756,7 @@ func (s *Server) handleStartRetrieval(ctx context.Context, id *json.RawMessage, 
 		FullResults:        s.fullResults,
 		Detail:             args.Detail,
 		PathPrefix:         args.PathPrefix,
+		ArtifactKind:       args.ArtifactKind,
 	})
 	if err != nil {
 		return toolError(id, err.Error())
@@ -767,8 +776,12 @@ func (s *Server) handleStartMultiRetrieval(ctx context.Context, id *json.RawMess
 	args.ProviderProfileID = strings.TrimSpace(args.ProviderProfileID)
 	args.Detail = strings.TrimSpace(args.Detail)
 	args.PathPrefix = strings.TrimSpace(args.PathPrefix)
+	args.ArtifactKind = strings.TrimSpace(args.ArtifactKind)
 	if args.InformationRequest == "" {
 		return toolError(id, "information_request is required")
+	}
+	if err := validateArtifactKind(args.ArtifactKind); err != nil {
+		return toolError(id, err.Error())
 	}
 	paths, err := normalizeDirectoryPaths(args.DirectoryPaths)
 	if err != nil {
@@ -784,6 +797,7 @@ func (s *Server) handleStartMultiRetrieval(ctx context.Context, id *json.RawMess
 		FullResults:        s.fullResults,
 		Detail:             args.Detail,
 		PathPrefix:         args.PathPrefix,
+		ArtifactKind:       args.ArtifactKind,
 	})
 	if err != nil {
 		return toolError(id, err.Error())
@@ -941,16 +955,17 @@ type multiRetrievalResult struct {
 	SemanticCoverage string
 }
 
-func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID string, query string, detail string, pathPrefix string) (engine.Result, error) {
+func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID string, query string, detail string, pathPrefix string, artifactKind string) (engine.Result, error) {
 	return s.service.Search(ctx, engine.SearchRequest{
 		Workspace: engine.WorkspaceRef{
 			DirectoryPath:     dir,
 			ProviderProfileID: strings.TrimSpace(providerProfileID),
 		},
-		Query:       query,
-		FullResults: s.fullResults,
-		Detail:      detail,
-		PathPrefix:  pathPrefix,
+		Query:        query,
+		FullResults:  s.fullResults,
+		Detail:       detail,
+		PathPrefix:   pathPrefix,
+		ArtifactKind: artifactKind,
 	})
 }
 
@@ -978,7 +993,18 @@ func normalizeRetrievalArgs(args *retrievalArgs) error {
 	if args.DirectoryPath == "" {
 		return fmt.Errorf("directory_path is required")
 	}
-	return nil
+	args.ArtifactKind = strings.TrimSpace(args.ArtifactKind)
+	return validateArtifactKind(args.ArtifactKind)
+}
+
+// validateArtifactKind 在 wrapper 侧提前拒绝非法取值(异步任务也能在提交时
+// 报错,而不是等任务运行到引擎才失败);取值集合与引擎 parseArtifactKind 一致。
+func validateArtifactKind(value string) error {
+	switch value {
+	case "", "any", "code", "tests", "docs":
+		return nil
+	}
+	return fmt.Errorf("invalid artifact_kind %q; use any, code, tests or docs", value)
 }
 
 func validateMaxOutputLength(value int) error {
@@ -1009,7 +1035,7 @@ func normalizeDirectoryPaths(paths []string) ([]string, error) {
 	return normalized, nil
 }
 
-func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerProfileID string, query string, detail string, pathPrefix string) []multiRetrievalResult {
+func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerProfileID string, query string, detail string, pathPrefix string, artifactKind string) []multiRetrievalResult {
 	results := make([]multiRetrievalResult, len(paths))
 	var wg sync.WaitGroup
 	for i, path := range paths {
@@ -1018,7 +1044,7 @@ func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerP
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := s.retrieve(ctx, path, providerProfileID, query, detail, pathPrefix)
+			result, err := s.retrieve(ctx, path, providerProfileID, query, detail, pathPrefix, artifactKind)
 			if err != nil {
 				results[i].Error = err.Error()
 				return
@@ -1162,12 +1188,17 @@ const pathPrefixDescription = "Optional indexed relative path prefix (for exampl
 // 光谱的参数化位:Anthropic response_format enum 同型)。
 const detailDescription = "Output detail: \"full\" (default) returns the top-ranked results with source content and lists every remaining candidate as a `## path:start-end symbol` header line (how many get content is a user-side setting, OPENACE_FULL_RESULTS, default 20); \"paths\" returns header lines only so you can Read the files yourself — fresher (reads hit the live disk) and far cheaper in tokens, at the cost of one more round trip. Nothing is truncated by a byte budget in either mode."
 
+// artifactKindDescription 是 artifact_kind 参数契约(D1 H1 实验 2026-09-03:
+// 找实现的查询里精排把测试/文档排在实现之上,前五命中率低 8.75pp;伤害在
+// 精排窗口之内,输出层按类型分组即可拿回)。默认 any=现行为;不猜意图。
+const artifactKindDescription = "Optional. Set ONLY when the user explicitly wants one kind of file: \"code\" (implementation), \"tests\", or \"docs\" (markdown/rst/txt, docs/ trees, README/CHANGELOG). Results of that kind are listed first in their ranked order and every other candidate follows; nothing is dropped. Default \"any\" keeps the plain ranked order — use it for general or conceptual questions. Kinds are decided by file path rules and shown per result as `kind`."
+
 // maxOutputLengthDescription 是 repo_map 的 max_output_length 参数契约。
 // 检索工具已不再有输出字节预算(2026-09-02 用户裁决);repo_map 的地图
 // 体量仍按字节预算裁剪,截断时正文携带标记与 focus 续取提示。
 const maxOutputLengthDescription = "Optional map size budget in BYTES (default 20000, max 1000000). OMIT this unless the user explicitly wants a smaller map: when the map is truncated a marker reports how many files were shown and suggests focus for a subtree."
 
-const informationRequestDescription = "A complete, specific description of what to find. Include: (1) the purpose or behavior you seek, in a full sentence; (2) exact identifiers if known (function/class/config key names, keep original casing); (3) artifact type hints when relevant (config file, test, docs). Preserve distinctive terms from the user's request verbatim; do not translate identifiers. Good: \"where is the retry backoff policy for embedding provider requests implemented\". Bad: \"retry\"."
+const informationRequestDescription = "A complete, specific description of what to find. Include: (1) the purpose or behavior you seek, in a full sentence; (2) exact identifiers if known (function/class/config key names, keep original casing); (3) ONLY when the user is explicitly after one artifact type, say so in words — e.g. append \"implementation code only, not documentation or tests\" when they want the implementation, or \"documentation only\" / \"tests only\" — and also set `artifact_kind`; do not add such qualifiers for general or conceptual questions. Preserve distinctive terms from the user's request verbatim; do not translate identifiers. Good: \"where is the retry backoff policy for embedding provider requests implemented — implementation code only, not documentation or tests\". Bad: \"retry\"."
 
 func retrievalTool() map[string]any {
 	return map[string]any{
@@ -1181,6 +1212,7 @@ func retrievalTool() map[string]any {
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
 				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
+				"artifact_kind":       map[string]any{"type": "string", "enum": []string{"any", "code", "tests", "docs"}, "description": artifactKindDescription},
 			},
 			"required": []string{"information_request", "directory_path"},
 		},
@@ -1202,6 +1234,7 @@ func multiRetrievalTool() map[string]any {
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
 				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
+				"artifact_kind":       map[string]any{"type": "string", "enum": []string{"any", "code", "tests", "docs"}, "description": artifactKindDescription},
 			},
 			"required": []string{"information_request", "directory_paths"},
 		},
@@ -1235,6 +1268,7 @@ func startRetrievalTool() map[string]any {
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
 				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
+				"artifact_kind":       map[string]any{"type": "string", "enum": []string{"any", "code", "tests", "docs"}, "description": artifactKindDescription},
 			},
 			"required": []string{"information_request", "directory_path"},
 		},
@@ -1256,6 +1290,7 @@ func startMultiRetrievalTool() map[string]any {
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
 				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
 				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
+				"artifact_kind":       map[string]any{"type": "string", "enum": []string{"any", "code", "tests", "docs"}, "description": artifactKindDescription},
 			},
 			"required": []string{"information_request", "directory_paths"},
 		},

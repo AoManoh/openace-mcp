@@ -63,6 +63,9 @@ type TaskRequest struct {
 	// Detail 是输出详略(框架 18.2,与同步检索同契约)。
 	Detail     string `json:"detail,omitempty"`
 	PathPrefix string `json:"path_prefix,omitempty"`
+	// ArtifactKind 是调用方明示的产物类型(any/code/tests/docs),与同步检索
+	// 同契约,透传给引擎分组输出;非法值由引擎按请求类错误拒绝。
+	ArtifactKind string `json:"artifact_kind,omitempty"`
 }
 
 type TaskSnapshot struct {
@@ -77,6 +80,7 @@ type TaskSnapshot struct {
 	FullResults        int                   `json:"full_results"`
 	Detail             string                `json:"detail,omitempty"`
 	PathPrefix         string                `json:"path_prefix,omitempty"`
+	ArtifactKind       string                `json:"artifact_kind,omitempty"`
 	SubmittedAt        time.Time             `json:"submitted_at"`
 	StartedAt          *time.Time            `json:"started_at,omitempty"`
 	CompletedAt        *time.Time            `json:"completed_at,omitempty"`
@@ -225,6 +229,7 @@ func (s *TaskStore) Submit(req TaskRequest) (TaskSnapshot, error) {
 			FullResults:        normalized.FullResults,
 			Detail:             normalized.Detail,
 			PathPrefix:         normalized.PathPrefix,
+			ArtifactKind:       normalized.ArtifactKind,
 			SubmittedAt:        time.Now().UTC(),
 		},
 	}
@@ -815,6 +820,7 @@ func requestFromSnapshot(snapshot TaskSnapshot) TaskRequest {
 		FullResults:        snapshot.FullResults,
 		Detail:             snapshot.Detail,
 		PathPrefix:         snapshot.PathPrefix,
+		ArtifactKind:       snapshot.ArtifactKind,
 	}
 }
 
@@ -872,6 +878,7 @@ func normalizeTaskRequest(req TaskRequest) (TaskRequest, error) {
 	req.InformationRequest = strings.TrimSpace(req.InformationRequest)
 	req.Detail = strings.TrimSpace(req.Detail)
 	req.PathPrefix = strings.TrimSpace(req.PathPrefix)
+	req.ArtifactKind = strings.TrimSpace(req.ArtifactKind)
 	switch strings.TrimSpace(string(req.Kind)) {
 	case "sync", "sync_workspace", "sync-workspace":
 		req.Kind = TaskKindSync

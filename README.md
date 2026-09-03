@@ -178,6 +178,8 @@ MCP 客户端每次启动 agent 会话都会重新拉起 `command` 指定的进�
 
 **检索结果没有字节预算,也没有 `max_output_length` 参数。**默认(`detail=full`)回复的形状是:按排名前 N 个候选带源码正文,其后的每个候选一行 `## 路径:起止行 符号`,中间用一行 `-- remaining results listed as paths only; Read a file to see its content --` 隔开;精排窗口(前 50 个候选)之外的候选前另有一行 `-- results below were not reranked (fused order) --`。任何候选都不会被丢掉,AI 看标题决定是否用自己的 Read 工具展开。N 由**你**在 MCP 配置里设置,不是 AI 的调用参数:`OPENACE_FULL_RESULTS`,默认 20;AI 反馈"结果太长被客户端截断"就调小,反馈"总要多 Read 一轮"就调大;设 0 则全部只给标题行(等价于每次 `detail=paths`)。`detail=paths` 仍可由 AI 按需选择,只回标题行。本机实测(一次检索 79 个候选):默认 N=20 约 30 KB,N=5 约 13 KB,N=0 约 4 KB。
 
+**按产物类型分组:`artifact_kind`(可选,`any` / `code` / `tests` / `docs`)。**调用 AI 只在使用者明确要某一类文件时设置它:精排完成后,该类型的候选保持原相对顺序排到最前,其余候选按原序跟在后面,任何候选都不丢;每条结果带 `kind` 字段,分组依据可见。省略或 `any` 就是普通排名顺序,一个字节都不变。类型按路径机械规则判定,不猜意图:目录段 `test/`、`tests/`、`spec/`、`__tests__/`、`testdata/`,或文件名含 `_test.`、`.test.`、`.spec.`、以 `test_` 开头、以 `Test`/`Tests` 结尾 → `tests`;目录段 `doc/`、`docs/`、`documentation/`,或扩展名 `.md/.mdx/.rst/.adoc/.txt`,或文件名 `README*`/`CHANGELOG*` → `docs`;其余 → `code`。已知边界:框架自身的 `testing/` 目录算代码,代码目录里的 `.md` 算文档。依据:2026-09-03 在 django 快照上的 400 条"找实现"查询,精排把测试/文档排在实现之上,前五命中率因此低 8.75 个百分点;只在输出层把代码排前即可拿回(复算 +8.25 个百分点)。
+
 ## 运行模式
 
 | 模式 | 适合场景 | 说明 |

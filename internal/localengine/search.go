@@ -643,6 +643,10 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	if err != nil {
 		return retrieval{}, err
 	}
+	artifact, err := parseArtifactKind(req.ArtifactKind)
+	if err != nil {
+		return retrieval{}, err
+	}
 	timings := &engine.RetrievalTimings{}
 	started := time.Now()
 	handle, workspaceKey, syncResult, reasons, err := e.acquireQueryHandle(ctx, req.Workspace)
@@ -710,6 +714,15 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	if fragmentErr != nil {
 		e.releaseHandle(handle)
 		return retrieval{}, fragmentErr
+	}
+	// 产物类型分组(调用方明示 artifact_kind 时):放在精排与碎片门之后、
+	// 渲染之前,只改输出次序,不改召回/精排候选池,不丢弃候选。
+	if artifact != artifactAny {
+		ordered = groupByArtifactKind(handle, ordered, artifact)
+		if planLabel != "" {
+			planLabel += " "
+		}
+		planLabel += "artifact_kind=" + artifact
 	}
 
 	out := retrieval{
@@ -1164,6 +1177,94 @@ func anchorWithinWindow(ids []string, anchor string, window int) []string {
 	return ids
 }
 
+// 产物类型(artifact kind):按路径的机械规则把候选分为代码、测试、文档三类,
+// 供调用方经 SearchRequest.ArtifactKind 明示意图时分组输出。规则与 C2 实验
+// (2026-08-10)冻结的分类器一致;不做意图推断,不参与打分。
+const (
+	artifactAny   = "any"
+	artifactCode  = "code"
+	artifactTests = "tests"
+	artifactDocs  = "docs"
+)
+
+// parseArtifactKind 校验请求的产物类型:空/any=不分组;三个类型原样接受;
+// 其余按请求类错误拒绝(daemon 面 400,MCP 面工具错误),不静默回落。
+func parseArtifactKind(raw string) (string, error) {
+	switch strings.TrimSpace(raw) {
+	case "", artifactAny:
+		return artifactAny, nil
+	case artifactCode, artifactTests, artifactDocs:
+		return strings.TrimSpace(raw), nil
+	}
+	return "", engine.AsInvalidRequest(fmt.Errorf("invalid artifact_kind %q; use any, code, tests or docs", raw))
+}
+
+// artifactKind 按相对路径判定产物类型。tests 先于 docs 判定(tests/ 下的
+// README 归测试),目录段与文件名约定覆盖主流语言:tests?/、spec/、
+// __tests__/、testdata/ 目录;_test.、.test.、.spec. 中缀;test_ 前缀;
+// Test/Tests 文件名后缀(Java/C#/PHP)。docs:.md/.mdx/.rst/.adoc/.txt 扩展名,
+// docs?/、documentation/ 目录段,CHANGELOG*/README* 文件名。其余为 code。
+// 边界(已知、可接受):框架自身的 testing/ 目录不算测试;代码目录里的 .md
+// 算文档;误分只影响 artifact_kind 的分组次序,候选不会被隐藏。
+func artifactKind(relPath string) string {
+	lower := strings.ToLower(relPath)
+	segments := strings.Split(lower, "/")
+	base := segments[len(segments)-1]
+	for _, dir := range segments[:len(segments)-1] {
+		switch dir {
+		case "test", "tests", "spec", "__tests__", "testdata":
+			return artifactTests
+		}
+	}
+	stem := base
+	if dot := strings.LastIndex(base, "."); dot > 0 {
+		stem = base[:dot]
+	}
+	if strings.Contains(base, "_test.") || strings.Contains(base, ".test.") || strings.Contains(base, ".spec.") ||
+		strings.HasPrefix(base, "test_") || strings.HasSuffix(stem, "test") || strings.HasSuffix(stem, "tests") {
+		return artifactTests
+	}
+	for _, dir := range segments[:len(segments)-1] {
+		switch dir {
+		case "doc", "docs", "documentation":
+			return artifactDocs
+		}
+	}
+	for _, ext := range []string{".md", ".mdx", ".rst", ".adoc", ".txt"} {
+		if strings.HasSuffix(base, ext) {
+			return artifactDocs
+		}
+	}
+	if strings.HasPrefix(base, "changelog") || strings.HasPrefix(base, "readme") {
+		return artifactDocs
+	}
+	return artifactCode
+}
+
+// groupByArtifactKind 把请求类型的候选按原相对顺序排到最前,其余候选原序
+// 跟随;候选集合与数量不变。返回序重新按位置赋序分,使渲染排序(按序分)
+// 与分组序一致;reranked/rerankScore/source 逐条保留。any 原样返回。
+func groupByArtifactKind(handle *revisionHandle, ordered []rankedHit, kind string) []rankedHit {
+	if kind == artifactAny || kind == "" {
+		return ordered
+	}
+	head := make([]rankedHit, 0, len(ordered))
+	tail := make([]rankedHit, 0, len(ordered))
+	for _, hit := range ordered {
+		meta, ok := handle.chunks[hit.id]
+		if ok && artifactKind(meta.RelPath) == kind {
+			head = append(head, hit)
+		} else {
+			tail = append(tail, hit)
+		}
+	}
+	grouped := append(head, tail...)
+	for i := range grouped {
+		grouped[i].score = 1.0 / float64(i+1)
+	}
+	return grouped
+}
+
 // rankByPosition 把最终 ID 序转换为合成序分（1/(pos+1)），保证渲染合并
 // 后的跨块排序与最终排名一致（暗坑 K27 确定性）。
 func rankByPosition(ids []string) []rankedHit {
@@ -1461,14 +1562,27 @@ func renderHitsDetail(handle *revisionHandle, hits []rankedHit, fullResults int,
 	}
 	inventory := make([]engine.Hit, len(merged))
 	anyReranked := false
+	// 精排边界标记只在"所有精排块都在未精排块之前"时有意义;artifact_kind
+	// 分组会把未精排的目标类型候选提到精排块之前,此时不插标记,逐条
+	// reranked 字段仍如实携带。
+	cleanBoundary := true
+	seenUnreranked := false
 	for i, block := range merged {
 		inventory[i] = engine.Hit{
 			Path: block.record.RelPath, StartLine: block.record.StartLine,
 			EndLine: block.record.EndLine, Symbol: block.record.Symbol, Rank: i + 1, Shown: true,
 			Reranked: block.reranked, RerankScore: block.rerankScore, Source: block.source,
+			Kind: artifactKind(block.record.RelPath),
 		}
 		anyReranked = anyReranked || block.reranked
+		if block.reranked && seenUnreranked {
+			cleanBoundary = false
+		}
+		if !block.reranked {
+			seenUnreranked = true
+		}
 	}
+	anyReranked = anyReranked && cleanBoundary
 	numbered := renderLineNumbersEnabled()
 	var out strings.Builder
 	sawReranked, markedBoundary := false, false
