@@ -31,8 +31,13 @@ type EmbedPlan struct {
 	TotalChunks int
 	// UniqueKeys 是唯一 embedKey 数。
 	UniqueKeys int
-	// Reusable 是已有向量可复用数(active/previous revision ∪ journal)。
+	// Reusable 是已有向量可复用数(active/previous revision ∪ 兼容兄弟
+	// profile 子树 ∪ journal),口径与在线构建 embedRecords 步骤 1 一致。
 	Reusable int
+	// CrossProfileReusable 是 Reusable 中来自兄弟 profile 子树的份额
+	// (与 engine.Result.CrossProfileReused 同口径),让"当前子树为空却
+	// 零缺口"的计划可解释。
+	CrossProfileReusable int
 	// Rejected 是持久化拒绝集内的键数(病理内容,不再送 provider)。
 	Rejected int
 	// Pending 是本次导出的待嵌任务数(= 回调次数)。
@@ -70,8 +75,9 @@ var ErrSemanticRequired = errors.New("batch 工具需要已配置的 embedding p
 
 // PlanEmbedJobs 枚举工作区当前形态下的待嵌任务:与在线构建同源的扫描
 // 与切分(含 previous chunk 复用),同源的复用池判定(active/previous
-// revision → journal → 拒绝集),零 provider 调用、零 revision 变更。
-// 持跨进程写锁执行,防并发构建改写 journal 造成计划失真。
+// revision → 兼容兄弟 profile 子树 → journal → 拒绝集),零 provider
+// 调用、零 revision 变更。持跨进程写锁执行,防并发构建改写 journal 造成
+// 计划失真。
 func (e *Engine) PlanEmbedJobs(ctx context.Context, ref engine.WorkspaceRef, fn func(EmbedJob) error) (EmbedPlan, error) {
 	if err := rejectProfileID(ref); err != nil {
 		return EmbedPlan{}, err
@@ -100,7 +106,7 @@ func (e *Engine) PlanEmbedJobs(ctx context.Context, ref engine.WorkspaceRef, fn 
 		return EmbedPlan{}, err
 	}
 	plan.TotalChunks = len(records)
-	if err := e.tallyEmbedPlan(ctx, &plan, store, workspaceKey, previous, records, fn); err != nil {
+	if err := e.tallyEmbedPlan(ctx, &plan, store, root, workspaceKey, previous, records, fn); err != nil {
 		return EmbedPlan{}, err
 	}
 	return plan, nil
@@ -155,13 +161,25 @@ func (e *Engine) planLiveRecords(ctx context.Context, workspaceKey string, root 
 }
 
 // tallyEmbedPlan 按 embedKey 去重后对复用池与拒绝集归类计数(与
-// embedRecords 步骤 1/2 同源判定:active/previous revision → journal →
-// 拒绝集),pending 键回调 fn 导出待嵌任务。
-func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *index.Store, workspaceKey string, previous *index.Manifest, records []chunkRecord, fn func(EmbedJob) error) error {
+// embedRecords 步骤 1/2 同源判定:active/previous revision → 兼容兄弟
+// profile 子树 → journal → 拒绝集),pending 键回调 fn 导出待嵌任务。
+func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *index.Store, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, records []chunkRecord, fn func(EmbedJob) error) error {
 	var prior priorVectors
 	defer func() { prior.release() }()
 	if previous != nil {
 		prior = e.loadPriorVectors(store, previous, nil)
+	}
+	// 兄弟 profile 子树复用池必须与 buildFull 阶段 2.5 的门槛逐字一致
+	// (冷子树 / 语义未完整 / active 段物理不全时并入,完整现役 revision
+	// 不并入)。2026-09-03 评测误停:二进制 chunk profile 已升 v8 而缓存由
+	// v7 建成,v8 子树为空,计划面只看当前子树,报 57,650 个 chunk 缺向量,
+	// -sync-only 零费预检据此拒绝执行;同一形态下在线构建经
+	// mergeSiblingProfileVectors 按内容哈希从 v7 子树零费复用全部向量,
+	// 真实缺口为 0。计划面少算复用池 = 假阳性缺口 = 用户被迫放弃零费
+	// 路径或误判需重付。候选发现与身份匹配逻辑复用 profile_reuse.go,
+	// 此处不重写;并入的索引属主转移给 prior,随 defer 统一释放。
+	if previous == nil || !previous.SemanticComplete() || prior.activeLoadedSegments != prior.activeExpectedSegments {
+		e.mergeSiblingProfileVectors(store, root, &prior)
 	}
 	journal, err := e.journalFor(workspaceKey, store)
 	if err != nil {
@@ -185,6 +203,13 @@ func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *ind
 		}
 		if _, ok := prior.olderByHash[key]; ok {
 			plan.Reusable++
+			continue
+		}
+		// 优先级低于当前 active/previous、高于 journal,与 embedRecords
+		// 的 reuse 表填充顺序一致(crossProfileReused 只计未被现役覆盖的键)。
+		if _, ok := prior.crossProfileByHash[key]; ok {
+			plan.Reusable++
+			plan.CrossProfileReusable++
 			continue
 		}
 		if _, ok := journalKeys[key]; ok {
