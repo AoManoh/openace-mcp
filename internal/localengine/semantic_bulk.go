@@ -139,7 +139,7 @@ func (e *Engine) bulkEmbedMissing(ctx context.Context, journal *index.Journal, s
 	// 与"已创建但响应丢失"。自动重提会让同一段输入计费两次，所以这里
 	// 停下来交给人工核对。
 	if intent := state.PendingIntent; intent != nil {
-		return fmt.Errorf("批车道存在未收尾的提交意向(%d 输入, keys_sha256=%s, 记录于 %s):请到 provider 控制台核对该时刻附近的批作业——不存在则删除 %s 中的 pending_intent 字段后重跑;存在则把该作业的 id/input_file_id/keys 手工补入 jobs 数组后重跑续轮询。引擎不自动重提该段(防双份计费)",
+		return fmt.Errorf("Batch API 路径存在未收尾的提交意向(%d 输入, keys_sha256=%s, 记录于 %s):请到 provider 控制台核对该时刻附近的批作业——不存在则删除 %s 中的 pending_intent 字段后重跑;存在则把该作业的 id/input_file_id/keys 手工补入 jobs 数组后重跑续轮询。引擎不自动重提该段(防双份计费)",
 			intent.Count, intent.KeysSHA256, intent.CreatedAt.Format(time.RFC3339), statePath)
 	}
 
@@ -175,7 +175,7 @@ func (e *Engine) bulkEmbedMissing(ctx context.Context, journal *index.Journal, s
 		}
 		job, err := e.embedClient.BulkSubmit(ctx, segKeys, segTexts)
 		if err != nil {
-			return fmt.Errorf("批车道提交失败,且无法确认服务端是否已创建作业(意向已留档,重跑会显式停在核对步;已登记的 %d 个作业不受影响): %w", len(state.Jobs), err)
+			return fmt.Errorf("Batch API 提交失败,且未能确认服务端是否已创建作业(意向已留档,重跑会显式停在核对步;已登记的 %d 个作业不受影响): %w", len(state.Jobs), err)
 		}
 		state.PendingIntent = nil
 		state.Jobs = append(state.Jobs, job)
@@ -259,7 +259,7 @@ func (e *Engine) bulkEmbedMissing(ctx context.Context, journal *index.Journal, s
 			if saveErr := saveBulkState(statePath, state); saveErr != nil {
 				return fmt.Errorf("批作业 %s 终态 %s 且状态落盘失败: %v (原始失败见前)", job.ID, jobStatus.Status, saveErr)
 			}
-			return fmt.Errorf("批作业 %s 终态 %s:已回收 %d 条已计费向量入 journal,其余 %d 条输入未产出向量;重跑 sync 只对缺口重新提交并计费(journal 复用保证已回收部分不重付),或改用同步车道(unset %s)",
+			return fmt.Errorf("批作业 %s 终态 %s:已回收 %d 条已计费向量入 journal,其余 %d 条输入未产出向量;重跑 sync 只对缺口重新提交并计费(journal 复用保证已回收部分不重付),或改用同步嵌入路径(unset %s)",
 				job.ID, jobStatus.Status, recovered, len(job.Keys)-recovered, embedding.EnvBatchAPI)
 		}
 		result, err := e.embedClient.BulkFetchResults(ctx, jobStatus, job.Keys)

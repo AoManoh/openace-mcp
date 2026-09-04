@@ -34,6 +34,14 @@ func TestArtifactKindPathRules(t *testing.T) {
 		"internal/index/manifest.go":               artifactCode,
 		"Documentation/kernel/api.txt":             artifactDocs,
 		"internal/reliability/classify_p2_test.go": artifactTests,
+		// 文件名以小写 test 结尾但不是测试的文件:后缀规则只认大写 Test/Tests
+		// (Java、C#、PHP 的类名约定),小写结尾不命中。
+		"pkg/latest.go":       artifactCode,
+		"apps/contest.py":     artifactCode,
+		"manifest":            artifactCode,
+		"internal/attest.go":  artifactCode,
+		"src/Latest.java":     artifactCode,
+		"src/RunnerTest.java": artifactTests,
 	}
 	for path, want := range cases {
 		if got := artifactKind(path); got != want {

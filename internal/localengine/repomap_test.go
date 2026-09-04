@@ -117,8 +117,10 @@ func TestRepoMapFocus(t *testing.T) {
 // 防单目录刷屏——反馈二 §3.4 预算错配教训)。
 func TestRepoMapBudgetAndQuota(t *testing.T) {
 	e, root := repoMapFixture(t)
+	// 275 字节放不下全部 5 个文件(281 字节),但容得下标题、两个目录各一个
+	// 文件以及截断提示行。
 	res, err := e.RepoMap(context.Background(), engine.RepoMapRequest{
-		Workspace: engine.WorkspaceRef{DirectoryPath: root}, MaxOutputLen: 260})
+		Workspace: engine.WorkspaceRef{DirectoryPath: root}, MaxOutputLen: 275})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +129,20 @@ func TestRepoMapBudgetAndQuota(t *testing.T) {
 	}
 	if !strings.Contains(res.Text, "[map truncated") {
 		t.Fatalf("超预算应带可行动截断标记:\n%s", res.Text)
+	}
+	// 截断提示行计入预算:此前提示行在预算判定之后追加,截断时输出会比
+	// max_output_length 多出约一行。
+	if len(res.Text) > 275 {
+		t.Fatalf("截断后的地图连同提示行应不超过预算 275 字节,实际 %d", len(res.Text))
+	}
+	// 预算小到连两个目录加提示行都放不下时,退掉文件也要把提示行放进预算。
+	tight, err := e.RepoMap(context.Background(), engine.RepoMapRequest{
+		Workspace: engine.WorkspaceRef{DirectoryPath: root}, MaxOutputLen: 260})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tight.Text) > 260 || !strings.Contains(tight.Text, "[map truncated") {
+		t.Fatalf("预算 260 字节下输出应不超过预算且带截断提示,实际 %d 字节:\n%s", len(tight.Text), tight.Text)
 	}
 }
 

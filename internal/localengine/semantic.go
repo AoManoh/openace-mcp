@@ -46,9 +46,6 @@ type semanticOutcome struct {
 	rejected int
 	// lastError 是最后一次失败的脱敏错误文本，进入 workspace_status。
 	lastError string
-	// backedOff 表示有批调用因熔断退避（provider 连续失败后暂停向它发请
-	// 求）被拒绝，此时后续批也不再投放。
-	backedOff bool
 }
 
 // improved 报告本次构建是否比 active revision 多覆盖了 chunk。内容未变的
@@ -104,19 +101,16 @@ type priorVectors struct {
 	// 的旧 chunk profile 子树，由 mergeSiblingProfileVectors 注入；优先级
 	// 低于 active/previous，只读复用。
 	crossProfileByHash map[string][]float32
-	// activeLoadedRows/activeLoadedSegments 是 active revision 实际通过校验
-	// 装载的行数与段数，activeExpectedRows/activeExpectedSegments 是其
-	// manifest 宣称的数量；两者不等说明 manifest 完整但向量文件损坏或缺
-	// 失。loadedRows 是两个 revision 合计装载（按行选读时为实际读出）的
-	// 行数。
+	// activeLoadedSegments 是 active revision 实际通过校验装载的段数，
+	// activeExpectedSegments 是其 manifest 宣称的段数；两者不等说明 manifest
+	// 完整但向量文件损坏或缺失，构建与嵌入计划据此决定是否并入旧切分版本
+	// 子树的向量。activeLoadedRows 与 loadedRows 分别是 active revision 与两个
+	// revision 合计装载（按行选读时为实际读出）的行数，只供测试核对装载策略，
+	// 生产代码不读。
 	activeLoadedRows       int
-	activeExpectedRows     int
 	activeLoadedSegments   int
 	activeExpectedSegments int
 	loadedRows             int
-	// activeIDs 是 active revision 中已持久化向量的 chunk ID 集合，两种
-	// 装载策略下都按全段填充。
-	activeIDs map[string]bool
 	// indexes 持有底层数据：整段装载时是 *vector.Index，各 byHash 表的值
 	// 是其数据的子切片，可能指向 mmap 页；按行选读时是 *vector.RowReader，
 	// 表值是独立拷贝。构建方用完 prior 必须调用 release，否则映射与文件
@@ -153,7 +147,6 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest, 
 		activeByHash:       map[string][]float32{},
 		olderByHash:        map[string][]float32{},
 		crossProfileByHash: map[string][]float32{},
-		activeIDs:          map[string]bool{},
 	}
 	dimension := e.embedCfg.Dimension
 	manifest := previous
@@ -161,7 +154,6 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest, 
 	loadedRows := 0
 	limit := e.vectorMaxResident // 0 表示不限（默认）；>0 来自 OPENACE_VECTOR_MEMORY_BUDGET 折算的行数
 	if previous != nil {
-		prior.activeExpectedRows = previous.VectorCount
 		for _, segment := range previous.Segments {
 			if segment.VectorsChecksum != "" {
 				prior.activeExpectedSegments++
@@ -199,7 +191,6 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest, 
 			}
 			for i, entry := range ix.Entries() {
 				if hop == 0 {
-					prior.activeIDs[entry.ID] = true
 					if _, ok := prior.activeByHash[entry.ContentHash]; !ok {
 						prior.activeByHash[entry.ContentHash] = ix.Row(i)
 					}
@@ -221,8 +212,8 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest, 
 }
 
 // loadPriorRowsSelective 是 loadPriorVectors 在 needed 非 nil 时对单个
-// segment 的处理：打开按行读取器，把段内全部 chunk ID 计入 activeIDs
-// （仅 hop 0），只对键命中 needed 且目标表尚无该键的行读取向量。返回累计
+// segment 的处理：打开按行读取器，只对键命中 needed 且目标表尚无该键的行
+// 读取向量。返回累计
 // 读出的行数。段打不开或某行读出损坏时跳过，与整段装载遇到损坏的处理
 // 一致，缺口由新嵌入补齐；累计行数达到内存预算即停止。
 func (e *Engine) loadPriorRowsSelective(prior *priorVectors, store *index.Store, segment index.SegmentRef, dimension int, hop int, needed map[string]bool, limit int, loadedRows int) int {
@@ -237,9 +228,6 @@ func (e *Engine) loadPriorRowsSelective(prior *priorVectors, store *index.Store,
 		prior.activeLoadedSegments++
 	}
 	for i, entry := range entries {
-		if hop == 0 {
-			prior.activeIDs[entry.ID] = true
-		}
 		if !needed[entry.ContentHash] {
 			continue
 		}
@@ -441,10 +429,9 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 					callErr := &reliability.CallError{}
 					if errors.As(err, &callErr) && callErr.Class == reliability.ClassBackoff {
 						// 熔断已进入退避，后续每一批都会被同样拒绝；取消
-						// workCtx 让已入队的批次立刻退出，不再逐批撞退避。
-						embedMu.Lock()
-						out.backedOff = true
-						embedMu.Unlock()
+						// workCtx 让已入队的批次立刻退出，不再逐批发出注定被
+						// 拒绝的请求。停止后续批与记录覆盖缺口都由这次取消和
+						// lastError 承担，不另设标记字段。
 						cancelWork()
 					}
 					continue

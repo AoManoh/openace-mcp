@@ -251,7 +251,7 @@ func TestLoadPriorVectorsDeduplicatesSharedSegments(t *testing.T) {
 }
 
 // 按行选读(delta 构建路径):只物化命中 needed 的行;完整性口径
-// (activeIDs/activeLoadedRows/activeLoadedSegments)保持全段语义,与
+// (activeLoadedRows/activeLoadedSegments)保持全段语义,与
 // 整段装载一致——否则 sibling 合并条件会把选读误判成物理损坏。
 func TestLoadPriorVectorsSelectiveMaterializesOnlyNeededRows(t *testing.T) {
 	const dim = 8
@@ -293,9 +293,6 @@ func TestLoadPriorVectorsSelectiveMaterializesOnlyNeededRows(t *testing.T) {
 	}
 	if got := selective.activeByHash[pickKey]; !reflect.DeepEqual(got, pickVec) {
 		t.Fatalf("选读行应与整段装载位级一致")
-	}
-	if len(selective.activeIDs) != len(full.activeIDs) {
-		t.Fatalf("activeIDs 必须保持全段口径: selective=%d full=%d", len(selective.activeIDs), len(full.activeIDs))
 	}
 	if selective.activeLoadedRows != full.activeLoadedRows || selective.activeLoadedSegments != full.activeLoadedSegments {
 		t.Fatalf("完整性口径不得随选读改变: rows %d/%d segments %d/%d",

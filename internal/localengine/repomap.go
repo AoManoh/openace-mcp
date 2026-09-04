@@ -273,7 +273,35 @@ func renderRepoMap(revision string, files []mapFile, budget int, focus string) (
 		}
 	}
 	if truncated {
-		out.WriteString(fmt.Sprintf("[map truncated: %d of %d files shown; raise max_output_length or use focus for a subtree]\n", shown, len(files)))
+		// 截断提示行也占预算：提示行本身约 90 字节，若不计入，截断时的输出会
+		// 超出 max_output_length。这里按选入的反序逐个退掉文件——每次从当前
+		// 选入文件最多的目录（并列取排序靠后的）退掉最后一个，保持各目录
+		// 轮流各有代表——直到正文加提示行不超过预算；未截断的地图不受影响。
+		marker := fmt.Sprintf("[map truncated: %d of %d files shown; raise max_output_length or use focus for a subtree]\n", shown, len(files))
+		for out.Len()+len(marker) > budget && shown > 0 {
+			victim := ""
+			for _, dir := range dirOrder {
+				if len(selected[dir]) > 0 && (victim == "" || len(selected[dir]) >= len(selected[victim])) {
+					victim = dir
+				}
+			}
+			selected[victim] = selected[victim][:len(selected[victim])-1]
+			shown--
+			out.Reset()
+			out.WriteString(title)
+			for _, dir := range dirOrder {
+				group := selected[dir]
+				if len(group) == 0 {
+					continue
+				}
+				out.WriteString(dirHeader(dir))
+				for _, f := range group {
+					out.WriteString(formatMapFile(f))
+				}
+			}
+			marker = fmt.Sprintf("[map truncated: %d of %d files shown; raise max_output_length or use focus for a subtree]\n", shown, len(files))
+		}
+		out.WriteString(marker)
 	}
 	return strings.TrimRight(out.String(), "\n"), shown, truncated
 }

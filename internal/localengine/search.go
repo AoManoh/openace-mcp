@@ -115,10 +115,10 @@ func (h *revisionHandle) record(id string) (chunkRecord, error) {
 	}
 	var record chunkRecord
 	if err := json.Unmarshal(buf, &record); err != nil {
-		return chunkRecord{}, fmt.Errorf("chunk 内容损坏（K47）: %w", err)
+		return chunkRecord{}, fmt.Errorf("chunk 记录解码失败,索引文件可能被改写: %w", err)
 	}
 	if record.ID != id {
-		return chunkRecord{}, fmt.Errorf("chunk 偏移错位（K47）: 期望 %s 实际 %s", id, record.ID)
+		return chunkRecord{}, fmt.Errorf("chunk 记录与偏移不匹配,索引文件可能被改写: 期望 %s 实际 %s", id, record.ID)
 	}
 	return record, nil
 }
@@ -1325,8 +1325,9 @@ func parseArtifactKind(raw string) (string, error) {
 
 // artifactKind 按相对路径判定产物类型，规则按顺序匹配，先命中先返回：
 //   - tests：路径中有 test、tests、spec、__tests__、testdata 目录段；或文件名
-//     含 _test.、.test.、.spec.，以 test_ 开头，去扩展名后以 test 或 tests
-//     结尾（Java、C#、PHP 的 FooTest 命名）。
+//     含 _test.、.test.、.spec.，以 test_ 开头，去扩展名后以大写 Test 或
+//     Tests 结尾（Java、C#、PHP 的 FooTest 类名约定）。后缀规则区分大小写，
+//     latest.go、contest.py、manifest 这类小写结尾的普通文件不算测试。
 //   - docs：路径中有 doc、docs、documentation 目录段；或扩展名为 .md、
 //     .mdx、.rst、.adoc、.txt；或文件名以 changelog、readme 开头。
 //   - 其余为 code。
@@ -1335,25 +1336,25 @@ func parseArtifactKind(raw string) (string, error) {
 // 的 testing/ 目录不算测试，代码目录里的 .md 算文档。误分只影响
 // artifact_kind 的分组次序，候选不会被隐藏。
 func artifactKind(relPath string) string {
-	lower := strings.ToLower(relPath)
-	segments := strings.Split(lower, "/")
-	base := segments[len(segments)-1]
+	segments := strings.Split(relPath, "/")
+	rawBase := segments[len(segments)-1]
+	base := strings.ToLower(rawBase)
 	for _, dir := range segments[:len(segments)-1] {
-		switch dir {
+		switch strings.ToLower(dir) {
 		case "test", "tests", "spec", "__tests__", "testdata":
 			return artifactTests
 		}
 	}
-	stem := base
-	if dot := strings.LastIndex(base, "."); dot > 0 {
-		stem = base[:dot]
+	rawStem := rawBase
+	if dot := strings.LastIndex(rawBase, "."); dot > 0 {
+		rawStem = rawBase[:dot]
 	}
 	if strings.Contains(base, "_test.") || strings.Contains(base, ".test.") || strings.Contains(base, ".spec.") ||
-		strings.HasPrefix(base, "test_") || strings.HasSuffix(stem, "test") || strings.HasSuffix(stem, "tests") {
+		strings.HasPrefix(base, "test_") || strings.HasSuffix(rawStem, "Test") || strings.HasSuffix(rawStem, "Tests") {
 		return artifactTests
 	}
 	for _, dir := range segments[:len(segments)-1] {
-		switch dir {
+		switch strings.ToLower(dir) {
 		case "doc", "docs", "documentation":
 			return artifactDocs
 		}

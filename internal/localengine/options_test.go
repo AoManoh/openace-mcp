@@ -116,7 +116,7 @@ func TestFingerprintSensitivity(t *testing.T) {
 	bulk := base
 	bulk.Embedding.BatchAPIMode = embedding.ProviderVoyage
 	if bulk.Fingerprint() == fp {
-		t.Fatalf("批车道模式必须改变指纹(T8:构建行为模式,daemon/wrapper 必须同模式)")
+		t.Fatalf("Batch API 模式必须改变配置指纹:构建行为模式不同的 daemon 与 wrapper 不得混用")
 	}
 	governorOff := base
 	governorOff.Embedding.GovernorDisabled = true
