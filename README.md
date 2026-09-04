@@ -173,12 +173,17 @@ MCP 客户端每次启动 agent 会话都会重新拉起 `command` 指定的进�
 | `task_status` / `list_tasks` | 查询异步任务状态/找回最近任务 |
 | `workspace_status` | workspace revision、同步阶段、语义覆盖、provider 健康摘要、顶层目录文件计数(排除面可见) |
 | `daemon_status` | wrapper 与 daemon 的 build、pid、cache namespace、capability |
+| `repo_map` | 只读的仓库地图(按目录/文件聚合的索引概览,带预算截断与 `focus` 子树参数);冷仓返回 index_not_ready,不触发索引 |
+| `cancel_task` | 取消一个排队或运行中的异步任务 |
+| `list_workspaces` | 列出 daemon 已知的工作区及其状态摘要 |
 
 小仓库直接 `codebase_retrieval`;大仓库预热或跨仓问题开完整面后用 `start_*` + `task_status`(进度携带速率与 ETA 估算)。
 
-**检索结果没有字节预算,也没有 `max_output_length` 参数。**默认(`detail=full`)回复的形状是:按排名前 N 个候选带源码正文,其后的每个候选一行 `## 路径:起止行 符号`,中间用一行 `-- remaining results listed as paths only; Read a file to see its content --` 隔开;精排窗口(前 50 个候选)之外的候选前另有一行 `-- results below were not reranked (fused order) --`。任何候选都不会被丢掉,AI 看标题决定是否用自己的 Read 工具展开。N 由**你**在 MCP 配置里设置,不是 AI 的调用参数:`OPENACE_FULL_RESULTS`,默认 20;AI 反馈"结果太长被客户端截断"就调小,反馈"总要多 Read 一轮"就调大;设 0 则全部只给标题行(等价于每次 `detail=paths`)。`detail=paths` 仍可由 AI 按需选择,只回标题行。本机实测(一次检索 79 个候选):默认 N=20 约 30 KB,N=5 约 13 KB,N=0 约 4 KB。
+**检索结果没有字节预算,也没有 `max_output_length` 参数。**默认(`detail=full`)回复的形状是:按排名前 N 个候选带源码正文,其后的每个候选一行 `## 路径:起止行 符号`,中间用一行 `-- remaining results listed as paths only; Read a file to see its content --` 隔开;精排窗口(前 50 个候选)之外的候选前另有一行 `-- results below were not reranked (fused order) --`。任何候选都不会被丢掉,AI 看标题决定是否用自己的 Read 工具展开。N 由**你**在 MCP 配置里设置,不是 AI 的调用参数:`OPENACE_FULL_RESULTS`,默认 20;AI 反馈"结果太长被客户端截断"就调小,反馈"总要多 Read 一轮"就调大;设 0 则全部只给标题行(内容与 `detail=paths` 相同,只多首行一条"以下只列路径"的分隔文字)。`detail=paths` 仍可由 AI 按需选择,只回标题行。本机实测(一次检索 79 个候选):默认 N=20 约 30 KB,N=5 约 13 KB,N=0 约 4 KB。
 
-**按产物类型分组:`artifact_kind`(可选,`any` / `code` / `tests` / `docs`)。**调用 AI 只在使用者明确要某一类文件时设置它:精排完成后,该类型的候选保持原相对顺序排到最前,其余候选按原序跟在后面,任何候选都不丢;每条结果带 `kind` 字段,分组依据可见。省略或 `any` 就是普通排名顺序,一个字节都不变。类型按路径机械规则判定,不猜意图:目录段 `test/`、`tests/`、`spec/`、`__tests__/`、`testdata/`,或文件名含 `_test.`、`.test.`、`.spec.`、以 `test_` 开头、以 `Test`/`Tests` 结尾 → `tests`;目录段 `doc/`、`docs/`、`documentation/`,或扩展名 `.md/.mdx/.rst/.adoc/.txt`,或文件名 `README*`/`CHANGELOG*` → `docs`;其余 → `code`。已知边界:框架自身的 `testing/` 目录算代码,代码目录里的 `.md` 算文档。依据:2026-09-03 在 django 快照上的 400 条"找实现"查询,精排把测试/文档排在实现之上,前五命中率因此低 8.75 个百分点;只在输出层把代码排前即可拿回(复算 +8.25 个百分点)。
+**按产物类型分组:`artifact_kind`(可选,`any` / `code` / `tests` / `docs`)。**调用 AI 只在使用者明确要某一类文件时设置它:精排完成后,该类型的候选保持原相对顺序排到最前,其余候选按原序跟在后面,任何候选都不丢;每条结果带 `kind` 字段,分组依据可见。省略或 `any` 就是普通排名顺序,一个字节都不变。类型按路径机械规则判定,不猜意图:目录段 `test/`、`tests/`、`spec/`、`__tests__/`、`testdata/`,或文件名含 `_test.`、`.test.`、`.spec.`、以 `test_` 开头、以 `Test`/`Tests` 结尾 → `tests`;目录段 `doc/`、`docs/`、`documentation/`,或扩展名 `.md/.mdx/.rst/.adoc/.txt`,或文件名 `README*`/`CHANGELOG*` → `docs`;其余 → `code`。已知边界:框架自身的 `testing/` 目录算代码,代码目录里的 `.md` 算文档,文件名以 `test` 结尾的非测试文件(如 `latest.go`)会被归为测试。`kind` 只出现在结构化结果 `hits[]` 里,正文标题行不带它;客户端不向 AI 展示结构化字段时,AI 看不到分类结果。分组把未精排的候选提到精排候选之前时,正文不再插入"以下未经 rerank 打分"的分界行,每条结果的 `reranked` 字段仍如实给出。依据:2026-09-03 在 django 快照上的 400 条"找实现"查询,精排把测试/文档排在实现之上,前五命中率因此低 8.75 个百分点;只在输出层把代码排前即可拿回(复算 +8.25 个百分点)。
+
+**其他两个可选参数与结构化字段。**`path_prefix`(索引内相对路径前缀,如 `internal/localengine`):融合之后、精排之前只保留该子树的候选,只在使用者明确点名子树、或上一轮检索已经确认目标在该子树时使用;不要从截断的仓库地图推断前缀。`detail`:`full`(默认)/`paths`。每条结果在结构化字段 `hits[]` 里带 `path`、`start_line`、`end_line`、`symbol`、`rank`、`shown`(恒为 true)、`reranked`(是否经过精排)、`rerank_score`(精排相关度,仅 reranked 时有值)、`source`(`lexical`/`dense`/`both`,来自哪一路召回)、`kind`(`code`/`tests`/`docs`)。这些字段只在结构化结果里,正文不含;不透传结构化字段的客户端里 AI 看不到它们。
 
 ## 运行模式
 
@@ -215,14 +220,21 @@ MCP 客户端每次启动 agent 会话都会重新拉起 `command` 指定的进�
 | `OPENACE_THROUGHPUT_GOVERNOR` | 吞吐治理器与车道分离的逃生门:默认 `on`——索引 429 自动降速续跑(尊重 Retry-After,乘性减/加性增),自部署按延迟梯度自动收放并发,交互查询与索引各持独立熔断互不拖累;`off` 回到固定并发+共用熔断的旧行为 |
 | `OPENACE_EMBEDDING_BATCH_API` | 离线批车道:`voyage` = 大额嵌入改走 voyage Batch API(费用 -33%,服务端 12h 完成窗,崩溃后续作业不重复付费);默认 `off`。要求 provider 就是 voyage,其他组合启动即报错 |
 | `OPENACE_EMBEDDING_BATCH_MIN_CHUNKS` | 批车道触发阈值(默认 `2000`):缺失量低于此走同步车道——几百个 chunk 分钟级就完了,不值得排 12h 窗 |
-| `OPENACE_RERANK_PROVIDER` | 精排(质量至上默认档):`tei` / `voyage` / `off`;默认 `voyage`,key 缺省回退 `VOYAGE_API_KEY`。配置即启用;语义已配而精排缺配置时结果携带 `rerank-unconfigured` 提示(`OPENACE_QUALITY_STRICT=on` 下升级为报错),显式 `off` 视为确认放弃。`_BASE_URL`/`_API_KEY`/`_MODEL`/`_MAX_TOKENS` 语义同上 |
+| `OPENACE_RERANK_PROVIDER` | 精排(质量至上默认档):`tei` / `voyage` / `off`;默认 `voyage`,key 缺省回退 `VOYAGE_API_KEY`。配置即启用;语义已配而精排缺配置时结果携带 `rerank-unconfigured` 提示(`OPENACE_QUALITY_STRICT=on` 下升级为报错),显式 `off` 视为确认放弃。`_BASE_URL`/`_API_KEY`/`_MODEL` 语义同上;`OPENACE_RERANK_MAX_TOKENS` 是单次精排请求送审文本的估算 token 上限(默认 `200000`),超出部分的候选不送审、按融合顺序跟在精排结果之后 |
 | `OPENACE_RETRIEVAL_DEGRADE` / `OPENACE_RERANK_DEGRADE` | 语义路/精排失败策略:`allow`(默认,放行并标 `[DEGRADED]`)/ `deny`(返回可行动错误) |
 | `OPENACE_QUALITY_STRICT` | `on` = 质量严格档:语义链路任一缺口(覆盖 <100%、查询嵌入失败、已配置的 rerank 未生效等)直接报错;要求已配置 embedding。默认 `off`。结构化结果携带 `rerank_sent`/`query_embed_failed`/`embedding_profile` |
 | `OPENACE_QUERY_BUILD_WAIT` | 查询等待在建索引的上界,**默认 `40s`**(先于主流 MCP 客户端的请求超时,冷仓首建期间的同步检索返回带构建进度的可行动错误,而非裸超时):超时后有旧索引按 allow/deny 降级,无旧索引返回带进度的错误;显式 `0` = 等到构建完成 |
 | `OPENACE_MCP_TOOLS` | MCP 工具面:未设 = 只暴露 `codebase_retrieval`;`all` = 完整能力面;或逗号清单指定 |
 | `OPENACE_RENDER_LINE_NUMBERS` | `1` = 检索结果围栏内逐行携带真实文件行号(`cat -n` 形状,Read-parity 试验面);默认关闭 |
 | `OPENACE_FULL_RESULTS` | `detail=full` 时带正文返回的候选块数(按排名取前 N 个,其余只给标题行),默认 `20`;`0`=全部只给标题行。这是使用者侧配置,不是 AI 的调用参数;改动后重启 MCP 会话生效,不需要重启 daemon |
-| `OPENACE_GRAY_FEEDBACK` | `1` = instructions 追加灰度反馈协议:调用 AI 每轮工具调用后输出多维诊断报告(事实/效果/体验/耗时/bug 复现),供测试者汇总回传。默认关闭 |
+| `OPENACE_FRESHNESS_WINDOW` | 查询前复用最近一次扫描结果的时长(如 `30s`),期间不重扫工作区;留空(默认)每次查询都扫描;不接受 `0` |
+| `OPENACE_VECTOR_MEMORY_BUDGET` | 常驻向量的内存上限(字节数);留空(默认)不限 |
+| `OPENACE_MAX_FILE_BYTES` / `OPENACE_MAX_TEXT_FILE_BYTES` | 单文件索引上限:一般文件默认 1 MiB,纯文本文件默认 4 MiB,超过整篇不索引 |
+| `OPENACE_CACHE_DIR` | 索引缓存根目录;默认用户缓存目录下的 `openace-mcp` |
+| `OPENACE_TOOL_TIMEOUT` | 单次 MCP 工具调用的处理超时,默认 `110s` |
+| `OPENACE_WATCH_*` / `OPENACE_RECONCILE_CONCURRENCY` | daemon 对已服务过的工作区做变更监测:`OPENACE_WATCH_MODE` `seen`(默认)/`off`;间隔默认 30s、去抖 2s、单次同步超时 5m、探测出错后退避 5s–2m、最多 64 个工作区;并行 reconcile worker 默认 2 |
+| `OPENACE_TASK_QUEUE_SIZE` / `OPENACE_TASK_HISTORY_LIMIT` | 异步任务队列长度(默认 256,最大 4096)与保留的已完成任务数(默认 1024) |
+| `OPENACE_GRAY_FEEDBACK` | `1` = instructions 追加灰度反馈协议:调用 AI 在任务收尾交付答案时,一次性汇总本次全部 openACE 调用的诊断(事实/效果/体验/耗时/bug 复现),不在每次调用后打断任务。默认关闭 |
 | `OPENACE_PROVIDER_TIMEOUT` / `OPENACE_PROVIDER_MAX_RETRIES` | provider HTTP 超时(默认 `60s`)与单批重试上限(默认 `5`) |
 | `OPENACE_MODE` | `auto` / `direct` / `manual-daemon`(默认 `auto`) |
 | `OPENACE_CACHE_NAMESPACE` | cache 命名空间,隔离账号/tenant/测试批次 |
@@ -243,7 +255,7 @@ wrapper 与 daemon 的一致性分两层,行为刻意不同:
 
 ## 按场景选配置
 
-环境变量的完整语义都在上表,这里只给三组常用组合。
+环境变量的说明见上表与 `.env.example`,这里只给三组常用组合。
 
 - **结果完整性优先**——审计、事实核查这类"宁可报错,不要部分结果"的任务。设 `OPENACE_RETRIEVAL_DEGRADE=deny`,任何降级直接变报错;要求更严就 `OPENACE_QUALITY_STRICT=on`,语义链路差一点都不放行。为什么要设:默认档是降级放行,key 失效那天词法结果照样返回,顶部一行 `[DEGRADED]` 横幅是唯一警示——只看文件列表、不看横幅的调用方,会把词法结果当成完整语义检索用。
 - **大仓高频查询**——每次查询前有一轮内联重扫,成本随文件数线性涨,接近十万文件的仓库实测 1.5 秒起步。设 `OPENACE_FRESHNESS_WINDOW=30s`,窗口内的查询跳过重扫,同档实测 p50 降到 0.4 秒。代价明码标价:窗口内的磁盘改动最多延迟 30 秒可见,自己权衡。
