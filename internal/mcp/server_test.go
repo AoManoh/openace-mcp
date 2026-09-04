@@ -811,3 +811,38 @@ func TestArtifactKindReachesEngineAndRejectsUnknown(t *testing.T) {
 		t.Fatalf("information_request 描述应给出按意图加限定的规则并指向 artifact_kind: %s", informationRequestDescription)
 	}
 }
+
+// TestDiagnosticsLineExposesRerankScoresAndKinds:hits[] 里的精排相关度与
+// 产物类型此前只在 structuredContent 中,不向 AI 展开结构化字段的客户端看
+// 不到。文本 diagnostics 行现在给出精排最高分、相关度 ≥0.5 的候选数与三类
+// 候选的计数,让只读正文的调用方也能判断"这批结果里可能没有答案"。未执行
+// 精排时不出现精排分段;没有 hits 时不出现 kinds 段。
+func TestDiagnosticsLineExposesRerankScoresAndKinds(t *testing.T) {
+	result := engine.Result{
+		RetrievalMode: "hybrid+rerank",
+		RerankSent:    50,
+		Hits: []engine.Hit{
+			{Path: "a.go", Rank: 1, Shown: true, Reranked: true, RerankScore: 0.494, Kind: "code"},
+			{Path: "b_test.go", Rank: 2, Shown: true, Reranked: true, RerankScore: 0.31, Kind: "tests"},
+			{Path: "docs/c.md", Rank: 3, Shown: true, Kind: "docs"},
+		},
+		Display: &engine.DisplayStats{CandidateBlocks: 3, ShownBlocks: 3, FullBlocks: 3, ShownFiles: 3},
+	}
+	line := retrievalDiagnosticsText(result)
+	for _, want := range []string{"rerank_top=0.494", "rerank_ge_0.5=0", "kinds[code=1 tests=1 docs=1]"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("diagnostics 应含 %q: %s", want, line)
+		}
+	}
+	result.Hits[0].RerankScore = 0.859
+	if line = retrievalDiagnosticsText(result); !strings.Contains(line, "rerank_top=0.859 rerank_ge_0.5=1") {
+		t.Fatalf("精排统计应随分数变化: %s", line)
+	}
+	lexical := engine.Result{RetrievalMode: "lexical", Hits: []engine.Hit{{Path: "a.go", Rank: 1, Shown: true, Kind: "code"}}}
+	if line = retrievalDiagnosticsText(lexical); strings.Contains(line, "rerank_top") || !strings.Contains(line, "kinds[code=1 tests=0 docs=0]") {
+		t.Fatalf("未精排时不应出现精排分段,仍应有类型计数: %s", line)
+	}
+	if line = retrievalDiagnosticsText(engine.Result{RetrievalMode: "lexical"}); strings.Contains(line, "kinds[") {
+		t.Fatalf("无 hits 时不应出现 kinds 段: %s", line)
+	}
+}

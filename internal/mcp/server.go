@@ -588,6 +588,9 @@ func retrievalDiagnosticsText(result engine.Result) string {
 		parts = append(parts, fmt.Sprintf("timings_ms[total=%d sync=%d lexical=%d embed=%d vector=%d fuse=%d rerank=%d render=%d]",
 			t.TotalMs, t.SyncMs, t.LexicalMs, t.QueryEmbedMs, t.VectorMs, t.FuseMs, t.RerankMs, t.RenderMs))
 	}
+	if summary := hitsSummaryText(result.Hits); summary != "" {
+		parts = append(parts, summary)
+	}
 	if result.Display != nil {
 		d := result.Display
 		if d.FullBlocks > 0 || !d.Truncated {
@@ -601,6 +604,40 @@ func retrievalDiagnosticsText(result engine.Result) string {
 		return ""
 	}
 	return "diagnostics: " + strings.Join(parts, " ")
+}
+
+// hitsSummaryText 把 hits[] 逐条字段里的两组信号压成文本:精排最高分与
+// 相关度 ≥0.5 的候选数(只在有候选经过精排时给出),以及 code/tests/docs
+// 三类候选的计数。这些数在结构化字段里一直有,但不向 AI 展开
+// structuredContent 的客户端看不到;一次对仓库中不存在概念的检索,精排最高
+// 分 0.49、无一条 ≥0.5,而真实存在的功能最高分 0.86、25 条 ≥0.5——只读正文
+// 的调用方需要这两个数来判断"这批结果里可能没有答案"。0.5 只是报数的分界,
+// 不做任何过滤或阈值判定。
+func hitsSummaryText(hits []engine.Hit) string {
+	if len(hits) == 0 {
+		return ""
+	}
+	top, above, reranked := 0.0, 0, false
+	kinds := map[string]int{}
+	for _, hit := range hits {
+		kinds[hit.Kind]++
+		if !hit.Reranked {
+			continue
+		}
+		reranked = true
+		if hit.RerankScore > top {
+			top = hit.RerankScore
+		}
+		if hit.RerankScore >= 0.5 {
+			above++
+		}
+	}
+	var parts []string
+	if reranked {
+		parts = append(parts, fmt.Sprintf("rerank_top=%.3f rerank_ge_0.5=%d", top, above))
+	}
+	parts = append(parts, fmt.Sprintf("kinds[code=%d tests=%d docs=%d]", kinds["code"], kinds["tests"], kinds["docs"]))
+	return strings.Join(parts, " ")
 }
 
 // retrievalStructured 构造单仓检索的 structuredContent(P1,review 二批:
