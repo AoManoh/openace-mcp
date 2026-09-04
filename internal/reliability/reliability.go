@@ -45,8 +45,9 @@ const (
 
 // CallError 是归类后的 provider 调用错误。Message 是单行、限长的文本：
 // 取自 provider 响应正文或底层错误的部分先经 SanitizeMessage 处理（正文
-// 最长 512 字节），其余为固定格式。API key 只出现在请求头构造处，从不
-// 进入 Message，所以 Message 可以直接进入日志、workspace_status 和给
+// 最长 512 字节），其余为固定格式。本包拼接的固定文本不含 API key（key
+// 只出现在请求头构造处）；provider 响应正文的截取部分原样进入 Message，
+// 本包不检查其中是否回显了凭据。Message 进入日志、workspace_status 和给
 // 用户的错误。
 type CallError struct {
 	Class      Class
@@ -75,8 +76,8 @@ func (e *CallError) Retryable() bool {
 // SanitizeMessage 把任意文本压成一条单行错误消息：连续空白（含换行、
 // 制表符）合并为一个空格。正文超过 512 字节时截到 512 字节以内并追加
 // "…"。截断点回退到 UTF-8 字符的起始字节。原因：按字节数硬切会把一个
-// 多字节字符切成非法序列，消息不再是合法 UTF-8，日志和 JSON 状态面里
-// 出现乱码。
+// 多字节字符切成非法序列，消息不再是合法 UTF-8，日志和 workspace_status
+// 的 JSON 输出里出现乱码。
 func SanitizeMessage(text string) string {
 	text = strings.Join(strings.Fields(text), " ")
 	const maxLen = 512
@@ -124,7 +125,7 @@ const (
 	maxBackoff = 5 * time.Minute
 	// authBackoff 是 ClassAuth 与 ClassQuota 失败后的退避时长。这两类
 	// 失败在用户换 key 或充值之前重试结果不变，所以退避远长于 maxBackoff，
-	// 避免每隔几分钟就用注定失败的请求打上游。
+	// 避免每隔几分钟就向上游发一次注定失败的请求。
 	authBackoff = 15 * time.Minute
 	// defaultRateLimitBackoff 是 429 没有携带 Retry-After 时的退避时长。
 	// 吞吐治理器（Governor）同场景的 governorPauseFallback 取同一值。
@@ -136,9 +137,10 @@ const (
 
 // Circuit 是熔断器：记录一条 provider 调用路径最近连续失败的次数，在
 // 退避期内拒绝发出新请求。每个实例都挂在 daemon 级客户端单例上，由全部
-// workspace 的构建与查询共用，不按任务新建：embedding 客户端为索引批
-// 请求和查询请求各持一个，rerank 客户端持一个。按任务各建一个的话，
-// 并发任务会同时重试，请求量成倍放大。状态有三种：
+// workspace 的构建与查询共用，不按任务新建：embedding 客户端默认为索引批
+// 请求和查询请求各持一个熔断器（OPENACE_THROUGHPUT_GOVERNOR=off 时两类
+// 请求共用一个），rerank 客户端持一个。按任务各建一个的话，并发任务会
+// 同时重试，请求量成倍放大。状态有三种：
 //
 //   - healthy：没有未恢复的失败，Gate 直接放行。
 //   - backoff：最近一次最终失败之后、backoffUntil 之前，Gate 拒绝请求。

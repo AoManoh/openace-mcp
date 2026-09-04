@@ -38,14 +38,14 @@ func TestClassifyCertificateErrorsPermanent(t *testing.T) {
 			t.Fatalf("应返回 CallError: %v", got)
 		}
 		if callErr.Class != ClassPermanent {
-			t.Fatalf("证书类错误应 permanent,got %v for %v", callErr.Class, err)
+			t.Fatalf("证书类错误应归为 ClassPermanent,得到 %v(输入 %v)", callErr.Class, err)
 		}
 	}
 	// 对照：普通连接失败仍归为 ClassTransient。
 	got := ClassifyTransportError(ctx, attempt, time.Minute, errors.New("dial tcp: connection refused"))
 	callErr := &CallError{}
 	if !errors.As(got, &callErr) || callErr.Class != ClassTransient {
-		t.Fatalf("连接失败应保持 transient: %v", got)
+		t.Fatalf("连接失败应仍归为 ClassTransient: %v", got)
 	}
 }
 
@@ -62,6 +62,6 @@ func TestSanitizeMessageRuneBoundary(t *testing.T) {
 		t.Fatalf("超长消息应带截断标记: %q", got[len(got)-8:])
 	}
 	if len(got) > 512+len("…") {
-		t.Fatalf("截断长度失守: %d", len(got))
+		t.Fatalf("截断后长度超过 512 字节加省略号: %d", len(got))
 	}
 }

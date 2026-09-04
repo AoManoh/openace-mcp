@@ -82,13 +82,14 @@ func TestGovernor429EntersLearningAndPauses(t *testing.T) {
 		t.Fatal("429 后必须进入学习态")
 	}
 	if snap.TargetTokensPerMin < governorRateFloorTokens {
-		t.Fatalf("学习速率不得低于地板: %d", snap.TargetTokensPerMin)
+		t.Fatalf("学习速率不得低于 governorRateFloorTokens: %d", snap.TargetTokensPerMin)
 	}
 	if snap.TargetTokensPerMin > 600_000 {
 		t.Fatalf("学习速率应为实测吞吐×%.1f 量级,得到 %d", governorRateMDFactor, snap.TargetTokensPerMin)
 	}
 	before := clock.now()
-	// 下一次 AcquireIndex 要先等 7s 暂停，再等令牌桶从 0 补到本次需求。
+	// 下一次 AcquireIndex 至少要等完 7s 暂停;暂停期间令牌桶按目标速率补充,
+	// 到期时余额已够本次 10K 的需求,断言只检查不少于 7s。
 	if err := g.AcquireIndex(context.Background(), 10_000); err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +109,7 @@ func TestGovernorRepeated429HitsFloor(t *testing.T) {
 		g.Observe(OutcomeRateLimited, 1_000, 0, time.Millisecond)
 	}
 	if !g.AtRateFloor() {
-		t.Fatalf("连续 429 后必须压到速率地板: %+v", g.Snapshot())
+		t.Fatalf("连续 429 后目标速率必须降到 governorRateFloorTokens: %+v", g.Snapshot())
 	}
 }
 
@@ -120,7 +121,7 @@ func TestGovernorOversizedRequestProgressesWithDebt(t *testing.T) {
 	}
 	g.Observe(OutcomeRateLimited, 1_000, 0, time.Millisecond)
 	if got := g.Snapshot().TargetTokensPerMin; got != governorRateFloorTokens {
-		t.Fatalf("冷启动 429 后学习目标应为地板 %d, 得到 %d", governorRateFloorTokens, got)
+		t.Fatalf("刚启动即收到 429 时学习目标应为下限 %d, 得到 %d", governorRateFloorTokens, got)
 	}
 	// 单批估算 65,536 token 大于下限 40K。桶的上限等于一分钟额度，若要求
 	// 余额攒够需求才放行，这一批的需求在任何时刻都大于余额，请求一直
@@ -170,7 +171,7 @@ func TestGovernorSuccessRaisesLearnedRate(t *testing.T) {
 		acquireRelease(t, g, 1_000, time.Second)
 	}
 	if got := g.Snapshot().TargetTokensPerMin; got <= low {
-		t.Fatalf("干净期速率必须加性回升: %d -> %d", low, got)
+		t.Fatalf("连续成功后目标速率必须高于 429 后的初值: %d -> %d", low, got)
 	}
 }
 
@@ -209,7 +210,7 @@ func TestGovernorWindowRegrowsAfterCleanStreak(t *testing.T) {
 		acquireRelease(t, g, 1_000, time.Second)
 	}
 	if got := g.Snapshot().Window; got <= shrunk {
-		t.Fatalf("干净期窗口必须回升: %d -> %d", shrunk, got)
+		t.Fatalf("连续延迟正常的样本后窗口必须大于减半后的值: %d -> %d", shrunk, got)
 	}
 }
 
@@ -261,11 +262,11 @@ func TestGovernorAcquireCancellable(t *testing.T) {
 func TestGovernorNilSafe(t *testing.T) {
 	var g *Governor
 	if err := g.AcquireIndex(context.Background(), 10); err != nil {
-		t.Fatal("nil 治理器必须直通(逃生门形态)")
+		t.Fatal("nil 治理器必须直接放行(OPENACE_THROUGHPUT_GOVERNOR=off 时治理器为 nil)")
 	}
 	g.Observe(OutcomeSuccess, 10, time.Second, 0)
 	if g.AtRateFloor() {
-		t.Fatal("nil 治理器不得报告地板")
+		t.Fatal("nil 治理器的 AtRateFloor 必须返回 false")
 	}
 }
 

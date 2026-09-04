@@ -9,10 +9,10 @@ package reliability
 //     目标速率乘性减半并按 Retry-After 暂停，之后每个成功请求让速率
 //     加性回升一点（即 AIMD：加性增、乘性减。AWS SDK 的 adaptive retry
 //     模式用同一做法的客户端令牌桶）。不调节并发数的原因：实际速率等于
-//     并发数 × 批大小 × 每批 token ÷ 单请求耗时，而托管服务的单请求耗时
+//     并发数 × 每批 token 数 ÷ 单请求耗时，而托管服务的单请求耗时
 //     波动大（本项目实测 1.3s 到 60s），固定并发数下速率会自行漂移。
-//   - 自部署服务（TEI、vLLM 等）没有配额，过载时不返回 429，表现为延迟
-//     上升、超时或 503。要调节的量是并发窗口：短期延迟均值明显高于
+//   - 自部署服务（Hugging Face 的 Text Embeddings Inference、vLLM 等）没有
+//     配额，过载时不返回 429，表现为延迟上升、超时或 503。要调节的量是并发窗口：短期延迟均值明显高于
 //     长期基线即判定服务端开始排队，把窗口乘性减半。延迟平稳时窗口
 //     加性加一（Netflix 开源库 concurrency-limits 的延迟梯度算法用同一
 //     做法，见 github.com/Netflix/concurrency-limits）。
@@ -49,7 +49,7 @@ const (
 	// governorRateAIFraction 是每个成功请求给目标速率的加性回升比例。
 	// 2% 意味着约 35 个连续成功后速率回升到原来的两倍（1.02 的 35 次方
 	// 约等于 2），与配额按分钟刷新的节奏相当。取更大值会在配额边缘反复
-	// 撞 429。
+	// 收到 429。
 	governorRateAIFraction = 0.02
 	// governorRateFloorTokens 是学习到的目标速率允许降到的最低值，单位
 	// tokens/min。默认一批 128 条、每条约 300 token，一批约 4 万 token。
@@ -161,9 +161,9 @@ func NewGovernor(maxWindow int) *Governor {
 }
 
 // AcquireIndex 是索引批请求的准入：请求发出前调用，返回 nil 表示可以
-// 发送，nil 治理器直接放行。tokens 是本请求的 token 估算（每条文本按
-// 字节数 ÷ 4 向上取整，与 RateLimiter 同一口径）。依次等待三道条件，
-// ctx 结束时立即返回 ctx 错误：
+// 发送，nil 治理器直接放行。tokens 是本请求的 token 估算，每条文本按
+// len(text)/4 + 1 计，与 embedding 客户端的 estimateTokens 相同。依次等待
+// 三道条件，ctx 结束时立即返回 ctx 错误：
 //
 //  1. Retry-After 暂停：pausedUntil 未到就等到该时刻。
 //  2. 速率令牌：只在学习态（rateLearning 为真，即见过 429 之后）检查。
@@ -193,11 +193,12 @@ func (g *Governor) AcquireIndex(ctx context.Context, tokens int) error {
 			// 单个请求的估算可以超过一分钟的目标额度：默认满批 128 条、每条
 			// 顶格 2KB 的 chunk 估算约 65.5K token，而目标速率的下限是 40K。
 			// 桶的上限恒等于一分钟额度，若要求余额攒够需求才放行，这类批次
-			// 的需求在任何时刻都大于余额，构建 goroutine 一直等待，状态面上
-			// 看不出原因。所以把本次需求先截到桶容量，桶满即放行，再从余额
-			// 里扣掉完整需求，余额转负。后续请求要先等余额补回非负、再等到
-			// 自己的需求，长期平均速率仍不超过目标。Guava 的 SmoothRateLimiter
-			// 用同一做法：当前请求放行，等待由后来的请求承担。
+			// 的需求在任何时刻都大于余额，构建 goroutine 一直等待，而
+			// workspace_status 里看不出原因。所以把本次需求先截到桶容量，
+			// 桶满即放行，再从余额里扣掉完整需求，余额转负。后续请求要先等
+			// 余额补回非负、再等到自己的需求，长期平均速率仍不超过目标。
+			// Guava 的 SmoothRateLimiter 用同一做法：当前请求放行，等待由
+			// 后来的请求承担。
 			need := float64(tokens)
 			if need > g.targetTokensPerMin {
 				need = g.targetTokensPerMin
@@ -368,7 +369,8 @@ func (g *Governor) onRateLimitedLocked(now time.Time, retryAfter time.Duration) 
 		g.rateLearning = true
 		observed := g.recentWindowTokens
 		if elapsed := now.Sub(g.recentWindowStart); elapsed > time.Second && elapsed < time.Minute {
-			// 窗口不满一分钟时按已过时长折算成每分钟速率。
+			// 窗口已过 1s 到 1min 之间时按已过时长折算成每分钟速率；不满 1s
+			// 不折算，避免用极短时长做除数得到虚高的速率。
 			observed = g.recentWindowTokens / elapsed.Minutes()
 		}
 		g.targetTokensPerMin = math.Max(observed*governorRateMDFactor, governorRateFloorTokens)
@@ -440,8 +442,9 @@ func (g *Governor) releaseSlotLocked() {
 
 func (g *Governor) wakeWaitersLocked() {
 	// 只发信号，不替被唤醒者预占槽位：它回到 AcquireIndex 循环开头重新
-	// 判定，没抢到就再次入队，所以多发几个信号没有副作用。若在这里预占，
-	// 被唤醒者重新判定时又占一次，同一个槽位被计两次。
+	// 判定，没抢到就再次入队；令牌在拿到槽位时才扣，多发几个信号只是多
+	// 做一次判定，不会重复计费。若在这里预占，被唤醒者重新判定时又占一
+	// 次，同一个槽位被计两次。
 	free := g.window - g.inFlight
 	for free > 0 && len(g.waiters) > 0 {
 		close(g.waiters[0])

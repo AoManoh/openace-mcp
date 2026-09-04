@@ -20,10 +20,10 @@ func NewHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ForceAttemptHTTP2 = false
 	// 只关 ForceAttemptHTTP2 并清空 TLSNextProto 还不够：从 DefaultTransport
-	// 克隆的 TLS 配置可能已经在 ALPN 里声明了 h2。服务端选中 h2 而本端
-	// 只按 HTTP/1.1 解析时，响应以 "malformed HTTP response" 失败，实际
-	// 收到的是 h2 的 SETTINGS 帧。把 NextProtos 固定为 http/1.1，协商结果
-	// 才与传输实现一致。
+	// 克隆的 TLS 配置可能已经在 ALPN（TLS 握手时协商应用层协议的扩展）里
+	// 声明了 h2。服务端选中 h2 而本端只按 HTTP/1.1 解析时，响应以
+	// "malformed HTTP response" 失败，实际收到的是 h2 的 SETTINGS 帧。把
+	// NextProtos 固定为 http/1.1，协商结果才与传输实现一致。
 	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 	if transport.TLSClientConfig == nil {
 		transport.TLSClientConfig = &tls.Config{}

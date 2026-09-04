@@ -169,7 +169,7 @@ func TestRetryPolicyReturnsContextErrorOnCancel(t *testing.T) {
 		return &CallError{Class: ClassTransient}
 	})
 	if !errors.Is(err, context.Canceled) || attempts != 1 {
-		t.Fatalf("取消应原样返回 ctx 错误（不误判 provider 失败，K26）: attempts=%d err=%v", attempts, err)
+		t.Fatalf("取消应原样返回 ctx 错误,不计为 provider 失败: attempts=%d err=%v", attempts, err)
 	}
 }
 
