@@ -268,3 +268,51 @@ func TestGovernorNilSafe(t *testing.T) {
 		t.Fatal("nil 治理器不得报告地板")
 	}
 }
+
+// TestGovernorWindowWaitChargesTokensOnce：学习态下窗口已满的请求先排队等
+// 槽位，被唤醒后重走速率检查。修复前速率检查在拿到槽位之前就从令牌桶扣减，
+// 排队一次就多扣一次；两个各 100 token 的请求先后放行后，余额应恰好减少
+// 200，而不是 300。
+func TestGovernorWindowWaitChargesTokensOnce(t *testing.T) {
+	g, _ := governed(1)
+	g.mu.Lock()
+	g.rateLearning = true
+	g.targetTokensPerMin = 1_000_000
+	g.bucketTokens = 1_000_000
+	g.mu.Unlock()
+
+	if err := g.AcquireIndex(context.Background(), 100); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- g.AcquireIndex(context.Background(), 100) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		g.mu.Lock()
+		waiting := len(g.waiters)
+		g.mu.Unlock()
+		if waiting == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("第二个请求应在窗口占满时排队等待")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	g.Observe(OutcomeSuccess, 100, time.Second, 0)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("槽位释放后等待者未被放行")
+	}
+	g.mu.Lock()
+	balance := g.bucketTokens
+	g.mu.Unlock()
+	if balance != 1_000_000-200 {
+		t.Fatalf("两个请求各 100 token,余额应为 999800,实际 %.0f(排队请求被重复扣减)", balance)
+	}
+	g.Observe(OutcomeSuccess, 100, time.Second, 0)
+}

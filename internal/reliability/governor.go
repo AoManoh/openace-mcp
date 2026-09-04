@@ -216,11 +216,16 @@ func (g *Governor) AcquireIndex(ctx context.Context, tokens int) error {
 				}
 				continue
 			}
-			g.bucketTokens -= float64(tokens)
 		}
 		// 3) 并发窗口槽位。窗口可能已被延迟判定缩到小于在途数，此时排队
-		// 等释放信号，不轮询。
+		// 等释放信号，不轮询。令牌只在真正拿到槽位、请求即将发出时扣减：
+		// 排队的请求被唤醒后要回到循环开头重走速率检查，若在检查处就扣，
+		// 每排队一次就多扣一次，余额低于真实消耗，拥堵时的发送速率会低于
+		// 目标速率。速率检查在此只决定"现在能不能放行"，不记账。
 		if g.inFlight < g.window {
+			if g.rateLearning {
+				g.bucketTokens -= float64(tokens)
+			}
 			g.inFlight++
 			g.mu.Unlock()
 			return nil
@@ -231,10 +236,8 @@ func (g *Governor) AcquireIndex(ctx context.Context, tokens int) error {
 		select {
 		case <-ready:
 			// 被唤醒只表示可能有槽位，没有预占：回到循环开头重新判定暂停、
-			// 速率、槽位三道条件，没抢到就再次入队。
-			// TODO(修复窗口等待后的重复扣减): 重新判定时速率步骤会再次从
-			// 令牌桶扣减同一请求的 tokens，等待过窗口槽位的请求被多扣一次，
-			// 结果是发送比目标速率更慢；令牌应在拿到槽位后再扣。
+			// 速率、槽位三道条件，没抢到就再次入队。此时尚未扣过令牌，
+			// 重走速率检查不会重复计费。
 		case <-ctx.Done():
 			g.abandonWaiter(ready)
 			return ctx.Err()
