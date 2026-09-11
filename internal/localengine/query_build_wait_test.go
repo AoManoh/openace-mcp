@@ -124,10 +124,24 @@ func TestQueryBuildWaitDetachesEarlyOnLongETA(t *testing.T) {
 	server := newEmbedServer(t, dim)
 	defer server.ts.Close()
 	var delayMs int64
+	serviceSlots := make(chan struct{}, 1)
 	inner := server.ts.Config.Handler
 	server.ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if d := atomic.LoadInt64(&delayMs); d > 0 {
-			time.Sleep(time.Duration(d) * time.Millisecond)
+			// 服务一次只处理一个请求，构建耗时不随客户端扩窗而缩短。
+			select {
+			case serviceSlots <- struct{}{}:
+			case <-r.Context().Done():
+				return
+			}
+			defer func() { <-serviceSlots }()
+			timer := time.NewTimer(time.Duration(d) * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-r.Context().Done():
+				return
+			}
 		}
 		inner.ServeHTTP(w, r)
 	})
@@ -140,7 +154,7 @@ func TestQueryBuildWaitDetachesEarlyOnLongETA(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 变更引入大量新 chunk 并拨慢每批嵌入:ETA ≈ 25×0.4s = 10s > 8s 预算。
+	// 服务容量固定为一批，每批 400ms，25 批的服务时间超过 8s 查询预算。
 	var b strings.Builder
 	b.WriteString("package app\n")
 	for i := 0; i < 25; i++ {
