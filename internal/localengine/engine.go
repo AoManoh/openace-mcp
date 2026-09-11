@@ -1,7 +1,10 @@
-// Package localengine 实现 local-hybrid 检索引擎的 Stage 2 形态：
-// 本地扫描（复用 workspace AssetPolicy）→ 确定性 chunk → Bleve BM25
-// 词法索引 → immutable revision 发布与检索。无任何远程依赖；词法
-// 检索是本模式的完整能力，不是降级（阶段计划 D2）。
+// Package localengine 实现 local-hybrid 检索引擎：扫描工作区（复用
+// workspace 包的 AssetPolicy 文件选择与忽略规则）、按 chunk profile 切分、
+// 建 Bleve BM25 词法索引，配置了 embedding provider 时再为 chunk 生成向量，
+// 然后发布为不可变的 revision（一次发布的索引版本，由若干只读 segment
+// 目录与一份 manifest 组成）供检索。词法路径不依赖任何凭据与网络，是
+// 完整能力而不是降级：未配置 provider 时结果不带 [DEGRADED] 标记，状态
+// 里也没有 semantic 字段。
 package localengine
 
 import (
@@ -28,29 +31,43 @@ import (
 )
 
 const (
-	// EngineID 是引擎标识，进入 manifest、状态与检索结果。
+	// EngineID 是引擎标识，写入 manifest、状态与检索结果。
 	EngineID = "local-hybrid"
-	// EngineVersion 随引擎行为不兼容变化而更新（Stage 4：manifest v2
-	// 多 segment + journal + 跨进程锁；v1 数据可直读，升级无需重建）。
+	// EngineVersion 写入 manifest 的 engine_version 字段，标记索引由哪一代
+	// 引擎产出：当前这一代引入了多 segment 的 manifest v2、embedding journal
+	// （已付费但尚未进入 revision 的向量暂存文件）与跨进程写锁。v1 manifest
+	// 读取时归一为单段的 v2 视图，升级不重建索引。目前没有代码路径按该值
+	// 做判断，只供人核对。
 	EngineVersion = "stage4"
-	// policyHash 标识当前复用的 workspace AssetPolicy 版本。
+	// policyHash 写入 manifest 的 policy_hash 字段，标记扫描复用的 workspace
+	// AssetPolicy（文件选择与忽略规则）版本。
 	policyHash = "workspace-assetpolicy-v1"
-	// defaultTopK 是纯词法模式的候选深度。
+	// defaultTopK 是纯词法配置下的词法召回深度。
 	defaultTopK = 20
-	// hybridRouteTopK 是 hybrid 模式下每路召回深度（阶段计划 D7 受测常数）。
+	// hybridRouteTopK 是配置了语义路（向量检索）时词法与向量两路各自的
+	// 召回深度，融合前每路最多取这么多候选。深度是评测中固定的常数，
+	// 不提供环境变量。
 	hybridRouteTopK = 60
-	// rerankHeadLimit 是送审精排的头部候选上限（D7；再受 token 预算截断）。
+	// rerankHeadLimit 是送去精排（rerank：让 provider 对头部候选重新排序）
+	// 的候选数上限；实际送审数还受 rerank token 预算截断，窗口外的候选按
+	// 融合序跟在后面。
 	rerankHeadLimit = 50
 )
 
-// Engine 是 local-hybrid 引擎；daemon 进程内唯一实例，
-// 持有全部索引句柄、构建 singleflight 与 provider 客户端（暗坑 K36）。
+// Engine 是 local-hybrid 引擎，daemon 进程内只有一个实例：全部索引句柄、
+// 构建去重表与 provider 客户端都挂在它上面。客户端若按任务实例化，并发
+// 构建会独立计数和限速，收到 429 后各自退避。单例使构建共用索引治理状态，
+// 查询与索引共用显式请求预算。启用治理器时两者的熔断器独立；关闭时共用。
 type Engine struct {
 	profile chunk.Profile
-	// storeProfile 是索引子树 profile 段：chunk profile（semantic off，
-	// 与 Stage 2 逐字节一致）或追加 +emb-<hash>（阶段计划 D4）。
+	// storeProfile 是索引子树目录名的 profile 段：未配置 embedding 时是
+	// chunk profile（如 default-v8），配置了则追加 "+emb-<ProfileHash>-<模板
+	// 版本>"。embedding 身份或模板一变就换子树全量重建，旧子树保留，
+	// 不同身份的向量不会混进同一索引。
 	storeProfile string
-	// fingerprint 是配置指纹，经 ServedBy 广播用于复用判定（暗坑 K29）。
+	// fingerprint 是引擎配置指纹（见 Options.Fingerprint），随 ServedBy 广播
+	// 给 wrapper：wrapper 只复用指纹一致的 daemon，用户改了 provider 或降级
+	// 配置后不会静默连上仍按旧配置运行的 daemon。
 	fingerprint string
 
 	embedCfg         embedding.Config
@@ -59,30 +76,37 @@ type Engine struct {
 	rerankClient     *rerank.Client
 	retrievalDegrade DegradeMode
 	rerankDegrade    DegradeMode
-	// lexWeights 是词法子句权重（T10a 受测常数；默认 DefaultWeights，
-	// 评测 harness 可经 Options 覆盖做权重扫描）。
+	// lexWeights 是词法各子句（内容、路径、符号等）的权重，默认
+	// lexical.DefaultWeights()；评测程序 openace-bench 经 Options 覆盖做
+	// 权重扫描，定值后冻结进 DefaultWeights。
 	lexWeights lexical.Weights
-	// fusion 是 RRF 融合参数;默认 fusion.DefaultParams()={K:20,
-	// LexWeight:0.15, DenseWeight:0.85}(2026-07-31 四语料评测后冻结),
-	// 评测 harness 可经 Options 覆盖做融合扫描。
+	// fusion 是 RRF 融合参数，默认 fusion.DefaultParams()（K=20，词法权重
+	// 0.15，向量权重 0.85，四语料评测后冻结）；同样只由评测程序经 Options
+	// 覆盖。
 	fusion fusion.Params
-	// qualityStrict 开启质量严格档(方案④):语义链路任一缺口显式报错。
+	// qualityStrict 为 true（OPENACE_QUALITY_STRICT=on）时，语义链路出现
+	// 任一缺口都报错而不降级放行。缺口包括覆盖率不足、查询嵌入失败、
+	// 配置了 rerank 但未生效、任何降级原因。
 	qualityStrict bool
-	// queryBuildWait>0 时查询等待在建索引有上界(P1 有界化);0=无界。
+	// queryBuildWait 大于 0 时，查询等待在建索引最多等这么久；0 表示一直
+	// 等到构建完成。
 	queryBuildWait time.Duration
-	// buildWaitSlice 是有界等待的切片粒度:每片醒来核对构建 ETA,
-	// ETA 超出剩余预算且有旧 revision 可答时提前脱离等待(灰度反馈三
-	// C.2:大仓重建 ETA 分钟级时等满整个预算再降级是纯延迟)。测试可
-	// 拨小。
+	// buildWaitSlice 是有界等待的分片长度：每片结束核对一次构建的嵌入 ETA，
+	// ETA 超出剩余预算且已有旧 revision 可以应答时提前放弃等待，让查询
+	// 用旧索引降级应答。大仓重建的 ETA 是分钟级，等满整个预算再降级只是
+	// 增加延迟。测试可以调小。
 	buildWaitSlice time.Duration
-	// freshnessWindow>0 时,上次成功同步距今小于窗口的查询跳过内联
-	// 扫描(Stage 6 前置;新鲜度上界=窗口)。
+	// freshnessWindow 大于 0 时，上次成功同步距今不足该时长的查询跳过
+	// 内联扫描，直接用现有 revision；该时长只限定跳过扫描的时间，构建失败
+	// 或尚未完成时返回的旧索引仍可能更早。
 	freshnessWindow time.Duration
-	// lexicalFirst 控制冷仓词法中间发布;生产默认 true,仅 Options
-	// 程序化保险丝可关闭(不暴露 env,避免配置指纹语义漂移)。
+	// lexicalFirst 控制首次构建时是否先发布只有词法索引的中间 revision，
+	// 生产默认 true；只能经 Options.DisableLexicalFirst 在程序内关闭，不
+	// 提供环境变量，避免再多一个需要纳入配置指纹判定的开关。
 	lexicalFirst bool
-	// fragmentGate 是碎片密度门 spike(候选 (l));仅 Options 程序化
-	// 开启,生产 env 不暴露,默认 false。
+	// fragmentGate 开启实验性的碎片过滤（见 fragment_gate.go）：在精排之后
+	// 从结果里去掉行窗口切分产生的纯日期、纯符号碎片块。只能经 Options
+	// 在程序内开启，生产没有对应环境变量，默认 false。
 	fragmentGate bool
 
 	mu       sync.Mutex
@@ -90,38 +114,42 @@ type Engine struct {
 	statuses map[string]*wsStatus
 	stores   map[string]*index.Store
 	handles  map[string]*revisionHandle
-	// vectorSegments 是 Engine 级 immutable segment 向量缓存；active/
-	// previous revision 共享 segment 时只常驻一份,按 handle 引用计数释放。
+	// vectorSegments 是引擎级的向量 segment 缓存，键含目录、维度与校验和。
+	// active 与 previous revision 共享同一 segment 时内存里只有一份，按
+	// 持有它的句柄数引用计数，归零即释放。
 	vectorMu       sync.Mutex
 	vectorSegments map[string]*sharedVectorIndex
-	// vectorMaxResident 是常驻向量行数上限;0=不限(默认,2026-08-26 裁决:
-	// 能力默认不设限,资源约束由用户显式配置)。>0 时来自
-	// OPENACE_VECTOR_MEMORY_BUDGET 字节预算按维度折算。
+	// vectorMaxResident 是常驻向量行数上限，0 表示不限（默认：能力默认
+	// 不设限，资源约束由用户显式配置）。大于 0 时由
+	// OPENACE_VECTOR_MEMORY_BUDGET 的字节预算按 维度×4 字节折算。
 	vectorMaxResident int
-	// vectorMemoryBudget 是用户配置的原始字节预算(journal 同预算封顶)。
+	// vectorMemoryBudget 是用户配置的原始字节预算，journal 也按它封顶。
 	vectorMemoryBudget int64
-	// repair 记录查询期发现向量不可用的工作区，下次 sync 强制重建自愈
-	// （暗坑 K25；键为 workspaceKey，构建开始时消费）。
+	// repair 记录查询期发现向量文件损坏或缺失的工作区（键为 workspaceKey），
+	// 下次同步强制全量重建向量；构建开始时取走标记。
 	repair map[string]bool
-	// journals 是 per-workspace 的 embedding 断点续嵌暂存区与持久化
-	// 拒绝集（Stage 4 D4：取消/kill 不丢已付费批次；K35 拒绝史跨重启
-	// 生效）。仅 semanticEnabled 时创建。
+	// journals 是每个工作区的 embedding journal（已付费但尚未进入 revision
+	// 的向量暂存文件）与持久化拒绝集：构建被取消或进程被杀时已付费批次
+	// 不丢；provider 返回零向量或 NaN 的内容记入拒绝集，跨重启不再重复
+	// 送审付费。只在配置了 embedding provider 时创建。
 	journals map[string]*index.Journal
-	// statCaches 每 workspace 一个扫描 stat 短路缓存(T11;构建持写锁
-	// 串行,缓存自身另有锁自卫)。
+	// statCaches 是每个工作区一个的扫描 stat 缓存：大小与 mtime 都没变的
+	// 文件跳过重新哈希。构建持写锁串行执行，缓存自身仍加锁。
 	statCaches map[string]*workspace.StatCache
-	// firstTouchKicks 是首触快路径(T1)的每 workspace 后台同步单飞位。
+	// firstTouchKicks 记录正在后台做首触同步的工作区（首触：daemon 启动后
+	// 某工作区的第一次查询），每个工作区最多一个后台同步 goroutine。
 	firstTouchKicks sync.Map
-	// lastSyncOK 是每 workspace 最近一次成功同步完成时刻(freshness
-	// 窗口判据;仅成功路径刷新)。
+	// lastSyncOK 是每个工作区最近一次成功同步的完成时刻，只在成功路径
+	// 刷新，是新鲜度窗口与首触判定的依据。
 	lastSyncOK map[string]time.Time
-	// locks 是 per-workspace 的跨进程写锁（Stage 4 D6：daemon 是唯一
-	// index owner 从假设变为机制），首次构建时获取、Close 时释放。
+	// locks 是每个工作区的跨进程写锁，首次构建时获取、Close 时释放。有了
+	// 锁，daemon 是唯一索引写入者就从假设变成机制：两个进程共享同一 cache
+	// 子树时不会互相覆盖。
 	locks  map[string]*index.ProcessLock
 	closed bool
 }
 
-// 编译期断言：Engine 满足全部通用 contract。
+// 编译期断言：Engine 实现全部引擎契约接口。
 var (
 	_ engine.Service            = (*Engine)(nil)
 	_ engine.WorkspaceInspector = (*Engine)(nil)
@@ -130,7 +158,16 @@ var (
 	_ engine.Lifecycle          = (*Engine)(nil)
 )
 
-// New 创建 local-hybrid 引擎；opts 零值 = Stage 2 词法行为（K32）。
+// New 创建 local-hybrid 引擎。opts 为零值时是纯词法行为：不配置 embedding
+// 与 rerank，降级模式为 allow。
+//   - OPENACE_QUALITY_STRICT=on 但没有可用的 embedding provider：构造期报错。
+//     严格档承诺完整的语义质量，没有 provider 时每次查询都会因缺口失败，
+//     在启动时指出配置错误比查询期反复失败更早暴露问题。
+//   - 配置了向量内存预算且 embedding 维度已知：按 维度×4 字节把预算折算
+//     成常驻行数上限，最少 1 行；journal 在 journalFor 里按同一预算封顶。
+//   - 配置了 embedding：创建客户端，索引子树名追加 embedding 身份与模板
+//     版本，换模型、换维度或换模板都进入新子树全量重建，旧子树保留。
+//   - 配置了 rerank：创建客户端。
 func New(opts Options) (*Engine, error) {
 	e := &Engine{
 		profile:          chunk.DefaultProfile(),
@@ -155,8 +192,8 @@ func New(opts Options) (*Engine, error) {
 	if opts.FusionParams != nil {
 		e.fusion = *opts.FusionParams
 	}
-	// 方案④:strict 是「完整语义质量」契约,无 embedding provider 时
-	// 每查询必失败——按配置错误在构造期显式拒绝,防呆。
+	// 严格档没有 embedding provider 时每次查询都会失败，在构造期按配置
+	// 错误拒绝，不等到查询期。
 	if opts.QualityStrict && !opts.Embedding.Enabled {
 		return nil, fmt.Errorf("%s=on 需要已配置的 embedding provider(语义质量契约无从谈起)", EnvQualityStrict)
 	}
@@ -167,14 +204,14 @@ func New(opts Options) (*Engine, error) {
 	e.lexicalFirst = !opts.DisableLexicalFirst
 	e.fragmentGate = opts.FragmentGate
 	e.storeProfile = e.profile.ID + "-v" + e.profile.Version
-	// 模板版本注入(M9② 单一事实源):ProfileHash 与子树后缀取同一常量。
-	// 注入使既有 ProfileHash 变化——随 A2'(23aab91)同一 BREAKING 窗口
-	// 落地,升级用户本就经历一次平行重建,无额外迁移成本。
+	// TemplateVersion 的唯一来源是 embedTemplateVersion：它同时参与
+	// ProfileHash 与索引子树后缀，两处必须取同一常量，否则 wrapper 与
+	// daemon 算出的指纹会不一致。
 	opts.Embedding.TemplateVersion = embedTemplateVersion
 	e.embedCfg = opts.Embedding
-	// 常驻向量默认不限(2026-08-26 裁决)。配置字节预算时按维度折算行数
-	// 上限(只计 float 数据 rows×dim×4;条目/元数据开销与实测内存见
-	// A&Q 文档),同一预算在 journalFor 里同步封顶 journal 字节。
+	// 常驻向量默认不限。用户配置字节预算时按 维度×4 字节折算行数上限，
+	// 只计向量数据本身；条目与元数据另有开销。
+	// journalFor 用同一预算封顶 journal 字节数。
 	if opts.VectorMemoryBudget > 0 && opts.Embedding.Dimension > 0 {
 		rows := opts.VectorMemoryBudget / int64(opts.Embedding.Dimension*4)
 		if rows < 1 {
@@ -189,10 +226,10 @@ func New(opts Options) (*Engine, error) {
 			return nil, err
 		}
 		e.embedClient = client
-		// 平行 profile 子树：向量身份变化即全量重建，semantic off 路径
-		// 与 Stage 2 逐字节一致（阶段计划 D4/K24）。模板版本进子树名
-		// (方案①):模板变化 = 嵌入输入语义变化 = 新身份,旧子树保留
-		// 供回退。
+		// 索引子树按 embedding 身份隔离：ProfileHash 覆盖 provider、端点、
+		// 模型、维度、dtype 与模板版本，模板版本另以明文缀在后面便于辨认。
+		// 任一项变化即换子树全量重建，旧子树保留可回退，不同身份的向量
+		// 不会混进同一索引；未配置 embedding 时子树名与纯词法配置完全一致。
 		e.storeProfile += "+emb-" + opts.Embedding.ProfileHash() + "-" + embedTemplateVersion
 	}
 	e.rerankCfg = opts.Rerank
@@ -207,17 +244,18 @@ func New(opts Options) (*Engine, error) {
 	return e, nil
 }
 
-// EngineProfileFingerprint 实现 engine.ProfileIdentifier（暗坑 K29）。
+// EngineProfileFingerprint 实现 engine.ProfileIdentifier，返回配置指纹供
+// daemon 复用判定。
 func (e *Engine) EngineProfileFingerprint() string {
 	return e.fingerprint
 }
 
-// semanticEnabled 报告语义路是否已配置。
+// semanticEnabled 报告是否配置了 embedding provider，即语义路是否可用。
 func (e *Engine) semanticEnabled() bool {
 	return e.embedClient != nil
 }
 
-// statCacheFor 返回(必要时创建)workspace 的扫描 stat 缓存。
+// statCacheFor 返回该工作区的扫描 stat 缓存，没有则创建。
 func (e *Engine) statCacheFor(workspaceKey string) *workspace.StatCache {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -229,19 +267,20 @@ func (e *Engine) statCacheFor(workspaceKey string) *workspace.StatCache {
 	return cache
 }
 
-// fusionParams 返回本引擎实例的 RRF 融合参数。
+// fusionParams 返回本实例的 RRF 融合参数。
 func (e *Engine) fusionParams() fusion.Params {
 	return e.fusion
 }
 
-// markVectorRepair 登记查询期发现的向量损坏，触发下次 sync 自愈（K25）。
+// markVectorRepair 登记查询期发现的向量文件损坏或缺失，下次同步对该工作区
+// 强制全量重建向量。
 func (e *Engine) markVectorRepair(workspaceKey string) {
 	e.mu.Lock()
 	e.repair[workspaceKey] = true
 	e.mu.Unlock()
 }
 
-// consumeVectorRepair 取出并清除自愈标记（构建开始时调用）。
+// consumeVectorRepair 取出并清除修复标记，构建开始时调用。
 func (e *Engine) consumeVectorRepair(workspaceKey string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -252,14 +291,18 @@ func (e *Engine) consumeVectorRepair(workspaceKey string) bool {
 	return false
 }
 
-// vectorRepairPending 只读查询自愈标记（WorkspaceChanged 用）。
+// vectorRepairPending 只读查询修复标记，WorkspaceChanged 用它判断是否需要
+// 同步。
 func (e *Engine) vectorRepairPending(workspaceKey string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.repair[workspaceKey]
 }
 
-// journalFor 返回（必要时打开）工作区的 embedding journal（D4）。
+// journalFor 返回该工作区的 embedding journal，没有则打开。用户配置了向量
+// 内存预算时 journal 按同一字节数封顶：预算只拦截新的付费写入，不丢弃
+// 已有条目。两次加锁之间可能有并发调用先打开了 journal，此时关闭自己
+// 打开的、返回已登记的那个。
 func (e *Engine) journalFor(workspaceKey string, store *index.Store) (*index.Journal, error) {
 	e.mu.Lock()
 	if journal, ok := e.journals[workspaceKey]; ok {
@@ -273,8 +316,9 @@ func (e *Engine) journalFor(workspaceKey string, store *index.Store) (*index.Jou
 		return nil, err
 	}
 	if e.vectorMemoryBudget > 0 {
-		// journal 与常驻向量共用同一字节预算(付费前拦截;每条记录另有
-		// ~78B 头部,可容条数略低于 revision 常驻,保守方向)。
+		// journal 与常驻向量共用同一字节预算，在付费前拦截。journal 每条
+		// 记录另有 78 字节头部，同样字节数下可容条数略少于 revision 的常驻
+		// 行数，偏保守。
 		journal.LimitBytes(e.vectorMemoryBudget)
 	}
 	e.mu.Lock()
@@ -287,25 +331,28 @@ func (e *Engine) journalFor(workspaceKey string, store *index.Store) (*index.Jou
 	return journal, nil
 }
 
-// EngineID 实现 engine.Identifier。
+// EngineID 实现 engine.Identifier，返回引擎标识。
 func (e *Engine) EngineID() string {
 	return engine.EngineLocalHybrid
 }
 
-// rejectProfileID 拒绝 legacy ACE 专属的 provider_profile_id（迁移方案 §7.3）。
+// rejectProfileID 拒绝已删除的旧引擎 ACE 专用参数 provider_profile_id：
+// local-hybrid 没有多 provider profile 路由，收到非空值即报错。
 func rejectProfileID(ref engine.WorkspaceRef) error {
 	if strings.TrimSpace(ref.ProviderProfileID) != "" {
-		// P7:请求类标记,daemon 面映射 400 而非 502。
+		// 请求类错误：调用方可修复，daemon 返回 400 而不是 502。
 		return engine.AsInvalidRequest(fmt.Errorf("provider_profile_id 仅适用于 legacy ACE 引擎；local-hybrid 不接受该参数（收到 %q）", ref.ProviderProfileID))
 	}
 	return nil
 }
 
-// resolveRoot 规范化工作区并返回 store 键身份。
+// resolveRoot 规范化工作区路径，返回规范根与索引子树的 workspaceKey：
+// 目录名收敛为安全字符后，加上规范路径、路径类型与宿主 OS 的 sha256
+// 前 12 位。
 func (e *Engine) resolveRoot(dir string) (pathutil.WorkspaceRoot, string, error) {
 	root, err := pathutil.ResolveWorkspaceRoot(dir)
 	if err != nil {
-		// P7:目录不存在/非法是调用方可修复的输入错误。
+		// 目录不存在或非法是调用方可修复的输入错误，daemon 返回 400。
 		return pathutil.WorkspaceRoot{}, "", engine.AsInvalidRequest(err)
 	}
 	sum := sha256.Sum256([]byte(root.CanonicalPath + "\x00" + string(root.PathKind) + "\x00" + root.HostOS))
@@ -313,7 +360,8 @@ func (e *Engine) resolveRoot(dir string) (pathutil.WorkspaceRoot, string, error)
 	return root, key, nil
 }
 
-// sanitizeKey 把目录名收敛为安全的路径片段。
+// sanitizeKey 把目录名收敛为只含字母、数字、连字符与下划线的路径片段：
+// 其余字符替换为下划线，空名用 ws，最长 32 字节。
 func sanitizeKey(name string) string {
 	var b strings.Builder
 	for _, r := range name {
@@ -335,9 +383,10 @@ func sanitizeKey(name string) string {
 	return out
 }
 
-// storeFor 返回（必要时创建）工作区的索引 Store。残留清理（staging/
-// 孤儿 segment）延迟到获得跨进程写锁之后执行（D6/S15：无锁清理可能
-// 误删其他进程的在飞产物），查询只读路径不触发清理。
+// storeFor 返回该工作区的索引 Store，没有则创建目录结构。残留清理（未
+// 完成的 staging 目录，即发布前的临时构建目录；不被任何 manifest 引用的
+// segment）不在这里做，推迟到 acquireWriteLock 拿到跨进程写锁之后：没有
+// 锁就清理，可能删掉另一个进程正在构建的产物。查询只读路径不触发清理。
 func (e *Engine) storeFor(workspaceKey string) (*index.Store, error) {
 	e.mu.Lock()
 	if store, ok := e.stores[workspaceKey]; ok {
@@ -363,8 +412,10 @@ func (e *Engine) storeFor(workspaceKey string) (*index.Store, error) {
 	return store, nil
 }
 
-// acquireWriteLock 获取（并缓存）工作区的跨进程写锁；首次获得后以
-// owner 身份执行一次残留清理（D6：清理只在确认所有权后进行）。
+// acquireWriteLock 获取并缓存该工作区的跨进程写锁。已缓存的锁先复验仍
+// 归自己持有：心跳超时后锁可能被其他进程接管。首次拿到锁后以所有者身份
+// 清理残留 staging 与孤儿 segment，清理失败释放锁并报错。登记时发现引擎
+// 已关闭或已有并发调用登记了锁，释放自己刚拿到的这把。
 func (e *Engine) acquireWriteLock(workspaceKey string, store *index.Store) (*index.ProcessLock, error) {
 	e.mu.Lock()
 	if lock, ok := e.locks[workspaceKey]; ok {
@@ -404,17 +455,19 @@ func (e *Engine) acquireWriteLock(workspaceKey string, store *index.Store) (*ind
 	return lock, nil
 }
 
-// Sync 实现 engine.Service。
+// Sync 实现 engine.Service：同步工作区索引，阻塞到构建完成。
 func (e *Engine) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
 	return e.syncWorkspace(ctx, req.Workspace)
 }
 
-// SyncBackground 实现 engine.BackgroundSyncer；Stage 2 与 Sync 同路径。
+// SyncBackground 实现 engine.BackgroundSyncer，与 Sync 走同一路径。
 func (e *Engine) SyncBackground(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
 	return e.syncWorkspace(ctx, req.Workspace)
 }
 
-// buildCall 是同工作区并发构建的共享执行体（暗坑 K12）。
+// buildCall 是同一工作区并发构建请求共享的执行体：同时只有一个构建在跑，
+// 后到的调用加入等待并共享结果，多个 client 同时 sync 同一仓库不会把 CPU
+// 与磁盘开销放大 N 倍。
 type buildCall struct {
 	done      chan struct{}
 	cancel    context.CancelFunc
@@ -422,25 +475,28 @@ type buildCall struct {
 	cancelled bool
 	result    engine.Result
 	err       error
-	// startedAt 是本构建的创建时点(单调时钟)。语义收紧(review -15 (1),
-	// 裁决 (i)):caller 只加入创建晚于自身到达的构建——更早的构建其扫描
-	// 可能未覆盖 caller 到达前的写入,等其结束后重新循环自建/加入新一轮,
-	// 保证"Sync 返回的索引包含调用前的全部写入"。
+	// startedAt 是本构建的创建时刻。调用方只加入创建时刻晚于自身到达时刻
+	// 的构建：更早创建的构建其扫描可能没有覆盖调用方到达前的写入，等它
+	// 结束后重新循环，自建或加入新一轮，保证 Sync 返回的索引包含调用前
+	// 的全部写入。
 	startedAt time.Time
 }
 
-// errQueryBuildWait 标记查询等待在建索引超界(P1 有界化);构建继续
-// 后台推进,调用方按 revision 有无决定降级或报错。
+// errQueryBuildWait 表示查询等待在建索引超过了 OPENACE_QUERY_BUILD_WAIT
+// 上界。构建继续在后台推进；调用方有旧 revision 时降级应答（原因
+// index-building），没有则报错。
 var errQueryBuildWait = errors.New("query wait for index build exceeded")
 
-// errFirstTouchRefresh 标记首触快路径(T1):磁盘 revision 立即可服务,
-// 真实同步已在后台单飞推进;上层以 index-refreshing reason 服务旧索引。
+// errFirstTouchRefresh 表示走了首触快路径：磁盘上的 revision 立即可服务，
+// 真实同步已在后台进行；上层以 index-refreshing 原因用旧索引应答。
 var errFirstTouchRefresh = errors.New("first touch refresh in background")
 
-// firstTouchFastPath 判定并踢出首触后台同步(T1)。返回 (sentinel, true)
-// 表示走快路径;后台同步 goroutine 每 workspace 单飞(firstTouchKicks),
-// 完成后清位——若同步失败,下一次查询会再次踢(重试语义与内联失败一致,
-// 失败原因经 status/last_error 可见,不静默永久陈旧)。
+// firstTouchFastPath 判定是否走首触快路径，需要时启动后台同步。返回
+// (errFirstTouchRefresh, true) 表示走快路径。条件：本 daemon 生命周期内该
+// 工作区还没有成功同步过，且磁盘上已有可服务的 revision。后台同步
+// goroutine 每个工作区最多一个（firstTouchKicks 登记），完成后清除登记；
+// 同步失败时下一次查询会再启动一次，与内联同步失败后的重试一致，失败
+// 原因经状态的 last_error 可见，不会一直静默用旧索引。
 func (e *Engine) firstTouchFastPath(ref engine.WorkspaceRef) (error, bool) {
 	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
 	if err != nil {
@@ -456,8 +512,9 @@ func (e *Engine) firstTouchFastPath(ref engine.WorkspaceRef) (error, bool) {
 		go func() {
 			defer e.firstTouchKicks.Delete(workspaceKey)
 			defer func() {
-				// 后台 goroutine 不得因引擎关闭等竞态拖垮进程;失败留给
-				// status/下次查询重踢,这里只兜 panic。
+				// 后台 goroutine 里的 panic（如引擎关闭期间的竞态）若不恢复会
+				// 让整个 daemon 进程退出，这里只恢复 panic；同步失败本身不在
+				// 此处理，由状态与下一次查询重新触发。
 				_ = recover()
 			}()
 			_, _ = e.syncWorkspaceDetachable(context.Background(), ref, false)
@@ -466,28 +523,31 @@ func (e *Engine) firstTouchFastPath(ref engine.WorkspaceRef) (error, bool) {
 	return errFirstTouchRefresh, true
 }
 
-// syncWorkspaceForQuery 是查询路径的同步入口:配置了 QueryBuildWait 时
-// 以其为上界等待在建构建;超界即脱离等待(不取消构建,phantom waiter
-// 保证后续 leave 也不会取消),错误带构建进度与 env 名(可行动)。
+// syncWorkspaceForQuery 是查询路径的同步入口，依次尝试：
+//   - 新鲜度窗口内：直接用现有 revision 应答，不扫描。
+//   - 首触快路径（降级模式不是 deny 且未开严格档）：返回
+//     errFirstTouchRefresh，上层用磁盘上的旧 revision 应答，同步在后台
+//     进行。
+//   - OPENACE_QUERY_BUILD_WAIT 为 0：等到构建完成。
+//   - 配置了上界：分片等待，超界后返回 errQueryBuildWait。构建不被取消，
+//     错误文本带构建进度与环境变量名。
 func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.WorkspaceRef) (engine.Result, error) {
-	// freshness 窗口短路只属于查询期内联同步(F2,review 2026-08-06):
-	// 显式 Sync 永远真实扫描——"编辑后 sync 即可见"不受窗口影响。
+	// 新鲜度窗口只作用于查询期的内联同步；显式 Sync 每次都真实扫描，
+	// 编辑后 sync 立即可见，不受窗口影响。
 	if e.freshnessWindow > 0 {
 		if res, ok := e.freshnessShortcut(ref); ok {
 			return res, nil
 		}
 	}
-	// 首触快路径(T1,2026-08-14):进程重启后 lastSyncOK 清空,而磁盘上
-	// 的 published revision 依旧可服务——现状是首查内联全量扫描,大仓
-	// 实测阻塞 40s+ 后才 stale-serve 本就在盘上的 revision(gradle 29K
-	// files 43.6s,docs/tasks/T1)。此处改为:本 daemon 生命周期内该
-	// workspace 尚无成功同步且存在可服务 revision 时,立即以 sentinel
-	// 错误交上层按既有 stale-serve 机制服务旧 revision(reason=
-	// index-refreshing,进 [DEGRADED] 横幅),同时单飞踢一次后台真实
-	// 同步;收敛后 lastSyncOK 置位,本路径自动失效。边界(与 task 文档
-	// 一致):显式 Sync 不经此路(F2);真冷仓无 revision 不适用;deny=
-	// 正确性优先不适用;strict 会把任何降级 reason 判违规,走快路径
-	// 只会必然报错,故同样不适用。
+	// 首触快路径。进程重启后 lastSyncOK 为空，而磁盘上的 revision 依旧可
+	// 服务；改动前首次查询要内联全量扫描，大仓实测阻塞 43.6 秒（gradle
+	// 仓库 2.9 万文件）之后才用本就在盘上的 revision 应答。现在：该工作区
+	// 尚无成功同步且有可服务 revision 时，立即返回 errFirstTouchRefresh
+	// 让上层用旧 revision 应答（原因 index-refreshing，进 [DEGRADED] 横幅），
+	// 同时后台启动一次真实同步；同步成功后 lastSyncOK 置位，本路径不再
+	// 触发。不走的情况：显式 Sync；没有任何 revision 的工作区；降级模式
+	// deny（正确性优先）；严格档（它会把任何降级原因判为违规，走快路径
+	// 只会必然报错）。
 	if e.retrievalDegrade != DegradeDeny && !e.qualityStrict {
 		if err, ok := e.firstTouchFastPath(ref); ok {
 			return engine.Result{}, err
@@ -496,11 +556,10 @@ func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.Workspace
 	if e.queryBuildWait <= 0 {
 		return e.syncWorkspace(ctx, ref)
 	}
-	// 切片等待(灰度反馈三 C.2):预算切成 buildWaitSlice 粒度,每片
-	// 醒来核对构建 ETA——ETA 超出剩余预算且有旧 revision 可答时提前
-	// 脱离,立即让上层以旧索引降级应答,不再等满整个预算(大仓重建
-	// ETA 分钟级时,等满整个 buildWait 预算再降级是纯延迟)。ETA 未知
-	// (首批未完成)或无旧 revision 时行为与整段等待一致。
+	// 分片等待：把预算切成 buildWaitSlice 长的片，每片结束核对构建 ETA。
+	// ETA 超出剩余预算且有旧 revision 可答时立即返回，让上层用旧索引降级
+	// 应答，不再等满整个预算。ETA 未知（首批尚未完成）或没有旧 revision
+	// 时与整段等待行为一致。
 	deadline := time.Now().Add(e.queryBuildWait)
 	for {
 		remaining := time.Until(deadline)
@@ -513,14 +572,14 @@ func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.Workspace
 		}
 		waitCtx, cancel := context.WithTimeout(ctx, slice)
 		res, err := e.syncWorkspaceDetachable(waitCtx, ref, false)
-		// T3 修正:必须在 cancel() 前取 waitCtx.Err()——cancel 后恒为
-		// Canceled(非 nil),原写法把"非超时的真实构建错误"也吞进重试
-		// 环,直至预算耗尽后以 index-building 语言包装(坏路径 40s 白等
-		// 实录,docs/tasks/T3;与本注释声明的语义相悖)。
+		// waitCtx.Err() 必须在 cancel() 之前读取：cancel 之后它已非 nil，
+		// 原写法把非超时的真实构建错误也当成超时进入重试循环，直到预算
+		// 耗尽后用 index-building 的措辞包装，路径不存在这类错误要等 40 秒
+		// 才返回，而且看不到真实原因。
 		waitExpired := waitCtx.Err() != nil
 		cancel()
 		if err == nil || ctx.Err() != nil || !waitExpired {
-			// 真结果 / 调用方取消 / 非超时的真实构建错误:原样返回。
+			// 拿到结果、调用方取消、或非超时的真实构建错误：原样返回。
 			return res, err
 		}
 		if eta := e.buildETASeconds(ref); eta > 0 && time.Duration(eta)*time.Second > time.Until(deadline) && e.hasServableRevision(ref) {
@@ -529,8 +588,8 @@ func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.Workspace
 	}
 }
 
-// queryBuildWaitError 构造有界等待脱离错误(errQueryBuildWait 族,上层
-// 按 revision 有无降级或报错),携带实时进度与可行动后缀。
+// queryBuildWaitError 构造 errQueryBuildWait 族错误：带构建进度快照与
+// suffix 里的处置提示；上层按有无 revision 决定降级或报错。
 func (e *Engine) queryBuildWaitError(ref engine.WorkspaceRef, suffix string) error {
 	progress := ""
 	if _, workspaceKey, err := e.resolveRoot(ref.DirectoryPath); err == nil {
@@ -539,7 +598,7 @@ func (e *Engine) queryBuildWaitError(ref engine.WorkspaceRef, suffix string) err
 	return fmt.Errorf("%w: index still building (%s); %s", errQueryBuildWait, progress, suffix)
 }
 
-// buildETASeconds 读取在建构建的嵌入 ETA 估算(秒);无进度返回 0。
+// buildETASeconds 读取在建构建的嵌入 ETA 估算（秒），没有进度信息返回 0。
 func (e *Engine) buildETASeconds(ref engine.WorkspaceRef) int {
 	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
 	if err != nil {
@@ -557,9 +616,9 @@ func (e *Engine) buildETASeconds(ref engine.WorkspaceRef) int {
 	return eta
 }
 
-// hasServableRevision 报告 workspace 是否已有可应答的 revision(提前
-// 脱离等待只在旧索引可答时发生;无 revision 时提前脱离只会把可行动
-// 错误提前,反而缩短小仓首建等到结果的机会)。
+// hasServableRevision 报告该工作区是否有可以应答的 revision。提前放弃等待
+// 只在有旧索引可答时发生：没有 revision 时提前放弃只是把错误提前返回，
+// 小仓首建本来可能在预算内等到结果。
 func (e *Engine) hasServableRevision(ref engine.WorkspaceRef) bool {
 	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
 	if err != nil {
@@ -573,8 +632,9 @@ func (e *Engine) hasServableRevision(ref engine.WorkspaceRef) bool {
 	return true
 }
 
-// buildProgressLabel 读取构建期进度快照(D8 可见性字段的错误文案投影)。
-// 有嵌入进度时附速率与 ETA(灰度反馈 2026-08-07:等待方需要"多久能好")。
+// buildProgressLabel 把构建进度快照格式化为错误文本里的一段：阶段、已嵌
+// 与待嵌 chunk 数；有嵌入速率时附速率与 ETA，等待方能看出构建是否在
+// 推进以及大约多久完成。
 func (e *Engine) buildProgressLabel(workspaceKey string) string {
 	e.mu.Lock()
 	tracker := e.statuses[workspaceKey]
@@ -598,9 +658,9 @@ func (e *Engine) syncWorkspace(ctx context.Context, ref engine.WorkspaceRef) (en
 	return e.syncWorkspaceDetachable(ctx, ref, true)
 }
 
-// freshnessShortcut 在窗口内以现役 revision 直接应答(仅查询期内联同步
-// 使用;F2 后显式 Sync 不经此路)。失败过的 workspace 不短路(lastSyncOK
-// 仅成功刷新),保证故障不被窗口掩盖。
+// freshnessShortcut 在新鲜度窗口内用当前 revision 直接应答，只供查询期的
+// 内联同步使用，显式 Sync 不经此路。判断依据是 lastSyncOK 中最近一次
+// 成功同步的时间。失败不会刷新或删除该时间，窗口内仍可能返回旧索引。
 func (e *Engine) freshnessShortcut(ref engine.WorkspaceRef) (engine.Result, bool) {
 	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
 	if err != nil {
@@ -624,18 +684,18 @@ func (e *Engine) freshnessShortcut(ref engine.WorkspaceRef) (engine.Result, bool
 	}, true
 }
 
-// syncWorkspaceDetachable 的 cancelOnLeave=false 供有界查询等待使用:
-// 等待者超时脱离时不递减 waiters(留 phantom waiter),构建不因此被
-// 取消——有界化的全部意义就是"查询先走,构建继续"。
+// syncWorkspaceDetachable 是全部同步入口的共同实现。cancelOnLeave=false
+// 供有界查询等待使用：等待者超时离开时不递减 waiters，构建不会因为查询
+// 放弃等待而被取消；有界等待的意义就是查询先返回、构建继续。
 func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.WorkspaceRef, cancelOnLeave bool) (engine.Result, error) {
 	if err := rejectProfileID(ref); err != nil {
 		return engine.Result{}, err
 	}
-	// T3(docs/tasks/T3):不存在/非目录路径入口即错——此前坏路径落进
-	// 构建失败+有界等待,用户白等 40s 后得到 index-building 语言的 502,
-	// 真实原因(路径不存在)被吞进 stage=failed。os.Stat 跟随符号链接
-	// (链接指向不存在同口径);权限不可读目录 stat 可过,保持既有扫描
-	// fatal 语义不吞并。
+	// 路径不存在或不是目录的请求在入口就按请求类错误返回。改动前这类
+	// 请求进入构建失败加有界等待，用户等 40 秒后得到 index-building 措辞
+	// 的 502，真实原因藏在 stage=failed 里。os.Stat 跟随符号链接，链接指向
+	// 不存在的目标同样按不存在处理；没有读权限的目录 stat 能通过，交给
+	// 扫描阶段按既有错误处理。
 	if info, statErr := os.Stat(ref.DirectoryPath); statErr != nil {
 		return engine.Result{}, engine.AsInvalidRequest(fmt.Errorf("workspace directory does not exist: %s", ref.DirectoryPath))
 	} else if !info.IsDir() {
@@ -656,12 +716,12 @@ func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.Workspa
 			return engine.Result{}, errors.New("local-hybrid 引擎已关闭")
 		}
 		if call, ok := e.inflight[workspaceKey]; ok {
-			// 语义收紧(review -15 (1),裁决 (i)):只加入创建晚于自身
-			// 到达的构建。更早的构建其扫描可能未覆盖 caller 到达前的
-			// 写入——等其结束后重循环,下一轮的构建创建时点必然晚于
-			// arrival(写入 < 到达 ≤ 新 startedAt < 新扫描),写入必被
-			// 覆盖;同波次并发 caller 在第二轮正常 join,singleflight
-			// 不放大(两轮收敛)。cancelled 构建沿用等待重试语义。
+			// 只加入创建时刻晚于自身到达时刻的构建。更早的构建其扫描可能
+			// 没有覆盖调用方到达前的写入：等它结束后重新循环，下一轮构建
+			// 的创建时刻必然晚于 arrival（写入早于到达，到达早于新构建，
+			// 新构建早于新扫描），写入一定被覆盖；同一波并发调用方在第二
+			// 轮正常加入，两轮即收敛，不会无限放大构建次数。已取消的构建
+			// 同样等它结束再重试。
 			if call.cancelled || call.startedAt.Before(arrival) {
 				done := call.done
 				e.mu.Unlock()
@@ -689,9 +749,8 @@ func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.Workspa
 				e.mu.Unlock()
 			}
 			call.result, call.err = result, err
-			// 对齐 legacy 语义（review S9）：先在锁内摘除表项（带身份
-			// 校验）再 close(done)，消除"看到 done 但表内仍是本 call"
-			// 的忙转窗口。
+			// 先在锁内摘除表项（核对确是本 call）再 close(done)：若先
+			// close，等待者会看到 done 已关闭而表里仍是本 call，进入忙转。
 			e.mu.Lock()
 			if e.inflight[workspaceKey] == call {
 				delete(e.inflight, workspaceKey)
@@ -703,17 +762,17 @@ func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.Workspa
 	}
 }
 
-// waitBuild 等待共享构建完成；cancelOnLeave 时最后一个等待者取消即中止
-// 构建(K12 原语义);有界查询等待用 cancelOnLeave=false——脱离不记账
-// (phantom waiter),构建永不因查询超时被取消,Close 仍兜底强停。
+// waitBuild 等待共享构建完成。cancelOnLeave=true 时最后一个等待者取消即
+// 中止构建；有界查询等待传 false，离开时不记账，构建不会因为查询超时被
+// 取消，Close 仍会强停它。
 func (e *Engine) waitBuild(ctx context.Context, workspaceKey string, call *buildCall, cancelOnLeave bool) (engine.Result, error) {
 	select {
 	case <-call.done:
 		return call.result, call.err
 	case <-ctx.Done():
 	}
-	// ctx 取消后复查 done（review S9，对齐 legacy）：已完成的有效结果
-	// 不因取消竞态被丢弃。
+	// ctx 取消后再查一次 done：构建恰在此刻完成的有效结果不因取消竞态
+	// 被丢弃。
 	select {
 	case <-call.done:
 		return call.result, call.err
@@ -723,8 +782,8 @@ func (e *Engine) waitBuild(ctx context.Context, workspaceKey string, call *build
 		return engine.Result{}, ctx.Err()
 	}
 	e.mu.Lock()
-	// 递减前校验身份（review S9）：本 call 已被摘除时不再记账，
-	// 防 waiters 负数误伤后继构建。
+	// 递减前核对表里仍是本 call：本 call 已被摘除时不再记账，否则 waiters
+	// 变成负数会误取消后续构建。
 	if e.inflight[workspaceKey] == call {
 		call.waiters--
 		if call.waiters <= 0 && !call.cancelled {
@@ -736,8 +795,10 @@ func (e *Engine) waitBuild(ctx context.Context, workspaceKey string, call *build
 	return engine.Result{}, ctx.Err()
 }
 
-// WorkspaceChanged 实现 engine.ChangeDetector：对比当前文件内容身份
-// 与 active manifest 的差异；无 revision 时视为已变化。
+// WorkspaceChanged 实现 engine.ChangeDetector：对比当前文件集与内容身份和
+// active manifest 的差异，没有 revision 视为已变化。内容未变时语义缺口也
+// 算需要同步：向量待修复，或覆盖不完整且 provider 熔断器不在退避期；
+// 退避期内返回未变化，否则 watcher 每个周期都会触发一次注定失败的重建。
 func (e *Engine) WorkspaceChanged(ctx context.Context, ref engine.WorkspaceRef) (bool, error) {
 	if err := rejectProfileID(ref); err != nil {
 		return false, err
@@ -770,8 +831,8 @@ func (e *Engine) WorkspaceChanged(ctx context.Context, ref engine.WorkspaceRef) 
 			return true, nil
 		}
 	}
-	// 内容未变：语义缺口也是"需要同步"的信号——watcher 借此触发向量
-	// 补齐/自愈；provider 退避期间如实返回未变化，防重建风暴（D10/K30）。
+	// 内容未变：语义缺口也是需要同步的信号，watcher 借此触发向量补齐或
+	// 修复；provider 退避期间返回未变化，避免每个周期重复触发重建。
 	if e.semanticEnabled() {
 		if e.vectorRepairPending(workspaceKey) {
 			return true, nil
@@ -783,9 +844,11 @@ func (e *Engine) WorkspaceChanged(ctx context.Context, ref engine.WorkspaceRef) 
 	return false, nil
 }
 
-// Close 实现 engine.Lifecycle：取消并等待在飞构建（review S6——provider
-// 时代构建可长达分钟级，daemon 关停不得遗留出网调用与 staging 写入）、
-// 关闭全部索引句柄，拒绝后续请求。
+// Close 实现 engine.Lifecycle：先标记关闭、取消在途构建，再关闭没有引用的
+// 索引句柄。仍被查询持有的句柄标记退役，由 releaseHandle 在引用归零时
+// 关闭。随后等待构建 goroutine 退出，避免它继续写 journal 时关闭写句柄。
+// 等待受调用方 ctx 限制，超时即返回；构建全部退出后关闭 journal，最后
+// 释放跨进程写锁。
 func (e *Engine) Close(ctx context.Context) error {
 	e.mu.Lock()
 	e.closed = true
@@ -821,7 +884,8 @@ func (e *Engine) Close(ctx context.Context) error {
 	}
 	e.mu.Unlock()
 
-	// 等待构建 goroutine 退出（有界：调用方 ctx 支配等待上限）。
+	// 等待构建 goroutine 退出，等待上限由调用方 ctx 决定；超时即返回，
+	// 剩余步骤不再执行。
 	for _, call := range inflight {
 		select {
 		case <-call.done:
@@ -832,13 +896,13 @@ func (e *Engine) Close(ctx context.Context) error {
 			return firstErr
 		}
 	}
-	// journal 在构建退出后关闭（构建期间可能持有写句柄）。
+	// journal 在构建退出后再关闭：构建期间可能正持有它的写句柄。
 	for _, journal := range journals {
 		if err := journal.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
-	// 写锁最后释放（此后其他进程可立即接管构建所有权）。
+	// 写锁最后释放，此后其他进程可以立即接管构建所有权。
 	for _, lock := range locks {
 		lock.Release()
 	}

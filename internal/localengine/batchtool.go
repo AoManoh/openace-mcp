@@ -12,72 +12,78 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/workspace"
 )
 
-// 本文件是 Batch API 驱动工具的引擎侧钩子(2026-08-05 主线;上游裁决:
-// 2026-08-03 batch verdict §2——工具形态"上传/建作业/轮询/下载/回灌
-// journal",不进产品面、不改引擎契约)。与 DumpChunkRecords 同类:仅
-// openace-bench 消费,不进 MCP 工具面。键与送审文本由引擎单一实现
-// (embedKey/embedDocText)导出,工具侧零重组,杜绝复制漂移。
+// 本文件是离线批量嵌入工具在引擎侧的入口。工具流程是：导出待嵌任务、
+// 提交 provider 批作业、轮询、下载结果、把向量导入 journal（已付费但尚未
+// 进入 revision 的向量暂存文件）。全部待嵌键已覆盖且内容未变化时，之后的
+// Sync 可直接复用这些向量；仍有缺口时会调用 provider 补齐。这些方法只由
+// 评测程序 openace-bench 调用，不进 MCP 工具面，也不
+// 改变引擎契约。任务键与送审文本由引擎的 embedKey 与 embedDocText 生成，
+// 工具侧不自行拼装，两处实现不会分叉。
 
-// EmbedJob 是一条待嵌任务:custom_id=Key(embedKey),送审文本与在线
-// 路径逐字节一致(a2p 模板)。
+// EmbedJob 是一条待嵌任务：Key 是 embedKey，作为批作业里的 custom_id；
+// Text 与在线构建送给 provider 的文本逐字节一致。
 type EmbedJob struct {
 	Key  string
 	Text string
 }
 
-// EmbedPlan 是计划摘要(费用预估与对账的事实源)。
+// EmbedPlan 是一次计划的摘要，供费用预估与结果核对。
 type EmbedPlan struct {
-	// TotalChunks 是存活 chunk 总数(embedKey 去重前)。
+	// TotalChunks 是存活 chunk 总数，按 embedKey 去重之前。
 	TotalChunks int
 	// UniqueKeys 是唯一 embedKey 数。
 	UniqueKeys int
-	// Reusable 是已有向量可复用数(active/previous revision ∪ 兼容兄弟
-	// profile 子树 ∪ journal),口径与在线构建 embedRecords 步骤 1 一致。
+	// Reusable 是已有向量可复用的键数，来源为 active 与 previous revision、
+	// 兼容的旧 chunk profile 子树、journal，与在线构建 embedRecords 的
+	// 复用判定一致。
 	Reusable int
-	// CrossProfileReusable 是 Reusable 中来自兄弟 profile 子树的份额
-	// (与 engine.Result.CrossProfileReused 同口径),让"当前子树为空却
-	// 零缺口"的计划可解释。
+	// CrossProfileReusable 是 Reusable 中来自旧 chunk profile 子树的份额，
+	// 与 engine.Result.CrossProfileReused 同一算法；当前子树为空却零缺口
+	// 的计划由此可以解释。
 	CrossProfileReusable int
-	// Rejected 是持久化拒绝集内的键数(病理内容,不再送 provider)。
+	// Rejected 是持久化拒绝集内的键数：provider 曾对这些内容返回零向量或
+	// NaN，不再送 provider。
 	Rejected int
-	// Pending 是本次导出的待嵌任务数(= 回调次数)。
+	// Pending 是本次导出的待嵌任务数，等于回调次数。
 	Pending int
-	// Dimension/Model/StoreProfile 供批量作业参数与子树对账。
+	// Dimension、Model、StoreProfile 供批作业参数与索引子树核对。
 	Dimension    int
 	Model        string
 	StoreProfile string
 }
 
-// ImportReport 是回灌结果摘要。
+// ImportReport 是一次导入的结果摘要。
 type ImportReport struct {
-	// Appended 是新写入 journal 的向量数。
+	// Appended 是通过检查并纳入本次追加的向量数。成功返回时均已写入
+	// journal；出错返回时可能包含当前批中尚未持久化的向量。
 	Appended int
 	// Existing 是 journal 已有同键而跳过的条数。
 	Existing int
-	// BadVector 是归一失败(零向量/NaN)而跳过的条数——不入持久化拒绝
-	// 集:拒绝集语义是"内容病理"(K35),批量结果异常可能是传输/服务面
-	// 问题,写入会阻断后续实时路径重嵌。
+	// BadVector 是归一化失败（零向量或 NaN）而跳过的条数。这些键不进持久化
+	// 拒绝集：拒绝集表示内容本身有问题，而批量结果异常可能出在传输或
+	// 服务端，写进拒绝集会让之后的实时路径也不再为它们嵌入。
 	BadVector int
-	// WrongDim 是维度不符而跳过的条数。
+	// WrongDim 是维度与配置不符而跳过的条数。
 	WrongDim int
-	// UnknownKey 是不属于本仓当前合法 embedKey 集而被拒的条数(R1,
-	// review 2026-08-06):错误归属的向量一旦入 journal,该 chunk 的
-	// 正确嵌入会被永久屏蔽(journal 命中即不再送 provider),且垃圾键
-	// 永驻 journal 挤占容量。合法集与 PlanEmbedJobs 同源(当前工作区
-	// 扫描+切分的全量 embedKey)。
+	// UnknownKey 是不属于当前工作区合法 embedKey 集而被拒的条数。错误
+	// 归属的向量一旦进入 journal，该 chunk 的正确嵌入会一直被跳过（journal
+	// 命中即不再送 provider），垃圾键也会一直留在 journal 里占用容量。
+	// 合法集由 legalEmbedKeys 按当前工作区扫描与切分算出。
 	UnknownKey int
 }
 
-// ErrSemanticRequired:批量工具依赖 embedding profile 定位 storeProfile
-// 子树,semantic off 时无从谈起,显式拒绝防静默空转白灌。导出供 bench
-// -sync-only 零费预检辨识纯词法形态(R3:无 provider 即无在线费用)。
+// ErrSemanticRequired 表示批量工具在未配置 embedding provider 时被拒绝：
+// 索引子树由 embedding 身份决定，没有它就没有可写入的目标，静默运行只会
+// 白做。导出给 openace-bench 的 -sync-only 预检用：收到该错误说明是纯词法
+// 配置，同步不会产生 provider 费用，直接放行。
 var ErrSemanticRequired = errors.New("batch 工具需要已配置的 embedding provider(storeProfile 子树由 embedding profile 决定)")
 
-// PlanEmbedJobs 枚举工作区当前形态下的待嵌任务:与在线构建同源的扫描
-// 与切分(含 previous chunk 复用),同源的复用池判定(active/previous
-// revision → 兼容兄弟 profile 子树 → journal → 拒绝集),零 provider
-// 调用、零 revision 变更。持跨进程写锁执行,防并发构建改写 journal 造成
-// 计划失真。
+// PlanEmbedJobs 枚举工作区当前状态下的待嵌任务，对每条 pending 任务回调
+// fn。扫描、切分与 previous 的 chunk 记录复用走在线构建的同一批函数
+// （chunkAsset、loadLiveChunkRecordsByFile），复用来源的判定顺序（active
+// 与 previous revision、兼容的旧 chunk profile 子树、journal、拒绝集）与
+// embedRecords 一致；不调用 provider，不发布 revision。持跨进程写锁执行，
+// 并发构建改写 journal 会让计划与实际不符。
 func (e *Engine) PlanEmbedJobs(ctx context.Context, ref engine.WorkspaceRef, fn func(EmbedJob) error) (EmbedPlan, error) {
 	if err := rejectProfileID(ref); err != nil {
 		return EmbedPlan{}, err
@@ -112,9 +118,10 @@ func (e *Engine) PlanEmbedJobs(ctx context.Context, ref engine.WorkspaceRef, fn 
 	return plan, nil
 }
 
-// planLiveRecords 枚举工作区当前形态的存活 chunk 记录:与 runBuild
-// 阶段 1/2 同源——扫描 → (previous 逐字节未变文件复用已切分 chunk |
-// 变更文件重切分)。零 provider 调用。
+// planLiveRecords 枚举工作区当前状态的存活 chunk 记录，步骤与 runBuild 的
+// 扫描与切分阶段相同：扫描工作区，内容身份未变的文件复用 previous 的
+// chunk 记录，其余文件重新切分；内容检查拒绝或切出 0 chunk 的文件跳过。
+// 不调用 provider。
 func (e *Engine) planLiveRecords(ctx context.Context, workspaceKey string, root pathutil.WorkspaceRoot, store *index.Store) (*index.Manifest, []chunkRecord, error) {
 	assets, _, err := workspace.FileAssetSource{Cache: e.statCacheFor(workspaceKey)}.LoadWithStats(ctx, root.CanonicalPath)
 	if err != nil {
@@ -160,24 +167,25 @@ func (e *Engine) planLiveRecords(ctx context.Context, workspaceKey string, root 
 	return previous, records, nil
 }
 
-// tallyEmbedPlan 按 embedKey 去重后对复用池与拒绝集归类计数(与
-// embedRecords 步骤 1/2 同源判定:active/previous revision → 兼容兄弟
-// profile 子树 → journal → 拒绝集),pending 键回调 fn 导出待嵌任务。
+// tallyEmbedPlan 按 embedKey 去重后把每个键归类计数：依次查 active 与
+// previous revision 的向量、兼容的旧 chunk profile 子树的向量、journal、
+// 持久化拒绝集，顺序与 embedRecords 一致；都没命中的键是 pending，回调 fn
+// 导出待嵌任务。
 func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *index.Store, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, records []chunkRecord, fn func(EmbedJob) error) error {
 	var prior priorVectors
 	defer func() { prior.release() }()
 	if previous != nil {
 		prior = e.loadPriorVectors(store, previous, nil)
 	}
-	// 兄弟 profile 子树复用池必须与 buildFull 阶段 2.5 的门槛逐字一致
-	// (冷子树 / 语义未完整 / active 段物理不全时并入,完整现役 revision
-	// 不并入)。2026-09-03 评测误停:二进制 chunk profile 已升 v8 而缓存由
-	// v7 建成,v8 子树为空,计划面只看当前子树,报 57,650 个 chunk 缺向量,
-	// -sync-only 零费预检据此拒绝执行;同一形态下在线构建经
-	// mergeSiblingProfileVectors 按内容哈希从 v7 子树零费复用全部向量,
-	// 真实缺口为 0。计划面少算复用池 = 假阳性缺口 = 用户被迫放弃零费
-	// 路径或误判需重付。候选发现与身份匹配逻辑复用 profile_reuse.go,
-	// 此处不重写;并入的索引属主转移给 prior,随 defer 统一释放。
+	// 并入旧 chunk profile 子树向量的条件必须与 buildFull 逐字一致：首建、
+	// 语义未完整或 active 段物理不全时并入，语义完整的 revision 不并入。
+	// 改动前计划只看当前子树：二进制的 chunk profile 已升到 v8 而缓存由 v7
+	// 建成时，v8 子树为空，计划报 57,650 个 chunk 缺向量，-sync-only 预检
+	// 据此拒绝执行；而同样状态下在线构建经 mergeSiblingProfileVectors 从
+	// v7 子树按键复用了全部向量，真实缺口为 0。计划少算复用来源就是假的
+	// 缺口，用户会放弃零费路径或以为需要重新付费。候选发现与身份匹配
+	// 复用 profile_reuse.go 的实现；并入的索引归 prior 持有，随 defer 统一
+	// 释放。
 	if previous == nil || !previous.SemanticComplete() || prior.activeLoadedSegments != prior.activeExpectedSegments {
 		e.mergeSiblingProfileVectors(store, root, &prior)
 	}
@@ -205,8 +213,9 @@ func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *ind
 			plan.Reusable++
 			continue
 		}
-		// 优先级低于当前 active/previous、高于 journal,与 embedRecords
-		// 的 reuse 表填充顺序一致(crossProfileReused 只计未被现役覆盖的键)。
+		// 旧子树向量的优先级低于 active 与 previous、高于 journal，与
+		// embedRecords 填充复用表的顺序一致；CrossProfileReusable 只计
+		// 前两级没有命中的键。
 		if _, ok := prior.crossProfileByHash[key]; ok {
 			plan.Reusable++
 			plan.CrossProfileReusable++
@@ -228,13 +237,9 @@ func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *ind
 	return nil
 }
 
-// ImportEmbeddings 把离线批量结果回灌 journal:逐条校验维度并 L2 归一
-// (与在线路径同口径,vector.Write 拒绝未归一输入),journal 已有键跳过。
-// next 返回 ok=false 表示流结束。回灌后一次正常 Sync 即零 provider 调用
-// 收编发布,发布随即 CompactAfterPublish 清理 journal。
-// legalEmbedKeys 枚举当前工作区全量合法 embedKey(与 PlanEmbedJobs 的
-// records 枚举同源:扫描 + 未变文件复用上一 revision 记录 + 变更文件
-// 现切),供 ImportEmbeddings 做键归属校验(R1)。
+// legalEmbedKeys 枚举当前工作区全部合法的 embedKey，供 ImportEmbeddings 校验
+// 键归属。枚举方式与 planLiveRecords 相同：扫描工作区，内容未变的文件复用
+// 上一 revision 的 chunk 记录，变更文件现切；扫描不带 stat 缓存。
 func (e *Engine) legalEmbedKeys(ctx context.Context, root pathutil.WorkspaceRoot, store *index.Store) (map[string]bool, error) {
 	assets, err := workspace.FileAssetSource{}.Load(ctx, root.CanonicalPath)
 	if err != nil {
@@ -282,6 +287,14 @@ func (e *Engine) legalEmbedKeys(ctx context.Context, root pathutil.WorkspaceRoot
 	return legal, nil
 }
 
+// ImportEmbeddings 把离线批量嵌入的结果写入 journal。next 每次返回一条
+// （键、向量），ok=false 表示流结束。每条依次检查：键不在当前工作区的
+// 合法 embedKey 集内则拒绝；journal 或本批已有同键则跳过；维度与配置不符
+// 则跳过；L2 归一化失败（零向量或 NaN）则跳过，归一化与在线路径一致，
+// vector.Write 拒绝未归一化的输入。通过的向量每 512 条批量追加进 journal。
+// 导入后 Sync 复用有效向量；只有全部待嵌键已覆盖且内容未变化时，才不需
+// 调用 provider。发布后 CompactAfterPublish 清理已入盘的条目。出错时
+// 返回已统计的计数，其中 Appended 可能包含尚未持久化的当前批。
 func (e *Engine) ImportEmbeddings(ctx context.Context, ref engine.WorkspaceRef, next func() (key string, vec []float32, ok bool, err error)) (ImportReport, error) {
 	if err := rejectProfileID(ref); err != nil {
 		return ImportReport{}, err
@@ -371,7 +384,9 @@ func (e *Engine) ImportEmbeddings(ctx context.Context, ref engine.WorkspaceRef, 
 	return report, nil
 }
 
-// EmbeddingIdentity 暴露当前语义身份三元组(R2,bench 回灌身份校验)。
+// EmbeddingIdentity 返回当前 embedding 身份的三元组：ProfileHash、模型、
+// 维度。openace-bench 导入前用它核对结果文件头部记录的身份，另一套模型
+// 或维度产出的向量不会被写进本子树的 journal。
 func (e *Engine) EmbeddingIdentity() (profileHash string, model string, dimension int) {
 	return e.embedCfg.ProfileHash(), e.embedCfg.Model, e.embedCfg.Dimension
 }
