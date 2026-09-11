@@ -41,6 +41,10 @@ type throughputSample struct {
 	measuredTokens                                      int64
 	measuredSuccess                                     int
 	invalid                                             bool
+	cohortSuccess, peakInFlight                         int
+	settlementStarted                                   bool
+	settleThrough                                       uint64
+	settling                                            int
 }
 
 // Governor 由全部工作区共享。window 是当前请求窗口，没有固定并发上限。
@@ -50,6 +54,7 @@ type Governor struct {
 	mu                                         sync.Mutex
 	window, inFlight, operations               int
 	inFlightBytes                              int64
+	inFlightTokens                             int64
 	nextID, epoch                              uint64
 	active                                     map[uint64]indexAttempt
 	waiters                                    []chan struct{}
@@ -70,7 +75,8 @@ type Governor struct {
 	sleep                                      func(context.Context, time.Duration) error
 }
 
-// NewGovernor 的参数只确定初始窗口。资源状态未知时维持当前窗口并报告原因。
+// NewGovernor 的参数只确定初始窗口。资源状态未知时不自动扩张并报告原因，
+// 过载时仍可降低窗口。
 func NewGovernor(initialWindow int) *Governor {
 	if initialWindow < 1 {
 		initialWindow = 16
@@ -158,6 +164,8 @@ func (g *Governor) AcquireIndexWithBudget(ctx context.Context, tokens int, bytes
 			g.active[p.id] = indexAttempt{epoch: g.epoch, tokens: tokens, bytes: bytes, sampled: sampled}
 			g.inFlight++
 			g.inFlightBytes += bytes
+			g.inFlightTokens += int64(tokens)
+			g.sample.peakInFlight = max(g.sample.peakInFlight, g.inFlight)
 			g.mu.Unlock()
 			return p, nil
 		}
@@ -173,8 +181,8 @@ func (g *Governor) AcquireIndexWithBudget(ctx context.Context, tokens int, bytes
 	}
 }
 
-// Observe 结算一次尝试。旧样本组的迟到结果仍释放名额并参与速率统计，
-// 但不再次改变当前窗口。按许可身份删除，避免重复反馈释放他人的名额。
+// Observe 结算一次尝试。旧样本组的迟到结果仍释放名额并计入完成量，
+// 但其过载结果不重复缩窗。按许可身份删除，避免重复反馈释放他人的名额。
 func (g *Governor) Observe(p IndexPermit, outcome GovernorOutcome, latency, retryAfter time.Duration) {
 	if g == nil || p.owner != g {
 		return
@@ -188,6 +196,10 @@ func (g *Governor) Observe(p IndexPermit, outcome GovernorOutcome, latency, retr
 	delete(g.active, p.id)
 	g.inFlight--
 	g.inFlightBytes -= a.bytes
+	g.inFlightTokens -= int64(a.tokens)
+	if g.sample.settling > 0 && p.id <= g.sample.settleThrough {
+		g.sample.settling--
+	}
 	now := g.now()
 	switch outcome {
 	case OutcomeSuccess:
@@ -209,8 +221,13 @@ func (g *Governor) Observe(p IndexPermit, outcome GovernorOutcome, latency, retr
 			g.sample.invalid = true
 		}
 	}
-	if a.epoch == g.epoch && a.sampled {
-		g.sample.outstanding--
+	if a.epoch == g.epoch {
+		if a.sampled {
+			g.sample.outstanding--
+			if outcome == OutcomeSuccess {
+				g.sample.cohortSuccess++
+			}
+		}
 		g.sample.completed++
 		switch outcome {
 		case OutcomeSuccess:
@@ -226,9 +243,10 @@ func (g *Governor) Observe(p IndexPermit, outcome GovernorOutcome, latency, retr
 			g.verifiedWindow, g.verifiedRate = 0, 0
 			g.fine, g.cooldown = true, 3
 			g.setWindowLocked(max(1, g.window/2), "overload")
-		} else if g.sample.admitted == g.window && g.sample.outstanding == 0 {
-			g.finishSampleLocked(now)
 		}
+	}
+	if g.sample.admitted == g.window && g.sample.outstanding == 0 {
+		g.finishSampleLocked(now)
 	}
 	g.wakeWaitersLocked()
 }
@@ -236,13 +254,33 @@ func (g *Governor) Observe(p IndexPermit, outcome GovernorOutcome, latency, retr
 func (g *Governor) finishSampleLocked(now time.Time) {
 	s := g.sample
 	duration := now.Sub(s.start).Seconds()
-	if s.invalid || s.overload > 0 || s.success != s.admitted || duration <= 0 {
+	if s.settling > 0 {
+		return
+	}
+	if s.invalid || s.overload > 0 || s.cohortSuccess != s.admitted || duration <= 0 {
+		g.nextSampleLocked()
+		return
+	}
+	// 本组从未实际用满窗口，不能把这种读数当作增大窗口没有收益的证据。
+	// 这只排除从未填满的情况，不证明整个观察期始终有足够工作。
+	if s.peakInFlight < g.window {
+		g.lastAdjustment = "window-not-filled"
 		g.nextSampleLocked()
 		return
 	}
 	rate, meanTokens := float64(s.measuredTokens)/duration, float64(s.measuredTokens)/float64(s.measuredSuccess)
 	if g.verifiedWindow > 0 && g.window > g.verifiedWindow && g.verifiedTokens > 0 && math.Abs(meanTokens-g.verifiedTokens)/g.verifiedTokens <= .25 {
 		if rate < g.verifiedRate*1.05 {
+			// 末尾已有在途请求可能改变判断时，等它们归还后再结算。
+			// 冻结许可边界，之后补充的请求不延长等待；HTTP 仍正常准入，
+			// 实际完成量才用于扩张，不把未完成 token 当作成功吞吐。
+			if !s.settlementStarted && g.inFlight > 0 &&
+				(float64(s.measuredTokens)+float64(g.inFlightTokens))/duration >= g.verifiedRate*1.05 {
+				g.sample.settlementStarted = true
+				g.sample.settleThrough, g.sample.settling = g.nextID, g.inFlight
+				g.lastAdjustment = "throughput-inconclusive"
+				return
+			}
 			g.fine, g.cooldown = true, 3
 			g.setWindowLocked(g.verifiedWindow, "no-throughput-gain")
 			return
