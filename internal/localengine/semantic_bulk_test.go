@@ -260,15 +260,18 @@ func TestBulkResumeAfterRestart(t *testing.T) {
 		_, err := e1.Sync(syncCtx, syncRequest(root))
 		done <- err
 	}()
-	// 等作业提交并进入轮询(上传+建作业各 1 次)。
+	// 首次轮询发生在客户端保存作业 ID 之后。仅看服务端创建次数，取消可能
+	// 早于响应接收，使测试进入“提交结果未确认”的另一恢复分支。
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		uploads, jobs, _ := provider.counts()
-		if uploads == 1 && jobs == 1 {
+		provider.mu.Lock()
+		uploads, jobs, polls := provider.uploads, provider.jobsCreated, provider.polls
+		provider.mu.Unlock()
+		if uploads == 1 && jobs == 1 && polls > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("作业未在期限内提交: uploads=%d jobs=%d", uploads, jobs)
+			t.Fatalf("作业未在期限内进入轮询: uploads=%d jobs=%d polls=%d", uploads, jobs, polls)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
