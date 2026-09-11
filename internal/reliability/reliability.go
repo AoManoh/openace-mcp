@@ -414,30 +414,45 @@ func NewRateLimiter(rpm, tpm int) *RateLimiter {
 // 裁决。原因：单笔需求大于预算时，任何一个空窗口都装不下它，不放行的
 // 话该请求会一直等待。
 func (l *RateLimiter) Acquire(ctx context.Context, requests, tokens int) error {
-	if l == nil {
-		return nil
-	}
 	for {
-		l.mu.Lock()
-		now := l.now()
-		if now.Sub(l.windowStart) >= time.Minute {
-			l.windowStart = now
-			l.usedReqs = 0
-			l.usedTokens = 0
+		wait, err := l.TryAcquire(ctx, requests, tokens)
+		if err != nil || wait <= 0 {
+			return err
 		}
-		fitsRPM := l.rpm <= 0 || l.usedReqs+requests <= l.rpm
-		fitsTPM := l.tpm <= 0 || l.usedTokens+tokens <= l.tpm
-		emptyWindow := l.usedReqs == 0 && l.usedTokens == 0
-		if (fitsRPM && fitsTPM) || emptyWindow {
-			l.usedReqs += requests
-			l.usedTokens += tokens
-			l.mu.Unlock()
-			return nil
-		}
-		wait := l.windowStart.Add(time.Minute).Sub(now)
-		l.mu.Unlock()
 		if err := l.sleep(ctx, wait); err != nil {
 			return err
 		}
 	}
+}
+
+// TryAcquire 在预算允许时立即登记本次尝试并返回零等待时间。预算不足时
+// 返回距窗口结束的时长，不预留或扣减用量。调用方可先释放并发名额再等待，
+// 避免预算等待阻塞其他可执行请求；醒来后必须重新检查，不能按旧窗口发送。
+// ctx 已结束时不登记。准入后的尝试不因传输错误退还预算，请求可能已到服务端。
+func (l *RateLimiter) TryAcquire(ctx context.Context, requests, tokens int) (time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if l == nil {
+		return 0, nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	now := l.now()
+	if now.Sub(l.windowStart) >= time.Minute {
+		l.windowStart = now
+		l.usedReqs, l.usedTokens = 0, 0
+	}
+	fitsRPM := l.rpm <= 0 || l.usedReqs+requests <= l.rpm
+	fitsTPM := l.tpm <= 0 || l.usedTokens+tokens <= l.tpm
+	emptyWindow := l.usedReqs == 0 && l.usedTokens == 0
+	if (fitsRPM && fitsTPM) || emptyWindow {
+		l.usedReqs += requests
+		l.usedTokens += tokens
+		return 0, nil
+	}
+	return l.windowStart.Add(time.Minute).Sub(now), nil
 }

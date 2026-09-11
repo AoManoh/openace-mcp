@@ -69,7 +69,7 @@ func NewClient(cfg Config) (*Client, error) {
 		retry:        reliability.DefaultRetryPolicy(cfg.MaxRetries),
 	}
 	if cfg.GovernorDisabled {
-		// 逃生门:单熔断共用、无治理器——与治理器引入前逐字节同行为。
+		// 关闭治理器时查询与索引共用熔断器；预算与逐次尝试的名额释放仍生效。
 		client.circuitQuery = client.circuitIndex
 	} else {
 		client.circuitQuery = reliability.NewCircuit()
@@ -178,38 +178,30 @@ func (c *Client) EmbedBatch(ctx context.Context, texts []string, inputType Input
 	return nil, callErr
 }
 
-// embedOnce 执行一次（含策略内重试的）批调用：limiter → 车道准入 → HTTP。
-// 索引车道:并发槽(硬上限)+治理器(速率令牌与动态窗口,每次真实 HTTP
-// 尝试都过闸并回报观测——重试也是真实请求,消耗同样的上游配额)。
-// 查询车道:直通并发槽与治理器——交互查询一次一条,不排在索引批后面;
-// 其上限由查询到达率天然约束。用户 RPM/TPM 预算(limiter)对两车道都是
-// 不可逾越的硬顶,语义与引入治理器前一致。
+// embedOnce 在每次 HTTP 尝试前检查显式预算和索引名额。重试同样计数，
+// 每次尝试结束后先释放名额再退避，避免没有 HTTP 在途时仍挡住其他批。
+// 查询共用显式预算，但不占索引名额。等待预算的时间不作为 provider 延迟。
 func (c *Client) embedOnce(ctx context.Context, texts []string, inputType InputType) ([][]float32, error) {
 	tokens := estimateTokens(texts)
-	if err := c.limiter.Acquire(ctx, 1, tokens); err != nil {
-		return nil, err
-	}
 	indexLane := inputType == InputDocument
-	if indexLane {
-		select {
-		case c.sem <- struct{}{}:
-			defer func() { <-c.sem }()
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
 	var vectors [][]float32
 	err := c.retry.Do(ctx, func(ctx context.Context) error {
-		if indexLane && c.governor != nil {
-			if err := c.governor.AcquireIndex(ctx, tokens); err != nil {
-				return err
-			}
+		if err := c.acquireAttempt(ctx, tokens, inputType); err != nil {
+			return err
 		}
 		start := time.Now()
-		got, err := c.doRequest(ctx, texts, inputType)
-		if indexLane && c.governor != nil {
-			c.governor.Observe(governorOutcome(err), tokens, time.Since(start), retryAfterOf(err))
+		outcome := reliability.OutcomeOther
+		var latency, retryAfter time.Duration
+		if indexLane {
+			defer func() {
+				// 先归还 sem 再唤醒治理器等待者，使已取得治理器名额的请求
+				// 能立即取得对应的 sem 名额，不在预算登记后继续排队。
+				<-c.sem
+				c.governor.Observe(outcome, tokens, latency, retryAfter)
+			}()
 		}
+		got, err := c.doRequest(ctx, texts, inputType)
+		outcome, latency, retryAfter = governorOutcome(err), time.Since(start), retryAfterOf(err)
 		if err != nil {
 			return err
 		}
@@ -220,6 +212,52 @@ func (c *Client) embedOnce(ctx context.Context, texts []string, inputType InputT
 		return nil, err
 	}
 	return vectors, nil
+}
+
+// acquireAttempt 不在预算等待期间占用并发名额。治理器启用时把显式预算
+// 合并到名额准入中；关闭时先尝试取得当前配置的 sem 名额，再核对预算。
+// 关闭路径预算不足会归还名额，等待后重新检查，不提前预留下一个窗口。
+func (c *Client) acquireAttempt(ctx context.Context, tokens int, inputType InputType) error {
+	if inputType != InputDocument {
+		return c.limiter.Acquire(ctx, 1, tokens)
+	}
+	if c.governor != nil {
+		if err := c.governor.AcquireIndexWithBudget(ctx, tokens, c.limiter); err != nil {
+			return err
+		}
+		select {
+		case c.sem <- struct{}{}:
+			return nil
+		case <-ctx.Done():
+			c.governor.Observe(reliability.OutcomeOther, tokens, 0, 0)
+			return ctx.Err()
+		}
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		select {
+		case c.sem <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		wait, err := c.limiter.TryAcquire(ctx, 1, tokens)
+		if err == nil && wait <= 0 {
+			return nil
+		}
+		<-c.sem
+		if err != nil {
+			return err
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+	}
 }
 
 // governorOutcome 把调用结果映射为治理器观测分类:429→速率信号,

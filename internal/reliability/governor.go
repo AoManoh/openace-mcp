@@ -173,11 +173,26 @@ func NewGovernor(maxWindow int) *Governor {
 //
 // 每次成功准入都必须由一次 Observe 配对，Observe 释放槽位。
 func (g *Governor) AcquireIndex(ctx context.Context, tokens int) error {
+	return g.AcquireIndexWithBudget(ctx, tokens, nil)
+}
+
+// AcquireIndexWithBudget 同时确认索引名额、已学习速率和用户显式预算。
+// 锁顺序为 Governor 后 RateLimiter。预算不足时不占名额、不扣速率令牌，
+// 等待结束后重新检查全部条件，避免在排队前登记的预算跨分钟后失真。
+// 成功返回仍须由一次 Observe 释放名额；nil 治理器只检查用户预算。
+func (g *Governor) AcquireIndexWithBudget(ctx context.Context, tokens int, budget *RateLimiter) error {
 	if g == nil {
-		return nil
+		return budget.Acquire(ctx, 1, tokens)
 	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		g.mu.Lock()
+		if err := ctx.Err(); err != nil {
+			g.mu.Unlock()
+			return err
+		}
 		now := g.now()
 		// 1) Retry-After 暂停：上游已经明确说了多久以后再来。
 		if wait := g.pausedUntil.Sub(now); wait > 0 {
@@ -224,6 +239,18 @@ func (g *Governor) AcquireIndex(ctx context.Context, tokens int) error {
 		// 每排队一次就多扣一次，余额低于真实消耗，拥堵时的发送速率会低于
 		// 目标速率。速率检查在此只决定"现在能不能放行"，不记账。
 		if g.inFlight < g.window {
+			wait, err := budget.TryAcquire(ctx, 1, tokens)
+			if err != nil {
+				g.mu.Unlock()
+				return err
+			}
+			if wait > 0 {
+				g.mu.Unlock()
+				if err := budget.sleep(ctx, wait); err != nil {
+					return err
+				}
+				continue
+			}
 			if g.rateLearning {
 				g.bucketTokens -= float64(tokens)
 			}
