@@ -211,7 +211,7 @@ func ConfigFromEnv() (Config, error) {
 	cfg.Enabled = true
 	// 只在语义 provider 已启用时拒绝旧并发配置，未配置凭据的词法路径照常可用。
 	if strings.TrimSpace(os.Getenv(EnvMaxConcurrency)) != "" {
-		return Config{}, fmt.Errorf("%s is no longer supported: remove it; indexing concurrency is adjusted dynamically, use RPM_BUDGET/TPM_BUDGET for request budgets", EnvMaxConcurrency)
+		return Config{}, fmt.Errorf("%s is no longer supported: remove it; indexing concurrency is adjusted dynamically, use %s/%s for request budgets", EnvMaxConcurrency, EnvRPMBudget, EnvTPMBudget)
 	}
 	switch governor := strings.TrimSpace(strings.ToLower(os.Getenv(EnvThroughputGovernor))); governor {
 	case "", "on":
