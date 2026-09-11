@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,7 +22,7 @@ func testConfig(baseURL string, dimension int) Config {
 	return Config{
 		Enabled: true, ProviderType: ProviderVoyage, BaseURL: baseURL,
 		APIKey: "canary-secret-key", Model: "voyage-code-3", Dimension: dimension,
-		BatchSize: 128, MaxConcurrency: 4, Timeout: 2 * time.Second, MaxRetries: 2,
+		BatchSize: 128, InitialConcurrency: 4, Timeout: 2 * time.Second, MaxRetries: 2,
 	}
 }
 
@@ -439,7 +440,10 @@ func TestCircuitGateShortCircuits(t *testing.T) {
 	}
 }
 
-func TestConcurrencyBounded(t *testing.T) {
+func TestConcurrencyIncreasesAfterCompleteGroup(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("自动扩窗仅在 Linux 有资源采样；其他平台维持当前窗口")
+	}
 	const dim = 2
 	var current, peak int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -459,7 +463,7 @@ func TestConcurrencyBounded(t *testing.T) {
 	defer ts.Close()
 
 	cfg := testConfig(ts.URL, dim)
-	cfg.MaxConcurrency = 2
+	cfg.InitialConcurrency = 2
 	client, _ := NewClient(cfg)
 	var wg sync.WaitGroup
 	for i := 0; i < 6; i++ {
@@ -472,8 +476,11 @@ func TestConcurrencyBounded(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	if p := atomic.LoadInt32(&peak); p > 2 {
-		t.Fatalf("并发应受 MaxConcurrency 约束（K36）: peak=%d", p)
+	if client.GovernorSnapshot().ResourceReason == "resource-unknown" {
+		t.Skip("当前资源信息不完整，按产品约定不扩窗")
+	}
+	if p := atomic.LoadInt32(&peak); p <= 2 {
+		t.Fatalf("并发应可越过初始窗口: peak=%d", p)
 	}
 }
 

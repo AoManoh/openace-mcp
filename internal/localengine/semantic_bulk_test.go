@@ -194,7 +194,7 @@ func bulkOptions(url string, dim int, minChunks int) Options {
 	return Options{Embedding: embedding.Config{
 		Enabled: true, ProviderType: embedding.ProviderVoyage, BaseURL: url,
 		APIKey: "test-key", Model: "voyage-code-3", Dimension: dim,
-		BatchSize: 8, MaxConcurrency: 2, Timeout: 5 * time.Second, MaxRetries: 0,
+		BatchSize: 8, InitialConcurrency: 2, Timeout: 5 * time.Second, MaxRetries: 0,
 		BatchAPIMode: embedding.ProviderVoyage, BatchMinChunks: minChunks,
 		BulkPollInterval: 20 * time.Millisecond,
 	}, Rerank: rerank.Config{
@@ -524,7 +524,7 @@ func TestGovernedBuildRidesThrough429Storm(t *testing.T) {
 	root := newFixtureWorkspace(t)
 	opts := Options{Embedding: embedding.Config{
 		Enabled: true, ProviderType: embedding.ProviderVoyage, BaseURL: server.URL,
-		APIKey: "k", Model: "m", Dimension: 8, BatchSize: 2, MaxConcurrency: 2,
+		APIKey: "k", Model: "m", Dimension: 8, BatchSize: 2, InitialConcurrency: 2,
 		Timeout: 5 * time.Second, MaxRetries: 2, // 批内重试跨越单批的 429
 	}, Rerank: rerank.Config{Enabled: false, ProviderType: rerank.ProviderOff, DisabledReason: "off"}}
 	e, err := New(opts)

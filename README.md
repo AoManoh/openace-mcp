@@ -216,8 +216,9 @@ MCP 客户端每次启动 agent 会话都会重新拉起 `command` 指定的进�
 |------|------|
 | `OPENACE_EMBEDDING_PROVIDER` | 语义路端点类型:`openai`(OpenAI-compatible)/ `voyage` / `off`。默认 `voyage` 且未提供 key 时语义路保持关闭、词法照常——即**不配置就是纯词法** |
 | `OPENACE_EMBEDDING_BASE_URL` `_API_KEY` `_MODEL` `_DIMENSION` | 模型服务身份四项(`openai` 类型必填 base_url 与 model);`voyage` 类型 key 为空时回退读 `VOYAGE_API_KEY`;任一身份变化触发平行索引全量重建 |
-| `OPENACE_EMBEDDING_BATCH_SIZE` `_MAX_CONCURRENCY` `_RPM_BUDGET` `_TPM_BUDGET` | 索引期调用参数(默认 128 / 16 / 不限 / 不限)。`_MAX_CONCURRENCY` 限制同时执行的索引请求，治理器可在其内调整。显式 RPM/TPM 预算按每次请求尝试计数，文档与查询的重试也计入；预算等待与重试退避不占索引并发名额。单笔需求已超过预算且当前分钟尚无用量时，保留允许该单笔执行的例外，避免请求永久等待。 |
-| `OPENACE_THROUGHPUT_GOVERNOR` | 吞吐治理器与车道分离的逃生门:默认 `on`——索引 429 自动降速续跑(尊重 Retry-After,乘性减/加性增),自部署按延迟梯度自动收放并发,交互查询与索引各持独立熔断互不拖累;`off` 回到固定并发+共用熔断的旧行为 |
+| `OPENACE_EMBEDDING_BATCH_SIZE` `_RPM_BUDGET` `_TPM_BUDGET` | 索引调用参数，默认 128 / 不限 / 不限。显式 RPM/TPM 预算按每次请求尝试计数，文档与查询的重试也计入；预算等待与重试退避不占索引并发名额。单笔需求超过预算且当前分钟尚无用量时，允许该单笔执行，避免请求永久等待。 |
+| `OPENACE_EMBEDDING_MAX_CONCURRENCY` | 已退役。启用语义 provider 时设置非空值会报错，请移除此变量。索引从有限窗口开始，按完整样本组的吞吐与过载调整，没有固定并发上限。 |
+| `OPENACE_THROUGHPUT_GOVERNOR` | 接受空值或 `on`；`off` 报迁移错误，请移除。429 按既有规则降低发送速率并尊重 Retry-After，查询与索引各持独立熔断器。Linux 上检查内存和文件描述符余量；资源不足时等待且不扣预算，资源数据未知时保持当前窗口并在状态中报告 `resource-unknown`。 |
 | `OPENACE_EMBEDDING_BATCH_API` | 离线批车道:`voyage` = 大额嵌入改走 voyage Batch API(费用 -33%,服务端 12h 完成窗,崩溃后续作业不重复付费);默认 `off`。要求 provider 就是 voyage,其他组合启动即报错 |
 | `OPENACE_EMBEDDING_BATCH_MIN_CHUNKS` | 批车道触发阈值(默认 `2000`):缺失量低于此走同步车道——几百个 chunk 分钟级就完了,不值得排 12h 窗 |
 | `OPENACE_RERANK_PROVIDER` | 精排(质量至上默认档):`tei` / `voyage` / `off`;默认 `voyage`,key 缺省回退 `VOYAGE_API_KEY`。配置即启用;语义已配而精排缺配置时结果携带 `rerank-unconfigured` 提示(`OPENACE_QUALITY_STRICT=on` 下升级为报错),显式 `off` 视为确认放弃。`_BASE_URL`/`_API_KEY`/`_MODEL` 语义同上;`OPENACE_RERANK_MAX_TOKENS` 是单次精排请求送审文本的估算 token 上限(默认 `200000`),超出部分的候选不送审、按融合顺序跟在精排结果之后 |

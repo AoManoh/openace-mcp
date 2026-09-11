@@ -114,7 +114,7 @@ func (s *embedServer) setFailWhen(fn func([]string) bool) {
 func embedOptions(url string, dim int, batch int, model string) Options {
 	return Options{Embedding: embedding.Config{
 		Enabled: true, ProviderType: embedding.ProviderOpenAI, BaseURL: url,
-		Model: model, Dimension: dim, BatchSize: batch, MaxConcurrency: 2,
+		Model: model, Dimension: dim, BatchSize: batch, InitialConcurrency: 2,
 		Timeout: 2 * time.Second, MaxRetries: 0,
 	}, Rerank: rerank.Config{
 		Enabled: false, ProviderType: rerank.ProviderOff,

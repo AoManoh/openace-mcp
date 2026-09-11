@@ -35,7 +35,7 @@ func TestDecodeConnectionResetIsTransient(t *testing.T) {
 
 	cfg := Config{
 		Enabled: true, ProviderType: ProviderOpenAI, BaseURL: ts.URL,
-		Model: "fake", Dimension: 4, BatchSize: 8, MaxConcurrency: 1,
+		Model: "fake", Dimension: 4, BatchSize: 8, InitialConcurrency: 1,
 		Timeout: 5 * time.Second, MaxRetries: 0,
 	}
 	client, err := NewClient(cfg)

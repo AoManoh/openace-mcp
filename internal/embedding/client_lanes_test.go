@@ -49,12 +49,11 @@ func laneServer(t *testing.T, dim int, docStatus int, docCalls, queryCalls *atom
 	}))
 }
 
-func laneConfig(url string, governorOff bool) Config {
+func laneConfig(url string) Config {
 	return Config{
 		Enabled: true, ProviderType: ProviderVoyage, BaseURL: url,
-		Model: "m", Dimension: 4, BatchSize: 8, MaxConcurrency: 2,
+		Model: "m", Dimension: 4, BatchSize: 8, InitialConcurrency: 2,
 		MaxRetries: 0, Timeout: 5 * time.Second, TemplateVersion: "t",
-		GovernorDisabled: governorOff,
 	}
 }
 
@@ -64,7 +63,7 @@ func TestQueryLaneSurvivesIndexStorm(t *testing.T) {
 	var docCalls, queryCalls atomic.Int64
 	server := laneServer(t, 4, http.StatusTooManyRequests, &docCalls, &queryCalls)
 	defer server.Close()
-	client, err := NewClient(laneConfig(server.URL, false))
+	client, err := NewClient(laneConfig(server.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,30 +93,6 @@ func TestQueryLaneSurvivesIndexStorm(t *testing.T) {
 	}
 }
 
-// TestEscapeHatchRestoresSharedCircuit(G4/逃生门):governor=off 时回到
-// 共用单熔断旧行为——索引失败后查询同样被熔断拦截。
-func TestEscapeHatchRestoresSharedCircuit(t *testing.T) {
-	var docCalls, queryCalls atomic.Int64
-	server := laneServer(t, 4, http.StatusTooManyRequests, &docCalls, &queryCalls)
-	defer server.Close()
-	client, err := NewClient(laneConfig(server.URL, true))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	if _, err := client.EmbedBatch(ctx, []string{"doc"}, InputDocument); err == nil {
-		t.Fatal("document 应失败")
-	}
-	_, err = client.EmbedQuery(ctx, "interactive")
-	callErr := asCallError(err)
-	if callErr == nil || callErr.Class != reliability.ClassBackoff {
-		t.Fatalf("逃生门下必须回到共用熔断旧行为(查询被退避拦截),得到: %v", err)
-	}
-	if queryCalls.Load() != 0 {
-		t.Fatal("逃生门共用熔断下查询请求不应发出")
-	}
-}
-
 // TestRateLimitBelowFloorDoesNotTripCircuit:治理器未到地板的 429 最终
 // 失败不进熔断(油门先于保险丝)。构造:先积累高实测吞吐,再单次 429。
 func TestRateLimitBelowFloorDoesNotTripCircuit(t *testing.T) {
@@ -143,7 +118,7 @@ func TestRateLimitBelowFloorDoesNotTripCircuit(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": vecs})
 	}))
 	defer server.Close()
-	client, err := NewClient(laneConfig(server.URL, false))
+	client, err := NewClient(laneConfig(server.URL))
 	if err != nil {
 		t.Fatal(err)
 	}

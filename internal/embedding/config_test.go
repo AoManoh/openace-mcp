@@ -34,7 +34,7 @@ func TestDefaultsWithVoyageKey(t *testing.T) {
 		cfg.Model != "voyage-code-3" || cfg.Dimension != 1024 {
 		t.Fatalf("默认身份不符: %+v", cfg)
 	}
-	if cfg.BatchSize != 128 || cfg.MaxConcurrency != 16 || cfg.RPMBudget != 0 || cfg.TPMBudget != 0 {
+	if cfg.BatchSize != 128 || cfg.InitialConcurrency != 16 || cfg.RPMBudget != 0 || cfg.TPMBudget != 0 {
 		t.Fatalf("默认运维参数不符: %+v", cfg)
 	}
 	if cfg.Timeout != 60*time.Second || cfg.MaxRetries != 5 {
@@ -148,7 +148,7 @@ func TestOperationalEnvParsing(t *testing.T) {
 	t.Setenv(EnvVoyageAPIKey, "k")
 	t.Setenv(EnvDimension, "2048")
 	t.Setenv(EnvBatchSize, "64")
-	t.Setenv(EnvMaxConcurrency, "8")
+	// 固定并发配置已退役，由迁移测试验证拒绝行为。
 	t.Setenv(EnvRPMBudget, "1000")
 	t.Setenv(EnvTPMBudget, "2000000")
 	t.Setenv("OPENACE_PROVIDER_TIMEOUT", "90s")
@@ -157,7 +157,7 @@ func TestOperationalEnvParsing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ConfigFromEnv: %v", err)
 	}
-	if cfg.Dimension != 2048 || cfg.BatchSize != 64 || cfg.MaxConcurrency != 8 ||
+	if cfg.Dimension != 2048 || cfg.BatchSize != 64 || cfg.InitialConcurrency != 16 ||
 		cfg.RPMBudget != 1000 || cfg.TPMBudget != 2000000 ||
 		cfg.Timeout != 90*time.Second || cfg.MaxRetries != 2 {
 		t.Fatalf("运维参数解析不符: %+v", cfg)
@@ -169,7 +169,7 @@ func TestOperationalEnvParsing(t *testing.T) {
 func TestProfileHashSensitivity(t *testing.T) {
 	base := Config{Enabled: true, ProviderType: ProviderVoyage,
 		BaseURL: "https://api.voyageai.com/v1", Model: "voyage-code-3", Dimension: 1024,
-		APIKey: "key-a", BatchSize: 128, MaxConcurrency: 4, Timeout: 60 * time.Second, MaxRetries: 5}
+		APIKey: "key-a", BatchSize: 128, InitialConcurrency: 4, Timeout: 60 * time.Second, MaxRetries: 5}
 	hash := base.ProfileHash()
 	if len(hash) != 12 {
 		t.Fatalf("hash 长度应为 12: %q", hash)
@@ -178,7 +178,7 @@ func TestProfileHashSensitivity(t *testing.T) {
 	insensitive := base
 	insensitive.APIKey = "key-b"
 	insensitive.BatchSize = 16
-	insensitive.MaxConcurrency = 1
+	insensitive.InitialConcurrency = 1
 	insensitive.Timeout = time.Second
 	insensitive.MaxRetries = 0
 	insensitive.RPMBudget = 5

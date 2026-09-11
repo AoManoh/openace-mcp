@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/embedding"
 	"github.com/AoManoh/openace-mcp/internal/engine"
@@ -349,7 +350,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	// 3) 分批嵌入。单批失败只记录并继续，成功的批照常入盘。熔断进入退避
 	// （provider 连续失败后暂停向它发请求）时停止投放后续批，后续批都会
 	// 被同样拒绝。ctx 取消中止整次构建。进度按批写入状态，构建期的
-	// workspace_status 能看到嵌入进展。批之间按 MaxConcurrency 并行：
+	// workspace_status 能看到嵌入进展。批次投放跟随客户端的动态窗口：
 	// provider 单次请求延迟在秒级且波动大，串行时整次构建的吞吐等于单请
 	// 求延迟。每批要么全部成功要么整批失败，journal 自身持锁，并行不改变
 	// 落盘语义。
@@ -367,7 +368,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	batchSize := e.embedCfg.BatchSize
 	if batchSize < 1 {
 		// 环境变量路径已校验 BatchSize ≥1，但程序化构造 Options 可能传 0；
-		// 不钳位时下面切分批次的步长为 0，循环不会结束。workers 同样钳位。
+		// 不钳位时下面切分批次的步长为 0，循环不会结束。
 		batchSize = 1
 	}
 	type batchSpan struct{ start, end int }
@@ -379,19 +380,11 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		}
 		batches = append(batches, batchSpan{start: start, end: end})
 	}
-	workers := e.embedCfg.MaxConcurrency
-	if workers < 1 {
-		workers = 1
-	}
-	if workers > len(batches) {
-		workers = len(batches)
-	}
 	var (
-		embedMu   sync.Mutex
-		embedded  int
-		fatalErr  error
-		workQueue = make(chan batchSpan)
-		wg        sync.WaitGroup
+		embedMu  sync.Mutex
+		embedded int
+		fatalErr error
+		wg       sync.WaitGroup
 	)
 	workCtx, cancelWork := context.WithCancel(ctx)
 	defer cancelWork()
@@ -403,85 +396,129 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		embedMu.Unlock()
 		cancelWork()
 	}
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for span := range workQueue {
-				if workCtx.Err() != nil {
-					return
-				}
-				vectors, err := e.embedClient.EmbedBatch(workCtx, missingTexts[span.start:span.end], embedding.InputDocument)
-				if err != nil {
-					if ctx.Err() != nil {
-						recordFatal(ctx.Err())
-						return
-					}
-					if workCtx.Err() != nil {
-						// 另一个 worker 已经触发停止（退避或致命错误），本批是
-						// 因 workCtx 被取消而失败，这个取消错误不应覆盖真实
-						// 原因。
-						return
-					}
-					embedMu.Lock()
-					out.lastError = sanitizeError(err)
-					embedMu.Unlock()
-					callErr := &reliability.CallError{}
-					if errors.As(err, &callErr) && callErr.Class == reliability.ClassBackoff {
-						// 熔断已进入退避，后续每一批都会被同样拒绝；取消
-						// workCtx 让已入队的批次立刻退出，不再逐批发出注定被
-						// 拒绝的请求。停止后续批与记录覆盖缺口都由这次取消和
-						// lastError 承担，不另设标记字段。
-						cancelWork()
-					}
-					continue
-				}
-				batchGood := make(map[string][]float32, len(vectors))
-				var batchRejected []string
-				rejectedCount := 0
-				for i, vec := range vectors {
-					if err := vector.Normalize(vec); err != nil {
-						// provider 返回零向量或含 NaN：归一化会除零，NaN 会让
-						// 排序失真，该内容记为未覆盖并计数；同时写入持久化拒
-						// 绝集，重启后也不再为它付费。
-						rejectedCount++
-						batchRejected = append(batchRejected, missingHashes[span.start+i])
-						continue
-					}
-					batchGood[missingHashes[span.start+i]] = vec
-				}
-				// 每批成功立刻写入 journal：之后即使构建被取消或进程被杀，
-				// 这批已付费的向量下次构建仍能复用。
-				if err := journal.Append(batchGood); err != nil {
-					recordFatal(fmt.Errorf("journal 落盘: %w", err))
-					return
-				}
-				if err := journal.MarkRejected(batchRejected); err != nil {
-					recordFatal(fmt.Errorf("journal 拒绝集落盘: %w", err))
-					return
-				}
-				embedMu.Lock()
-				out.rejected += rejectedCount
-				for hash, vec := range batchGood {
-					reuse[hash] = vec
-					out.newlyEmbedded++
-				}
-				embedded += span.end - span.start
-				status.setEmbedProgress(len(missingHashes)-embedded, embedded)
-				embedMu.Unlock()
-			}
-		}()
-	}
-	for _, span := range batches {
+	processSpan := func(span batchSpan, batch *embedding.IndexBatch, retryWaiting func(bool)) {
 		if workCtx.Err() != nil {
+			return
+		}
+		vectors, err := batch.Embed(workCtx, retryWaiting)
+		if err != nil {
+			if ctx.Err() != nil {
+				recordFatal(ctx.Err())
+				return
+			}
+			if workCtx.Err() != nil {
+				// 另一个 worker 已经触发停止（退避或致命错误），本批是
+				// 因 workCtx 被取消而失败，这个取消错误不应覆盖真实
+				// 原因。
+				return
+			}
+			embedMu.Lock()
+			out.lastError = sanitizeError(err)
+			embedMu.Unlock()
+			callErr := &reliability.CallError{}
+			if errors.As(err, &callErr) && callErr.Class == reliability.ClassBackoff {
+				// 熔断已进入退避，后续每一批都会被同样拒绝；取消
+				// workCtx 让已入队的批次立刻退出，不再逐批发出注定被
+				// 拒绝的请求。停止后续批与记录覆盖缺口都由这次取消和
+				// lastError 承担，不另设标记字段。
+				cancelWork()
+			}
+			return
+		}
+		batchGood := make(map[string][]float32, len(vectors))
+		var batchRejected []string
+		rejectedCount := 0
+		for i, vec := range vectors {
+			if err := vector.Normalize(vec); err != nil {
+				// provider 返回零向量或含 NaN：归一化会除零，NaN 会让
+				// 排序失真，该内容记为未覆盖并计数；同时写入持久化拒
+				// 绝集，重启后也不再为它付费。
+				rejectedCount++
+				batchRejected = append(batchRejected, missingHashes[span.start+i])
+				continue
+			}
+			batchGood[missingHashes[span.start+i]] = vec
+		}
+		// 每批成功立刻写入 journal：之后即使构建被取消或进程被杀，
+		// 这批已付费的向量下次构建仍能复用。
+		if err := journal.Append(batchGood); err != nil {
+			recordFatal(fmt.Errorf("journal 落盘: %w", err))
+			return
+		}
+		if err := journal.MarkRejected(batchRejected); err != nil {
+			recordFatal(fmt.Errorf("journal 拒绝集落盘: %w", err))
+			return
+		}
+		embedMu.Lock()
+		out.rejected += rejectedCount
+		for hash, vec := range batchGood {
+			reuse[hash] = vec
+			out.newlyEmbedded++
+		}
+		embedded += span.end - span.start
+		status.setEmbedProgress(len(missingHashes)-embedded, embedded)
+		embedMu.Unlock()
+	}
+	type batchEvent struct {
+		id            int
+		waiting, done bool
+	}
+	events := make(chan batchEvent)
+	waiting := make(map[int]bool)
+	next, running, waitingCount := 0, 0, 0
+	resourceTick := time.NewTicker(100 * time.Millisecond)
+	defer resourceTick.Stop()
+	cancelled := workCtx.Done()
+	for next < len(batches) || running > 0 {
+		changed := e.embedClient.IndexWindowChanges()
+		// 当前窗口之外只实体化一个待准入批。重试睡眠不计入正在执行的
+		// 批次数，但仍通过客户端的逻辑批次内存检查控制新建 goroutine。
+		for workCtx.Err() == nil && next < len(batches) && running-waitingCount <= e.embedClient.GovernorSnapshot().Window {
+			id, span := next, batches[next]
+			batch, ok := e.embedClient.TryIndexBatch(missingTexts[span.start:span.end])
+			if !ok {
+				break
+			}
+			next++
+			running++
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer batch.Close()
+				defer func() { events <- batchEvent{id: id, done: true} }()
+				processSpan(span, batch, func(isWaiting bool) {
+					select {
+					case events <- batchEvent{id: id, waiting: isWaiting}:
+					case <-workCtx.Done():
+					}
+				})
+			}()
+		}
+		if running == 0 && (next == len(batches) || workCtx.Err() != nil) {
 			break
 		}
 		select {
-		case workQueue <- span:
-		case <-workCtx.Done():
+		case event := <-events:
+			if event.done {
+				running--
+				if waiting[event.id] {
+					waitingCount--
+				}
+				delete(waiting, event.id)
+			} else if waiting[event.id] != event.waiting {
+				waiting[event.id] = event.waiting
+				if event.waiting {
+					waitingCount++
+				} else {
+					waitingCount--
+				}
+			}
+		case <-changed:
+		case <-resourceTick.C:
+		case <-cancelled:
+			cancelled = nil
 		}
 	}
-	close(workQueue)
 	wg.Wait()
 	if fatalErr != nil {
 		return out, fatalErr

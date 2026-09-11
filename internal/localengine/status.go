@@ -402,7 +402,8 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 		semantic.GovernorRateLearning = governor.RateLearning
 		semantic.GovernorTargetTPM = governor.TargetTokensPerMin
 		semantic.GovernorWindow = governor.Window
-		semantic.GovernorMaxWindow = governor.MaxWindow
+		semantic.GovernorResourceReason = governor.ResourceReason
+		semantic.GovernorAdjustment = governor.LastAdjustment
 		semantic.GovernorInFlight = governor.InFlight
 		if !governor.PausedUntil.IsZero() {
 			paused := governor.PausedUntil

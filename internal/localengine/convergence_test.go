@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,12 +12,10 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/embedding"
 )
 
-// TestProviderFaultConvergence 是 G7 端到端剧本：健康 → 瞬时 500（重试
-// 预算内自愈）→ 429 风暴（circuit 打开，词法照常发布部分覆盖）→ 退避
-// 窗口内零出网零发布（无风暴）→ circuit 恢复后补齐收敛至 100%，全程
-// 每内容成功嵌入恰一次、总调用数有界。timeout 与 500 同属 ClassTransient
-// （分类与退避在 reliability 单测覆盖），剧本用 500 代表该类以保持
-// circuit 窗口秒级（429 的 Retry-After 可控）。
+// 先索引两个内容并恢复一次 500，再增加三个内容并令服务持续返回 429。
+// 失败按构建阶段注入，不依赖 HTTP 到达次序：动态并发与重试释放名额后，
+// “第几次请求”不再固定对应某个内容。验收仍要求 2/5 部分发布、退避期
+// 不请求、不发布，以及恢复后 5/5 覆盖且每个内容只成功嵌入一次。
 func TestProviderFaultConvergence(t *testing.T) {
 	const dim = 8
 	type callRecord struct {
@@ -28,24 +25,23 @@ func TestProviderFaultConvergence(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var calls []callRecord
+	rateLimited := false
+	transientSent := false
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Input []string `json:"input"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		mu.Lock()
-		n := len(calls) + 1
 		record := callRecord{text: req.Input[0], at: time.Now()}
-		// 剧本（batch=1，MaxRetries=1）：
-		//   call1 OK | call2 500→call3 重试 OK | call4/5 429(RA:1) →
-		//   batch 失败，circuit backoff(1s) | call6+ 恢复 OK。
 		switch {
-		case n == 2:
+		case !transientSent:
+			transientSent = true
 			calls = append(calls, record)
 			mu.Unlock()
 			w.WriteHeader(http.StatusInternalServerError)
 			return
-		case n == 4 || n == 5:
+		case rateLimited:
 			calls = append(calls, record)
 			mu.Unlock()
 			w.Header().Set("Retry-After", "1")
@@ -65,13 +61,31 @@ func TestProviderFaultConvergence(t *testing.T) {
 
 	opts := Options{Embedding: embedding.Config{
 		Enabled: true, ProviderType: embedding.ProviderOpenAI, BaseURL: ts.URL,
-		Model: "fake-model", Dimension: dim, BatchSize: 1, MaxConcurrency: 1,
+		Model: "fake-model", Dimension: dim, BatchSize: 1, InitialConcurrency: 1,
 		Timeout: 2 * time.Second, MaxRetries: 1,
 	}}
 	e := newTestEngineWith(t, opts)
-	root := newFixtureWorkspace(t)
+	root := t.TempDir()
+	writeFixture(t, root, "one.go", "package app\nfunc One() int { return 1 }\n")
+	writeFixture(t, root, "two.go", "package app\nfunc Two() int { return 2 }\n")
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
+		t.Fatal(err)
+	}
+	warm, _ := loadActiveManifest(t, e, root)
+	if !warm.SemanticComplete() || warm.VectorCount != 2 {
+		t.Fatalf("瞬时错误恢复后应覆盖 2 个内容: %+v", warm)
+	}
+	mu.Lock()
+	if len(calls) != 3 {
+		t.Fatalf("两个成功与一次暂态失败应为 3 次请求: %d", len(calls))
+	}
+	rateLimited = true
+	mu.Unlock()
+	writeFixture(t, root, "three.go", "package app\nfunc Three() int { return 3 }\n")
+	writeFixture(t, root, "four.go", "package app\nfunc Four() int { return 4 }\n")
+	writeFixture(t, root, "five.go", "package app\nfunc Five() int { return 5 }\n")
 
-	// 构建 1：健康段自愈 500，429 打开 circuit → 部分覆盖发布。
+	// 限流结束前，新增内容保持未覆盖，已有向量仍参与检索。
 	first, err := e.Sync(context.Background(), syncRequest(root))
 	if err != nil {
 		t.Fatalf("provider 故障不得阻塞词法发布: %v", err)
@@ -85,7 +99,7 @@ func TestProviderFaultConvergence(t *testing.T) {
 	openedAt := calls[len(calls)-1].at
 	mu.Unlock()
 
-	// 退避窗口内：sync 是 no-op，零出网零发布（K30/G7 无风暴）。
+	// 退避窗口内同步保持当前 revision，也不产生 provider 请求。
 	during, err := e.Sync(context.Background(), syncRequest(root))
 	if err != nil || during.IndexRevision != first.IndexRevision {
 		t.Fatalf("退避窗口应 no-op: %+v err=%v", during, err)
@@ -94,9 +108,10 @@ func TestProviderFaultConvergence(t *testing.T) {
 	if len(calls) != callsAfterBuild1 {
 		t.Fatalf("退避窗口不得出网: %d → %d", callsAfterBuild1, len(calls))
 	}
+	rateLimited = false
 	mu.Unlock()
 
-	// circuit 恢复（candidate）后补齐收敛。
+	// 服务恢复后仅补齐三个新增内容。
 	deadline := time.After(15 * time.Second)
 	var final string
 	for {
@@ -123,13 +138,13 @@ func TestProviderFaultConvergence(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	// 无风暴：退避期（打开后 ~0.9s 内）零请求到达。
+	// Retry-After 为 1 秒；允许 100ms 测量误差。
 	for _, record := range calls[callsAfterBuild1:] {
 		if record.at.Sub(openedAt) < 900*time.Millisecond {
-			t.Fatalf("circuit 打开后 %v 即出网（违反 G7 gate）", record.at.Sub(openedAt))
+			t.Fatalf("退避开始后 %v 即发送请求", record.at.Sub(openedAt))
 		}
 	}
-	// 每内容成功嵌入恰一次（G7 费用口径）。
+	// 每个内容只成功嵌入一次，已有向量不能因补齐而重复请求。
 	succeeded := map[string]int{}
 	for _, record := range calls {
 		if record.ok {
@@ -141,15 +156,12 @@ func TestProviderFaultConvergence(t *testing.T) {
 	}
 	for text, count := range succeeded {
 		if count != 1 {
-			t.Fatalf("内容重复付费（违反 G7）: %q ×%d", text[:min(30, len(text))], count)
+			t.Fatalf("内容重复成功嵌入: %q ×%d", text[:min(30, len(text))], count)
 		}
 	}
-	// 总调用有界：1 OK + (500+重试) + 429×2 + 补齐 3 = 8。
-	if len(calls) != 8 {
-		texts := make([]string, 0, len(calls))
-		for _, record := range calls {
-			texts = append(texts, record.text[:min(20, len(record.text))])
-		}
-		t.Fatalf("总调用数应为 8（有界，无风暴）: %d %v", len(calls), strings.Join(texts, " | "))
+	// 最多为两个初始成功、一次 500、三个新增内容各两次 429、三个恢复成功。
+	// 熔断可能提前取消未完成的重试，所以按每批预算约束，不固定到达次序。
+	if len(calls) > 12 || callsAfterBuild1 <= 3 {
+		t.Fatalf("请求数未符合故障与重试预算: total=%d after_fault=%d", len(calls), callsAfterBuild1)
 	}
 }

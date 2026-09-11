@@ -86,7 +86,7 @@ func TestFingerprintSensitivity(t *testing.T) {
 	base := Options{Embedding: embedding.Config{
 		Enabled: true, ProviderType: embedding.ProviderVoyage,
 		BaseURL: "https://api.voyageai.com/v1", Model: "voyage-code-3", Dimension: 1024,
-		APIKey: "key-a", BatchSize: 128, MaxConcurrency: 4, Timeout: time.Minute, MaxRetries: 5,
+		APIKey: "key-a", BatchSize: 128, InitialConcurrency: 4, Timeout: time.Minute, MaxRetries: 5,
 	}}
 	fp := base.Fingerprint()
 
@@ -118,10 +118,10 @@ func TestFingerprintSensitivity(t *testing.T) {
 	if bulk.Fingerprint() == fp {
 		t.Fatalf("Batch API 模式必须改变配置指纹:构建行为模式不同的 daemon 与 wrapper 不得混用")
 	}
-	governorOff := base
-	governorOff.Embedding.GovernorDisabled = true
-	if governorOff.Fingerprint() != fp {
-		t.Fatalf("治理器逃生门是运行时参数,不得影响指纹")
+	initialWindow := base
+	initialWindow.Embedding.InitialConcurrency = 32
+	if initialWindow.Fingerprint() != fp {
+		t.Fatalf("初始窗口是运行参数，不改变向量身份与配置指纹")
 	}
 }
 

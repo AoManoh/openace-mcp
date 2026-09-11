@@ -35,7 +35,7 @@ const (
 	EnvDimension      = "OPENACE_EMBEDDING_DIMENSION"
 	EnvBatchSize      = "OPENACE_EMBEDDING_BATCH_SIZE"
 	EnvMaxConcurrency = "OPENACE_EMBEDDING_MAX_CONCURRENCY"
-	// EnvThroughputGovernor 是 T6 逃生门:off 关闭治理器与车道分离。
+	// EnvThroughputGovernor 只接受空值或 on；off 返回明确的迁移错误。
 	EnvThroughputGovernor = "OPENACE_THROUGHPUT_GOVERNOR"
 	// EnvBatchAPI 选择离线批车道 adapter:目前仅 voyage;默认关闭。
 	EnvBatchAPI = "OPENACE_EMBEDDING_BATCH_API"
@@ -51,13 +51,7 @@ const (
 	defaultVoyageModel   = "voyage-code-3"
 	defaultDimension     = 1024
 	defaultBatchSize     = 128
-	// defaultConcurrency 4→8(灰度反馈 2026-08-07:索引吞吐 450-780
-	// chunks/min 太慢)→16(2026-08-12 用户批示:高吞吐自部署 provider
-	// 下索引效率应默认拉满)。嵌入是纯 I/O 等待,worker 数不受
-	// GOMAXPROCS 约束;付费档 provider(如 Voyage 2000 RPM)与自部署
-	// 模型吞吐随并发近线性,免费档由 provider RPM 限速+429 退避兜底,
-	// 提并发不改变计费总量。自部署高吞吐环境可经
-	// OPENACE_EMBEDDING_MAX_CONCURRENCY 进一步调大(如 64)。
+	// defaultConcurrency 只决定初始请求窗口，后续由实测吞吐调整，不是上限。
 	defaultConcurrency = 16
 	// defaultBatchMinChunks:批车道触发阈值缺省。2000 chunks≈0.6M tokens,
 	// 同步车道分钟级即可完成——低于此走批只会平白多等服务端排队。
@@ -86,8 +80,9 @@ type Config struct {
 	Model        string
 	Dimension    int
 
-	BatchSize      int
-	MaxConcurrency int
+	BatchSize int
+	// InitialConcurrency 仅供程序化构造控制初始窗口，不限制后续扩张。
+	InitialConcurrency int
 	// RPMBudget/TPMBudget 为 0 表示不限（决策 14：默认不限预算）。
 	RPMBudget int
 	TPMBudget int
@@ -102,11 +97,6 @@ type Config struct {
 	// localengine.embedTemplateVersion,由引擎构造期注入(参与
 	// ProfileHash;M9② 单一化,禁止本包再设常量)。
 	TemplateVersion string
-
-	// GovernorDisabled 关闭吞吐治理器与车道分离(T6 逃生门,env
-	// OPENACE_THROUGHPUT_GOVERNOR=off):回到共用单熔断+固定并发的
-	// 旧行为。运行时参数,不参与 ProfileHash。
-	GovernorDisabled bool
 
 	// BatchAPIMode 是离线批车道(T8):""=关闭(默认),"voyage"=大额
 	// document 嵌入改走 voyage Batch API(-33% 费用,服务端 12h 窗)。
@@ -137,7 +127,7 @@ func ConfigFromEnv() (Config, error) {
 		return Config{}, fmt.Errorf("invalid %s %q; use %q, %q or %q", EnvProvider, os.Getenv(EnvProvider), ProviderVoyage, ProviderOpenAI, ProviderOff)
 	}
 
-	cfg := Config{ProviderType: provider}
+	cfg := Config{ProviderType: provider, InitialConcurrency: defaultConcurrency}
 	var err error
 	if cfg.Dimension, err = reliability.IntEnv(EnvDimension, defaultDimension, 1); err != nil {
 		return Config{}, err
@@ -147,9 +137,6 @@ func ConfigFromEnv() (Config, error) {
 	}
 	if cfg.BatchSize > maxBatchSize {
 		return Config{}, fmt.Errorf("invalid %s %d: must be <= %d (provider batch limit)", EnvBatchSize, cfg.BatchSize, maxBatchSize)
-	}
-	if cfg.MaxConcurrency, err = reliability.IntEnv(EnvMaxConcurrency, defaultConcurrency, 1); err != nil {
-		return Config{}, err
 	}
 	if cfg.RPMBudget, err = reliability.IntEnv(EnvRPMBudget, 0, 0); err != nil {
 		return Config{}, err
@@ -165,13 +152,6 @@ func ConfigFromEnv() (Config, error) {
 	}
 	if cfg.MaxRetries, err = reliability.MaxRetriesFromEnv(); err != nil {
 		return Config{}, err
-	}
-	switch governor := strings.TrimSpace(strings.ToLower(os.Getenv(EnvThroughputGovernor))); governor {
-	case "", "on":
-	case "off":
-		cfg.GovernorDisabled = true
-	default:
-		return Config{}, fmt.Errorf("invalid %s %q: use \"on\" or \"off\"", EnvThroughputGovernor, governor)
 	}
 	switch batchAPI := strings.TrimSpace(strings.ToLower(os.Getenv(EnvBatchAPI))); batchAPI {
 	case "", "off":
@@ -229,6 +209,17 @@ func ConfigFromEnv() (Config, error) {
 	}
 	cfg.BaseURL = normalized
 	cfg.Enabled = true
+	// 只在语义 provider 已启用时拒绝旧并发配置，未配置凭据的词法路径照常可用。
+	if strings.TrimSpace(os.Getenv(EnvMaxConcurrency)) != "" {
+		return Config{}, fmt.Errorf("%s is no longer supported: remove it; indexing concurrency is adjusted dynamically, use RPM_BUDGET/TPM_BUDGET for request budgets", EnvMaxConcurrency)
+	}
+	switch governor := strings.TrimSpace(strings.ToLower(os.Getenv(EnvThroughputGovernor))); governor {
+	case "", "on":
+	case "off":
+		return Config{}, fmt.Errorf("%s=off is no longer supported: remove it; indexing requires dynamic admission and resource checks", EnvThroughputGovernor)
+	default:
+		return Config{}, fmt.Errorf("invalid %s %q: use on or remove it", EnvThroughputGovernor, governor)
+	}
 	return cfg, nil
 }
 

@@ -227,21 +227,18 @@ type SemanticStatus struct {
 	BackoffUntil  *time.Time `json:"backoff_until,omitempty"`
 	// LastError 是最近一次 provider 失败的脱敏消息。
 	LastError string `json:"last_error,omitempty"`
-	// QueryProviderState 是查询车道独立熔断的状态(C3,2026-08-26,加性
-	// omitempty):车道分离后索引风暴不再殃及查询,但查询路自身故障需要
-	// 独立可见——ProviderState 只反映索引车道。逃生门关闭治理器时两车道
-	// 共用熔断,两字段相同。
+	// QueryProviderState 展示查询嵌入自己的健康状态。索引失败不会改变
+	// 查询熔断器，因此不能用 ProviderState 代替此字段判断查询是否可用。
 	QueryProviderState string `json:"query_provider_state,omitempty"`
-	// Governor* 是索引车道吞吐治理器视图(C3,加性 omitempty):没有它,
-	// 运营侧无法区分"构建挂死"与"429 降速/Retry-After 暂停/延迟收窗"
-	// ——历史上这种误判会引发人为重启 daemon,进而撞上批车道提交窗口。
-	// 治理器关闭(逃生门)或未见 429 时相应字段为零值不出现。
-	GovernorRateLearning bool       `json:"governor_rate_learning,omitempty"`
-	GovernorTargetTPM    int        `json:"governor_target_tpm,omitempty"`
-	GovernorWindow       int        `json:"governor_window,omitempty"`
-	GovernorMaxWindow    int        `json:"governor_max_window,omitempty"`
-	GovernorInFlight     int        `json:"governor_in_flight,omitempty"`
-	GovernorPausedUntil  *time.Time `json:"governor_paused_until,omitempty"`
+	// Governor* 展示当前索引窗口、在途请求、速率暂停及资源等待原因。
+	// 不再提供固定最大窗口；没有对应状态的可选字段省略。
+	GovernorRateLearning   bool       `json:"governor_rate_learning,omitempty"`
+	GovernorTargetTPM      int        `json:"governor_target_tpm,omitempty"`
+	GovernorWindow         int        `json:"governor_window,omitempty"`
+	GovernorResourceReason string     `json:"governor_resource_reason,omitempty"`
+	GovernorAdjustment     string     `json:"governor_adjustment,omitempty"`
+	GovernorInFlight       int        `json:"governor_in_flight,omitempty"`
+	GovernorPausedUntil    *time.Time `json:"governor_paused_until,omitempty"`
 
 	// Rerank* 描述精排 provider（未配置时 RerankDisabledReason 解释原因）。
 	RerankProvider       string `json:"rerank_provider,omitempty"`

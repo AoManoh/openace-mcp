@@ -73,8 +73,8 @@ func TestStatusSemanticCoverageAndCircuit(t *testing.T) {
 	if semantic.QueryProviderState != "healthy" {
 		t.Fatalf("查询车道熔断态应独立可见: %q", semantic.QueryProviderState)
 	}
-	if semantic.GovernorWindow == 0 || semantic.GovernorMaxWindow == 0 {
-		t.Fatalf("治理器窗口视图应可见: window=%d max=%d", semantic.GovernorWindow, semantic.GovernorMaxWindow)
+	if semantic.GovernorWindow == 0 {
+		t.Fatalf("治理器窗口视图应可见: window=%d", semantic.GovernorWindow)
 	}
 }
 

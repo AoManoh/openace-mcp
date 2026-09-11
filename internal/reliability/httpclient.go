@@ -12,10 +12,10 @@ import (
 // Go 默认对 https 端点协商 HTTP/2，之后全部并发请求复用同一条 TCP 连接。
 // embedding 响应体大（128 条 × 1024 维 float 的文本约 1.6MB），云端
 // provider 按连接限速：实测 Voyage 一批 128 条在单连接上要 27s，分到两条
-// 连接上各 12-15s。MaxConcurrency 路并发挤在一条连接上时，每批延迟随
+// 连接上各 12-15s。多个请求共用一条连接时，每批延迟随
 // 并发数成倍增长，直到整场构建超时。改用 HTTP/1.1 连接池后，每个在途
 // 请求独占一条连接，总带宽随并发数增长。同时打开的连接数等于同时在途
-// 的请求数，索引批请求的在途数又受客户端并发槽限制。
+// 的请求数，索引尝试在发送前受动态窗口与资源准入约束。
 func NewHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ForceAttemptHTTP2 = false
@@ -29,9 +29,8 @@ func NewHTTPClient() *http.Client {
 		transport.TLSClientConfig = &tls.Config{}
 	}
 	transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
-	// 空闲连接池上限 64：要覆盖常用的最高嵌入并发（默认 16，自部署高吞吐
-	// 场景会调到 64）。超出上限的连接用完即关，下一批请求重新建 TCP 与
-	// TLS，高并发下握手时间占掉吞吐。该值只影响连接复用，不限制并发数。
+	// 空闲连接最多保留 64 条，避免长时间保留大量描述符。这只影响复用，
+	// 不限制在途请求；超过此数量的重复突发可能增加连接与 TLS 开销。
 	transport.MaxIdleConnsPerHost = 64
 	return &http.Client{Transport: transport}
 }

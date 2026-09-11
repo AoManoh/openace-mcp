@@ -39,20 +39,22 @@ func TestGovernorBudgetWaitDoesNotHoldPermit(t *testing.T) {
 		}
 		return clock.sleep(ctx, d)
 	}
-	if err := g.AcquireIndexWithBudget(context.Background(), 100, l); err != nil {
+	permit, err := g.AcquireIndexWithBudget(context.Background(), 100, 0, l)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if waits != 1 || l.usedReqs != 1 || g.Snapshot().InFlight != 1 || g.bucketTokens != 59_900 {
 		t.Fatalf("跨窗口准入必须只登记一次: waits=%d requests=%d governor=%+v tokens=%f", waits, l.usedReqs, g.Snapshot(), g.bucketTokens)
 	}
-	g.Observe(OutcomeOther, 100, 0, 0)
+	g.Observe(permit, OutcomeOther, 0, 0)
 }
 
 func TestGovernorRechecksBudgetAfterSlotWaitAcrossMinute(t *testing.T) {
 	g, clock := governed(1)
 	l := NewRateLimiter(1, 0)
 	l.now = clock.now
-	if err := g.AcquireIndexWithBudget(context.Background(), 10, l); err != nil {
+	permit, err := g.AcquireIndexWithBudget(context.Background(), 10, 0, l)
+	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -64,7 +66,7 @@ func TestGovernorRechecksBudgetAfterSlotWaitAcrossMinute(t *testing.T) {
 		return ctx.Err()
 	}
 	done := make(chan error, 1)
-	go func() { done <- g.AcquireIndexWithBudget(ctx, 10, l) }()
+	go func() { _, err := g.AcquireIndexWithBudget(ctx, 10, 0, l); done <- err }()
 	deadline := time.Now().Add(time.Second)
 	for {
 		g.mu.Lock()
@@ -83,7 +85,7 @@ func TestGovernorRechecksBudgetAfterSlotWaitAcrossMinute(t *testing.T) {
 	if err := l.Acquire(context.Background(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	g.Observe(OutcomeOther, 10, 0, 0)
+	g.Observe(permit, OutcomeOther, 0, 0)
 	select {
 	case <-budgetWait:
 	case <-time.After(time.Second):

@@ -82,7 +82,7 @@ func newSemanticFakeProvider(t *testing.T, dim int, failQuery *atomic.Bool, call
 func semanticOptions(url string, dim int) localengine.Options {
 	return localengine.Options{Embedding: embedding.Config{
 		Enabled: true, ProviderType: embedding.ProviderOpenAI, BaseURL: url,
-		Model: "fake-model", Dimension: dim, BatchSize: 16, MaxConcurrency: 2,
+		Model: "fake-model", Dimension: dim, BatchSize: 16, InitialConcurrency: 2,
 		Timeout: 2 * time.Second, MaxRetries: 0,
 	}, Rerank: rerank.Config{
 		Enabled: false, ProviderType: rerank.ProviderOff,

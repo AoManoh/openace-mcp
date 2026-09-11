@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -41,7 +42,7 @@ func TestEmbedBatchConcurrencyOverlap(t *testing.T) {
 	client, err := NewClient(Config{
 		Enabled: true, ProviderType: ProviderOpenAI, BaseURL: server.URL,
 		APIKey: "test", Model: "m", Dimension: 4,
-		BatchSize: 8, MaxConcurrency: 16, Timeout: 5 * time.Second,
+		BatchSize: 8, InitialConcurrency: 16, Timeout: 5 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -62,9 +63,11 @@ func TestEmbedBatchConcurrencyOverlap(t *testing.T) {
 	}
 }
 
-// TestEmbedBatchConcurrencyCappedBySemaphore 验证并发槽同时是硬上限:
-// MaxConcurrency=2 时峰值在飞请求数不得超过 2(防误改把限流放飞)。
-func TestEmbedBatchConcurrencyCappedBySemaphore(t *testing.T) {
+// 后续请求可越过初始窗口，验证客户端没有保留固定信号量。
+func TestEmbedBatchConcurrencyGrowsBeyondInitialWindow(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("自动扩窗仅在 Linux 有资源采样；其他平台维持当前窗口")
+	}
 	var inflight, peak int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cur := atomic.AddInt64(&inflight, 1)
@@ -91,7 +94,7 @@ func TestEmbedBatchConcurrencyCappedBySemaphore(t *testing.T) {
 	client, err := NewClient(Config{
 		Enabled: true, ProviderType: ProviderOpenAI, BaseURL: server.URL,
 		APIKey: "test", Model: "m", Dimension: 4,
-		BatchSize: 8, MaxConcurrency: 2, Timeout: 5 * time.Second,
+		BatchSize: 8, InitialConcurrency: 2, Timeout: 5 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -107,7 +110,10 @@ func TestEmbedBatchConcurrencyCappedBySemaphore(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if got := atomic.LoadInt64(&peak); got > 2 {
-		t.Fatalf("peak in-flight = %d, want <= 2 (semaphore must cap concurrency)", got)
+	if client.GovernorSnapshot().ResourceReason == "resource-unknown" {
+		t.Skip("当前资源信息不完整，按产品约定不扩窗")
+	}
+	if got := atomic.LoadInt64(&peak); got <= 2 {
+		t.Fatalf("peak in-flight = %d, want > 2 (initial window must not be a fixed ceiling)", got)
 	}
 }

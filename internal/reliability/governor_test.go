@@ -2,318 +2,281 @@ package reliability
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 )
-
-// 本文件是 Governor 的单元测试。多数用例注入虚拟时钟：sleep 直接把 now
-// 拨快，速率与暂停的等待在测试里不消耗真实时间。窗口阻塞与唤醒的用例
-// 使用真实时钟和短暂的真实等待，因为要验证的是 goroutine 之间的信号。
 
 type governorClock struct {
 	mu  sync.Mutex
 	cur time.Time
 }
 
-func newGovernorClock() *governorClock {
-	return &governorClock{cur: time.Unix(1_700_000_000, 0)}
-}
-
-func (c *governorClock) now() time.Time {
+func newGovernorClock() *governorClock  { return &governorClock{cur: time.Unix(1_700_000_000, 0)} }
+func (c *governorClock) now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.cur }
+func (c *governorClock) sleep(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.cur
-}
-
-func (c *governorClock) sleep(_ context.Context, d time.Duration) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.cur = c.cur.Add(d)
+	c.mu.Unlock()
 	return nil
 }
-
-func governed(maxWindow int) (*Governor, *governorClock) {
-	g := NewGovernor(maxWindow)
+func governed(initial int) (*Governor, *governorClock) {
+	g := NewGovernor(initial)
 	clock := newGovernorClock()
 	g.now = clock.now
 	g.sleep = clock.sleep
+	g.sampleResources = func() resourceSnapshot {
+		return resourceSnapshot{memoryKnown: true, fdKnown: true, availableBytes: 1 << 40, availableFD: 1 << 20}
+	}
 	return g, clock
 }
-
-// acquireRelease 是测试辅助函数：AcquireIndex 放行后立即以 OutcomeSuccess
-// 上报，归还窗口槽位。
-func acquireRelease(t *testing.T, g *Governor, tokens int, latency time.Duration) {
+func mustAcquire(t *testing.T, g *Governor, tokens int) IndexPermit {
 	t.Helper()
-	if err := g.AcquireIndex(context.Background(), tokens); err != nil {
-		t.Fatalf("AcquireIndex: %v", err)
+	p, err := g.AcquireIndex(context.Background(), tokens)
+	if err != nil {
+		t.Fatal(err)
 	}
-	g.Observe(OutcomeSuccess, tokens, latency, 0)
+	return p
+}
+func completeGroup(t *testing.T, g *Governor, clock *governorClock, d time.Duration) {
+	t.Helper()
+	n := g.Snapshot().Window
+	ps := make([]IndexPermit, n)
+	for i := range ps {
+		ps[i] = mustAcquire(t, g, 100)
+	}
+	if err := clock.sleep(context.Background(), d); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range ps {
+		g.Observe(p, OutcomeSuccess, d, 0)
+	}
 }
 
 func TestGovernorPreLearningUnthrottled(t *testing.T) {
-	g, clock := governed(4)
-	start := clock.now()
+	g, _ := governed(4)
+	g.sleep = func(context.Context, time.Duration) error { t.Fatal("尚未限流却等待"); return nil }
 	for i := 0; i < 200; i++ {
-		acquireRelease(t, g, 50_000, time.Second)
+		p := mustAcquire(t, g, 100_000)
+		g.Observe(p, OutcomeOther, 0, 0)
 	}
-	if got := clock.now().Sub(start); got != 0 {
-		t.Fatalf("首个 429 之前不得限速,虚拟时钟前进了 %s", got)
-	}
-	if g.Snapshot().RateLearning {
-		t.Fatal("未见 429 不应进入学习态")
+	if s := g.Snapshot(); s.RateLearning || s.InFlight != 0 {
+		t.Fatalf("状态错误: %+v", s)
 	}
 }
-
 func TestGovernor429EntersLearningAndPauses(t *testing.T) {
 	g, clock := governed(4)
-	// 先在一分钟内成功发出 12 批共 600K token，作为实测吞吐。
-	for i := 0; i < 12; i++ {
-		acquireRelease(t, g, 50_000, time.Second)
+	start := clock.now()
+	p := mustAcquire(t, g, 50_000)
+	g.Observe(p, OutcomeRateLimited, 0, 7*time.Second)
+	s := g.Snapshot()
+	if !s.RateLearning || s.TargetTokensPerMin != 40_000 || !s.PausedUntil.Equal(start.Add(7*time.Second)) || s.Window != 4 {
+		t.Fatalf("429 状态: %+v", s)
 	}
-	// 收到带 Retry-After 7s 的 429：进入学习态（见过 429 后开始限速），
-	// 初始目标速率为实测吞吐乘 0.5，并暂停 7s。
-	if err := g.AcquireIndex(context.Background(), 50_000); err != nil {
-		t.Fatal(err)
+	p = mustAcquire(t, g, 1000)
+	if clock.now().Sub(start) < 7*time.Second {
+		t.Fatal("未遵守 Retry-After")
 	}
-	g.Observe(OutcomeRateLimited, 50_000, 0, 7*time.Second)
-	snap := g.Snapshot()
-	if !snap.RateLearning {
-		t.Fatal("429 后必须进入学习态")
-	}
-	if snap.TargetTokensPerMin < governorRateFloorTokens {
-		t.Fatalf("学习速率不得低于 governorRateFloorTokens: %d", snap.TargetTokensPerMin)
-	}
-	if snap.TargetTokensPerMin > 600_000 {
-		t.Fatalf("学习速率应为实测吞吐×%.1f 量级,得到 %d", governorRateMDFactor, snap.TargetTokensPerMin)
-	}
-	before := clock.now()
-	// 下一次 AcquireIndex 至少要等完 7s 暂停;暂停期间令牌桶按目标速率补充,
-	// 到期时余额已够本次 10K 的需求,断言只检查不少于 7s。
-	if err := g.AcquireIndex(context.Background(), 10_000); err != nil {
-		t.Fatal(err)
-	}
-	g.Observe(OutcomeSuccess, 10_000, time.Second, 0)
-	waited := clock.now().Sub(before)
-	if waited < 7*time.Second {
-		t.Fatalf("必须尊重 Retry-After 硬暂停,只等了 %s", waited)
-	}
+	g.Observe(p, OutcomeOther, 0, 0)
 }
-
 func TestGovernorRepeated429HitsFloor(t *testing.T) {
-	g, _ := governed(2)
-	for i := 0; i < 20; i++ {
-		if err := g.AcquireIndex(context.Background(), 1_000); err != nil {
-			t.Fatal(err)
-		}
-		g.Observe(OutcomeRateLimited, 1_000, 0, time.Millisecond)
+	g, _ := governed(1)
+	g.rateLearning = true
+	g.targetTokensPerMin = 2_000_000
+	g.bucketTokens = 2_000_000
+	for i := 0; i < 12; i++ {
+		p := mustAcquire(t, g, 1000)
+		g.Observe(p, OutcomeRateLimited, 0, time.Millisecond)
 	}
 	if !g.AtRateFloor() {
-		t.Fatalf("连续 429 后目标速率必须降到 governorRateFloorTokens: %+v", g.Snapshot())
+		t.Fatalf("既有速率规则未生效: %+v", g.Snapshot())
 	}
 }
-
 func TestGovernorOversizedRequestProgressesWithDebt(t *testing.T) {
-	g, clock := governed(4)
-	// 刚启动就收到 429，没有实测吞吐：学习目标落到下限 40K tokens/min。
-	if err := g.AcquireIndex(context.Background(), 1_000); err != nil {
-		t.Fatal(err)
+	g, clock := governed(1)
+	g.rateLearning = true
+	g.targetTokensPerMin = 40_000
+	g.bucketTokens = 40_000
+	g.lastRefill = clock.now()
+	p := mustAcquire(t, g, 65_536)
+	if g.bucketTokens != -25_536 {
+		t.Fatalf("债务错误: %f", g.bucketTokens)
 	}
-	g.Observe(OutcomeRateLimited, 1_000, 0, time.Millisecond)
-	if got := g.Snapshot().TargetTokensPerMin; got != governorRateFloorTokens {
-		t.Fatalf("刚启动即收到 429 时学习目标应为下限 %d, 得到 %d", governorRateFloorTokens, got)
-	}
-	// 单批估算 65,536 token 大于下限 40K。桶的上限等于一分钟额度，若要求
-	// 余额攒够需求才放行，这一批的需求在任何时刻都大于余额，请求一直
-	// 等待。期望行为：桶满即放行，超出部分让余额转负。保护：虚拟等待累计
-	// 超过 10 分钟仍未放行就取消 ctx，让用例以失败结束而不是挂住。
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var simulated time.Duration
-	g.sleep = func(sleepCtx context.Context, d time.Duration) error {
-		_ = clock.sleep(sleepCtx, d)
-		simulated += d
-		if simulated > 10*time.Minute {
-			cancel()
-			return sleepCtx.Err()
-		}
-		return nil
-	}
+	g.Observe(p, OutcomeOther, 0, 0)
 	start := clock.now()
-	if err := g.AcquireIndex(ctx, 65_536); err != nil {
-		t.Fatalf("超大批次必须在桶满后放行并转负债,而不是无限等待: %v", err)
+	p = mustAcquire(t, g, 1000)
+	if clock.now().Sub(start) < 39*time.Second {
+		t.Fatal("未偿还超额 token 债务")
 	}
-	g.Observe(OutcomeSuccess, 65_536, time.Second, 0)
-	if waited := clock.now().Sub(start); waited > 2*time.Minute {
-		t.Fatalf("放行等待应为攒满一分钟额度的量级,实际 %s", waited)
-	}
-	// 余额为负后：下一个 1,000 token 请求要先等余额从 -25,536 补回 0，再
-	// 等到 1,000，等待约 (25,536+1,000)/40,000×60s ≈ 40s。长期平均速率
-	// 因此不超过目标。
-	before := clock.now()
-	if err := g.AcquireIndex(context.Background(), 1_000); err != nil {
-		t.Fatal(err)
-	}
-	g.Observe(OutcomeSuccess, 1_000, time.Second, 0)
-	if repaid := clock.now().Sub(before); repaid < 30*time.Second || repaid > 90*time.Second {
-		t.Fatalf("负债偿还等待不在预期量级(≈40s): %s", repaid)
-	}
+	g.Observe(p, OutcomeOther, 0, 0)
 }
-
 func TestGovernorSuccessRaisesLearnedRate(t *testing.T) {
-	g, _ := governed(2)
-	if err := g.AcquireIndex(context.Background(), 1_000); err != nil {
-		t.Fatal(err)
-	}
-	g.Observe(OutcomeRateLimited, 1_000, 0, time.Millisecond)
-	low := g.Snapshot().TargetTokensPerMin
-	for i := 0; i < 50; i++ {
-		acquireRelease(t, g, 1_000, time.Second)
-	}
-	if got := g.Snapshot().TargetTokensPerMin; got <= low {
-		t.Fatalf("连续成功后目标速率必须高于 429 后的初值: %d -> %d", low, got)
+	g, _ := governed(1)
+	g.rateLearning = true
+	g.targetTokensPerMin = 50_000
+	g.bucketTokens = 50_000
+	p := mustAcquire(t, g, 1000)
+	g.Observe(p, OutcomeSuccess, time.Second, 0)
+	if g.Snapshot().TargetTokensPerMin != 51_000 {
+		t.Fatalf("速率恢复: %+v", g.Snapshot())
 	}
 }
-
-func TestGovernorLatencyDivergenceShrinksWindow(t *testing.T) {
-	g, _ := governed(16)
-	// 用 20 个 1s 延迟样本建立基线，样本数超过 governorMinSamplesForGradient。
-	for i := 0; i < 20; i++ {
-		acquireRelease(t, g, 1_000, time.Second)
+func TestGovernorGrowsBeyondInitialWindow(t *testing.T) {
+	g, clock := governed(16)
+	for i := 0; i < 7; i++ {
+		completeGroup(t, g, clock, time.Second)
 	}
-	if g.Snapshot().Window != 16 {
-		t.Fatalf("平稳期窗口不应收缩: %d", g.Snapshot().Window)
-	}
-	// 延迟跳到 5s：短窗均值超过长窗均值的 1.5 倍，窗口应减半。
-	for i := 0; i < 6; i++ {
-		acquireRelease(t, g, 1_000, 5*time.Second)
-	}
-	if got := g.Snapshot().Window; got >= 16 {
-		t.Fatalf("延迟偏离必须收窗: window=%d", got)
+	if s := g.Snapshot(); s.Window <= 128 || s.InFlight != 0 {
+		t.Fatalf("窗口应越过初始值与 128: %+v", s)
 	}
 }
-
-func TestGovernorWindowRegrowsAfterCleanStreak(t *testing.T) {
-	g, _ := governed(8)
-	for i := 0; i < 20; i++ {
-		acquireRelease(t, g, 1_000, time.Second)
-	}
-	if err := g.AcquireIndex(context.Background(), 1_000); err != nil {
-		t.Fatal(err)
-	}
-	g.Observe(OutcomeOverload, 1_000, 0, 0) // 503 或超时：窗口应减半
-	shrunk := g.Snapshot().Window
-	if shrunk >= 8 {
-		t.Fatalf("过载必须收窗: %d", shrunk)
-	}
-	for i := 0; i < governorWindowGrowEvery*3+3; i++ {
-		acquireRelease(t, g, 1_000, time.Second)
-	}
-	if got := g.Snapshot().Window; got <= shrunk {
-		t.Fatalf("连续延迟正常的样本后窗口必须大于减半后的值: %d -> %d", shrunk, got)
-	}
-}
-
-func TestGovernorWindowBlocksAndReleases(t *testing.T) {
-	g := NewGovernor(1) // 真实时钟：验证阻塞与唤醒
-	if err := g.AcquireIndex(context.Background(), 10); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() {
-		done <- g.AcquireIndex(context.Background(), 10)
-	}()
-	select {
-	case <-done:
-		t.Fatal("窗口占满时第二个准入不应立即通过")
-	case <-time.After(50 * time.Millisecond):
-	}
-	g.Observe(OutcomeSuccess, 10, time.Second, 0)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
+func TestGovernorSuccessfulLatencyShiftDoesNotCollapseWindow(t *testing.T) {
+	g, clock := governed(16)
+	completeGroup(t, g, clock, time.Second)
+	for i := 0; i < 8; i++ {
+		completeGroup(t, g, clock, 8*time.Second)
+		if g.Snapshot().Window < 16 {
+			t.Fatalf("时延变化使窗口连续缩小: %+v", g.Snapshot())
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("槽位释放后等待者未被唤醒")
 	}
-	g.Observe(OutcomeSuccess, 10, time.Second, 0)
+}
+func TestGovernorNoThroughputGainReturnsToVerifiedWindow(t *testing.T) {
+	g, clock := governed(16)
+	completeGroup(t, g, clock, time.Second)
+	completeGroup(t, g, clock, 1500*time.Millisecond)
+	if s := g.Snapshot(); s.Window != 16 || s.LastAdjustment != "no-throughput-gain" {
+		t.Fatalf("无吞吐收益应返回验证窗口: %+v", s)
+	}
 }
 
+func TestGovernorCountsCompletionsAcrossSampleBoundary(t *testing.T) {
+	g, clock := governed(16)
+	first := make([]IndexPermit, 16)
+	for i := range first {
+		first[i] = mustAcquire(t, g, 100)
+	}
+	_ = clock.sleep(context.Background(), time.Second)
+	inherited := make([]IndexPermit, 15)
+	// 完成的请求立即由待处理工作补充；最后一个观测请求完成时，仍有
+	// 15 个真实请求在执行。这是持续投放的正常时序。
+	for i := range inherited {
+		g.Observe(first[i], OutcomeSuccess, time.Second, 0)
+		inherited[i] = mustAcquire(t, g, 100)
+	}
+	g.Observe(first[15], OutcomeSuccess, time.Second, 0)
+	if g.Snapshot().Window != 24 {
+		t.Fatal("首组应开始 24 并发试探")
+	}
+	newFirst := make([]IndexPermit, 9)
+	for i := range newFirst {
+		newFirst[i] = mustAcquire(t, g, 100)
+	}
+	_ = clock.sleep(context.Background(), time.Second)
+	newLast := make([]IndexPermit, 15)
+	for i, p := range inherited {
+		g.Observe(p, OutcomeSuccess, time.Second, 0)
+		newLast[i] = mustAcquire(t, g, 100)
+	}
+	additional := make([]IndexPermit, 9)
+	for i, p := range newFirst {
+		g.Observe(p, OutcomeSuccess, time.Second, 0)
+		additional[i] = mustAcquire(t, g, 100)
+	}
+	_ = clock.sleep(context.Background(), time.Second)
+	for _, p := range additional {
+		g.Observe(p, OutcomeSuccess, time.Second, 0)
+	}
+	for _, p := range newLast {
+		g.Observe(p, OutcomeSuccess, time.Second, 0)
+	}
+	// 24 并发期间的 2 秒共完成 48 个请求，吞吐比 16 并发提高 50%。
+	// 只计算第二组新登记的 24 个请求会误报为下降 25%。
+	if s := g.Snapshot(); s.Window != 36 || s.LastAdjustment != "throughput-probe" {
+		t.Fatalf("持续完成的请求漏计导致错误回退: %+v", s)
+	}
+}
+func TestGovernorLateOverloadsDoNotRepeatShrink(t *testing.T) {
+	g, _ := governed(16)
+	ps := make([]IndexPermit, 16)
+	for i := range ps {
+		ps[i] = mustAcquire(t, g, 100)
+	}
+	for _, p := range ps {
+		g.Observe(p, OutcomeOverload, time.Second, 0)
+	}
+	if s := g.Snapshot(); s.Window != 8 || s.InFlight != 0 {
+		t.Fatalf("同组失败反复缩窗或名额泄漏: %+v", s)
+	}
+}
+func TestGovernorPermitReleasedOnce(t *testing.T) {
+	g, _ := governed(2)
+	p1, p2 := mustAcquire(t, g, 1), mustAcquire(t, g, 1)
+	g.Observe(p1, OutcomeOther, 0, 0)
+	g.Observe(p1, OutcomeOther, 0, 0)
+	if g.Snapshot().InFlight != 1 {
+		t.Fatal("重复归还释放了别人的名额")
+	}
+	other, _ := governed(2)
+	other.Observe(p2, OutcomeOther, 0, 0)
+	if g.Snapshot().InFlight != 1 {
+		t.Fatal("外部治理器改变了名额")
+	}
+	g.Observe(p2, OutcomeOther, 0, 0)
+}
 func TestGovernorAcquireCancellable(t *testing.T) {
 	g := NewGovernor(1)
-	if err := g.AcquireIndex(context.Background(), 10); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	p := mustAcquire(t, g, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if err := g.AcquireIndex(ctx, 10); err == nil {
-		t.Fatal("窗口占满+ctx 超时必须返回错误")
+	if _, err := g.AcquireIndex(ctx, 1); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("取消结果: %v", err)
 	}
-	// 取消的等待者已出队，之后释放槽位仍能放行新的 AcquireIndex，队列里
-	// 没有残留条目。
-	g.Observe(OutcomeSuccess, 10, time.Second, 0)
-	if err := g.AcquireIndex(context.Background(), 10); err != nil {
-		t.Fatalf("取消者出队后正常准入失败: %v", err)
+	g.Observe(p, OutcomeOther, 0, 0)
+	p = mustAcquire(t, g, 1)
+	g.Observe(p, OutcomeOther, 0, 0)
+	if len(g.waiters) != 0 || g.Snapshot().InFlight != 0 {
+		t.Fatal("取消后等待者或名额残留")
 	}
-	g.Observe(OutcomeSuccess, 10, time.Second, 0)
 }
-
+func TestGovernorResourceWaitConsumesNoBudget(t *testing.T) {
+	for _, r := range []resourceSnapshot{
+		{memoryKnown: true, fdKnown: true, availableBytes: 1, availableFD: 100},
+		{memoryKnown: true, fdKnown: true, availableBytes: 1 << 40, availableFD: 0},
+		{memoryKnown: true, availableBytes: 0},
+		{fdKnown: true, availableFD: 0},
+		{memoryKnown: true, fdKnown: true, incomplete: true, availableBytes: 1024, availableFD: 100},
+	} {
+		g := NewGovernor(16)
+		g.sampleResources = func() resourceSnapshot { return r }
+		budget := NewRateLimiter(1, 100)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		_, err := g.AcquireIndexWithBudget(ctx, 10, 1024, budget)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) || budget.usedReqs != 0 || g.Snapshot().InFlight != 0 || g.Snapshot().ResourceReason == "" {
+			t.Fatalf("资源等待状态: err=%v budget=%d snapshot=%+v", err, budget.usedReqs, g.Snapshot())
+		}
+	}
+}
+func TestGovernorUnknownResourcesPreventExpansion(t *testing.T) {
+	g, clock := governed(4)
+	g.sampleResources = func() resourceSnapshot { return resourceSnapshot{} }
+	completeGroup(t, g, clock, time.Second)
+	if s := g.Snapshot(); s.Window != 4 || s.ResourceReason != "resource-unknown" {
+		t.Fatalf("未知资源应可见且不扩张: %+v", s)
+	}
+}
 func TestGovernorNilSafe(t *testing.T) {
 	var g *Governor
-	if err := g.AcquireIndex(context.Background(), 10); err != nil {
-		t.Fatal("nil 治理器必须直接放行(OPENACE_THROUGHPUT_GOVERNOR=off 时治理器为 nil)")
-	}
-	g.Observe(OutcomeSuccess, 10, time.Second, 0)
-	if g.AtRateFloor() {
-		t.Fatal("nil 治理器的 AtRateFloor 必须返回 false")
-	}
-}
-
-// TestGovernorWindowWaitChargesTokensOnce：学习态下窗口已满的请求先排队等
-// 槽位，被唤醒后重走速率检查。修复前速率检查在拿到槽位之前就从令牌桶扣减，
-// 排队一次就多扣一次；两个各 100 token 的请求先后放行后，余额应恰好减少
-// 200，而不是 300。
-func TestGovernorWindowWaitChargesTokensOnce(t *testing.T) {
-	g, _ := governed(1)
-	g.mu.Lock()
-	g.rateLearning = true
-	g.targetTokensPerMin = 1_000_000
-	g.bucketTokens = 1_000_000
-	g.mu.Unlock()
-
-	if err := g.AcquireIndex(context.Background(), 100); err != nil {
+	p, err := g.AcquireIndex(context.Background(), 1)
+	if err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() { done <- g.AcquireIndex(context.Background(), 100) }()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		g.mu.Lock()
-		waiting := len(g.waiters)
-		g.mu.Unlock()
-		if waiting == 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("第二个请求应在窗口占满时排队等待")
-		}
-		time.Sleep(5 * time.Millisecond)
+	g.Observe(p, OutcomeSuccess, time.Second, 0)
+	if g.Snapshot().Window != 0 || g.AtRateFloor() {
+		t.Fatal("nil 状态非零")
 	}
-	g.Observe(OutcomeSuccess, 100, time.Second, 0)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("槽位释放后等待者未被放行")
-	}
-	g.mu.Lock()
-	balance := g.bucketTokens
-	g.mu.Unlock()
-	if balance != 1_000_000-200 {
-		t.Fatalf("两个请求各 100 token,余额应为 999800,实际 %.0f(排队请求被重复扣减)", balance)
-	}
-	g.Observe(OutcomeSuccess, 100, time.Second, 0)
 }
