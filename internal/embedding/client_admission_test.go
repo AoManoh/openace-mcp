@@ -80,7 +80,7 @@ func TestEmbedRetryBackoffReleasesConcurrency(t *testing.T) {
 			}))
 			defer srv.Close()
 			cfg := testConfig(srv.URL, 2)
-			cfg.InitialConcurrency, cfg.MaxRetries = 1, 1
+			cfg.InitialConcurrency, cfg.MaxRetries = initial, 1
 			client, err := NewClient(cfg)
 			if err != nil {
 				t.Fatal(err)
@@ -147,7 +147,7 @@ func TestEmbedBudgetWaitAllowsSmallerIndexRequest(t *testing.T) {
 			}))
 			defer srv.Close()
 			cfg := testConfig(srv.URL, 2)
-			cfg.InitialConcurrency, cfg.TPMBudget = 1, 5
+			cfg.InitialConcurrency, cfg.TPMBudget = initial, 5
 			client, err := NewClient(cfg)
 			if err != nil {
 				t.Fatal(err)
@@ -195,7 +195,7 @@ func TestEmbedHTTPTimeoutRetryReleasesAndCountsAdmission(t *testing.T) {
 			}))
 			defer srv.Close()
 			cfg := testConfig(srv.URL, 2)
-			cfg.InitialConcurrency, cfg.MaxRetries, cfg.RPMBudget = 1, 1, 2
+			cfg.InitialConcurrency, cfg.MaxRetries, cfg.RPMBudget = initial, 1, 2
 			cfg.Timeout = 30 * time.Millisecond
 			client, err := NewClient(cfg)
 			if err != nil {
