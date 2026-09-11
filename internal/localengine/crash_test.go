@@ -204,9 +204,8 @@ func TestCrashRecoveryKillPoints(t *testing.T) {
 	}
 }
 
-// TestCrashRecoverySubprocessKill 是 G4/G2 的真实 kill -9 证据：子进程
-// 构建中途被 SIGKILL，父进程在同一 cache 上恢复——已付费批次经 journal
-// 复活零重付，最终覆盖完整、无孤儿残留（WSL /mnt/d 实测由测试环境决定）。
+// 子进程确认两个批次已经 fsync 后才发送 SIGKILL。恢复必须复用这两个
+// 批次并达到完整覆盖。已发出但尚未持久化的请求不具备同样的恢复保证。
 func TestCrashRecoverySubprocessKill(t *testing.T) {
 	if os.Getenv("OPENACE_CRASH_HELPER") == "1" {
 		crashHelperMain()
@@ -225,11 +224,15 @@ func TestCrashRecoverySubprocessKill(t *testing.T) {
 		mu.Lock()
 		requestCount++
 		mu.Unlock()
-		// 每个批次都等父进程放行：kill 窗口完全确定。
-		<-proceed
-		mu.Lock()
-		texts = append(texts, req.Input...)
-		mu.Unlock()
+		// 未放行的请求在子进程被终止后退出，不伪造成功响应。
+		select {
+		case <-proceed:
+		case <-r.Context().Done():
+			return
+		}
+		if r.Context().Err() != nil {
+			return
+		}
 		type item struct {
 			Embedding []float32 `json:"embedding"`
 			Index     int       `json:"index"`
@@ -238,7 +241,12 @@ func TestCrashRecoverySubprocessKill(t *testing.T) {
 		for i, text := range req.Input {
 			items = append(items, item{Embedding: fakeVector(dim, text), Index: i})
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"data": items})
+		if err := json.NewEncoder(w).Encode(map[string]any{"data": items}); err != nil {
+			return
+		}
+		mu.Lock()
+		texts = append(texts, req.Input...)
+		mu.Unlock()
 	}))
 	defer ts.Close()
 
@@ -256,7 +264,7 @@ func TestCrashRecoverySubprocessKill(t *testing.T) {
 	if err := helper.Start(); err != nil {
 		t.Fatal(err)
 	}
-	// 放行 2 个批次（落 journal），第 3 批挂起时 SIGKILL。
+	// 后续请求的到达不证明前批已落盘，必须等待子进程报告持久化进度。
 	proceed <- struct{}{}
 	proceed <- struct{}{}
 	deadline := time.After(20 * time.Second)
@@ -264,13 +272,15 @@ func TestCrashRecoverySubprocessKill(t *testing.T) {
 		mu.Lock()
 		count := requestCount
 		mu.Unlock()
-		if count >= 3 {
+		_, markerErr := os.Stat(filepath.Join(cacheDir, "crash-two-journaled"))
+		if count >= 3 && markerErr == nil {
 			break
 		}
 		select {
 		case <-deadline:
 			_ = helper.Process.Kill()
-			t.Fatal("等待第 3 批超时")
+			_ = helper.Wait()
+			t.Fatal("等待两个已落盘批次和一个在途批次超时")
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
@@ -278,14 +288,13 @@ func TestCrashRecoverySubprocessKill(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = helper.Wait()
-	// 快照 kill 时刻已完成（已回包、helper 已 journal）的批次文本；
-	// kill 时在飞的批次未获响应、不可能入 journal，恢复期重发是
-	// 唯一正确语义，不计入重付。
+	// 只有两个批次获准返回，子进程又已确认两个批次持久化，因此这里的
+	// 成功文本与 journal 内容一一对应。未返回的请求在恢复时可以重发。
 	mu.Lock()
 	completedAtKill := append([]string{}, texts...)
 	paidBefore := len(completedAtKill)
 	mu.Unlock()
-	if paidBefore < 2 {
+	if paidBefore != 2 {
 		t.Fatalf("kill 前应已有完成批次: %d", paidBefore)
 	}
 	// 放行后续全部批次（含被 kill 时挂起的在飞批次）。
@@ -375,7 +384,23 @@ func crashHelperMain() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if _, err := e.Sync(context.Background(), syncRequest(os.Getenv("OPENACE_CRASH_ROOT"))); err != nil {
+	root := os.Getenv("OPENACE_CRASH_ROOT")
+	go func() {
+		for {
+			s, err := e.WorkspaceStatus(context.Background(), syncRequest(root).Workspace)
+			if err == nil && s.Semantic != nil && s.Semantic.EmbeddedChunks >= 2 {
+				// setEmbedProgress 在 journal.Append 的 fsync 成功后执行。
+				err := os.WriteFile(filepath.Join(os.Getenv("OPENACE_CACHE_DIR"), "crash-two-journaled"), []byte("2\n"), 0o600)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
