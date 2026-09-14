@@ -37,6 +37,8 @@ type indexAttempt struct {
 }
 type throughputSample struct {
 	start                                               time.Time
+	usageObservedAt                                     time.Time
+	underfilledFor                                      time.Duration
 	admitted, outstanding, completed, success, overload int
 	measuredTokens                                      int64
 	measuredSuccess                                     int
@@ -107,6 +109,7 @@ func (g *Governor) AcquireIndexWithBudget(ctx context.Context, tokens int, bytes
 		}
 		g.resource = resources
 		now := g.now()
+		g.measureWindowUseLocked(now)
 		wait := g.pausedUntil.Sub(now)
 		if wait <= 0 && !g.resourceFitsLocked(bytes, true) {
 			wait = 100 * time.Millisecond
@@ -155,6 +158,7 @@ func (g *Governor) AcquireIndexWithBudget(ctx context.Context, tokens int, bytes
 			if sampled {
 				if g.sample.admitted == 0 {
 					g.sample.start = now
+					g.sample.usageObservedAt = now
 				}
 				g.sample.admitted++
 				g.sample.outstanding++
@@ -193,6 +197,8 @@ func (g *Governor) Observe(p IndexPermit, outcome GovernorOutcome, latency, retr
 	if !ok {
 		return
 	}
+	now := g.now()
+	g.measureWindowUseLocked(now)
 	delete(g.active, p.id)
 	g.inFlight--
 	g.inFlightBytes -= a.bytes
@@ -200,7 +206,6 @@ func (g *Governor) Observe(p IndexPermit, outcome GovernorOutcome, latency, retr
 	if g.sample.settling > 0 && p.id <= g.sample.settleThrough {
 		g.sample.settling--
 	}
-	now := g.now()
 	switch outcome {
 	case OutcomeSuccess:
 		g.trackThroughputLocked(now, a.tokens)
@@ -251,6 +256,19 @@ func (g *Governor) Observe(p IndexPermit, outcome GovernorOutcome, latency, retr
 	g.wakeWaitersLocked()
 }
 
+// 在占用数变化前记录上一段时间，避免把同一时刻逐个归还许可的顺序
+// 当作持续供给不足。允许一个名额用于正常完成与补充；多个名额长期
+// 空闲说明当时的吞吐没有受当前窗口限制，不能据此比较服务处理容量。
+func (g *Governor) measureWindowUseLocked(now time.Time) {
+	if g.sample.start.IsZero() {
+		return
+	}
+	if elapsed := now.Sub(g.sample.usageObservedAt); elapsed > 0 && g.inFlight < max(1, g.window-1) {
+		g.sample.underfilledFor += elapsed
+	}
+	g.sample.usageObservedAt = now
+}
+
 func (g *Governor) finishSampleLocked(now time.Time) {
 	s := g.sample
 	duration := now.Sub(s.start).Seconds()
@@ -261,8 +279,7 @@ func (g *Governor) finishSampleLocked(now time.Time) {
 		g.nextSampleLocked()
 		return
 	}
-	// 本组从未实际用满窗口，不能把这种读数当作增大窗口没有收益的证据。
-	// 这只排除从未填满的情况，不证明整个观察期始终有足够工作。
+	// 从未填满的窗口没有提供足够的并发样本。
 	if s.peakInFlight < g.window {
 		g.lastAdjustment = "window-not-filled"
 		g.nextSampleLocked()
@@ -279,6 +296,14 @@ func (g *Governor) finishSampleLocked(now time.Time) {
 				g.sample.settlementStarted = true
 				g.sample.settleThrough, g.sample.settling = g.nextID, g.inFlight
 				g.lastAdjustment = "throughput-inconclusive"
+				return
+			}
+			// 先收齐可能改变结论的已有反馈，再排除供给不足造成的
+			// 低吞吐。提前清空样本会漏掉迟到成功或过载；实际已测得
+			// 的吞吐增益仍按原规则处理。
+			if s.underfilledFor > now.Sub(s.start)/5 {
+				g.lastAdjustment = "window-underutilized"
+				g.nextSampleLocked()
 				return
 			}
 			g.fine, g.cooldown = true, 3
