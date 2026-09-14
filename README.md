@@ -265,7 +265,7 @@ wrapper 与 daemon 的一致性分两层,行为刻意不同:
 ## 排障提示
 
 - **某个目录整体检索不到**:文件选择遵循逐目录的 `.gitignore` / `.ignore` / `.openaceignore`,内置敏感文件 denylist 先于一切。最常见的一种:根 `.gitignore` 忽略了 `docs/`,git 惯例把私有或生成内容排除在版本库外,索引跟着跳过了。解法一行:在 `.openaceignore` 里加 `!docs/`。不确定哪个目录被排除?看 `workspace_status` 的 `top_level_file_counts`,预期目录缺失或计数为 0 就是被排除了,不用做对照实验。
-- **索引速度慢**:嵌入吞吐通常由 provider 限速决定(免费档 RPM 很低)。`workspace_status`/`task_status` 进度带 `rate/eta`;付费档/自部署高吞吐模型可调大 `OPENACE_EMBEDDING_MAX_CONCURRENCY`(默认 16,自部署可到 64)。
+- **索引速度慢**：先用 `workspace_status` 或 `task_status` 确认当前阶段、进度和 provider 状态。嵌入并发按成功吞吐与过载自动调整；窗口长时间未被用满且未测得吞吐增益时，保留已有判断，等待输入恢复后再比较。检查显式 `OPENACE_EMBEDDING_RPM_BUDGET`、`OPENACE_EMBEDDING_TPM_BUDGET` 和状态中的资源等待原因。`OPENACE_EMBEDDING_MAX_CONCURRENCY` 已退役，启用语义 provider 时设置它会报错，应移除此变量。
 - **客户端找不到命令**:`command` 写绝对路径(`~/go/bin/openace-mcp` 等);IDE 启动子进程不经过 shell,环境变量占位符不展开。
 - **升级不生效**:Unix 上重跑 `go install` 就完事,旧 daemon 会被自动接管,开着的会话下次调用自动跟上;`daemon_status` 能核对两边的 build。Windows 仍需手动:停旧 daemon,重启 MCP 会话。
 - **改了 provider env 没反应**:确认重启了 MCP 会话;`daemon_status` 可查当前 daemon 的 build 与配置指纹。
