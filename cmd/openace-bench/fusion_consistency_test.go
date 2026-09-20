@@ -23,7 +23,7 @@ func TestFusionOfflineReplayConsistency(t *testing.T) {
 	}
 	// 本探针只裁决"离线 RRF 复算是否忠实"，精排必须关闭：rerank 在
 	// key 存在时默认开启，会在融合后重排头部（T10b 排障发现）。
-	t.Setenv("OPENACE_RERANK_PROVIDER", "off")
+	t.Setenv("OPENACE_RERANK_ADAPTER", "off")
 	opts, err := localengine.OptionsFromEnv()
 	if err != nil {
 		t.Fatal(err)

@@ -13,8 +13,8 @@ import (
 func clearProviderEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
-		"OPENACE_EMBEDDING_PROVIDER", "OPENACE_EMBEDDING_BASE_URL", "OPENACE_EMBEDDING_API_KEY",
-		"VOYAGE_API_KEY", "OPENACE_EMBEDDING_MODEL", "OPENACE_RERANK_PROVIDER",
+		"OPENACE_EMBEDDING_PROVIDER", "OPENACE_EMBEDDING_ADAPTER", "OPENACE_EMBEDDING_BASE_URL", "OPENACE_EMBEDDING_API_KEY",
+		"VOYAGE_API_KEY", "OPENACE_EMBEDDING_MODEL", "OPENACE_RERANK_PROVIDER", "OPENACE_RERANK_ADAPTER",
 		"OPENACE_RETRIEVAL_DEGRADE", "OPENACE_RERANK_DEGRADE",
 	} {
 		t.Setenv(key, "")
@@ -41,11 +41,11 @@ func TestLocalHybridStartsWithoutCredentials(t *testing.T) {
 func TestLocalHybridInvalidProviderEnvRejected(t *testing.T) {
 	clearProviderEnv(t)
 	t.Setenv("OPENACE_ENGINE", "local-hybrid")
-	t.Setenv("OPENACE_EMBEDDING_PROVIDER", "azure-openai")
-	if _, err := buildLocalService(context.Background()); err == nil || !strings.Contains(err.Error(), "OPENACE_EMBEDDING_PROVIDER") {
-		t.Fatalf("非法 provider 应在启动显式报错: %v", err)
+	t.Setenv("OPENACE_EMBEDDING_ADAPTER", "azure-openai")
+	if _, err := buildLocalService(context.Background()); err == nil || !strings.Contains(err.Error(), "OPENACE_EMBEDDING_ADAPTER") {
+		t.Fatalf("非法 adapter 应在启动显式报错: %v", err)
 	}
-	t.Setenv("OPENACE_EMBEDDING_PROVIDER", "")
+	t.Setenv("OPENACE_EMBEDDING_ADAPTER", "")
 	t.Setenv("OPENACE_RETRIEVAL_DEGRADE", "silent")
 	if _, err := buildLocalService(context.Background()); err == nil || !strings.Contains(err.Error(), "OPENACE_RETRIEVAL_DEGRADE") {
 		t.Fatalf("非法降级值应在启动显式报错: %v", err)

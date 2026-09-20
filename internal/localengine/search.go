@@ -756,13 +756,12 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 			reasons = append(reasons, rerankReason)
 		}
 	} else if e.semanticEnabled() && !e.rerankCfg.Enabled && e.rerankCfg.ProviderType != rerank.ProviderOff {
-		// 配置了 embedding provider 却没有可用的 rerank 配置（缺 key，而不是
-		// 显式设为 off）：结果按 RRF 融合序返回，但追加 rerank-unconfigured
-		// 原因进 [DEGRADED] 横幅，让用户知道精排没有生效；
-		// OPENACE_QUALITY_STRICT=on 时 checkQualityStrict 会把它升级为报错。
-		// 显式 off 表示用户主动放弃精排，不提示。未配置 embedding 的纯词法
-		// 路径不进此分支。
-		reasons = append(reasons, "rerank-unconfigured(quality-first default; set "+rerank.EnvAPIKey+" or VOYAGE_API_KEY, or "+rerank.EnvProvider+"=off to opt out)")
+		// 配置了 embedding 却没有配置 rerank（地址与模型都没给，而不是显式设为
+		// off）：结果按 RRF 融合序返回，但追加 rerank-unconfigured 原因进
+		// [DEGRADED] 横幅，让用户知道精排没有生效；OPENACE_QUALITY_STRICT=on 时
+		// checkQualityStrict 会把它升级为报错。显式 off 表示用户主动放弃精排，
+		// 不提示。未配置 embedding 的纯词法路径不进此分支。
+		reasons = append(reasons, "rerank-unconfigured(quality-first default; set "+rerank.EnvBaseURL+" and "+rerank.EnvModel+" (+ "+rerank.EnvAPIKey+"), or "+rerank.EnvAdapter+"=off to opt out)")
 	}
 	// 碎片过滤是实验性开关：只在程序化 Options 开启 fragmentGate 时去掉行
 	// 窗口切分产生的纯日期、纯符号碎片块；生产环境没有对应 env，默认关闭，

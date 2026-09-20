@@ -37,8 +37,8 @@ go install -tags "grammar_subset,grammar_subset_python,grammar_subset_typescript
 
 | 写法 | 解析到 | 版本号形态(`openace-mcp version` / `daemon_status`) | 什么时候变化 | 适合 |
 |---|---|---|---|---|
-| `@latest` | 最新正式发布 tag(GitHub Releases 有对应发布说明) | `v0.2.0` | 只在打出新 tag 时 | 日常使用;想知道"这版改了什么"时看发布说明 |
-| `@main` | 主分支最新提交,含尚未发布的修复与变更 | `v0.2.1-0.20260901120000-<12位提交hash>`,中段是提交时间(UTC) | 每次重跑安装都可能变 | 跟进最新修复、参与灰度反馈 |
+| `@latest` | 最新正式发布 tag(GitHub Releases 有对应发布说明) | `v0.5.0` | 只在打出新 tag 时 | 日常使用;想知道"这版改了什么"时看发布说明 |
+| `@main` | 主分支最新提交,含尚未发布的修复与变更 | `<基础版本>-0.<UTC提交时间>-<12位提交hash>` | 每次重跑安装都可能变 | 跟进最新修复、参与灰度反馈 |
 | `@<commit>` | 指定提交 | 同上形态,时间与 hash 为该提交 | 从不 | 复现问题、锁定构建 |
 
 `@main` 经 Go module proxy(尤其镜像代理)可能解析到代理缓存的稍旧提交而非远端最新,装完用 `openace-mcp version` 核对。升级就一步:重跑同一条安装命令。Unix 上旧 daemon 会被下一个新会话自动接管,开着的 IDE 会话也会在下次调用时自己跟上;Windows 需要手动收尾——停掉旧的 `openace-mcp daemon` 进程,再重启 MCP 会话。
@@ -113,21 +113,30 @@ MCP 客户端每次启动 agent 会话都会重新拉起 `command` 指定的进�
 
 ## 开启语义混合检索(模型自备)
 
-在 MCP 配置的 `env` 里加上你的 embedding 服务(OpenAI-compatible 端点,自部署 vLLM/TEI/Infinity/Ollama 或任何兼容托管服务;亦支持 `voyage` 形状端点):
+openACE 不绑定任何模型服务商:你只需要回答"向哪个地址、调用哪个模型",每个阶段各写三项——地址、模型 id、key(自部署可空)。请求形状(OpenAI 兼容 / Voyage / TEI)按地址自动识别,服务商差异全部收在 openACE 内部的 adapter 里;向量维度启动后自动探测一次并缓存,也可以显式写。
 
 ```jsonc
 // 片段:并入上文 MCP 配置的 "env" 对象
 "env": {
   "OPENACE_MODE": "auto",
-  "OPENACE_EMBEDDING_PROVIDER": "openai",
   "OPENACE_EMBEDDING_BASE_URL": "http://127.0.0.1:8080/v1",
   "OPENACE_EMBEDDING_MODEL": "<your-embedding-model>",
-  "OPENACE_EMBEDDING_DIMENSION": "1024",
-  "OPENACE_EMBEDDING_API_KEY": "<key-if-required>"
+  "OPENACE_EMBEDDING_API_KEY": "<key-if-required>",
+  "OPENACE_RERANK_BASE_URL": "https://api.voyageai.com/v1",
+  "OPENACE_RERANK_MODEL": "rerank-3",
+  "OPENACE_RERANK_API_KEY": "<your-rerank-key>"
 }
 ```
 
-接入后查询自动升级:BM25 与向量双路召回,RRF 融合,头部候选送精排。精排默认启用——在 12 个真实仓、720 条查询的评测里,它把核心召回率比纯融合抬高了 12.8 个百分点,这是"质量至上"这个默认值的底气。rerank 支持 `tei` 与 `voyage` 形状端点。配置了 embedding 而没配 rerank 时,结果会带一条 `rerank-unconfigured` 提示;补上 `OPENACE_RERANK_API_KEY`(voyage 形状可直接复用 `VOYAGE_API_KEY`),或者显式 `OPENACE_RERANK_PROVIDER=off` 确认放弃,提示就消失。召回质量最终取决于你选的模型,挑面向代码检索、口碑可靠的。
+规则只有三条,对 embedding 与 rerank 各自独立成立:
+
+1. 地址和模型 id 都写了 = 启用;都没写 = 该阶段关闭(embedding 关闭是纯词法检索,rerank 关闭是按融合序返回),状态里如实显示"未配置",不算错误;只写了一项、或只写了 key = 启动报配置错误,错误里指明缺哪项并给示例。
+2. 没有跨阶段的共享 key 或共享地址:两个阶段用同一家服务时,地址写两遍。这样"网关没有 rerank"这类问题在启动期就按阶段暴露,而不是第一次查询时才发现。
+3. 形状识别不了或想强制时,才写可选的 `OPENACE_EMBEDDING_ADAPTER`(`openai` / `voyage` / `off`)或 `OPENACE_RERANK_ADAPTER`(`standard` / `tei` / `off`);自部署 TEI 的 rerank 端点没有固定主机名,需要显式 `tei`。
+
+**从 v0.5.x 升级(v0.6.0 起的破坏性变更)**:`VOYAGE_API_KEY`、`OPENACE_EMBEDDING_PROVIDER`、`OPENACE_RERANK_PROVIDER` 不再被读取,设置了会在启动时得到带迁移写法的错误;`OPENACE_EMBEDDING_BATCH_API` 的取值改为 `on`/`off`。原来只配 key 的用户请补上 `OPENACE_EMBEDDING_BASE_URL=https://api.voyageai.com/v1`、`OPENACE_EMBEDDING_MODEL=voyage-code-3`、`OPENACE_RERANK_BASE_URL=https://api.voyageai.com/v1`、`OPENACE_RERANK_MODEL=rerank-3`,并把 key 分别写到 `OPENACE_EMBEDDING_API_KEY` 与 `OPENACE_RERANK_API_KEY`。地址与模型不变时索引身份不变,不会重新嵌入。
+
+接入后查询自动升级:BM25 与向量各召回前 60 段,按 RRF K=20、词法权重 0.15、向量权重 0.85 融合,前 50 段送精排。精排默认启用——在 12 个真实仓、720 条查询的评测里,它把核心召回率比纯融合抬高了 12.8 个百分点,这是"质量至上"这个默认值的底气。rerank 支持 `tei` 与 `voyage` 形状端点。配置了 embedding 而没配 rerank 时,结果会带一条 `rerank-unconfigured` 提示;补上 `OPENACE_RERANK_API_KEY`(voyage 形状可直接复用 `VOYAGE_API_KEY`),或者显式 `OPENACE_RERANK_PROVIDER=off` 确认放弃,提示就消失。当前生产验证组合是 `voyage-code-3` + `rerank-3`;使用 Voyage 时请显式设置 `OPENACE_RERANK_MODEL=rerank-3`,因为二进制的兼容回落值仍是 `rerank-2.5`。召回质量最终取决于你选的模型,挑面向代码检索、口碑可靠的。
 
 ### 行为与边界(如实声明)
 
@@ -179,7 +188,7 @@ MCP 客户端每次启动 agent 会话都会重新拉起 `command` 指定的进�
 
 小仓库直接 `codebase_retrieval`;大仓库预热或跨仓问题开完整面后用 `start_*` + `task_status`(进度携带速率与 ETA 估算)。
 
-**检索结果没有字节预算,也没有 `max_output_length` 参数。**默认(`detail=full`)回复的形状是:按排名前 N 个候选带源码正文,其后的每个候选一行 `## 路径:起止行 符号`,中间用一行 `-- remaining results listed as paths only; Read a file to see its content --` 隔开;精排窗口(前 50 个候选)之外的候选前另有一行 `-- results below were not reranked (fused order) --`。任何候选都不会被丢掉,AI 看标题决定是否用自己的 Read 工具展开。N 由**你**在 MCP 配置里设置,不是 AI 的调用参数:`OPENACE_FULL_RESULTS`,默认 20;AI 反馈"结果太长被客户端截断"就调小,反馈"总要多 Read 一轮"就调大;设 0 则全部只给标题行(内容与 `detail=paths` 相同,只多首行一条"以下只列路径"的分隔文字)。`detail=paths` 仍可由 AI 按需选择,只回标题行。本机实测(一次检索 79 个候选):默认 N=20 约 30 KB,N=5 约 13 KB,N=0 约 4 KB。
+**四个检索工具的结果没有字节预算,也没有 `max_output_length` 参数。**该参数已于 2026-09-02 从 `codebase_retrieval`、`multi_codebase_retrieval` 及两个异步检索工具移除;`repo_map` 仍保留同名的地图大小预算。默认(`detail=full`)回复的形状是:按排名前 N 个候选带源码正文,其后的每个候选一行 `## 路径:起止行 符号`,中间用一行 `-- remaining results listed as paths only; Read a file to see its content --` 隔开;精排窗口(前 50 个候选)之外的候选前另有一行 `-- results below were not reranked (fused order) --`。任何候选都不会被丢掉,AI 看标题决定是否用自己的 Read 工具展开。N 由**你**在 MCP 配置里设置,不是 AI 的调用参数:`OPENACE_FULL_RESULTS`,默认 20;AI 反馈"结果太长被客户端截断"就调小,反馈"总要多 Read 一轮"就调大;设 0 则全部只给标题行(内容与 `detail=paths` 相同,只多首行一条"以下只列路径"的分隔文字)。`detail=paths` 仍可由 AI 按需选择,只回标题行。本机实测(一次检索 79 个候选):默认 N=20 约 30 KB,N=5 约 13 KB,N=0 约 4 KB。
 
 **按产物类型分组:`artifact_kind`(可选,`any` / `code` / `tests` / `docs`)。**调用 AI 只在使用者明确要某一类文件时设置它:精排完成后,该类型的候选保持原相对顺序排到最前,其余候选按原序跟在后面,任何候选都不丢;每条结果带 `kind` 字段,分组依据可见。省略或 `any` 就是普通排名顺序,一个字节都不变。类型按路径机械规则判定,不猜意图:目录段 `test/`、`tests/`、`spec/`、`__tests__/`、`testdata/`,或文件名含 `_test.`、`.test.`、`.spec.`、以 `test_` 开头、主干以大写 `Test`/`Tests` 结尾 → `tests`;目录段 `doc/`、`docs/`、`documentation/`,或扩展名 `.md/.mdx/.rst/.adoc/.txt`,或文件名 `README*`/`CHANGELOG*` → `docs`;其余 → `code`。已知边界:框架自身的 `testing/` 目录算代码,代码目录里的 `.md` 算文档;后缀规则区分大小写,只认大写 `Test`/`Tests` 结尾(Java、C#、PHP 的类名约定),`latest.go` 这类小写结尾的普通文件算代码。`kind` 只出现在结构化结果 `hits[]` 里,正文标题行不带它;客户端不向 AI 展示结构化字段时,AI 看不到分类结果。分组把未精排的候选提到精排候选之前时,正文不再插入"以下未经 rerank 打分"的分界行,每条结果的 `reranked` 字段仍如实给出。依据:2026-09-03 在 django 快照上的 400 条"找实现"查询,精排把测试/文档排在实现之上,前五命中率因此低 8.75 个百分点;只在输出层把代码排前即可拿回(复算 +8.25 个百分点)。
 
@@ -208,20 +217,20 @@ MCP 客户端每次启动 agent 会话都会重新拉起 `command` 指定的进�
 !docs/**/*.md
 ```
 
-规则文件只认 `.openaceignore` 这一个名字;安全硬拒绝名单任何规则都覆盖不了。
+规则文件只认 `.openaceignore` 这一个名字;旧 `.augmentignore` 兼容别名已于 2026-08-10 移除。安全硬拒绝名单任何规则都覆盖不了。
 
 ## 常用环境变量
 
 | 变量 | 说明 |
 |------|------|
-| `OPENACE_EMBEDDING_PROVIDER` | 语义路端点类型:`openai`(OpenAI-compatible)/ `voyage` / `off`。默认 `voyage` 且未提供 key 时语义路保持关闭、词法照常——即**不配置就是纯词法** |
-| `OPENACE_EMBEDDING_BASE_URL` `_API_KEY` `_MODEL` `_DIMENSION` | 模型服务身份四项(`openai` 类型必填 base_url 与 model);`voyage` 类型 key 为空时回退读 `VOYAGE_API_KEY`;任一身份变化触发平行索引全量重建 |
+| `OPENACE_EMBEDDING_BASE_URL` `_MODEL` `_API_KEY` | 语义路的三项:地址、模型 id、key(自部署可空)。地址与模型都给 = 启用;都不给 = 纯词法(状态显示未配置);只给一项或只给 key = 启动报配置错误。请求形状按地址识别(`api.voyageai.com` → Voyage 形状,其余 → OpenAI 兼容形状),可用 `OPENACE_EMBEDDING_ADAPTER=openai\|voyage\|off` 覆盖。地址、模型或维度变化触发平行索引全量重建 |
+| `OPENACE_EMBEDDING_DIMENSION` | 向量维度。留空 = 启动后向端点发一条最短文本探测一次并缓存(缓存文件 `embedding-dimensions.json` 在 cache 根目录);显式写则跳过探测,返回向量长度与之不符时报错 |
 | `OPENACE_EMBEDDING_BATCH_SIZE` `_RPM_BUDGET` `_TPM_BUDGET` | 索引调用参数，默认 128 / 不限 / 不限。显式 RPM/TPM 预算按每次请求尝试计数，文档与查询的重试也计入；预算等待与重试退避不占索引并发名额。单笔需求超过预算且当前分钟尚无用量时，允许该单笔执行，避免请求永久等待。 |
-| `OPENACE_EMBEDDING_MAX_CONCURRENCY` | 已退役。启用语义 provider 时设置非空值会报错，请移除此变量。索引从有限窗口开始，按完整样本组的吞吐与过载调整，没有固定并发上限。 |
+| `OPENACE_EMBEDDING_MAX_CONCURRENCY` | 已于 v0.5.0（2026-09-14）退役。启用语义 provider 时设置非空值会报错，请移除此变量。索引从有限窗口开始，按完整样本组的吞吐与过载调整，没有固定并发上限。 |
 | `OPENACE_THROUGHPUT_GOVERNOR` | 接受空值或 `on`；`off` 报迁移错误，请移除。429 按既有规则降低发送速率并尊重 Retry-After，查询与索引各持独立熔断器。Linux 上检查内存和文件描述符余量；资源不足时等待且不扣预算，资源数据未知时保持当前窗口并在状态中报告 `resource-unknown`。 |
-| `OPENACE_EMBEDDING_BATCH_API` | 离线批车道:`voyage` = 大额嵌入改走 voyage Batch API(费用 -33%,服务端 12h 完成窗,崩溃后续作业不重复付费);默认 `off`。要求 provider 就是 voyage,其他组合启动即报错 |
+| `OPENACE_EMBEDDING_BATCH_API` | 离线批车道:`on` = 大额嵌入改走服务商的 Batch API(目前只有 Voyage 形状支持;费用 -33%,服务端 12h 完成窗,崩溃后续作业不重复付费);默认 `off`。adapter 不支持批接口时启动即报错;旧取值 `voyage` 报迁移错误 |
 | `OPENACE_EMBEDDING_BATCH_MIN_CHUNKS` | 批车道触发阈值(默认 `2000`):缺失量低于此走同步车道——几百个 chunk 分钟级就完了,不值得排 12h 窗 |
-| `OPENACE_RERANK_PROVIDER` | 精排(质量至上默认档):`tei` / `voyage` / `off`;默认 `voyage`,key 缺省回退 `VOYAGE_API_KEY`。配置即启用;语义已配而精排缺配置时结果携带 `rerank-unconfigured` 提示(`OPENACE_QUALITY_STRICT=on` 下升级为报错),显式 `off` 视为确认放弃。`_BASE_URL`/`_API_KEY`/`_MODEL` 语义同上;`OPENACE_RERANK_MAX_TOKENS` 是单次精排请求送审文本的估算 token 上限(默认 `200000`),超出部分的候选不送审、按融合顺序跟在精排结果之后 |
+| `OPENACE_RERANK_BASE_URL` `_MODEL` `_API_KEY` | 精排的三项,规则与 embedding 相同、彼此独立(不共享 key 或地址)。形状:已知托管服务与未知地址都按通用 rerank 形状(`documents` → `results`/`data`,覆盖 Voyage、Cohere、Jina 与多数网关);自部署 TEI 需显式 `OPENACE_RERANK_ADAPTER=tei`(此时模型 id 可留空,由端点决定);`off` 显式放弃精排。语义已配而精排未配时结果携带 `rerank-unconfigured` 提示(`OPENACE_QUALITY_STRICT=on` 下升级为报错)。`_MAX_TOKENS` 是单请求送审 token 上限(默认 200000),超限候选按融合序跟随不送审 |
 | `OPENACE_RETRIEVAL_DEGRADE` / `OPENACE_RERANK_DEGRADE` | 语义路/精排失败策略:`allow`(默认,放行并标 `[DEGRADED]`)/ `deny`(返回可行动错误) |
 | `OPENACE_QUALITY_STRICT` | `on` = 质量严格档:语义链路任一缺口(覆盖 <100%、查询嵌入失败、已配置的 rerank 未生效等)直接报错;要求已配置 embedding。默认 `off`。结构化结果携带 `rerank_sent`/`query_embed_failed`/`embedding_profile` |
 | `OPENACE_QUERY_BUILD_WAIT` | 查询等待在建索引的上界,**默认 `40s`**(先于主流 MCP 客户端的请求超时,冷仓首建期间的同步检索返回带构建进度的可行动错误,而非裸超时):超时后有旧索引按 allow/deny 降级,无旧索引返回带进度的错误;显式 `0` = 等到构建完成 |
@@ -229,7 +238,7 @@ MCP 客户端每次启动 agent 会话都会重新拉起 `command` 指定的进�
 | `OPENACE_RENDER_LINE_NUMBERS` | `1` = 检索结果围栏内逐行携带真实文件行号(`cat -n` 形状,Read-parity 试验面);默认关闭 |
 | `OPENACE_FULL_RESULTS` | `detail=full` 时带正文返回的候选块数(按排名取前 N 个,其余只给标题行),默认 `20`;`0`=全部只给标题行。这是使用者侧配置,不是 AI 的调用参数;改动后重启 MCP 会话生效,不需要重启 daemon |
 | `OPENACE_FRESHNESS_WINDOW` | 查询前复用最近一次扫描结果的时长(如 `30s`),期间不重扫工作区;留空(默认)每次查询都扫描;不接受 `0` |
-| `OPENACE_VECTOR_MEMORY_BUDGET` | 常驻向量的内存上限(字节数);留空(默认)不限 |
+| `OPENACE_VECTOR_MEMORY_BUDGET` | 可寻址向量数据的字节预算;留空(默认)不限。旧 400K 行默认上限已于 2026-08-26 移除 |
 | `OPENACE_MAX_FILE_BYTES` / `OPENACE_MAX_TEXT_FILE_BYTES` | 单文件索引上限:一般文件默认 1 MiB,纯文本文件默认 4 MiB,超过整篇不索引 |
 | `OPENACE_CACHE_DIR` | 索引缓存根目录;默认用户缓存目录下的 `openace-mcp` |
 | `OPENACE_TOOL_TIMEOUT` | 单次 MCP 工具调用的处理超时,默认 `110s` |
@@ -245,7 +254,7 @@ MCP 客户端每次启动 agent 会话都会重新拉起 `command` 指定的进�
 | `OPENACE_TASK_WORKERS` | daemon 异步任务 worker 数(默认 `4`) |
 | `OPENACE_TOOL_TIMEOUT` | 同步 MCP 工具超时(默认 `110s`) |
 
-daemon 只监听 loopback,不要直接暴露公网。引擎固定为 local-hybrid,历史 `OPENACE_ENGINE=ace` 已退役,设置会得到明确报错。
+daemon 只监听 loopback,不要直接暴露公网。引擎固定为 local-hybrid;legacy ACE 引擎已于 2026-08-04 删除,历史 `OPENACE_ENGINE=ace` 设置会得到明确报错。
 
 wrapper 与 daemon 的一致性分两层,行为刻意不同:
 

@@ -325,10 +325,14 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// 服务商差异只在这里：voyage 形状带 input_type 与 output_dimension（维度未知时不传，
+	// 由服务端按模型默认维度返回，供探测）；OpenAI 兼容形状只有 input 与 model。
 	body := map[string]any{"input": texts, "model": c.cfg.Model}
 	if c.cfg.ProviderType == ProviderVoyage {
 		body["input_type"] = string(inputType)
-		body["output_dimension"] = c.cfg.Dimension
+		if c.cfg.Dimension > 0 {
+			body["output_dimension"] = c.cfg.Dimension
+		}
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -397,7 +401,8 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 				Message: fmt.Sprintf("embedding response index invalid or duplicated: %d (batch rejected)", item.Index),
 			}
 		}
-		if len(item.Embedding) != c.cfg.Dimension {
+		// Dimension==0 只出现在维度探测请求（ResolveDimension）：此时不校验，由调用方读取长度。
+		if c.cfg.Dimension > 0 && len(item.Embedding) != c.cfg.Dimension {
 			return nil, &reliability.CallError{
 				Class: reliability.ClassPermanent,
 				Message: fmt.Sprintf("embedding dimension mismatch: got %d, want %d (check %s or the served model)",

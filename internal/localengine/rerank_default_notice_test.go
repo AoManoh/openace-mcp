@@ -11,7 +11,7 @@ import (
 // 本文件回归 2026-08-13 用户裁决"rerank 生产默认(质量至上)":
 // 语义链路已配置而 rerank 未配置时,检索结果必须显式提示(降级 reason
 // 进横幅),不得静默按 RRF 序放行;OPENACE_QUALITY_STRICT=on 时升级为
-// 显式报错(既有 strict 闸自动覆盖 reason)。显式 OPENACE_RERANK_PROVIDER
+// 显式报错(既有 strict 闸自动覆盖 reason)。显式 OPENACE_RERANK_ADAPTER
 // =off 是配置形态而非缺口(config.go:Enabled=false 语义),不提示;
 // 纯词法零凭据路径不受影响(红线:词法路永远可用,不标 DEGRADED)。
 

@@ -11,7 +11,7 @@ import (
 func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
-		EnvProvider, EnvBaseURL, EnvAPIKey, EnvVoyageAPIKey, EnvModel,
+		EnvAdapter, EnvBaseURL, EnvAPIKey, legacyEnvVoyageAPIKey, legacyEnvProvider, EnvModel,
 		EnvDimension, EnvBatchSize, EnvMaxConcurrency, EnvRPMBudget, EnvTPMBudget,
 		EnvThroughputGovernor, EnvBatchAPI, EnvBatchMinChunks,
 		"OPENACE_PROVIDER_TIMEOUT", "OPENACE_PROVIDER_MAX_RETRIES",
@@ -20,9 +20,25 @@ func clearEnv(t *testing.T) {
 	}
 }
 
+// TestVoyageRequiresExplicitBaseURLAndModel：有 key 但缺端点或模型 id 时必须报配置错误，
+// 错误里要指明缺哪个变量并给示例；不再回落到写死的 provider 默认值（2026-09-20 用户裁决）。
+func TestVoyageRequiresExplicitBaseURLAndModel(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvAPIKey, "canary-key-123")
+	if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), EnvBaseURL) || !strings.Contains(err.Error(), "example") {
+		t.Fatalf("有 key 缺 base_url 应报错并给示例: %v", err)
+	}
+	t.Setenv(EnvBaseURL, "https://api.voyageai.com/v1")
+	if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), EnvModel) || !strings.Contains(err.Error(), "example") {
+		t.Fatalf("有 key 缺 model 应报错并给示例: %v", err)
+	}
+}
+
 func TestDefaultsWithVoyageKey(t *testing.T) {
 	clearEnv(t)
-	t.Setenv(EnvVoyageAPIKey, "canary-key-123")
+	t.Setenv(EnvAPIKey, "canary-key-123")
+	t.Setenv(EnvBaseURL, "https://api.voyageai.com/v1")
+	t.Setenv(EnvModel, "voyage-code-3")
 	cfg, err := ConfigFromEnv()
 	if err != nil {
 		t.Fatalf("ConfigFromEnv: %v", err)
@@ -31,8 +47,8 @@ func TestDefaultsWithVoyageKey(t *testing.T) {
 		t.Fatalf("有 key 时应启用，reason=%q", cfg.DisabledReason)
 	}
 	if cfg.ProviderType != ProviderVoyage || cfg.BaseURL != "https://api.voyageai.com/v1" ||
-		cfg.Model != "voyage-code-3" || cfg.Dimension != 1024 {
-		t.Fatalf("默认身份不符: %+v", cfg)
+		cfg.Model != "voyage-code-3" || cfg.Dimension != 0 || !cfg.DimensionAuto {
+		t.Fatalf("显式身份不符（adapter 应由地址识别为 voyage，维度未配置应为待探测）: %+v", cfg)
 	}
 	if cfg.BatchSize != 128 || cfg.InitialConcurrency != 16 || cfg.RPMBudget != 0 || cfg.TPMBudget != 0 {
 		t.Fatalf("默认运维参数不符: %+v", cfg)
@@ -54,27 +70,29 @@ func TestNoKeyDisablesSemanticNotError(t *testing.T) {
 	if cfg.Enabled {
 		t.Fatalf("缺 key 时不应启用")
 	}
-	if !strings.Contains(cfg.DisabledReason, "no API key") || !strings.Contains(cfg.DisabledReason, "lexical") {
-		t.Fatalf("原因应说明缺 key 且词法可用: %q", cfg.DisabledReason)
+	if !strings.Contains(cfg.DisabledReason, "not configured") || !strings.Contains(cfg.DisabledReason, "lexical") {
+		t.Fatalf("原因应说明未配置且词法可用: %q", cfg.DisabledReason)
 	}
 	if cfg.ProfileHash() != "" {
 		t.Fatalf("未启用时 ProfileHash 应为空")
 	}
 }
 
-func TestExplicitKeyOverridesVoyageKey(t *testing.T) {
+// TestOwnKeyOnly：embedding 只读自己的 key（不再有 VOYAGE_API_KEY 回退链）。
+func TestOwnKeyOnly(t *testing.T) {
 	clearEnv(t)
-	t.Setenv(EnvVoyageAPIKey, "fallback")
 	t.Setenv(EnvAPIKey, "explicit")
+	t.Setenv(EnvBaseURL, "https://api.voyageai.com/v1")
+	t.Setenv(EnvModel, "voyage-code-3")
 	cfg, err := ConfigFromEnv()
 	if err != nil || cfg.APIKey != "explicit" {
-		t.Fatalf("OPENACE_EMBEDDING_API_KEY 应优先: key=%q err=%v", cfg.APIKey, err)
+		t.Fatalf("OPENACE_EMBEDDING_API_KEY 应生效: key=%q err=%v", cfg.APIKey, err)
 	}
 }
 
 func TestProviderOff(t *testing.T) {
 	clearEnv(t)
-	t.Setenv(EnvProvider, "off")
+	t.Setenv(EnvAdapter, "off")
 	cfg, err := ConfigFromEnv()
 	if err != nil || cfg.Enabled {
 		t.Fatalf("off 应禁用且无错误: %+v err=%v", cfg, err)
@@ -86,24 +104,25 @@ func TestProviderOff(t *testing.T) {
 
 func TestInvalidProviderRejected(t *testing.T) {
 	clearEnv(t)
-	t.Setenv(EnvProvider, "openai-azure")
-	if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), EnvProvider) {
-		t.Fatalf("非法 provider 应显式报错并指明变量: %v", err)
+	t.Setenv(EnvAdapter, "openai-azure")
+	if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), EnvAdapter) {
+		t.Fatalf("非法 adapter 应显式报错并指明变量: %v", err)
 	}
 }
 
 func TestOpenAIRequiresBaseURLAndModel(t *testing.T) {
 	clearEnv(t)
-	t.Setenv(EnvProvider, "openai")
-	if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), EnvBaseURL) {
-		t.Fatalf("openai 缺 base_url 应报错: %v", err)
-	}
-	t.Setenv(EnvBaseURL, "http://127.0.0.1:8080/v1")
-	if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), EnvModel) {
-		t.Fatalf("openai 缺 model 应报错: %v", err)
+	t.Setenv(EnvAdapter, "openai")
+	cfg, err := ConfigFromEnv()
+	if err != nil || cfg.Enabled {
+		t.Fatalf("只写 adapter、地址与模型都空 = 未配置，不是错误: %+v err=%v", cfg, err)
 	}
 	t.Setenv(EnvModel, "nomic-embed-code")
-	cfg, err := ConfigFromEnv()
+	if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), EnvBaseURL) {
+		t.Fatalf("有模型缺 base_url 应报错: %v", err)
+	}
+	t.Setenv(EnvBaseURL, "http://127.0.0.1:8080/v1")
+	cfg, err = ConfigFromEnv()
 	if err != nil || !cfg.Enabled {
 		t.Fatalf("自部署 keyless 应可启用（K21）: %+v err=%v", cfg, err)
 	}
@@ -112,9 +131,78 @@ func TestOpenAIRequiresBaseURLAndModel(t *testing.T) {
 	}
 }
 
+// TestAdapterDetectedFromBaseURL：不写 OPENACE_EMBEDDING_ADAPTER 时按地址识别形状。
+func TestAdapterDetectedFromBaseURL(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvModel, "m")
+	t.Setenv(EnvBaseURL, "http://127.0.0.1:8080/v1")
+	cfg, err := ConfigFromEnv()
+	if err != nil || cfg.ProviderType != ProviderOpenAI {
+		t.Fatalf("未知主机应识别为 openai 形状: %+v err=%v", cfg, err)
+	}
+	t.Setenv(EnvBaseURL, "https://API.voyageai.com/v1")
+	cfg, err = ConfigFromEnv()
+	if err != nil || cfg.ProviderType != ProviderVoyage {
+		t.Fatalf("api.voyageai.com 应识别为 voyage 形状: %+v err=%v", cfg, err)
+	}
+	t.Setenv(EnvAdapter, "openai")
+	cfg, err = ConfigFromEnv()
+	if err != nil || cfg.ProviderType != ProviderOpenAI {
+		t.Fatalf("显式 adapter 应覆盖识别结果: %+v err=%v", cfg, err)
+	}
+}
+
+// TestLegacyVariablesRejected：旧变量设置了就报带迁移指引的错误，不静默忽略。
+func TestLegacyVariablesRejected(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(legacyEnvProvider, "voyage")
+	if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), legacyEnvProvider) || !strings.Contains(err.Error(), EnvAdapter) {
+		t.Fatalf("旧 PROVIDER 应报错并指向 ADAPTER: %v", err)
+	}
+	clearEnv(t)
+	t.Setenv(legacyEnvVoyageAPIKey, "k")
+	if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), legacyEnvVoyageAPIKey) || !strings.Contains(err.Error(), EnvAPIKey) {
+		t.Fatalf("VOYAGE_API_KEY 应报错并指向各阶段自己的 key: %v", err)
+	}
+	clearEnv(t)
+	t.Setenv(EnvBaseURL, "https://api.voyageai.com/v1")
+	t.Setenv(EnvModel, "voyage-code-3")
+	t.Setenv(EnvBatchAPI, "voyage")
+	if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), "on") {
+		t.Fatalf("BATCH_API=voyage 应报错并提示改为 on: %v", err)
+	}
+	t.Setenv(EnvBatchAPI, "on")
+	cfg, err := ConfigFromEnv()
+	if err != nil || cfg.BatchAPIMode != ProviderVoyage {
+		t.Fatalf("voyage 形状 + BATCH_API=on 应启用批车道: %+v err=%v", cfg, err)
+	}
+	t.Setenv(EnvBaseURL, "http://127.0.0.1:8080/v1")
+	if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), "batch API") {
+		t.Fatalf("openai 形状不支持批车道应报错: %v", err)
+	}
+}
+
+// TestDimensionExplicitOrAuto：显式维度记为非 auto；未设为待探测。
+func TestDimensionExplicitOrAuto(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvBaseURL, "http://127.0.0.1:8080/v1")
+	t.Setenv(EnvModel, "m")
+	cfg, err := ConfigFromEnv()
+	if err != nil || cfg.Dimension != 0 || !cfg.DimensionAuto || cfg.ConfigIdentity() == "" {
+		t.Fatalf("未设维度应为待探测: %+v err=%v", cfg, err)
+	}
+	autoIdentity := cfg.ConfigIdentity()
+	t.Setenv(EnvDimension, "1536")
+	cfg, err = ConfigFromEnv()
+	if err != nil || cfg.Dimension != 1536 || cfg.DimensionAuto || cfg.ConfigIdentity() == autoIdentity {
+		t.Fatalf("显式维度应生效且配置身份随之变化: %+v err=%v", cfg, err)
+	}
+}
+
 func TestBaseURLNormalizationAndValidation(t *testing.T) {
 	clearEnv(t)
-	t.Setenv(EnvVoyageAPIKey, "k")
+	t.Setenv(EnvAPIKey, "k")
+	t.Setenv(EnvModel, "voyage-code-3")
 	t.Setenv(EnvBaseURL, "https://api.voyageai.com/v1/")
 	cfg, err := ConfigFromEnv()
 	if err != nil || cfg.BaseURL != "https://api.voyageai.com/v1" {
@@ -132,7 +220,9 @@ func TestBaseURLNormalizationAndValidation(t *testing.T) {
 
 func TestBatchSizeBounds(t *testing.T) {
 	clearEnv(t)
-	t.Setenv(EnvVoyageAPIKey, "k")
+	t.Setenv(EnvAPIKey, "k")
+	t.Setenv(EnvBaseURL, "https://api.voyageai.com/v1")
+	t.Setenv(EnvModel, "voyage-code-3")
 	t.Setenv(EnvBatchSize, "1001")
 	if _, err := ConfigFromEnv(); err == nil || !strings.Contains(err.Error(), EnvBatchSize) {
 		t.Fatalf("超过 1000 条应报错: %v", err)
@@ -145,7 +235,9 @@ func TestBatchSizeBounds(t *testing.T) {
 
 func TestOperationalEnvParsing(t *testing.T) {
 	clearEnv(t)
-	t.Setenv(EnvVoyageAPIKey, "k")
+	t.Setenv(EnvAPIKey, "k")
+	t.Setenv(EnvBaseURL, "https://api.voyageai.com/v1")
+	t.Setenv(EnvModel, "voyage-code-3")
 	t.Setenv(EnvDimension, "2048")
 	t.Setenv(EnvBatchSize, "64")
 	// 固定并发配置已退役，由迁移测试验证拒绝行为。

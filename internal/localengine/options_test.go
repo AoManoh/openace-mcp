@@ -17,11 +17,11 @@ import (
 func clearProviderEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
-		embedding.EnvProvider, embedding.EnvBaseURL, embedding.EnvAPIKey, embedding.EnvVoyageAPIKey,
+		embedding.EnvAdapter, embedding.EnvBaseURL, embedding.EnvAPIKey, "VOYAGE_API_KEY", "OPENACE_EMBEDDING_PROVIDER",
 		embedding.EnvModel, embedding.EnvDimension, embedding.EnvBatchSize, embedding.EnvMaxConcurrency,
 		embedding.EnvRPMBudget, embedding.EnvTPMBudget,
 		embedding.EnvThroughputGovernor, embedding.EnvBatchAPI, embedding.EnvBatchMinChunks,
-		rerank.EnvProvider, rerank.EnvBaseURL, rerank.EnvAPIKey, rerank.EnvModel, rerank.EnvMaxTokens,
+		rerank.EnvAdapter, "OPENACE_RERANK_PROVIDER", rerank.EnvBaseURL, rerank.EnvAPIKey, rerank.EnvModel, rerank.EnvMaxTokens,
 		EnvRetrievalDegrade, EnvRerankDegrade, EnvVectorMemoryBudget,
 		"OPENACE_PROVIDER_TIMEOUT", "OPENACE_PROVIDER_MAX_RETRIES",
 	} {

@@ -18,12 +18,12 @@ func TestEnsureSyncOnlyZeroProviderRejectsPendingGap(t *testing.T) {
 	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
 	t.Setenv("OPENACE_CACHE_NAMESPACE", "synconly-test")
 	// 必死端点:预检本身零 provider 调用,任何真实请求都会立即失败。
-	t.Setenv("OPENACE_EMBEDDING_PROVIDER", "openai")
+	t.Setenv("OPENACE_EMBEDDING_ADAPTER", "openai")
 	t.Setenv("OPENACE_EMBEDDING_BASE_URL", "http://127.0.0.1:1")
 	t.Setenv("OPENACE_EMBEDDING_API_KEY", "dead")
 	t.Setenv("OPENACE_EMBEDDING_MODEL", "m")
 	t.Setenv("OPENACE_EMBEDDING_DIMENSION", "8")
-	t.Setenv("OPENACE_RERANK_PROVIDER", "off")
+	t.Setenv("OPENACE_RERANK_ADAPTER", "off")
 
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\n\nfunc A() {}\n"), 0o600); err != nil {
@@ -52,10 +52,11 @@ func TestEnsureSyncOnlyZeroProviderRejectsPendingGap(t *testing.T) {
 func TestEnsureSyncOnlyZeroProviderAllowsLexicalOnly(t *testing.T) {
 	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
 	t.Setenv("OPENACE_CACHE_NAMESPACE", "synconly-test")
-	t.Setenv("OPENACE_EMBEDDING_PROVIDER", "")
+	t.Setenv("OPENACE_EMBEDDING_ADAPTER", "")
+	t.Setenv("OPENACE_EMBEDDING_MODEL", "")
 	t.Setenv("OPENACE_EMBEDDING_BASE_URL", "")
 	t.Setenv("OPENACE_EMBEDDING_API_KEY", "")
-	t.Setenv("OPENACE_RERANK_PROVIDER", "off")
+	t.Setenv("OPENACE_RERANK_ADAPTER", "off")
 
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\n"), 0o600); err != nil {

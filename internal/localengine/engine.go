@@ -208,6 +208,21 @@ func New(opts Options) (*Engine, error) {
 	// ProfileHash 与索引子树后缀，两处必须取同一常量，否则 wrapper 与
 	// daemon 算出的指纹会不一致。
 	opts.Embedding.TemplateVersion = embedTemplateVersion
+	// 维度未显式配置时在这里探测一次（先查 cache 根目录的缓存，命中则零调用）：
+	// 索引身份与向量预算都依赖真实维度。探测失败按配置错误返回，错误文本提示
+	// 可设 OPENACE_EMBEDDING_DIMENSION 跳过探测；不会静默退到词法。
+	if opts.Embedding.Enabled && opts.Embedding.DimensionAuto {
+		cacheDir := ""
+		if snap, err := workspace.CurrentCacheSnapshot(); err == nil {
+			cacheDir = snap.Dir
+		}
+		resolved, err := embedding.ResolveDimension(context.Background(), opts.Embedding, cacheDir)
+		var warn *embedding.CacheWriteWarning
+		if err != nil && !errors.As(err, &warn) {
+			return nil, err
+		}
+		opts.Embedding = resolved
+	}
 	e.embedCfg = opts.Embedding
 	// 常驻向量默认不限。用户配置字节预算时按 维度×4 字节折算行数上限，
 	// 只计向量数据本身；条目与元数据另有开销。

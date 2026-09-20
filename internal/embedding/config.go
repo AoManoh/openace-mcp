@@ -18,26 +18,28 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/reliability"
 )
 
-// Provider 类型取值。
+// adapter 标识（内部值，同时是索引身份 ProfileHash 的第一段，改值会让现有索引重建）。
+// 2026-09-20 用户裁决：用户只给"地址 + 模型 id (+ key)"，服务商差异全部收进 adapter；
+// adapter 默认按地址自动识别，可用 OPENACE_EMBEDDING_ADAPTER 显式覆盖。
 const (
-	ProviderVoyage = "voyage"
-	ProviderOpenAI = "openai"
-	ProviderOff    = "off"
+	ProviderVoyage = "voyage" // Voyage 形状：/embeddings 带 input_type、output_dimension
+	ProviderOpenAI = "openai" // OpenAI 兼容形状：vLLM、TEI 的 OpenAI 端点、Infinity、Ollama、各类网关
+	ProviderOff    = "off"    // 显式关闭语义路
+	adapterAuto    = "auto"
 )
 
-// 环境变量名（阶段计划 §4 定稿）。
+// 环境变量名。
 const (
-	EnvProvider       = "OPENACE_EMBEDDING_PROVIDER"
+	EnvAdapter        = "OPENACE_EMBEDDING_ADAPTER"
 	EnvBaseURL        = "OPENACE_EMBEDDING_BASE_URL"
 	EnvAPIKey         = "OPENACE_EMBEDDING_API_KEY"
-	EnvVoyageAPIKey   = "VOYAGE_API_KEY"
 	EnvModel          = "OPENACE_EMBEDDING_MODEL"
 	EnvDimension      = "OPENACE_EMBEDDING_DIMENSION"
 	EnvBatchSize      = "OPENACE_EMBEDDING_BATCH_SIZE"
 	EnvMaxConcurrency = "OPENACE_EMBEDDING_MAX_CONCURRENCY"
 	// EnvThroughputGovernor 只接受空值或 on；off 返回明确的迁移错误。
 	EnvThroughputGovernor = "OPENACE_THROUGHPUT_GOVERNOR"
-	// EnvBatchAPI 选择离线批车道 adapter:目前仅 voyage;默认关闭。
+	// EnvBatchAPI 选择离线批车道：on / off；on 要求 adapter 支持批接口（目前只有 voyage）。
 	EnvBatchAPI = "OPENACE_EMBEDDING_BATCH_API"
 	// EnvBatchMinChunks 是批车道触发阈值(缺失 chunk 数)。
 	EnvBatchMinChunks = "OPENACE_EMBEDDING_BATCH_MIN_CHUNKS"
@@ -45,12 +47,16 @@ const (
 	EnvTPMBudget      = "OPENACE_EMBEDDING_TPM_BUDGET"
 )
 
-// 默认值（调研报告 B4 参考值，全部用户可覆盖）。
+// 已淘汰的变量：设置了就在启动期报迁移错误，不静默忽略（2026-09-20 配置收束）。
 const (
-	defaultVoyageBaseURL = "https://api.voyageai.com/v1"
-	defaultVoyageModel   = "voyage-code-3"
-	defaultDimension     = 1024
-	defaultBatchSize     = 128
+	legacyEnvProvider     = "OPENACE_EMBEDDING_PROVIDER"
+	legacyEnvVoyageAPIKey = "VOYAGE_API_KEY"
+)
+
+// 运维参数默认值（调研报告 B4 参考值，全部用户可覆盖）。地址、模型 id、维度没有默认值：
+// 地址与模型必须显式给出，维度不给则启动后探测一次（ResolveDimension）。
+const (
+	defaultBatchSize = 128
 	// defaultConcurrency 只决定初始请求窗口，后续由实测吞吐调整，不是上限。
 	defaultConcurrency = 16
 	// defaultBatchMinChunks:批车道触发阈值缺省。2000 chunks≈0.6M tokens,
@@ -58,6 +64,9 @@ const (
 	defaultBatchMinChunks = 2000
 	// maxBatchSize 是单批条数硬上限（Voyage 官方 ≤1000 条）。
 	maxBatchSize = 1000
+	// exampleVoyageBaseURL / exampleVoyageModel 只用于报错提示。
+	exampleVoyageBaseURL = "https://api.voyageai.com/v1"
+	exampleVoyageModel   = "voyage-code-3"
 )
 
 // Dtype 是向量元素类型；Stage 3 固定 float32（量化属 Stage 5）。
@@ -78,7 +87,11 @@ type Config struct {
 	BaseURL      string
 	APIKey       string
 	Model        string
-	Dimension    int
+	// Dimension 是向量维度；0 表示"待探测"（未显式配置，见 ResolveDimension）。
+	Dimension int
+	// DimensionAuto 为 true 表示维度未显式配置、由启动期探测得到。它进入引擎
+	// 指纹（wrapper 与 daemon 都能从 env 算出同一值），探测结果只进索引身份。
+	DimensionAuto bool
 
 	BatchSize int
 	// InitialConcurrency 仅供程序化构造控制初始窗口，不限制后续扩张。
@@ -112,26 +125,68 @@ type Config struct {
 	BulkPollInterval time.Duration
 }
 
-// ConfigFromEnv 解析 embedding 配置；配置错误在启动即报（fail-fast），
-// 缺 key 不是错误——返回 Enabled=false 并附原因（阶段计划 D1）。
+// ConfigFromEnv 解析 embedding 配置（2026-09-20 配置收束契约）：
+//   - 用户只给 OPENACE_EMBEDDING_BASE_URL + OPENACE_EMBEDDING_MODEL (+ OPENACE_EMBEDDING_API_KEY)。
+//     地址与模型都为空 = 语义路未配置（Enabled=false，词法照常）；只给其中一项或只给 key
+//     = 配置错误 fail-fast；adapter 由地址自动识别，OPENACE_EMBEDDING_ADAPTER 可显式覆盖或设 off。
+//   - 维度不再有默认值：未设 OPENACE_EMBEDDING_DIMENSION 时 Dimension=0、DimensionAuto=true，
+//     由引擎构造期 ResolveDimension 探测一次并缓存。
+//   - 旧变量 OPENACE_EMBEDDING_PROVIDER、VOYAGE_API_KEY、OPENACE_EMBEDDING_BATCH_API=voyage
+//     设置了就报带迁移指引的错误，不静默忽略。
 func ConfigFromEnv() (Config, error) {
-	provider := strings.TrimSpace(strings.ToLower(os.Getenv(EnvProvider)))
-	if provider == "" {
-		provider = ProviderVoyage
+	if v := strings.TrimSpace(os.Getenv(legacyEnvProvider)); v != "" {
+		return Config{}, fmt.Errorf("%s is no longer read (value %q): the request shape is detected from %s; remove it, or set %s=%s|%s|%s to force one",
+			legacyEnvProvider, v, EnvBaseURL, EnvAdapter, ProviderOpenAI, ProviderVoyage, ProviderOff)
 	}
-	switch provider {
-	case ProviderVoyage, ProviderOpenAI:
+	if strings.TrimSpace(os.Getenv(legacyEnvVoyageAPIKey)) != "" {
+		return Config{}, fmt.Errorf("%s is no longer read: set %s for embeddings and OPENACE_RERANK_API_KEY for reranking (each stage has its own key)",
+			legacyEnvVoyageAPIKey, EnvAPIKey)
+	}
+	adapter := strings.TrimSpace(strings.ToLower(os.Getenv(EnvAdapter)))
+	if adapter == "" {
+		adapter = adapterAuto
+	}
+	switch adapter {
+	case adapterAuto, ProviderVoyage, ProviderOpenAI:
 	case ProviderOff:
-		return Config{Enabled: false, ProviderType: ProviderOff, DisabledReason: "embedding provider is off"}, nil
+		return Config{Enabled: false, ProviderType: ProviderOff, DisabledReason: "embedding adapter is off"}, nil
 	default:
-		return Config{}, fmt.Errorf("invalid %s %q; use %q, %q or %q", EnvProvider, os.Getenv(EnvProvider), ProviderVoyage, ProviderOpenAI, ProviderOff)
+		return Config{}, fmt.Errorf("invalid %s %q; use %s, %s, %s or %s", EnvAdapter, os.Getenv(EnvAdapter), adapterAuto, ProviderOpenAI, ProviderVoyage, ProviderOff)
 	}
 
-	cfg := Config{ProviderType: provider, InitialConcurrency: defaultConcurrency}
-	var err error
-	if cfg.Dimension, err = reliability.IntEnv(EnvDimension, defaultDimension, 1); err != nil {
+	baseURL := strings.TrimSpace(os.Getenv(EnvBaseURL))
+	model := strings.TrimSpace(os.Getenv(EnvModel))
+	apiKey := strings.TrimSpace(os.Getenv(EnvAPIKey))
+	if baseURL == "" && model == "" {
+		if apiKey != "" {
+			return Config{}, fmt.Errorf("%s is set but %s and %s are missing: set the endpoint and model id (example: %s, %s), or remove the key to run lexical-only",
+				EnvAPIKey, EnvBaseURL, EnvModel, exampleVoyageBaseURL, exampleVoyageModel)
+		}
+		return Config{
+			Enabled:        false,
+			ProviderType:   adapter,
+			DisabledReason: fmt.Sprintf("embedding not configured (set %s and %s); semantic path disabled, lexical retrieval fully available", EnvBaseURL, EnvModel),
+		}, nil
+	}
+	if baseURL == "" {
+		return Config{}, fmt.Errorf("%s is required when %s is set (example: %s)", EnvBaseURL, EnvModel, exampleVoyageBaseURL)
+	}
+	if model == "" {
+		return Config{}, fmt.Errorf("%s is required when %s is set (example: %s)", EnvModel, EnvBaseURL, exampleVoyageModel)
+	}
+	normalized, err := normalizeBaseURL(EnvBaseURL, baseURL)
+	if err != nil {
 		return Config{}, err
 	}
+	if adapter == adapterAuto {
+		adapter = DetectAdapter(normalized)
+	}
+
+	cfg := Config{ProviderType: adapter, BaseURL: normalized, Model: model, APIKey: apiKey, InitialConcurrency: defaultConcurrency}
+	if cfg.Dimension, err = reliability.IntEnv(EnvDimension, 0, 0); err != nil {
+		return Config{}, err
+	}
+	cfg.DimensionAuto = cfg.Dimension == 0
 	if cfg.BatchSize, err = reliability.IntEnv(EnvBatchSize, defaultBatchSize, 1); err != nil {
 		return Config{}, err
 	}
@@ -155,59 +210,21 @@ func ConfigFromEnv() (Config, error) {
 	}
 	switch batchAPI := strings.TrimSpace(strings.ToLower(os.Getenv(EnvBatchAPI))); batchAPI {
 	case "", "off":
-	case "voyage":
-		// 批车道要求 provider 就是 voyage:不支持的组合 fail-fast,
-		// 绝不静默忽略(用户裁决 2026-08-20:错误显式外抛)。
-		if provider != ProviderVoyage {
-			return Config{}, fmt.Errorf("%s=voyage requires %s=voyage (got %q)", EnvBatchAPI, EnvProvider, provider)
+	case "on":
+		// 批车道是 adapter 能力：只有 voyage 形状有 Batch API；不支持的组合 fail-fast，
+		// 绝不静默忽略（用户裁决 2026-08-20：错误显式外抛）。
+		if adapter != ProviderVoyage {
+			return Config{}, fmt.Errorf("%s=on requires an adapter with a batch API (detected %q for %s); only the voyage adapter supports it", EnvBatchAPI, adapter, cfg.BaseURL)
 		}
 		cfg.BatchAPIMode = ProviderVoyage
+	case "voyage":
+		return Config{}, fmt.Errorf("%s=voyage is no longer accepted: use %s=on (the adapter is detected from %s)", EnvBatchAPI, EnvBatchAPI, EnvBaseURL)
 	default:
-		return Config{}, fmt.Errorf("invalid %s %q: use \"voyage\" or \"off\"", EnvBatchAPI, batchAPI)
+		return Config{}, fmt.Errorf("invalid %s %q: use \"on\" or \"off\"", EnvBatchAPI, batchAPI)
 	}
 	if cfg.BatchMinChunks, err = reliability.IntEnv(EnvBatchMinChunks, defaultBatchMinChunks, 1); err != nil {
 		return Config{}, err
 	}
-
-	cfg.Model = strings.TrimSpace(os.Getenv(EnvModel))
-	baseURL := strings.TrimSpace(os.Getenv(EnvBaseURL))
-	cfg.APIKey = strings.TrimSpace(os.Getenv(EnvAPIKey))
-
-	switch provider {
-	case ProviderVoyage:
-		if baseURL == "" {
-			baseURL = defaultVoyageBaseURL
-		}
-		if cfg.Model == "" {
-			cfg.Model = defaultVoyageModel
-		}
-		// key 解析链：OPENACE_EMBEDDING_API_KEY → VOYAGE_API_KEY（阶段计划 D3）。
-		if cfg.APIKey == "" {
-			cfg.APIKey = strings.TrimSpace(os.Getenv(EnvVoyageAPIKey))
-		}
-		if cfg.APIKey == "" {
-			return Config{
-				Enabled:        false,
-				ProviderType:   provider,
-				DisabledReason: fmt.Sprintf("embedding provider %q has no API key (%s / %s); semantic path disabled, lexical retrieval fully available", provider, EnvAPIKey, EnvVoyageAPIKey),
-			}, nil
-		}
-	case ProviderOpenAI:
-		// 自部署 OpenAI-compatible：base_url/model 必填，key 允许为空（K21：
-		// 无 key 时不发送 Authorization 头）。
-		if baseURL == "" {
-			return Config{}, fmt.Errorf("%s is required when %s=%s (self-hosted OpenAI-compatible endpoint)", EnvBaseURL, EnvProvider, ProviderOpenAI)
-		}
-		if cfg.Model == "" {
-			return Config{}, fmt.Errorf("%s is required when %s=%s", EnvModel, EnvProvider, ProviderOpenAI)
-		}
-	}
-
-	normalized, err := normalizeBaseURL(EnvBaseURL, baseURL)
-	if err != nil {
-		return Config{}, err
-	}
-	cfg.BaseURL = normalized
 	cfg.Enabled = true
 	// 只在语义 provider 已启用时拒绝旧并发配置，未配置凭据的词法路径照常可用。
 	if strings.TrimSpace(os.Getenv(EnvMaxConcurrency)) != "" {
@@ -221,6 +238,34 @@ func ConfigFromEnv() (Config, error) {
 		return Config{}, fmt.Errorf("invalid %s %q: use on or remove it", EnvThroughputGovernor, governor)
 	}
 	return cfg, nil
+}
+
+// DetectAdapter 按地址主机名选择 adapter：api.voyageai.com → voyage，其余一律 OpenAI 兼容形状。
+// 识别表是代码常量，改表走发布；识别结果会写进状态上报，用户可用 OPENACE_EMBEDDING_ADAPTER 覆盖。
+func DetectAdapter(baseURL string) string {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return ProviderOpenAI
+	}
+	switch strings.ToLower(parsed.Hostname()) {
+	case "api.voyageai.com":
+		return ProviderVoyage
+	}
+	return ProviderOpenAI
+}
+
+// ConfigIdentity 返回 wrapper 与 daemon 都能只凭 env 算出的配置身份（不含 key、不含探测结果）：
+// adapter、地址、模型、维度配置（显式数字或 auto）、模板版本。引擎指纹用它，索引身份用 ProfileHash。
+func (c Config) ConfigIdentity() string {
+	if !c.Enabled {
+		return "off"
+	}
+	dim := "auto"
+	if !c.DimensionAuto {
+		dim = fmt.Sprintf("%d", c.Dimension)
+	}
+	sum := sha256.Sum256([]byte(strings.Join([]string{c.ProviderType, c.BaseURL, c.Model, dim, Dtype, c.TemplateVersion}, "\x00")))
+	return hex.EncodeToString(sum[:])[:12]
 }
 
 // normalizeBaseURL 校验并规范化 base URL（去尾部斜杠，保证 hash 稳定）。

@@ -208,7 +208,9 @@ func normalizeDegrade(mode DegradeMode) DegradeMode {
 func (o Options) Fingerprint() string {
 	embedComponent := "off"
 	if o.Embedding.Enabled {
-		embedComponent = o.Embedding.ProfileHash()
+		// 用只凭 env 可算的配置身份（维度未显式配置时记 auto），不用含探测维度的
+		// ProfileHash：wrapper 不做探测，两边才能算出同一指纹。
+		embedComponent = o.Embedding.ConfigIdentity()
 	}
 	rerankComponent := "off"
 	if o.Rerank.Enabled {

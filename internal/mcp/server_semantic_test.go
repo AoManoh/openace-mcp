@@ -215,12 +215,17 @@ func TestSemanticOffNeverCallsProvider(t *testing.T) {
 	t.Setenv("OPENACE_CACHE_NAMESPACE", "e2e")
 	var calls atomic.Int32
 	provider := newSemanticFakeProvider(t, 8, nil, &calls)
-	// voyage 类型 + 端点指向 fake + 无 key → OptionsFromEnv 判 semantic off。
-	t.Setenv("OPENACE_EMBEDDING_PROVIDER", "voyage")
-	t.Setenv("OPENACE_EMBEDDING_BASE_URL", provider.URL)
+	// 2026-09-20 配置收束：语义路"未配置" = 地址与模型都不给（fake provider 只用来
+	// 证明零调用）；OptionsFromEnv 判 semantic off，词法能力完整。
+	_ = provider.URL
+	t.Setenv("OPENACE_EMBEDDING_ADAPTER", "")
+	t.Setenv("OPENACE_EMBEDDING_BASE_URL", "")
+	t.Setenv("OPENACE_EMBEDDING_MODEL", "")
 	t.Setenv("OPENACE_EMBEDDING_API_KEY", "")
+	t.Setenv("OPENACE_EMBEDDING_PROVIDER", "")
 	t.Setenv("VOYAGE_API_KEY", "")
-	t.Setenv("OPENACE_RERANK_PROVIDER", "off")
+	t.Setenv("OPENACE_RERANK_ADAPTER", "off")
+	t.Setenv("OPENACE_RERANK_PROVIDER", "")
 	t.Setenv("OPENACE_RETRIEVAL_DEGRADE", "")
 	t.Setenv("OPENACE_RERANK_DEGRADE", "")
 

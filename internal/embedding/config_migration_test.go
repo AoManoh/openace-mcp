@@ -9,7 +9,7 @@ func TestRetiredConcurrencyConfigurationRequiresMigration(t *testing.T) {
 	for _, env := range []struct{ key, value string }{{EnvMaxConcurrency, "16"}, {EnvMaxConcurrency, "0"}, {EnvThroughputGovernor, "off"}} {
 		t.Run(env.key+"="+env.value, func(t *testing.T) {
 			clearEnv(t)
-			t.Setenv(EnvProvider, ProviderOpenAI)
+			t.Setenv(EnvAdapter, ProviderOpenAI)
 			t.Setenv(EnvBaseURL, "http://127.0.0.1:1")
 			t.Setenv(EnvModel, "local-test")
 			t.Setenv(env.key, env.value)
@@ -22,10 +22,10 @@ func TestRetiredConcurrencyConfigurationRequiresMigration(t *testing.T) {
 }
 
 func TestRetiredConcurrencyDoesNotDisableUnconfiguredLexicalSearch(t *testing.T) {
-	for _, provider := range []string{ProviderOff, ProviderVoyage} {
-		t.Run(provider, func(t *testing.T) {
+	for _, adapter := range []string{ProviderOff, ""} {
+		t.Run("adapter="+adapter, func(t *testing.T) {
 			clearEnv(t)
-			t.Setenv(EnvProvider, provider)
+			t.Setenv(EnvAdapter, adapter)
 			t.Setenv(EnvMaxConcurrency, "16")
 			t.Setenv(EnvThroughputGovernor, "off")
 			cfg, err := ConfigFromEnv()
