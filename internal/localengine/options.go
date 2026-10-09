@@ -199,8 +199,8 @@ func normalizeDegrade(mode DegradeMode) DegradeMode {
 
 // Fingerprint 计算引擎配置指纹，wrapper 与 daemon 各自计算后比对，不一致
 // 即拒绝复用 daemon，用户改了配置不会静默继续用旧配置的 daemon。指纹
-// 覆盖会改变检索语义的项：embedding ProfileHash、rerank 身份、两个降级
-// 开关、质量严格档、批量嵌入模式。不含凭据（key 不进任何指纹、状态或
+// 覆盖会改变检索语义的项：词法评分模型、embedding ProfileHash、rerank 身份、
+// 两个降级开关、质量严格档、批量嵌入模式。不含凭据（key 不进任何指纹、状态或
 // 日志，换 key 也不该判成不同引擎）与运维参数（批大小、并发、超时、
 // 预算，它们不改变检索语义）。Embedding.Enabled=false 时嵌入身份记为 off，
 // 其他指纹项相同才会得到相同指纹。OpenAI-compatible 服务允许不带 key，
@@ -227,14 +227,19 @@ func (o Options) Fingerprint() string {
 	// 必须一致：不进指纹就会按先启动者的模式执行，与降级、严格档开关的
 	// 处理不一致。它不改变向量身份（同模型同维度，批接口与实时接口产出
 	// 的向量在三个抽样点上的余弦相似度均为 1.000000），所以不进 ProfileHash，索引子树
-	// 不变。前缀 "engine-profile-v3" 在指纹组成项变化时升版，旧版 daemon
+	// 不变。前缀 "engine-profile-v4" 在指纹组成项变化时升版，旧版 daemon
 	// 与新版 wrapper 不会算出相同指纹。
 	bulkComponent := "bulk-off"
 	if o.Embedding.BatchAPIMode != "" {
 		bulkComponent = "bulk-" + o.Embedding.BatchAPIMode
 	}
+	// 词法评分模型决定词法路的分数与排序，不由 env 配置，但必须进指纹：
+	// 未设置评分模型、实际按 TF-IDF 评分的旧 daemon 与 BM25 的 wrapper 即使
+	// env 完全相同也不能互相复用。加入该项时前缀从 v3 升到 v4，纯词法零值
+	// 配置的指纹同样随之改变。
 	sum := sha256.Sum256([]byte(strings.Join([]string{
-		"engine-profile-v3",
+		"engine-profile-v4",
+		"lexical-" + lexical.ScoringModel,
 		embedComponent,
 		rerankComponent,
 		string(normalizeDegrade(o.RetrievalDegrade)),

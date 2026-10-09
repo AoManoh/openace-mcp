@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -56,7 +57,7 @@ const (
 
 // JournalDir 返回 store 的 journal 目录。
 func (s *Store) JournalDir() string {
-	return filepath.Join(s.root, journalDirName)
+	return JournalDirOf(s.root)
 }
 
 // OpenJournal 打开（必要时创建）store 的 journal，载入既有条目与拒绝集。
@@ -401,6 +402,106 @@ func (j *Journal) loadRejected() error {
 		return writeFileAtomic(j.rejectedPath(), buf)
 	}
 	return nil
+}
+
+// JournalDirOf 返回索引子树根 root 下的 journal 目录路径，不检查也不创建。
+// 引擎用它在不打开 Store 的情况下判断旧子树有没有 journal。
+func JournalDirOf(root string) string {
+	return filepath.Join(root, journalDirName)
+}
+
+// ErrJournalCorrupt 表示只读快照在 journal 目录里遇到不完整、长度非法、校验
+// 失败或维度不符的记录，或拒绝集末行没写完。这类文件里至少有一部分已付费
+// 记录读不出来，调用方不能把读出的部分当作完整状态。
+var ErrJournalCorrupt = errors.New("journal 记录不完整或校验失败")
+
+// ReadJournalSnapshot 以只读方式读出 journal 目录 dir 里的已付费向量与拒绝集，
+// 供引擎在换用新索引子树时复用旧子树的已付费状态。它不创建目录或文件、
+// 不截断、不改写、不保留文件句柄，也不需要该子树的写锁，旧文件保持原样。
+// 只有在记录边界处干净结束才算读完：不完整的记录、长度非法、CRC 不符、
+// 维度不符与拒绝集末行不完整都以 ErrJournalCorrupt 返回，错误里带文件路径、
+// 记录序号与偏移；打开或读取时的 I/O 错误原样包装返回（不是
+// ErrJournalCorrupt）。出错时不返回部分结果。dir 或其中的文件不存在时返回
+// 空结果。拒绝集与 loadRejected 一样只保留最近的 rejectedMaxEntries 条。
+func ReadJournalSnapshot(dir string, dimension int) (map[string][]float32, map[string]bool, error) {
+	if dimension <= 0 {
+		return nil, nil, errors.New("journal 需要正维度")
+	}
+	vectors, err := readVectorsSnapshot(filepath.Join(dir, journalFileName), dimension)
+	if err != nil {
+		return nil, nil, err
+	}
+	rejected, err := readRejectedSnapshot(filepath.Join(dir, rejectedFileName))
+	if err != nil {
+		return nil, nil, err
+	}
+	return vectors, rejected, nil
+}
+
+// readVectorsSnapshot 逐条读取向量文件，见 ReadJournalSnapshot 的错误约定。
+func readVectorsSnapshot(path string, dimension int) (map[string][]float32, error) {
+	vectors := map[string][]float32{}
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return vectors, nil
+		}
+		return nil, fmt.Errorf("打开 %s: %w", path, err)
+	}
+	defer file.Close()
+	reader := bufio.NewReaderSize(file, 1<<20)
+	var offset int64
+	for record := 1; ; record++ {
+		if _, err := reader.Peek(1); err == io.EOF {
+			return vectors, nil
+		} else if err != nil {
+			return nil, fmt.Errorf("读取 %s（偏移 %d）: %w", path, offset, err)
+		}
+		hash, vector, size, err := readJournalRecord(reader, dimension)
+		if err != nil {
+			var pathErr *os.PathError
+			if errors.As(err, &pathErr) {
+				return nil, fmt.Errorf("读取 %s（第 %d 条记录，偏移 %d）: %w", path, record, offset, err)
+			}
+			return nil, fmt.Errorf("%w: %s 第 %d 条记录（偏移 %d）: %v", ErrJournalCorrupt, path, record, offset, err)
+		}
+		vectors[hash] = vector
+		offset += size
+	}
+}
+
+// readRejectedSnapshot 只读解析拒绝集文件：按首次出现的顺序去重，超过
+// rejectedMaxEntries 时保留最近的条目，与 loadRejected 的保留结果一致，但
+// 不改写文件。MarkRejected 每条都以换行结尾，文件非空却不以换行结尾说明
+// 最后一条没写完，按 ErrJournalCorrupt 返回。
+func readRejectedSnapshot(path string) (map[string]bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]bool{}, nil
+		}
+		return nil, fmt.Errorf("读取 %s: %w", path, err)
+	}
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		return nil, fmt.Errorf("%w: %s 末行不完整（文件不以换行结尾）", ErrJournalCorrupt, path)
+	}
+	seen := map[string]bool{}
+	var order []string
+	for _, hash := range strings.Split(string(data), "\n") {
+		if hash == "" || seen[hash] {
+			continue
+		}
+		seen[hash] = true
+		order = append(order, hash)
+	}
+	if len(order) > rejectedMaxEntries {
+		order = order[len(order)-rejectedMaxEntries:]
+	}
+	rejected := make(map[string]bool, len(order))
+	for _, hash := range order {
+		rejected[hash] = true
+	}
+	return rejected, nil
 }
 
 // Close 关闭 journal 文件句柄。

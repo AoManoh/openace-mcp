@@ -1,7 +1,15 @@
 // Package lexical 封装 Bleve BM25 词法索引：建库、批量写入、查询与
 // 句柄生命周期。只使用纯 Go 路径（scorch + 默认 analyzer），不启用
-// vector build tag。BM25 参数保持 Bleve 默认，不引入针对单一评测集
-// 校准的常数。
+// vector build tag。
+//
+// 评分模型由建库时写入 mapping 的 ScoringModel 决定，并随 mapping 持久化
+// 在每个索引目录里；查询期 Bleve 按打开时读回的 mapping 选分支。Bleve
+// v2.5.7 的 mapping 不设该字段时按 bleve_index_api v1.2.11 的
+// DefaultScoringModel 走 TF-IDF，所以必须显式写 bm25，打开时也逐段核对。
+// 所用的是 Bleve v2.5.7 自带的 BM25：k1=1.2、b=0.75；词频先取平方根再进
+// 饱和项；文档的字段长度由 norm 反推；平均字段长度取该字段词典基数
+// （按 Bleve 内部段累加）除以文档数后向上取整，不是平均词元数。参数保持
+// Bleve 默认，不引入针对单一评测集校准的常数。
 package lexical
 
 import (
@@ -17,11 +25,27 @@ import (
 	"github.com/blevesearch/bleve/v2/search/query"
 )
 
-// EngineName/EngineVersion 写入 manifest 的 lexical 字段。
+// EngineName/EngineVersion 是词法引擎与钉定的 Bleve 版本，写入 manifest
+// 的 lexical 字段；lexical_version 另带 "+"+ScoringModel 后缀（如
+// v2.5.7+bm25）。没有后缀的旧 manifest 来自未设置评分模型、实际按 Bleve
+// 默认 TF-IDF 评分的二进制。
 const (
 	EngineName    = "bleve"
 	EngineVersion = "v2.5.7"
 )
+
+// ScoringModel 是建库时写入 Bleve mapping 的评分模型名，取值与
+// bleve_index_api v1.2.11 的 BM25Scoring 相同；写成字面量是为了不直接依赖
+// 该间接模块。Bleve 的 mapping 校验只接受空串、tf-idf 与 bm25，取值失效时
+// 建库直接报错。该值同时进入索引子树名与引擎配置指纹（localengine），
+// 改动它等于换一套索引身份。
+const ScoringModel = "bm25"
+
+// ErrScoringModelMismatch 表示索引目录持久化的评分模型不是 ScoringModel。
+// 这样的段来自未设置评分模型的旧二进制或被人工复制进来，打开即拒绝：
+// 同一 alias 里各成员按各自 mapping 评分，混入 TF-IDF 段会让两种分数在
+// 同一排序里直接比较，单独服务它又会把 TF-IDF 结果当作 BM25 返回。
+var ErrScoringModelMismatch = errors.New("lexical 索引段的评分模型与当前实现不一致")
 
 // writeBatchSize 是单个 Bleve batch 的文档数上限。
 const writeBatchSize = 512
@@ -67,11 +91,16 @@ type Weights struct {
 
 // DefaultWeights 返回默认子句权重。Symbol=0.1 是 Stage 5 T10a 定值
 // （F1 消解）：profile v3 首次为非 Go 语言填充符号后，symbol 短字段的
-// BM25 权重在 NL 查询语料上放大噪声（旧值 1.0 使 CoSQA R@5 0.166→0.092），
+// 词法权重在 NL 查询语料上放大噪声（旧值 1.0 使 CoSQA R@5 0.166→0.092），
 // 0.1 让 CoSQA 完全回到无符号基线（0.1660）、django weaksup 保住 +21.8%
 // 增益（0.3100→0.3775）、508 条 exact-symbol 探针全权重满分（声明行
 // content 命中已足）。SymbolExact=4 对多词查询惰性、对全串精确查询
 // 提供 +0.33pp MRR，保留。证据：docs/refactor/2026-07-30-stage5b-tuning.md。
+//
+// 这里与 Weights 字段注释中的全部定值和评测数字，都是在索引 mapping 未设置
+// 评分模型、实际按 Bleve 默认 TF-IDF 评分时测得的（当时的代码与说明称之
+// 为 BM25）。改为 BM25 后这些权重原样保留，没有在 BM25 下重新调参；BM25
+// 下的效果需要另做评测，不能沿用这些数字。
 func DefaultWeights() Weights {
 	// LatinContent=4/LatinPath=1 是方案② T4 零费用网格的初值(中值),
 	// 定值证据落 docs/benchmarks/work/wp4/ 后按证据冻结。
@@ -186,8 +215,10 @@ func hanRuneCount(query string) int {
 // blevemapping 构建索引 mapping：
 // content/path/symbol 走默认 analyzer（分词检索），
 // path_raw/symbol_raw/language 走 keyword analyzer（精确匹配与过滤）。
+// 评分模型显式设为 ScoringModel，随 mapping 持久化。
 func blevemapping() mapping.IndexMapping {
 	m := bleve.NewIndexMapping()
+	m.ScoringModel = ScoringModel
 	doc := bleve.NewDocumentMapping()
 
 	text := bleve.NewTextFieldMapping()
@@ -273,10 +304,15 @@ func Build(ctx context.Context, dir string, docs []Doc) error {
 	return idx.Close()
 }
 
-// Index 是打开的只读词法索引句柄；多 segment 时经 IndexAlias 聚合检索
-// （Stage 4 D2）。已知限制：alias 下 BM25 语料统计按各 segment 局部计算，
-// 跨段分数存在偏差——候选按 rank 进 RRF 且有 rerank 精排缓冲（暗坑 K38，
-// Stage 5 benchmark 量化）。
+// Index 是打开的只读词法索引句柄；revision 有多个 segment 时经 IndexAlias
+// 聚合检索。保留的限制：alias 下 BM25 的文档数、含词文档数与平均字段长度
+// 都按各 segment 局部计算，同一个词在小 delta 段与基段里得到不同的 idf 与
+// 长度归一，跨段的词法分数不可比，合并排序可能与把同样内容建成单段时
+// 不同。单段 revision（首建与 compaction 之后）没有这一偏差；delta 链上的
+// 多段 revision 在合并前一直带着它。没有开启 Bleve 的 GlobalScoring：
+// v2.5.7 的全局预检索只汇总文档数与字段词典基数，含词文档数仍取成员局部
+// 值；42 篇文档、delta 段 2 篇的实测里，delta 段命中的分数从单索引的
+// 0.253 升到 0.644 并排到首位，偏差比局部统计更大。
 //
 // 并发契约（Stage 2 review S8）：Search 可并发；Close 与 Search 的互斥
 // 由上层 revisionHandle 的引用计数保证（refs==0 才关闭），本类型自身
@@ -292,27 +328,55 @@ func Open(dir string) (*Index, error) {
 }
 
 // OpenMulti 以只读方式打开一组 segment 索引并聚合为单一检索句柄；
-// 任一打开失败即整体失败并回收已打开成员。
+// 任一打开失败即整体失败并回收已打开成员。每个成员读回的持久化 mapping
+// 必须以 ScoringModel 评分，否则按 ErrScoringModelMismatch 失败：调用方
+// 把它与段损坏同样处理（沿 previous 回退或重建），不会把 TF-IDF 段与
+// BM25 段混排，也不会把 TF-IDF 段当作 BM25 服务。
 func OpenMulti(dirs []string) (*Index, error) {
 	if len(dirs) == 0 {
 		return nil, errors.New("OpenMulti 需要至少一个索引目录")
 	}
 	members := make([]bleve.Index, 0, len(dirs))
+	closeAll := func() {
+		for _, opened := range members {
+			_ = opened.Close()
+		}
+	}
 	for _, dir := range dirs {
 		member, err := bleve.OpenUsing(dir, map[string]interface{}{"read_only": true})
 		if err != nil {
-			for _, opened := range members {
-				_ = opened.Close()
-			}
+			closeAll()
 			return nil, fmt.Errorf("打开 lexical 索引: %w", err)
 		}
 		members = append(members, member)
+		if model := persistedScoringModel(member); model != ScoringModel {
+			closeAll()
+			return nil, fmt.Errorf("打开 lexical 索引 %s: %w: 持久化评分模型为 %s，当前只服务 %s 段，需要重建", dir, ErrScoringModelMismatch, scoringModelLabel(model), ScoringModel)
+		}
 	}
 	if len(members) == 1 {
 		return &Index{idx: members[0], members: members}, nil
 	}
 	alias := bleve.NewIndexAlias(members...)
 	return &Index{idx: alias, members: members}, nil
+}
+
+// persistedScoringModel 返回已打开索引读回的持久化评分模型；mapping 不是
+// Bleve 默认实现类型时返回空串，与未设置同样按不匹配处理。
+func persistedScoringModel(idx bleve.Index) string {
+	if impl, ok := idx.Mapping().(*mapping.IndexMappingImpl); ok {
+		return impl.ScoringModel
+	}
+	return ""
+}
+
+// scoringModelLabel 把持久化评分模型写成错误文本里的说明；空串是旧二进制
+// 未设置该字段的情形，Bleve 此时按默认 TF-IDF 评分。
+func scoringModelLabel(model string) string {
+	if model == "" {
+		return "未设置（Bleve 默认 tf-idf）"
+	}
+	return model
 }
 
 // ErrClosed 表示句柄已关闭。
@@ -341,6 +405,26 @@ func (i *Index) SearchWeightedPrefix(ctx context.Context, queryText string, topK
 	if topK <= 0 {
 		topK = 10
 	}
+	q := buildQuery(queryText, w, pathPrefix)
+	if q == nil {
+		return nil, nil
+	}
+	request := bleve.NewSearchRequestOptions(q, topK, 0, false)
+	result, err := i.idx.SearchInContext(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	hits := make([]Hit, 0, len(result.Hits))
+	for _, hit := range result.Hits {
+		hits = append(hits, Hit{ID: hit.ID, Score: hit.Score})
+	}
+	return hits, nil
+}
+
+// buildQuery 按子句权重组装 SearchWeightedPrefix 的查询，没有任何子句时
+// 返回 nil。单独成函数是为了让测试对生产同一查询开启 Explain，核对落盘
+// 重开后的实际评分分支。
+func buildQuery(queryText string, w Weights, pathPrefix string) query.Query {
 	var clauses []query.Query
 	if w.Content > 0 {
 		match := bleve.NewMatchQuery(queryText)
@@ -397,7 +481,7 @@ func (i *Index) SearchWeightedPrefix(ctx context.Context, queryText string, topK
 		}
 	}
 	if len(clauses) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	var q query.Query = bleve.NewDisjunctionQuery(clauses...)
@@ -409,16 +493,7 @@ func (i *Index) SearchWeightedPrefix(ctx context.Context, queryText string, topK
 		scope := bleve.NewDisjunctionQuery(exact, subtree)
 		q = bleve.NewConjunctionQuery(q, scope)
 	}
-	request := bleve.NewSearchRequestOptions(q, topK, 0, false)
-	result, err := i.idx.SearchInContext(ctx, request)
-	if err != nil {
-		return nil, err
-	}
-	hits := make([]Hit, 0, len(result.Hits))
-	for _, hit := range result.Hits {
-		hits = append(hits, Hit{ID: hit.ID, Score: hit.Score})
-	}
-	return hits, nil
+	return q
 }
 
 // DocCount 返回索引文档数（状态上报用）。

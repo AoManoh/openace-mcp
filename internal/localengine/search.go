@@ -708,6 +708,17 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	if err != nil {
 		return retrieval{}, err
 	}
+	// 所服务 revision 记录的语义迁移暂停原因（见 siblingPaidStateFor）：检索
+	// 带上原因；deny 时与其他语义路失败一样返回可行动错误；strict 由
+	// checkQualityStrict 按原因报错。原因随 revision 持久化，重启后走首触快
+	// 路径服务旧 revision 时同样可见。
+	if reason := handle.manifest.SemanticMigrationBlock; reason != "" {
+		if e.retrievalDegrade == DegradeDeny {
+			e.releaseHandle(handle)
+			return retrieval{}, degradeDeniedError(migrationBlockedReason, errors.New(reason), EnvRetrievalDegrade)
+		}
+		reasons = append(reasons, migrationBlockedReason)
+	}
 
 	lexStart := time.Now()
 	lexHits, planLabel, err := e.lexicalRoute(ctx, handle, query, pathPrefix)

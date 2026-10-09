@@ -669,8 +669,9 @@ func TestEmbeddingOffManifestUnchanged(t *testing.T) {
 			t.Fatalf("semantic off 不得写向量文件: %s", name)
 		}
 	}
-	if filepath.Base(store.Root()) != e.profile.ID+"-v"+e.profile.Version || strings.Contains(store.Root(), "+emb-") {
-		t.Fatalf("semantic off 的子树路径应与 Stage 2 一致: %s", store.Root())
+	// 子树名只含 chunk profile 与词法评分标记，没有 embedding 身份段。
+	if filepath.Base(store.Root()) != e.profile.ID+"-v"+e.profile.Version+"+lex-bm25" || strings.Contains(store.Root(), "+emb-") {
+		t.Fatalf("semantic off 的子树路径应为 chunk profile 加词法评分标记: %s", store.Root())
 	}
 }
 

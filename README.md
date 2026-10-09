@@ -136,13 +136,38 @@ openACE 不绑定任何模型服务商:你只需要回答"向哪个地址、调�
 
 **从 v0.5.x 升级(v0.6.0 起的破坏性变更)**:`VOYAGE_API_KEY`、`OPENACE_EMBEDDING_PROVIDER`、`OPENACE_RERANK_PROVIDER` 不再被读取,设置了会在启动时得到带迁移写法的错误;`OPENACE_EMBEDDING_BATCH_API` 的取值改为 `on`/`off`。原来只配 key 的用户请补上 `OPENACE_EMBEDDING_BASE_URL=https://api.voyageai.com/v1`、`OPENACE_EMBEDDING_MODEL=voyage-code-3`、`OPENACE_RERANK_BASE_URL=https://api.voyageai.com/v1`、`OPENACE_RERANK_MODEL=rerank-3`,并把 key 分别写到 `OPENACE_EMBEDDING_API_KEY` 与 `OPENACE_RERANK_API_KEY`。地址与模型不变时索引身份不变,不会重新嵌入。
 
-接入后查询自动升级:BM25 与向量各召回前 60 段,按 RRF K=20、词法权重 0.15、向量权重 0.85 融合,前 50 段送精排。精排默认启用——在 12 个真实仓、720 条查询的评测里,它把核心召回率比纯融合抬高了 12.8 个百分点,这是"质量至上"这个默认值的底气。rerank 支持 `tei` 与 `voyage` 形状端点。配置了 embedding 而没配 rerank 时,结果会带一条 `rerank-unconfigured` 提示;补上 `OPENACE_RERANK_API_KEY`(voyage 形状可直接复用 `VOYAGE_API_KEY`),或者显式 `OPENACE_RERANK_PROVIDER=off` 确认放弃,提示就消失。当前生产验证组合是 `voyage-code-3` + `rerank-3`;使用 Voyage 时请显式设置 `OPENACE_RERANK_MODEL=rerank-3`,因为二进制的兼容回落值仍是 `rerank-2.5`。召回质量最终取决于你选的模型,挑面向代码检索、口碑可靠的。
+**从 v0.6.0 及更早版本升级(词法评分改为 BM25)**
+
+这些版本建出的词法索引没有写评分模型,实际按 Bleve 默认的 TF-IDF 打分。升级后第一次同步会在同一 cache 目录下新建一棵带 `+lex-bm25` 标记的平行索引子树,在本地重新切分、重建 BM25 词法索引,这一步不调用模型服务。重建期间这个工作区按冷仓首次检索处理,查询最多等 `OPENACE_QUERY_BUILD_WAIT` 后返回带进度的提示。旧子树原样保留,换回旧版本还能接着用;确认不再回退后可以手动删除。
+
+embedding 地址、模型、维度和内置嵌入模板都没变时,新子树只读使用旧子树里已经付过费的数据,不改动旧文件:
+
+- 迁移的全量构建按内容复用旧子树 revision 里的向量;之后经增量更新加回的内容不再查旧 revision,会重新送审。
+- 每次准备送审前,先查旧子树 journal 里已付费、还没发布的向量,有就直接复用;增量更新加回的内容也会查。
+- 旧子树记下的零向量内容不再送审。
+
+以下情况新子树不为任何缺口送审,语义部分暂停:
+
+- 旧子树的目录、journal 或批作业状态读不出来,或 journal 里有不完整、校验失败的记录。
+- 待送审的内容登记在旧子树尚未回收结果的 Batch 作业里(开着 `OPENACE_EMBEDDING_BATCH_API` 时在批作业中途升级),或旧子树有一条未收尾的提交意向。
+- 旧子树登记的某个 Batch 作业没有可用的输入键清单(`keys` 缺失、为空,或有一项不是 64 位小写十六进制),无法确定它覆盖哪些内容。
+
+采用默认 `allow` 策略时,暂停期间词法检索和已复用的向量继续可用。同步结果和检索横幅带 `semantic-migration-blocked`,`workspace_status` 的 `semantic.last_error` 写明涉及的文件、实际错误和恢复办法。设了 `OPENACE_RETRIEVAL_DEGRADE=deny` 或 `OPENACE_QUALITY_STRICT=on` 时,同步和检索直接返回错误。
+
+暂停原因随当前索引版本一起保存,进程重启后不用等同步就能看到。增量构建只检查本次变更,其他文件的暂停原因会继续保留;全量构建重新检查后确认原因已解除,或语义覆盖补齐时,新发布的版本清除该原因。
+
+恢复办法:通常是用升级前的版本对该工作区同步一次,让它回收作业或处理损坏的 journal;也可以在确认这些旧数据不再需要后手动移走对应文件,这时缺口会重新送审计费。
+
+配置指纹也加入了词法评分模型,新 wrapper 不会复用仍按 TF-IDF 打分的旧 daemon。
+
+接入后查询自动升级:BM25 与向量各召回前 60 段,按 RRF K=20、词法权重 0.15、向量权重 0.85 融合,前 50 段送精排。精排默认启用。在 12 个真实仓、720 条查询的评测里,精排把核心召回率比纯融合抬高了 12.8 个百分点;那次评测的词法路实际按 TF-IDF 打分,该组评测尚未在 BM25 下重新执行。rerank 端点默认按通用 rerank 形状接入(覆盖 Voyage、Cohere、Jina 与多数网关),自部署 TEI 需要显式 `OPENACE_RERANK_ADAPTER=tei`。配置了 embedding 而没配 rerank 时,结果会带一条 `rerank-unconfigured` 提示;补上 `OPENACE_RERANK_BASE_URL` 与 `OPENACE_RERANK_MODEL`(服务需要时再加 `OPENACE_RERANK_API_KEY`),或者显式设 `OPENACE_RERANK_ADAPTER=off` 确认放弃,提示就消失。当前生产验证组合是 `voyage-code-3` + `rerank-3`;代码不内置默认模型,模型 id 需要显式写。召回质量最终取决于你选的模型,挑面向代码检索、口碑可靠的。
 
 ### 行为与边界(如实声明)
 
 - **词法路径永远可用**:无 key、断网、模型服务故障时 BM25 检索继续完整工作;未配置模型服务时与纯词法模式完全一致,不出现降级标记。
+- **词法评分与已知限制**:词法路用 Bleve v2.5.7 自带的 BM25(k1=1.2、b=0.75,未调参)。评分模型写在每个索引段里,打开时逐段核对,评分模型不符的段按损坏处理,不会和 BM25 段混在一起排序。增量更新会让一个索引版本暂时由多个段组成,文档数、含词文档数和平均字段长度按段各自统计,跨段的词法分数并不严格可比;合并(compaction)会改变这些统计,排名也可能随之变化。Bleve 的平均字段长度取"字段词典基数 ÷ 文档数"向上取整,不是平均词数。各词法子句的权重是在实际 TF-IDF 打分下调出来的,改用 BM25 后沿用原值,没有重新调参。
 - **降级完全显式,由你支配**:语义路/精排失败或索引覆盖不完整时,结果首行出现 `[DEGRADED] <原因>; mode=...; semantic_coverage=...` 横幅,结构化字段同步携带 `retrieval_mode`/`degraded_reason`/`semantic_coverage`;`OPENACE_RETRIEVAL_DEGRADE=deny` / `OPENACE_RERANK_DEGRADE=deny` 可改为直接返回可行动错误(默认 `allow` 放行词法结果)。不存在静默降级。
-- **成本边界**:embedding/rerank 的调用与计费发生在你自己的模型服务上。索引期按变更内容付费——未变更 chunk 跨 revision 复用向量,不重复付费;查询期每次消耗一次 query embedding(启用 rerank 时另加一次精排调用)。预算护栏建议设在你的服务/账户侧。大额首建(万级 chunk 以上)可开 `OPENACE_EMBEDDING_BATCH_API=voyage` 走批作业:同样的向量,费用少三分之一,代价是服务端排队(上限 12 小时,实测通常快得多);排队期间词法检索照常可用,daemon 重启会接着等同一个作业,不会重复交钱。
+- **成本边界**:embedding/rerank 的调用与计费发生在你自己的模型服务上。索引期按变更内容付费——未变更 chunk 跨 revision 复用向量,不重复付费;查询期每次消耗一次 query embedding(启用 rerank 时另加一次精排调用)。预算护栏建议设在你的服务/账户侧。大额首建(万级 chunk 以上)可开 `OPENACE_EMBEDDING_BATCH_API=on` 走批作业:同样的向量,费用少三分之一,代价是服务端排队(上限 12 小时,实测通常快得多);排队期间词法检索照常可用,daemon 重启会接着等同一个作业,不会重复交钱。
 - **数据边界**:索引在本机 cache 目录保存被索引文件的明文片段副本(权限仅当前用户);启用 embedding 时 chunk 内容会发送到你配置的模型服务。使用任何**托管**服务前请自行核实其数据保留与训练条款(多数托管服务默认可将数据用于训练,需显式退出);自部署端点无此顾虑。`.openaceignore` 与内置敏感文件 denylist 先于一切生效。
 - **向量身份隔离**:模型/维度/端点、内置嵌入模板版本或切分器版本(如新增 AST 语言批次)任一变化,创建平行索引子树并全量重建(一次 corpus 全量嵌入费用,旧子树保留可回退);换 key 不触发重建。
 - **增量索引**:首建后编辑只重建变更文件,删除/重命名立即从结果消失;嵌入费用有界于变更量。delta 链自动本地合并(compaction,零模型调用);索引只保留最近两个 revision,内容按需读取不常驻内存。

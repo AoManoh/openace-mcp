@@ -169,8 +169,10 @@ func (e *Engine) planLiveRecords(ctx context.Context, workspaceKey string, root 
 
 // tallyEmbedPlan 按 embedKey 去重后把每个键归类计数：依次查 active 与
 // previous revision 的向量、兼容的旧 chunk profile 子树的向量、journal、
-// 持久化拒绝集，顺序与 embedRecords 一致；都没命中的键是 pending，回调 fn
-// 导出待嵌任务。
+// 持久化拒绝集，再对剩下的键做与 embedRecords 相同的旧子树已付费状态检查
+// （siblingPaidStateFor），顺序与 embedRecords 一致；都没命中的键是 pending，
+// 回调 fn 导出待嵌任务。旧状态无法确认或尚未回收且存在 pending 键时返回该
+// 原因，不导出任务。
 func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *index.Store, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, records []chunkRecord, fn func(EmbedJob) error) error {
 	var prior priorVectors
 	defer func() { prior.release() }()
@@ -195,6 +197,7 @@ func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *ind
 	}
 	journalKeys := journal.Snapshot()
 	seen := make(map[string]bool, len(records))
+	var pending []chunkRecord
 	for _, record := range records {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -229,8 +232,40 @@ func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *ind
 			plan.Rejected++
 			continue
 		}
+		pending = append(pending, record)
+	}
+	// 与 embedRecords 同一检查：旧子树 journal 里已付费的键算复用，旧拒绝集
+	// 里的键算拒绝；旧状态无法确认或尚未回收时在线构建不会为缺口送审，计划
+	// 也不导出任务，否则离线工具会把同一批输入再提交一次。在回调任何任务
+	// 之前报错。
+	if len(pending) > 0 {
+		keys := make([]string, 0, len(pending))
+		for _, record := range pending {
+			keys = append(keys, embedKey(record))
+		}
+		paid := e.siblingPaidStateFor(store, keys)
+		kept := pending[:0]
+		for _, record := range pending {
+			key := embedKey(record)
+			if _, ok := paid.vectors[key]; ok {
+				plan.Reusable++
+				plan.CrossProfileReusable++
+				continue
+			}
+			if paid.rejected[key] {
+				plan.Rejected++
+				continue
+			}
+			kept = append(kept, record)
+		}
+		pending = kept
+		if len(pending) > 0 && paid.blockReason != "" {
+			return errors.New(paid.blockReason)
+		}
+	}
+	for _, record := range pending {
 		plan.Pending++
-		if err := fn(EmbedJob{Key: key, Text: embedDocText(record)}); err != nil {
+		if err := fn(EmbedJob{Key: embedKey(record), Text: embedDocText(record)}); err != nil {
 			return err
 		}
 	}

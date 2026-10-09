@@ -38,9 +38,14 @@ type semanticOutcome struct {
 	coveredByActive int
 	// newlyEmbedded 是本次真正调用 provider 新获得向量的唯一键数。
 	newlyEmbedded int
-	// crossProfileReused 是从兼容的旧 chunk profile 子树复用到的唯一键数，
+	// crossProfileReused 是从兼容的兄弟索引子树（旧 chunk profile 或旧词法
+	// 评分模型的子树，revision 向量与 journal 条目都算）复用到的唯一键数，
 	// 进入同步结果供调用方核对升级后的复用效果。
 	crossProfileReused int
+	// migrationBlock 非空时，同一 embedding 身份旧子树里的已付费状态无法
+	// 确认或尚未回收（见 siblingPaidStateFor），本次没有为缺口发任何文档
+	// 嵌入请求；值是原因与恢复步骤，同时写进 lastError。
+	migrationBlock string
 	// rejected 是被拒绝的键数：provider 返回零向量或含 NaN 的向量，或该键
 	// 已在持久化拒绝集内。零向量归一化时除零，NaN 会让相似度排序失真，
 	// 这类 chunk 记为未覆盖。
@@ -99,8 +104,8 @@ type priorVectors struct {
 	activeByHash map[string][]float32
 	olderByHash  map[string][]float32
 	// crossProfileByHash 来自同一 workspace、同一 embedding 身份与模板版本
-	// 的旧 chunk profile 子树，由 mergeSiblingProfileVectors 注入；优先级
-	// 低于 active/previous，只读复用。
+	// 的兄弟子树（旧 chunk profile 或旧词法评分模型）的 revision，由
+	// mergeSiblingProfileVectors 注入；优先级低于 active/previous，只读复用。
 	crossProfileByHash map[string][]float32
 	// activeLoadedSegments 是 active revision 实际通过校验装载的段数，
 	// activeExpectedSegments 是其 manifest 宣称的段数；两者不等说明 manifest
@@ -258,6 +263,11 @@ func (e *Engine) loadPriorRowsSelective(prior *priorVectors, store *index.Store,
 //     previous revision、兼容的旧 profile 子树、journal（上次构建中断前已
 //     付费落盘的批次），取第一个命中。复用是逐位拷贝，同一 chunk 跨
 //     revision 的向量完全一致。
+//   - 当前子树拒绝集里的键不送 provider。仍有缺口时先经 siblingPaidStateFor
+//     只读检查同一 embedding 身份旧子树的已付费状态：其 journal 里的向量
+//     直接复用，其拒绝集里的键不送审并记进当前子树的拒绝集；旧状态无法
+//     确认或尚未回收时，所有缺口都不送 provider，按未覆盖发布并在
+//     lastError 与 migrationBlock 说明原因。
 //   - 再对仍缺失的唯一键调用 provider。每批成功立刻写入 journal，之后即使
 //     构建被取消或进程被杀，这批付费向量下次构建仍可复用。
 //   - provider 失败只记录不中断：词法索引的新鲜度优先于语义覆盖，本次拿到
@@ -330,6 +340,43 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		}
 		missingHashes = append(missingHashes, key)
 		missingTexts = append(missingTexts, embedDocText(record))
+	}
+
+	// 送审前只读检查同一 embedding 身份旧子树里与这些缺口有关的已付费状态
+	// （换子树后它们仍留在旧子树）：journal 里已付费的向量直接复用；旧拒绝
+	// 集里的键不送审，并写进当前子树的拒绝集；旧状态无法确认或尚未回收时，
+	// 不向 provider 发任何文档嵌入请求，复用到的向量照常组装发布，缺口按
+	// 未覆盖如实上报，原因与恢复步骤写进 lastError。
+	if len(missingHashes) > 0 {
+		paid := e.siblingPaidStateFor(store, missingHashes)
+		var inherited []string
+		keptHashes := make([]string, 0, len(missingHashes))
+		keptTexts := make([]string, 0, len(missingTexts))
+		for i, key := range missingHashes {
+			if vec, ok := paid.vectors[key]; ok {
+				reuse[key] = vec
+				reusedRows++
+				out.crossProfileReused++
+				continue
+			}
+			if paid.rejected[key] {
+				inherited = append(inherited, key)
+				out.rejected++
+				continue
+			}
+			keptHashes = append(keptHashes, key)
+			keptTexts = append(keptTexts, missingTexts[i])
+		}
+		missingHashes, missingTexts = keptHashes, keptTexts
+		if err := journal.MarkRejected(inherited); err != nil {
+			return out, fmt.Errorf("journal 拒绝集落盘: %w", err)
+		}
+		if len(missingHashes) > 0 && paid.blockReason != "" {
+			out.lastError = paid.blockReason
+			out.migrationBlock = paid.blockReason
+			status.setEmbedProgress(len(missingHashes), 0)
+			return e.assembleSemanticOutcome(records, reuse, activeUsable, out), nil
+		}
 	}
 
 	// 付费前的预算拦截，仅在用户配置了 OPENACE_VECTOR_MEMORY_BUDGET 时生效

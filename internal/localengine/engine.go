@@ -60,10 +60,11 @@ const (
 // 查询与索引共用显式请求预算。启用治理器时两者的熔断器独立；关闭时共用。
 type Engine struct {
 	profile chunk.Profile
-	// storeProfile 是索引子树目录名的 profile 段：未配置 embedding 时是
-	// chunk profile（如 default-v8），配置了则追加 "+emb-<ProfileHash>-<模板
-	// 版本>"。embedding 身份或模板一变就换子树全量重建，旧子树保留，
-	// 不同身份的向量不会混进同一索引。
+	// storeProfile 是索引子树目录名的 profile 段：chunk profile 加词法评分
+	// 标记（如 default-v8+lex-bm25），配置了 embedding 再追加
+	// "+emb-<ProfileHash>-<模板版本>"。词法评分模型、embedding 身份或模板
+	// 一变就换子树全量重建，旧子树保留，不同评分模型的词法段与不同身份的
+	// 向量都不会混进同一索引。
 	storeProfile string
 	// fingerprint 是引擎配置指纹（见 Options.Fingerprint），随 ServedBy 广播
 	// 给 wrapper：wrapper 只复用指纹一致的 daemon，用户改了 provider 或降级
@@ -165,6 +166,8 @@ var (
 //     在启动时指出配置错误比查询期反复失败更早暴露问题。
 //   - 配置了向量内存预算且 embedding 维度已知：按 维度×4 字节把预算折算
 //     成常驻行数上限，最少 1 行；journal 在 journalFor 里按同一预算封顶。
+//   - 索引子树名带词法评分标记（+lex-bm25），评分模型变化同样进入新子树
+//     全量重建，旧子树保留。
 //   - 配置了 embedding：创建客户端，索引子树名追加 embedding 身份与模板
 //     版本，换模型、换维度或换模板都进入新子树全量重建，旧子树保留。
 //   - 配置了 rerank：创建客户端。
@@ -203,7 +206,15 @@ func New(opts Options) (*Engine, error) {
 	e.freshnessWindow = opts.FreshnessWindow
 	e.lexicalFirst = !opts.DisableLexicalFirst
 	e.fragmentGate = opts.FragmentGate
-	e.storeProfile = e.profile.ID + "-v" + e.profile.Version
+	// 词法评分标记进子树名：未设置评分模型的旧二进制按 Bleve 默认 TF-IDF
+	// 建出的子树（default-v8、default-v8+emb-…）不再被打开，旧段既不会与
+	// BM25 段混排，也不会被当作 BM25 服务。首次同步在新子树全量重建词法
+	// 索引；embedding 身份与模板未变时，旧子树 revision 的向量经
+	// mergeSiblingProfileVectors 按 embedKey 复用，送审前再经
+	// siblingPaidStateFor 只读检查旧子树 journal、拒绝集与 Batch 作业状态，
+	// 已付费的向量直接复用，旧状态无法确认或尚未回收时暂停送审（见
+	// profile_reuse.go）。旧子树原样保留，换回旧二进制时仍可使用。
+	e.storeProfile = e.profile.ID + "-v" + e.profile.Version + "+lex-" + lexical.ScoringModel
 	// TemplateVersion 的唯一来源是 embedTemplateVersion：它同时参与
 	// ProfileHash 与索引子树后缀，两处必须取同一常量，否则 wrapper 与
 	// daemon 算出的指纹会不一致。
@@ -245,7 +256,7 @@ func New(opts Options) (*Engine, error) {
 		// 模型、维度、dtype 与模板版本，模板版本另以明文缀在后面便于辨认。
 		// 任一项变化即换子树全量重建，旧子树保留可回退，不同身份的向量
 		// 不会混进同一索引；未配置 embedding 时子树名与纯词法配置完全一致。
-		e.storeProfile += "+emb-" + opts.Embedding.ProfileHash() + "-" + embedTemplateVersion
+		e.storeProfile += embeddingSubtreeSuffix(opts.Embedding)
 	}
 	e.rerankCfg = opts.Rerank
 	if opts.Rerank.Enabled {
@@ -257,6 +268,13 @@ func New(opts Options) (*Engine, error) {
 	}
 	e.fingerprint = opts.Fingerprint()
 	return e, nil
+}
+
+// embeddingSubtreeSuffix 是索引子树名里的 embedding 身份段
+// "+emb-<ProfileHash>-<模板版本>"。子树名以同一段结尾的兄弟子树属于同一
+// embedding 身份，profile_reuse.go 据此找出送审前要只读检查的旧子树。
+func embeddingSubtreeSuffix(cfg embedding.Config) string {
+	return "+emb-" + cfg.ProfileHash() + "-" + embedTemplateVersion
 }
 
 // EngineProfileFingerprint 实现 engine.ProfileIdentifier，返回配置指纹供
@@ -472,12 +490,53 @@ func (e *Engine) acquireWriteLock(workspaceKey string, store *index.Store) (*ind
 
 // Sync 实现 engine.Service：同步工作区索引，阻塞到构建完成。
 func (e *Engine) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
-	return e.syncWorkspace(ctx, req.Workspace)
+	res, err := e.syncWorkspace(ctx, req.Workspace)
+	return e.withMigrationBlock(req.Workspace, res, err)
 }
 
 // SyncBackground 实现 engine.BackgroundSyncer，与 Sync 走同一路径。
 func (e *Engine) SyncBackground(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
-	return e.syncWorkspace(ctx, req.Workspace)
+	res, err := e.syncWorkspace(ctx, req.Workspace)
+	return e.withMigrationBlock(req.Workspace, res, err)
+}
+
+// migrationBlockedReason 是语义迁移受阻（见 siblingPaidStateFor）在同步结果与
+// 检索横幅里的降级原因。
+const migrationBlockedReason = "semantic-migration-blocked"
+
+// withMigrationBlock 让语义迁移受阻在每次同步的结果里都可见，包括构建没有
+// 发布新 revision 的同步：原因取 active revision 记录的
+// SemanticMigrationBlock（跟踪器在 ready 时同步），DegradedReason 追加
+// semantic-migration-blocked，原因与恢复步骤在 workspace_status 的
+// semantic.last_error。
+// OPENACE_QUALITY_STRICT=on 或 OPENACE_RETRIEVAL_DEGRADE=deny 时改为返回带
+// 原因与恢复步骤的错误；词法 revision 已照常发布。只处理这一种原因，其余
+// 降级字段保持原样。
+func (e *Engine) withMigrationBlock(ref engine.WorkspaceRef, res engine.Result, err error) (engine.Result, error) {
+	if err != nil {
+		return res, err
+	}
+	_, workspaceKey, resolveErr := e.resolveRoot(ref.DirectoryPath)
+	if resolveErr != nil {
+		return res, nil
+	}
+	reason := e.migrationBlockFor(workspaceKey)
+	if reason == "" {
+		return res, nil
+	}
+	if !strings.Contains(res.DegradedReason, migrationBlockedReason) {
+		if res.DegradedReason != "" {
+			res.DegradedReason += ","
+		}
+		res.DegradedReason += migrationBlockedReason
+	}
+	if e.qualityStrict {
+		return res, fmt.Errorf("%s=on: 语义质量缺口 [%s]: %s", EnvQualityStrict, migrationBlockedReason, reason)
+	}
+	if e.retrievalDegrade == DegradeDeny {
+		return res, degradeDeniedError(migrationBlockedReason, errors.New(reason), EnvRetrievalDegrade)
+	}
+	return res, nil
 }
 
 // buildCall 是同一工作区并发构建请求共享的执行体：同时只有一个构建在跑，

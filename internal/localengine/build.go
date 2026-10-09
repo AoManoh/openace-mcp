@@ -365,8 +365,9 @@ func (e *Engine) buildSegmentStaging(ctx context.Context, store *index.Store, re
 }
 
 // newManifestSkeleton 组装 manifest v2 的公共字段：工作区身份、引擎与切分
-// 器版本、词法引擎版本、时间戳；有 previous 时记录前一 revision；配置了
-// embedding 时记录 provider、模型、维度、dtype 与 ProfileHash。
+// 器版本、词法引擎版本与评分模型（lexical_version 形如 v2.5.7+bm25）、时间
+// 戳；有 previous 时记录前一 revision；配置了 embedding 时记录 provider、
+// 模型、维度、dtype 与 ProfileHash。
 func (e *Engine) newManifestSkeleton(root pathutil.WorkspaceRoot, revision string, previous *index.Manifest) *index.Manifest {
 	now := time.Now().UTC()
 	manifest := &index.Manifest{
@@ -383,7 +384,7 @@ func (e *Engine) newManifestSkeleton(root pathutil.WorkspaceRoot, revision strin
 		ChunkerID:      e.profile.ID,
 		ChunkerVersion: e.profile.Version,
 		LexicalEngine:  lexical.EngineName,
-		LexicalVersion: lexical.EngineVersion,
+		LexicalVersion: lexical.EngineVersion + "+" + lexical.ScoringModel,
 		CreatedAt:      now,
 		ActivatedAt:    now,
 	}
@@ -412,6 +413,10 @@ func (e *Engine) newManifestSkeleton(root pathutil.WorkspaceRoot, revision strin
 //     形态与成因；配置了 embedding 时携带覆盖率，覆盖不完整给出降级原因
 //     semantic-coverage-partial（与查询路径同名），同步成功也不隐藏缺口。
 func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKey string, manifest *index.Manifest, staging string, discard func(), seman semanticOutcome, skippedFiles int, added int, buildMode string) (engine.Result, error) {
+	// 语义覆盖完整就没有被暂停的缺口，迁移暂停原因随本 revision 清除。
+	if manifest.SemanticComplete() {
+		manifest.SemanticMigrationBlock = ""
+	}
 	// 发布前复验写锁：失锁说明所有权已被其他进程接管，本次构建作废。
 	if lock, err := e.acquireWriteLock(workspaceKey, store); err != nil {
 		if discard != nil {
@@ -600,8 +605,12 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 	}
 
 	// 内容未变、词法可用且向量没有实质增加时不发布新 revision，返回现有
-	// revision，缺口留在状态里，避免堆积没有变化的 revision。
-	if previous != nil && !contentChanged && !needsLexicalRebuild && !seman.improved() {
+	// revision，缺口留在状态里，避免堆积没有变化的 revision。全量构建覆盖
+	// 全部存活 chunk，迁移暂停原因（seman.migrationBlock）就是本次的完整
+	// 判定；它与现有 revision 记录的不同（出现、换成别的原因或已解除）时
+	// 照常发布，持久化的原因跟着更新，重启后不会读到过期的原因。
+	if previous != nil && !contentChanged && !needsLexicalRebuild && !seman.improved() &&
+		seman.migrationBlock == previous.SemanticMigrationBlock {
 		status.setSemanticOutcome(seman.rejected, seman.lastError)
 		status.ready(previous, revisionCount(store, previous))
 		return engine.Result{
@@ -646,6 +655,7 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 	if seman.enabled {
 		manifest.VectorCount = seman.covered
 	}
+	manifest.SemanticMigrationBlock = seman.migrationBlock
 	return e.finishPublish(store, status, workspaceKey, manifest, artifacts.staging, discard, seman, skippedFiles, len(records), buildMode)
 }
 
@@ -777,6 +787,13 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 	}
 	if e.semanticEnabled() {
 		manifest.VectorCount = vectorCount
+	}
+	// delta 只判定变更文件的缺口：本次受阻就记本次的原因；本次不受阻不代表
+	// 其他文件的旧缺口已解除，沿用前一 revision 记录的原因，留给全量构建
+	// 重新判定。语义覆盖完整时 finishPublish 统一清除。
+	manifest.SemanticMigrationBlock = seman.migrationBlock
+	if manifest.SemanticMigrationBlock == "" {
+		manifest.SemanticMigrationBlock = previous.SemanticMigrationBlock
 	}
 	staging := ""
 	if hasSegment {

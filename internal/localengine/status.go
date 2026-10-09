@@ -54,6 +54,12 @@ type wsStatus struct {
 	coveredChunks  int
 	rejectedChunks int
 	embedError     string
+	// migrationBlock 是 active revision 记录的语义迁移暂停原因
+	// （manifest.SemanticMigrationBlock，见 siblingPaidStateFor）：非空时有缺口
+	// 因旧子树的已付费状态无法确认或尚未回收而没有送审。ready 与
+	// publishedInterim 从 manifest 同步；同步结果据此带出
+	// semantic-migration-blocked，workspace_status 的 last_error 据此给出原因。
+	migrationBlock string
 	// 构建期 embedding 进度，按批更新，构建结束归零。
 	embedPending int
 	embedDone    int
@@ -130,6 +136,7 @@ func (s *wsStatus) publishedInterim(manifest *index.Manifest, revisions int) {
 	s.coveredChunks = manifest.VectorCount
 	s.revisionCount = revisions
 	s.capabilities = manifest.ChunkerCapabilities
+	s.migrationBlock = manifest.SemanticMigrationBlock
 	s.updatedAt = time.Now().UTC()
 }
 
@@ -142,6 +149,44 @@ func (s *wsStatus) setSemanticOutcome(rejected int, lastError string) {
 	s.embedError = lastError
 	s.updatedAt = time.Now().UTC()
 	s.mu.Unlock()
+}
+
+// seedMigrationBlockFromServed 处理重启后第一次构建尚未结束的窗口：跟踪器
+// 已建立但自进程启动以来还没有就绪过（revision 为空）时，从当前可服务
+// revision 的 manifest 读出迁移暂停原因，状态查询不必等这次构建结束。
+// 打不开句柄时不做任何事。
+func (e *Engine) seedMigrationBlockFromServed(tracker *wsStatus, workspaceKey string) {
+	tracker.mu.Lock()
+	ready := tracker.revision != ""
+	tracker.mu.Unlock()
+	if ready {
+		return
+	}
+	handle, err := e.acquireHandle(workspaceKey)
+	if err != nil {
+		return
+	}
+	reason := handle.manifest.SemanticMigrationBlock
+	e.releaseHandle(handle)
+	tracker.mu.Lock()
+	if tracker.revision == "" {
+		tracker.migrationBlock = reason
+	}
+	tracker.mu.Unlock()
+}
+
+// migrationBlockFor 返回工作区 active revision 记录的语义迁移暂停原因；没有
+// 状态跟踪器或没有受阻时返回空串。
+func (e *Engine) migrationBlockFor(workspaceKey string) string {
+	e.mu.Lock()
+	status, ok := e.statuses[workspaceKey]
+	e.mu.Unlock()
+	if !ok {
+		return ""
+	}
+	status.mu.Lock()
+	defer status.mu.Unlock()
+	return status.migrationBlock
 }
 
 // setScannedFiles 在扫描期间与扫描完成时回填文件数。改动前构建期的
@@ -222,6 +267,7 @@ func (s *wsStatus) ready(manifest *index.Manifest, revisions int) {
 	s.revisionCount = revisions
 	s.capabilities = manifest.ChunkerCapabilities
 	s.lastError = ""
+	s.migrationBlock = manifest.SemanticMigrationBlock
 	s.finishedAt = &now
 	s.updatedAt = now
 }
@@ -365,6 +411,15 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 			semantic.TotalChunks = tracker.chunkCount
 			semantic.RejectedChunks = tracker.rejectedChunks
 			semantic.LastError = tracker.embedError
+			// 迁移暂停原因在解除前一直有效：之后一次成功的无关 delta 会把
+			// embedError 清空，这里仍给出暂停原因；两者都有时暂停原因在前。
+			if block := tracker.migrationBlock; block != "" && !strings.Contains(semantic.LastError, block) {
+				if semantic.LastError == "" {
+					semantic.LastError = block
+				} else {
+					semantic.LastError = block + "；" + semantic.LastError
+				}
+			}
 			semantic.PendingChunks = tracker.embedPending
 			semantic.EmbeddedChunks = tracker.embedDone
 			semantic.EmbedRatePerMin, semantic.EmbedETASeconds = tracker.embedRateETALocked(time.Now().UTC())
@@ -440,6 +495,7 @@ func (e *Engine) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (
 	status, ok := e.statuses[workspaceKey]
 	e.mu.Unlock()
 	if ok {
+		e.seedMigrationBlockFromServed(status, workspaceKey)
 		snapshot := status.snapshot()
 		e.attachSemantic(&snapshot, status)
 		e.attachTopLevelCounts(&snapshot, workspaceKey)

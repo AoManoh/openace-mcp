@@ -116,6 +116,12 @@ type Manifest struct {
 	// Counts.Chunks（暗坑 K31，读取时计算不落盘防口径漂移）。
 	// v2 语义：存活（newest-wins）chunk 中有向量者的计数。
 	VectorCount int `json:"vector_count,omitempty"`
+	// SemanticMigrationBlock 是可选的诊断字段：发布本 revision 时，同一
+	// embedding 身份旧子树里的已付费状态无法确认或尚未回收，有语义缺口
+	// 没有送审，值是原因与恢复步骤。它随 revision 原子发布，进程重启后从
+	// 所服务的 revision 读回；空串时不写出，旧 manifest 没有该字段即按空值
+	// 读取，schema 版本不变。
+	SemanticMigrationBlock string `json:"semantic_migration_block,omitempty"`
 
 	// —— Stage 4 v2 字段（D1；v1 manifest 读取时经 Normalize 归一）——
 

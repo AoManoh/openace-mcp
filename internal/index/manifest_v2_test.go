@@ -43,6 +43,48 @@ func newV2TestStore(t *testing.T) *Store {
 	return store
 }
 
+// TestManifestSemanticMigrationBlockIsOptional：语义迁移暂停原因是 manifest 的
+// 可选诊断字段，schema 版本不变。值为空时不写出该字段，正常 manifest 的
+// JSON 形状与加字段前相同，按旧格式写出的 manifest 照常读取、值为空；有值
+// 时原样读回。
+func TestManifestSemanticMigrationBlockIsOptional(t *testing.T) {
+	store := newV2TestStore(t)
+	sum := makeSegmentDir(t, store, "seg-diag")
+	now := time.Now().UTC()
+	counts := Counts{Files: 1, Chunks: 1, Bytes: 10}
+	plain := &Manifest{
+		SchemaVersion: ManifestSchemaV2,
+		EngineID:      "local-hybrid", EngineVersion: "test",
+		Revision: "rev-plain", ChunkerID: "default", ChunkerVersion: "8",
+		LexicalEngine: "bleve", LexicalVersion: "v2.5.7+bm25",
+		Files:     map[string]FileEntry{"a.go": {ContentHash: "h1", ChunkCount: 1, SegmentID: "seg-diag"}},
+		Counts:    counts,
+		Segments:  []SegmentRef{{ID: "seg-diag", ChunksChecksum: sum, Counts: counts}},
+		CreatedAt: now, ActivatedAt: now,
+	}
+	writeManifestFile(t, store, plain)
+	raw, err := os.ReadFile(filepath.Join(store.root, manifestsDir, "rev-plain.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "semantic_migration_block") {
+		t.Fatalf("值为空时不应写出该字段: %s", raw)
+	}
+	loaded, err := store.LoadManifest("rev-plain")
+	if err != nil || loaded.SemanticMigrationBlock != "" || loaded.SchemaVersion != ManifestSchemaV2 {
+		t.Fatalf("没有该字段的 manifest 应照常读取且值为空: %+v err=%v", loaded, err)
+	}
+
+	withReason := *plain
+	withReason.Revision = "rev-diag"
+	withReason.SemanticMigrationBlock = "语义迁移已暂停：示例原因"
+	writeManifestFile(t, store, &withReason)
+	loaded, err = store.LoadManifest("rev-diag")
+	if err != nil || loaded.SemanticMigrationBlock != withReason.SemanticMigrationBlock || loaded.SchemaVersion != ManifestSchemaV2 {
+		t.Fatalf("暂停原因应原样读回且 schema 版本不变: %+v err=%v", loaded, err)
+	}
+}
+
 // TestV1ManifestNormalizedOnLoad 是 D1/K43 兼容承诺：Stage 2/3 产出的
 // v1 manifest 在新代码下读取即归一为单段 v2 视图，升级零感知。
 func TestV1ManifestNormalizedOnLoad(t *testing.T) {
