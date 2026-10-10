@@ -1616,17 +1616,19 @@ func (e *Engine) retireHandles(workspaceKey string, activeRevision string, _ str
 }
 
 // renderBlock 是渲染阶段的合并单元：一个候选 chunk 的完整记录加上它在
-// rankedHit 里的分数与标记。同文件相邻块合并时这些字段按 mergeBlocks 的
-// 规则聚合。
+// rankedHit 里的分数与标记。同文件重叠块合并时这些字段按 mergeBlocks 的
+// 规则聚合。rank 是候选在输入序列中的名次（从 0 起），合并块取成员中最早
+// 的名次；最终排序在分数相同时按 rank 升序，结果不依赖 map 遍历次序。
 type renderBlock struct {
 	record      chunkRecord
 	score       float64
 	reranked    bool
 	rerankScore float64
 	source      string
+	rank        int
 }
 
-// mergedBlockMaxLines 是同文件相邻块合并后单块的行数上限，取两个代码行
+// mergedBlockMaxLines 是同文件重叠块合并后单块的行数上限，取两个代码行
 // 窗口（默认 60 行，即 120 行）。不设上限时，行窗口切分的文档（40 行窗口、
 // 10 行重叠）相邻窗口天然满足合并条件，两路各 60 的召回深度把同一文档的
 // 多个相邻窗口都送进候选后，它们会被合成整篇文档（外部工作区实测出现过
@@ -1688,7 +1690,7 @@ const pathsOnlyMarker = "-- remaining results listed as paths only; Read a file 
 // 式固定并由 golden 测试锁定：宿主 AI 按 `## path:start-end symbol` 头行加
 // 代码围栏解析结果，格式漂移会破坏它的解析。
 //   - 没有候选或全部候选都不在存活集：返回 noHitsText。
-//   - 按需 pread 每个候选的内容，同文件重叠或相邻的块合并（上限见
+//   - 按需 pread 每个候选的内容，同文件的块在重叠行内容相同时合并（上限见
 //     mergedBlockMaxLines），合并后按 score 降序。
 //   - fullResults 决定几个块带正文：0 表示未指定，取
 //     engine.DefaultFullResults；负值表示一个都不带；paths 模式恒为 0。
@@ -1704,7 +1706,7 @@ func renderHitsDetail(handle *revisionHandle, hits []rankedHit, fullResults int,
 		return renderedResult{text: noHitsText}, nil
 	}
 	blocks := make([]renderBlock, 0, len(hits))
-	for _, hit := range hits {
+	for rank, hit := range hits {
 		if _, ok := handle.chunks[hit.id]; !ok {
 			continue
 		}
@@ -1712,13 +1714,20 @@ func renderHitsDetail(handle *revisionHandle, hits []rankedHit, fullResults int,
 		if err != nil {
 			return renderedResult{}, err
 		}
-		blocks = append(blocks, renderBlock{record: record, score: hit.score, reranked: hit.reranked, rerankScore: hit.rerankScore, source: hit.source})
+		blocks = append(blocks, renderBlock{record: record, score: hit.score, reranked: hit.reranked, rerankScore: hit.rerankScore, source: hit.source, rank: rank})
 	}
 	if len(blocks) == 0 {
 		return renderedResult{text: noHitsText}, nil
 	}
 	merged := mergeBlocks(blocks)
-	sort.SliceStable(merged, func(i, j int) bool { return merged[i].score > merged[j].score })
+	// 分数降序；同分按输入名次升序。纯词法模式保留真实分数，同分常见：输入
+	// 名次来自词法路固定的 score 降序、ID 升序，渲染沿用同一规则。
+	sort.SliceStable(merged, func(i, j int) bool {
+		if merged[i].score != merged[j].score {
+			return merged[i].score > merged[j].score
+		}
+		return merged[i].rank < merged[j].rank
+	})
 
 	// fullResults：0 表示未指定，取默认值；负值表示一个都不带正文；paths
 	// 模式无论传什么都是 0 个。
@@ -1800,34 +1809,50 @@ func blockHeader(record chunkRecord) string {
 	return header
 }
 
-// mergeBlocks 把同一文件里重叠或严格相邻的块合并成一块。
-//   - 只在 next.StartLine ≤ current.EndLine+1 时合并。中间缺行的两块不合并：
-//     合并后头行标注的行区间与实际内容会错位，path:line 引用就指错行。
+// mergeBlocks 把同一文件里有共同行、且共同行内容相同的块合并成一块。
+//   - 只在两块至少有一行共同的行（next.StartLine ≤ current.EndLine）时考虑
+//     合并。行号严格相邻、没有共同行的两块分别展示：索引只记录片段的行
+//     范围，不记录原文件字节区间，相邻行号不能证明两段字节连续。超长行按
+//     字节切出的片段中，第 1 行开头的一段与第 2 行中间的一段行号相邻，中间
+//     却隔着未召回的字节，直接接上换行会把它们显示成一段连续正文。相邻的
+//     完整声明也因此分别展示。中间缺行的两块同样不合并，合并后头行标注的
+//     行区间会与实际内容错位。
+//   - 有共同行时，按行位置对应逐行比较两块共有的行，全部相同才合并，共同
+//     行只保留一份。超长行按字节切出的片段行号相同或相交，但正文是同一行
+//     的不同部分，比较不相同，各自保留为独立块；只比较行号会把后一段当作
+//     重复内容丢掉。正文行数与行号范围对不上时无法按行位置比较，同样不合并。
 //   - 合并后行数超过 mergedBlockMaxLines 时 next 另起一块，两块的重叠行各
 //     自完整保留，行区间与内容仍一一对应。
 //   - 合并块的 score 取成员最高分，source 跟随分数更高的一方，rerankScore
 //     取最大，reranked 只要有一个成员为 true 即为 true，Symbol 取第一个非
-//     空值。
+//     空值，rank 取最早的名次。
 //
-// 返回顺序不保证，调用方自行排序。
+// 文件按在输入中首次出现的次序处理，同一文件内按起始行、再按输入次序；
+// 调用方按分数与名次排序。
 func mergeBlocks(blocks []renderBlock) []renderBlock {
 	byFile := make(map[string][]renderBlock)
+	var files []string
 	for _, block := range blocks {
-		byFile[block.record.RelPath] = append(byFile[block.record.RelPath], block)
+		path := block.record.RelPath
+		if _, ok := byFile[path]; !ok {
+			files = append(files, path)
+		}
+		byFile[path] = append(byFile[path], block)
 	}
 	var merged []renderBlock
-	for _, group := range byFile {
-		sort.Slice(group, func(i, j int) bool { return group[i].record.StartLine < group[j].record.StartLine })
+	for _, path := range files {
+		group := byFile[path]
+		sort.SliceStable(group, func(i, j int) bool { return group[i].record.StartLine < group[j].record.StartLine })
 		current := group[0]
 		for _, next := range group[1:] {
-			adjacent := next.record.StartLine <= current.record.EndLine+1
 			mergedEnd := current.record.EndLine
 			if next.record.EndLine > mergedEnd {
 				mergedEnd = next.record.EndLine
 			}
-			if adjacent && mergedEnd-current.record.StartLine+1 <= mergedBlockMaxLines {
-				if next.record.EndLine > current.record.EndLine {
-					current.record.Content = current.record.Content + "\n" + tailLines(next.record, current.record.EndLine)
+			tail, ok := overlapTail(current.record, next.record)
+			if ok && mergedEnd-current.record.StartLine+1 <= mergedBlockMaxLines {
+				if len(tail) > 0 {
+					current.record.Content = current.record.Content + "\n" + strings.Join(tail, "\n")
 					current.record.EndLine = next.record.EndLine
 				}
 				if next.score > current.score {
@@ -1841,6 +1866,9 @@ func mergeBlocks(blocks []renderBlock) []renderBlock {
 				if current.record.Symbol == "" {
 					current.record.Symbol = next.record.Symbol
 				}
+				if next.rank < current.rank {
+					current.rank = next.rank
+				}
 				continue
 			}
 			merged = append(merged, current)
@@ -1851,19 +1879,33 @@ func mergeBlocks(blocks []renderBlock) []renderBlock {
 	return merged
 }
 
-// tailLines 返回 record 内容中行号大于 afterLine 的部分：合并相邻块时，
-// 后一块与前一块重叠的行只保留一份。record 从 afterLine 之后开始时原样
-// 返回；record 整体都在 afterLine 之前时返回空串。
-func tailLines(record chunkRecord, afterLine int) string {
-	skip := afterLine - record.StartLine + 1
-	if skip <= 0 {
-		return record.Content
+// overlapTail 判断 next 能否并入 current（next.StartLine ≥ current.StartLine）：
+// 两块至少有一行共同的行，且共同的行按行位置对应逐行相同。可以合并时返回
+// next 中位于 current.EndLine 之后、需要追加的行（next 整体落在 current 之内
+// 时为空）。没有共同的行（行号严格相邻或中间缺行）、共同行有任何不同、或
+// 正文行数与行号范围对不上时 ok=false，两块分别展示。
+func overlapTail(current, next chunkRecord) ([]string, bool) {
+	if next.StartLine > current.EndLine {
+		return nil, false
 	}
-	lines := strings.Split(record.Content, "\n")
-	if skip >= len(lines) {
-		return ""
+	currentLines := strings.Split(current.Content, "\n")
+	nextLines := strings.Split(next.Content, "\n")
+	if len(currentLines) != current.EndLine-current.StartLine+1 || len(nextLines) != next.EndLine-next.StartLine+1 {
+		return nil, false
 	}
-	return strings.Join(lines[skip:], "\n")
+	overlapEnd := current.EndLine
+	if next.EndLine < overlapEnd {
+		overlapEnd = next.EndLine
+	}
+	for line := next.StartLine; line <= overlapEnd; line++ {
+		if currentLines[line-current.StartLine] != nextLines[line-next.StartLine] {
+			return nil, false
+		}
+	}
+	if next.EndLine <= current.EndLine {
+		return nil, true
+	}
+	return nextLines[current.EndLine-next.StartLine+1:], true
 }
 
 // EnvRenderLineNumbers 是开启代码围栏内逐行行号前缀的环境变量（取值

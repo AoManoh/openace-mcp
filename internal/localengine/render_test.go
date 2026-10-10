@@ -87,12 +87,14 @@ func TestRenderLineNumbersGolden(t *testing.T) {
 	}
 }
 
-// TestRenderLineNumbersMergedBlocksStayContinuous 相邻块合并后行号连续。
+// TestRenderLineNumbersMergedBlocksStayContinuous 有共同行的两块合并后行号
+// 连续。行号相邻、没有共同行的块不再合并，所以第二块从第 3 行开始，与第一块
+// 共有第 3 行。
 func TestRenderLineNumbersMergedBlocksStayContinuous(t *testing.T) {
 	t.Setenv(EnvRenderLineNumbers, "on")
 	handle := newRenderHandle(t,
 		chunkRecord{ID: "a", RelPath: "m.go", Language: "go", StartLine: 1, EndLine: 3, Content: "l1\nl2\nl3"},
-		chunkRecord{ID: "b", RelPath: "m.go", Language: "go", StartLine: 4, EndLine: 5, Content: "l4\nl5"},
+		chunkRecord{ID: "b", RelPath: "m.go", Language: "go", StartLine: 3, EndLine: 5, Content: "l3\nl4\nl5"},
 	)
 	got := mustRender(t, handle, []rankedHit{{id: "a", score: 1.5}, {id: "b", score: 1.0}}, 0)
 	want := "## m.go:1-5\n```go\n" +
@@ -102,16 +104,18 @@ func TestRenderLineNumbersMergedBlocksStayContinuous(t *testing.T) {
 	}
 }
 
-// TestRenderMergesAdjacentChunks 同文件相邻块合并且内容不重复。
-func TestRenderMergesAdjacentChunks(t *testing.T) {
+// TestRenderKeepsAdjacentChunksSeparate 同文件行号相邻、没有共同行的两块分别
+// 展示，各带自己的头行与正文：索引不记录字节区间，相邻行号不能证明两段
+// 字节连续。有共同行的块仍合并，见 TestRenderLineNumbersMergedBlocksStayContinuous。
+func TestRenderKeepsAdjacentChunksSeparate(t *testing.T) {
 	handle := newRenderHandle(t,
 		chunkRecord{ID: "a", RelPath: "m.go", Language: "go", StartLine: 1, EndLine: 3, Content: "l1\nl2\nl3"},
 		chunkRecord{ID: "b", RelPath: "m.go", Language: "go", StartLine: 4, EndLine: 5, Content: "l4\nl5"},
 	)
 	got := mustRender(t, handle, []rankedHit{{id: "a", score: 1.5}, {id: "b", score: 1.0}}, 0)
-	want := "## m.go:1-5\n```go\nl1\nl2\nl3\nl4\nl5\n```"
+	want := "## m.go:1-3\n```go\nl1\nl2\nl3\n```\n\n## m.go:4-5\n```go\nl4\nl5\n```"
 	if got != want {
-		t.Fatalf("相邻块合并错误:\n--- want ---\n%s\n--- got ---\n%s", want, got)
+		t.Fatalf("相邻块应分别展示:\n--- want ---\n%s\n--- got ---\n%s", want, got)
 	}
 }
 

@@ -24,14 +24,15 @@ func TestMergeBlocksNeverBridgesGaps(t *testing.T) {
 	if len(merged) != 2 {
 		t.Fatalf("跨间隙块不得合并: %+v", merged)
 	}
-	// 严格相邻仍应合并。
+	// 严格相邻、没有共同行的两块同样不合并：索引不记录字节区间，相邻行号
+	// 不能证明两段字节连续，各块原样保留。
 	adjacent := []renderBlock{
 		{record: chunkRecord{RelPath: "m.go", StartLine: 1, EndLine: 3, Content: "l1\nl2\nl3"}, score: 2},
 		{record: chunkRecord{RelPath: "m.go", StartLine: 4, EndLine: 5, Content: "l4\nl5"}, score: 1},
 	}
 	merged = mergeBlocks(adjacent)
-	if len(merged) != 1 || merged[0].record.Content != "l1\nl2\nl3\nl4\nl5" {
-		t.Fatalf("严格相邻块应无损合并: %+v", merged)
+	if len(merged) != 2 || merged[0].record.Content != "l1\nl2\nl3" || merged[1].record.Content != "l4\nl5" {
+		t.Fatalf("严格相邻块应分别保留: %+v", merged)
 	}
 }
 
