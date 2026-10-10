@@ -425,6 +425,12 @@ type retrieval struct {
 //     纯词法且无降级时保持空值，输出形状与最初的纯词法版本完全一致，
 //     新旧进程混布时旧端仍能解析。
 func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
+	// detail 是纯参数，在同步、建索引和查询嵌入之前校验：非法值不应先产生
+	// 模型请求再报错。调用本方法的单仓、多仓与异步任务入口都经过这里。
+	detail, err := parseDetail(req.Detail)
+	if err != nil {
+		return engine.Result{}, err
+	}
 	out, err := e.retrieve(ctx, req)
 	if err != nil {
 		return engine.Result{}, err
@@ -432,10 +438,6 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	handle := out.handle
 	defer e.releaseHandle(handle)
 
-	detail, err := parseDetail(req.Detail)
-	if err != nil {
-		return engine.Result{}, err
-	}
 	renderStart := time.Now()
 	rendered, renderErr := renderHitsDetail(handle, out.ordered, req.FullResults, detail)
 	if renderErr != nil {
