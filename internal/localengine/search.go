@@ -633,23 +633,12 @@ func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, dep
 	}
 	defer e.releaseHandle(handle)
 
-	// 词法路与 retrieve 一样应用查询规划（见 queryplan.go），导出的候选与
-	// 生产词法路一致；dense 路仍用原查询。结构变体零命中时回退原查询。
-	lexQuery := query
-	if plan := planLexicalQuery(query); plan.Triggered {
-		lexQuery = plan.LexicalQuery
-	}
-	lexHits, err := handle.lex.SearchWeighted(ctx, lexQuery, depth, e.lexWeights)
+	// 两路与 retrieve 用同一套候选规则（lexicalCandidates、denseRoute）：
+	// 词法路应用查询规划，按存活且不重复的 ID 计数；dense 路用原查询。
+	lexHits, _, err := e.lexicalCandidates(ctx, handle, query, "", depth)
 	if err != nil {
-		return RouteCandidates{}, fmt.Errorf("词法检索: %w", err)
+		return RouteCandidates{}, err
 	}
-	if lexQuery != query && len(lexHits) == 0 {
-		lexHits, err = handle.lex.SearchWeighted(ctx, query, depth, e.lexWeights)
-		if err != nil {
-			return RouteCandidates{}, fmt.Errorf("词法检索(回退): %w", err)
-		}
-	}
-	lexHits = filterLiveHits(handle, lexHits)
 	out := RouteCandidates{Lex: make([]CandidateRef, 0, len(lexHits))}
 	toRef := func(id string) (CandidateRef, bool) {
 		meta, ok := handle.chunks[id]
@@ -664,7 +653,7 @@ func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, dep
 		}
 	}
 	if e.semanticEnabled() {
-		denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, depth, nil, nil)
+		denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, depth, nil, "")
 		if denseErr != nil {
 			return RouteCandidates{}, denseErr
 		}
@@ -860,19 +849,27 @@ func (e *Engine) acquireQueryHandle(ctx context.Context, ref engine.WorkspaceRef
 }
 
 // lexicalRoute 执行词法召回，返回存活命中、查询规划标签与错误。不负责
-// 句柄释放。
-//   - 召回深度：纯词法模式 defaultTopK，配置了语义路时 hybridRouteTopK。
-//   - 查询规划（见 queryplan.go）：含结构 token 的非 CJK 自然语言查询，
-//     词法路只用结构 token 检索；结构查询零命中时用原查询再检索一次，
-//     标签追加 " fallback=original"。未触发时行为与没有规划时一致。
-//   - pathPrefix 在 Bleve 查询中直接过滤，不在召回后再截。
-//   - 存活过滤：Bleve 会命中旧 segment 中已被新版本覆盖或文件已删除的
-//     chunk，进入融合前按句柄的存活集过滤掉，已删除内容不进结果。
+// 句柄释放。召回深度：纯词法模式 defaultTopK，配置了语义路时
+// hybridRouteTopK；候选规则见 lexicalCandidates。
 func (e *Engine) lexicalRoute(ctx context.Context, handle *revisionHandle, query string, pathPrefix string) ([]lexical.Hit, string, error) {
 	lexTopK := defaultTopK
 	if e.semanticEnabled() {
 		lexTopK = hybridRouteTopK
 	}
+	return e.lexicalCandidates(ctx, handle, query, pathPrefix, lexTopK)
+}
+
+// lexicalCandidates 是词法路的候选规则，lexicalRoute 与 SearchRoutes 共用：
+//   - 所需数量指句柄存活集里不重复的 chunk ID。Bleve 会命中旧 segment 中
+//     已被新版本覆盖或文件已删除的记录，同一未变化的片段也会在多个段里
+//     各有一条；它们都不占名额。lexical.SearchLive 按 score 降序、ID 升序
+//     逐页检索，收满 topK、命中耗尽、ctx 取消或检索出错才停止。
+//   - 查询规划（见 queryplan.go）：含结构 token 的非 CJK 自然语言查询，
+//     词法路只用结构 token 检索；结构查询的存活结果为空（包括只命中已删除
+//     记录）时用原查询再检索一次，标签追加 " fallback=original"。未触发时
+//     行为与没有规划时一致。
+//   - pathPrefix 在 Bleve 查询中直接过滤，不在召回后再截。
+func (e *Engine) lexicalCandidates(ctx context.Context, handle *revisionHandle, query string, pathPrefix string, topK int) ([]lexical.Hit, string, error) {
 	plan := planLexicalQuery(query)
 	planLabel := ""
 	lexQuery := query
@@ -880,18 +877,22 @@ func (e *Engine) lexicalRoute(ctx context.Context, handle *revisionHandle, query
 		lexQuery = plan.LexicalQuery
 		planLabel = plan.LexicalQuery
 	}
-	lexHits, err := handle.lex.SearchWeightedPrefix(ctx, lexQuery, lexTopK, e.lexWeights, pathPrefix)
+	live := func(id string) bool {
+		_, ok := handle.chunks[id]
+		return ok
+	}
+	lexHits, err := handle.lex.SearchLive(ctx, lexQuery, topK, e.lexWeights, pathPrefix, live)
 	if err != nil {
 		return nil, "", fmt.Errorf("词法检索: %w", err)
 	}
 	if plan.Triggered && len(lexHits) == 0 {
 		planLabel += " fallback=original"
-		lexHits, err = handle.lex.SearchWeightedPrefix(ctx, query, lexTopK, e.lexWeights, pathPrefix)
+		lexHits, err = handle.lex.SearchLive(ctx, query, topK, e.lexWeights, pathPrefix, live)
 		if err != nil {
 			return nil, "", fmt.Errorf("词法检索(回退): %w", err)
 		}
 	}
-	return filterLiveHits(handle, lexHits), planLabel, nil
+	return lexHits, planLabel, nil
 }
 
 // fuseRoutes 把词法命中与语义召回融合成最终候选序，返回（候选序、模式、
@@ -913,7 +914,7 @@ func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *re
 		}
 		return ordered, "lexical", "", nil, nil
 	}
-	denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, hybridRouteTopK, timings, chunkPrefixPredicate(handle, pathPrefix))
+	denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, hybridRouteTopK, timings, pathPrefix)
 	if denseErr != nil {
 		return nil, "", "", nil, denseErr
 	}
@@ -1037,17 +1038,18 @@ func normalizeSearchPathPrefix(raw string) (string, error) {
 	return clean, nil
 }
 
-// chunkPrefixPredicate 构造 dense 路的路径前缀谓词：只放行路径等于 prefix
-// 或位于 prefix/ 之下的 chunk。prefix 为空返回 nil，表示不过滤。谓词在
-// 向量选择阶段生效，目标子树不会被前缀之外的候选挤出受限深度的 top-k。
+// candidatePredicate 构造 dense 路在向量选择阶段使用的候选谓词：只放行
+// 句柄存活集里的 chunk；prefix 非空时还要求路径等于 prefix 或位于 prefix/
+// 之下。谓词总是生效：已删除文件留在旧段里的向量行在选择阶段就被跳过，
+// 不会占满每段受限深度的 top-k；目标子树也不会被前缀之外的候选挤出。
 // 它会被多个评分 worker 并发调用，只读不可变的 handle.chunks，并发安全。
-func chunkPrefixPredicate(handle *revisionHandle, prefix string) func(id string) bool {
-	if prefix == "" {
-		return nil
-	}
+func candidatePredicate(handle *revisionHandle, prefix string) func(id string) bool {
 	return func(id string) bool {
 		meta, ok := handle.chunks[id]
-		return ok && (meta.RelPath == prefix || strings.HasPrefix(meta.RelPath, prefix+"/"))
+		if !ok {
+			return false
+		}
+		return prefix == "" || meta.RelPath == prefix || strings.HasPrefix(meta.RelPath, prefix+"/")
 	}
 }
 
@@ -1062,19 +1064,6 @@ func filterRankedByPathPrefix(handle *revisionHandle, ordered []rankedHit, prefi
 	return filtered
 }
 
-// filterLiveHits 去掉词法命中中不在句柄存活集里的 chunk（旧 segment 中已
-// 被新版本覆盖或文件已删除的记录）。语义路在 denseRoute 内做同一过滤，
-// 两路都在进入融合之前完成。
-func filterLiveHits(handle *revisionHandle, hits []lexical.Hit) []lexical.Hit {
-	live := hits[:0]
-	for _, hit := range hits {
-		if _, ok := handle.chunks[hit.ID]; ok {
-			live = append(live, hit)
-		}
-	}
-	return live
-}
-
 // denseRoute 执行语义召回，返回最多 depth 个 dense 候选 ID（nil 表示语义
 // 路未执行）、降级原因与致命错误。
 //   - 向量行数超过用户配置的内存预算：不标记修复（重建也超预算，没有
@@ -1087,12 +1076,17 @@ func filterLiveHits(handle *revisionHandle, hits []lexical.Hit) []lexical.Hit {
 //     的覆盖率如实上报。
 //   - 查询嵌入失败：ctx 已取消则返回 ctx 错误；deny 报错；allow 记
 //     query-embedding-failed(失败类别)。
-//   - 正常路径：每个 segment 各做一次精确（非近似）检索，合并后按分数
-//     降序、ID 升序排序，同一查询多次执行结果逐位相同；再按存活集过滤
-//     掉已删除或已被覆盖的 chunk，取前 depth 个。
+//   - 正常路径：每个 segment 各做一次精确（非近似）检索，选择阶段就用
+//     candidatePredicate 跳过已删除或已被覆盖的 chunk 与 pathPrefix 之外的
+//     chunk；合并后按分数降序、ID 升序排序，同一查询多次执行结果逐位相同。
+//     同一段内也可能有相同 ID 的多行（同一超长行切出内容相同的字节片段），
+//     vector.SearchFiltered 按不重复的 ID 取前 depth 个，每个 ID 取最高分行。
+//     未变化的片段可能在多个段里各有一行，合并时再按 ID 去重后才计入
+//     depth：全局去重后的前 depth 个 ID 中，每个 ID 在它最高分所在的段里
+//     排名也在前 depth 之内，所以每段取 depth 个再去重不会漏掉候选。
 //
 // 只有 ctx 取消、deny 拒绝与向量检索本身出错才返回 error。
-func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, depth int, timings *engine.RetrievalTimings, allow func(id string) bool) ([]string, []string, error) {
+func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, depth int, timings *engine.RetrievalTimings, pathPrefix string) ([]string, []string, error) {
 	ixs, loadErr := handle.vectorIndexes(e.embedCfg.Dimension)
 	if loadErr != nil {
 		if errors.Is(loadErr, vector.ErrEnvelopeExceeded) {
@@ -1136,6 +1130,7 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 		return nil, []string{"query-embedding-failed(" + failureClass(embedErr) + ")"}, nil
 	}
 	vectorStart := time.Now()
+	allow := candidatePredicate(handle, pathPrefix)
 	var merged []vector.Hit
 	for _, ix := range ixs {
 		queryCopy := make([]float32, len(queryVector))
@@ -1153,10 +1148,12 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 		return merged[a].ID < merged[b].ID
 	})
 	ids := make([]string, 0, depth)
+	seen := make(map[string]bool, depth)
 	for _, hit := range merged {
-		if _, live := handle.chunks[hit.ID]; !live {
+		if seen[hit.ID] || !allow(hit.ID) {
 			continue
 		}
+		seen[hit.ID] = true
 		ids = append(ids, hit.ID)
 		if len(ids) >= depth {
 			break

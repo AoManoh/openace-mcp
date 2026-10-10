@@ -16,6 +16,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -397,28 +399,96 @@ func (i *Index) SearchWeighted(ctx context.Context, queryText string, topK int, 
 // SearchWeightedPrefix 同 SearchWeighted,pathPrefix 非空时按 path_raw
 // (keyword 字段)把候选域收敛到该子树后再选 topK(P-gray-02 前缀下推:
 // 后置过滤在受限深度下会被无关子树淹没为空)。前缀语义与引擎侧一致:
-// 等于该路径本身,或以 prefix+"/" 开头。
+// 等于该路径本身,或以 prefix+"/" 开头。排序、跨段去重与分页规则同
+// SearchLive,不做存活过滤。
 func (i *Index) SearchWeightedPrefix(ctx context.Context, queryText string, topK int, w Weights, pathPrefix string) ([]Hit, error) {
+	if topK <= 0 {
+		topK = 10
+	}
+	return i.SearchLive(ctx, queryText, topK, w, pathPrefix, nil)
+}
+
+// livePageSize 是 SearchLive 每页向 Bleve 请求的命中数，每页的内存开销以它
+// 为上限。它不限制总扫描量：候选收满或命中耗尽才停止。
+const livePageSize = 128
+
+// SearchLive 按固定排序（score 降序、ID 升序）逐页检索，只收 live 判定为存活
+// 且尚未收过的 ID，收满 topK、命中耗尽、ctx 取消或检索出错才停止。
+//   - 跨页用 Bleve 的 search_after 游标：上一页末条的 score 与 ID。Go 接口
+//     返回的 Hit.Sort[0] 是 "_score" 占位符，不能直接当游标；score 用
+//     strconv.FormatFloat(score, 'g', -1, 64) 写成能精确还原的十进制。同一个
+//     打开的句柄成员不变，游标之后的顺序与一次性取全部命中的顺序相同。
+//   - 不按页数或扫描倍数截止：返回不足 topK 就说明全部命中都已检查过。
+//   - 多段聚合时某段检索失败，Bleve 把失败记进 SearchResult.Status 并照常
+//     返回其余段的命中；这里返回错误，不把部分段的结果当作完整候选。
+//   - 同一 ID 在多个段里都有记录时只保留排序最靠前（得分最高）的一条，
+//     重复记录不占名额。先判存活再查重：去重集合只记已接纳的 ID，最多
+//     topK 项；已删除的 ID 不记录，再次出现时重新调用 live，live 应是 O(1)
+//     的只读判定（引擎传入的是对不可变存活表的查找）。内存因此不随扫描过的
+//     已删除命中增长。
+//   - live 为 nil 时只按 ID 去重；pathPrefix 非空时在 Bleve 查询里过滤。
+func (i *Index) SearchLive(ctx context.Context, queryText string, topK int, w Weights, pathPrefix string, live func(id string) bool) ([]Hit, error) {
 	if i.idx == nil {
 		return nil, ErrClosed
 	}
 	if topK <= 0 {
-		topK = 10
+		return nil, fmt.Errorf("SearchLive 需要正的 topK，实际 %d", topK)
 	}
 	q := buildQuery(queryText, w, pathPrefix)
 	if q == nil {
 		return nil, nil
 	}
-	request := bleve.NewSearchRequestOptions(q, topK, 0, false)
-	result, err := i.idx.SearchInContext(ctx, request)
-	if err != nil {
-		return nil, err
+	hits := make([]Hit, 0, topK)
+	accepted := make(map[string]bool, topK)
+	var cursor []string
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		request := bleve.NewSearchRequestOptions(q, livePageSize, 0, false)
+		request.SortBy([]string{"-_score", "_id"})
+		if cursor != nil {
+			request.SetSearchAfter(cursor)
+		}
+		result, err := i.idx.SearchInContext(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		if status := result.Status; status != nil && status.Failed > 0 {
+			return nil, fmt.Errorf("词法检索有 %d 个段失败: %w", status.Failed, firstIndexError(status.Errors))
+		}
+		for _, hit := range result.Hits {
+			if live != nil && !live(hit.ID) {
+				continue
+			}
+			if accepted[hit.ID] {
+				continue
+			}
+			accepted[hit.ID] = true
+			hits = append(hits, Hit{ID: hit.ID, Score: hit.Score})
+			if len(hits) == topK {
+				return hits, nil
+			}
+		}
+		if len(result.Hits) < livePageSize {
+			return hits, nil
+		}
+		last := result.Hits[len(result.Hits)-1]
+		cursor = []string{strconv.FormatFloat(last.Score, 'g', -1, 64), last.ID}
 	}
-	hits := make([]Hit, 0, len(result.Hits))
-	for _, hit := range result.Hits {
-		hits = append(hits, Hit{ID: hit.ID, Score: hit.Score})
+}
+
+// firstIndexError 按段名排序返回第一条段错误，错误文本稳定可复现。
+func firstIndexError(errs bleve.IndexErrMap) error {
+	names := make([]string, 0, len(errs))
+	for name := range errs {
+		names = append(names, name)
 	}
-	return hits, nil
+	if len(names) == 0 {
+		return errors.New("Bleve 未给出段错误详情")
+	}
+	sort.Strings(names)
+	return fmt.Errorf("%s: %w", names[0], errs[names[0]])
 }
 
 // buildQuery 按子句权重组装 SearchWeightedPrefix 的查询，没有任何子句时

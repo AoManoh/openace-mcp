@@ -498,9 +498,9 @@ func (ix *Index) Row(i int) []float32 {
 	return ix.data[i*ix.dimension : (i+1)*ix.dimension]
 }
 
-// Search 返回 query 的 exact top-k：结果与单线程 brute-force 完全一致
-// （§11.2），并行仅是加速手段；tie-break 按 (score desc, ID asc) 保证
-// 确定性（暗坑 K27）。query 会被就地归一化。
+// Search 返回 query 的 exact top-k：结果与单线程 brute-force 按 ID 去重后
+// 完全一致（§11.2），并行仅是加速手段；tie-break 按 (score desc, ID asc)
+// 保证确定性（暗坑 K27）。query 会被就地归一化。
 func (ix *Index) Search(ctx context.Context, query []float32, topK int) ([]Hit, error) {
 	return ix.SearchFiltered(ctx, query, topK, nil)
 }
@@ -508,12 +508,20 @@ func (ix *Index) Search(ctx context.Context, query []float32, topK int) ([]Hit, 
 // SearchFiltered 同 Search,allow 非 nil 时只在谓词放行的条目中选 topK
 // (P-gray-02 前缀下推:被海量无关子树淹没时,受限深度的全局 topK 再过滤
 // 会漏掉目标子树;谓词在选择阶段生效,放行行的评分与无谓词时逐位相同)。
-// allow 会被多个评分 worker 并发调用,必须是并发安全的纯函数(包内唯一
-// 实现 chunkPrefixPredicate 只读不可变 map,满足)。
+// allow 会被多个评分 worker 并发调用,必须是并发安全的纯函数(localengine
+// 的 candidatePredicate 只读不可变 map,满足)。
+//
+// topK 指不重复的 ID。段内可能有相同 ID 的多行:同一超长行切出内容完全
+// 相同的字节片段时,片段 ID 相同,构建照常为每个片段保存一行。同一 ID 只
+// 取得分最高的一行(同分取行号最小的一行),重复行不占名额;否则一个重复
+// 62 次的片段会占满前 60 名,其他候选全部丢失。
 //
 // 选择用每 worker 有界堆+单线程归并取代全量排序:临时内存从 O(行数)
-// 降到 O(topK×workers),行序遍历/逐行求和序/全序比较器均与全排版一致,
-// 结果逐位等价(等价性由 referenceTopK 对照测试锁定)。
+// 降到 O(topK×workers),行序遍历/逐行求和序/全序比较器均与全排版一致。
+// 每个 worker 的堆内 ID 互不相同;不同 worker 可能各自留下同一 ID,归并
+// 时按 (score desc, ID asc, 行号 asc) 排序后只取每个 ID 的第一行。结果与
+// 按 ID 去重的 brute-force 逐位等价(由 referenceTopK、referenceUniqueTopK
+// 对照测试锁定)。
 func (ix *Index) SearchFiltered(ctx context.Context, query []float32, topK int, allow func(id string) bool) ([]Hit, error) {
 	if ix.closed.Load() {
 		return nil, errors.New("vector index 已关闭(use-after-close 是调用方生命周期缺陷)")
@@ -596,15 +604,26 @@ func (ix *Index) SearchFiltered(ctx context.Context, query []float32, topK int, 
 		if merged[a].score != merged[b].score {
 			return merged[a].score > merged[b].score
 		}
-		return ix.entries[merged[a].row].ID < ix.entries[merged[b].row].ID
+		if idA, idB := ix.entries[merged[a].row].ID, ix.entries[merged[b].row].ID; idA != idB {
+			return idA < idB
+		}
+		return merged[a].row < merged[b].row
 	})
 	if topK > len(merged) {
 		topK = len(merged)
 	}
 	hits := make([]Hit, 0, topK)
-	for _, cand := range merged[:topK] {
+	seen := make(map[string]bool, topK)
+	for _, cand := range merged {
 		entry := ix.entries[cand.row]
+		if seen[entry.ID] {
+			continue
+		}
+		seen[entry.ID] = true
 		hits = append(hits, Hit{ID: entry.ID, ContentHash: entry.ContentHash, Score: cand.score})
+		if len(hits) == topK {
+			break
+		}
 	}
 	return hits, nil
 }
@@ -616,13 +635,21 @@ type topKCandidate struct {
 	score float64
 }
 
-// topKSelector 维护"目前最优的 ≤capacity 个"候选:数组式二叉堆,堆顶=
-// 集合内 (score desc, ID asc) 全序的末位(最差者),新候选优于堆顶时替换
-// 下沉。分数与 ID 构成全序(段内 ID 唯一),无并列歧义。
+// topKSelector 维护"目前最优的 ≤capacity 个不重复 ID"候选:数组式二叉堆,
+// 堆顶=集合内 (score desc, ID asc) 全序的末位(最差者),新 ID 的候选优于
+// 堆顶时替换下沉。pos 记录堆内每个 ID 所在的下标,最多 capacity 项,随
+// 交换、替换、逐出同步更新:
+//   - 同一 ID 再次出现且更优时原位替换并下沉(更优者离堆顶更远),不另占
+//     位置;不更优(含同分)时保留先出现的行。
+//   - 逐出堆顶时同时删除它的 ID;该 ID 之后再出现时按新 ID 与堆顶比较。
+//     门槛只升不降,被逐出时的分数不可能再进入,只有更高的分数可以。
+//
+// 堆内 ID 互不相同,(score, ID) 构成全序,无并列歧义。
 type topKSelector struct {
 	ix       *Index
 	capacity int
 	items    []topKCandidate
+	pos      map[string]int
 }
 
 // worse 判断 a 是否排序在 b 之后,与归并/全排比较器同式取反。
@@ -634,16 +661,41 @@ func (s *topKSelector) worse(a, b topKCandidate) bool {
 }
 
 func (s *topKSelector) push(cand topKCandidate) {
-	if len(s.items) < s.capacity {
+	// 堆满且候选比堆顶差：堆内每一行（包括同 ID 的那行）都不比堆顶差，
+	// 这行既进不了堆，也不会替换同 ID 的行。大多数行走这个分支，先判断它，
+	// 不必查 ID 表。
+	full := len(s.items) == s.capacity
+	if full && s.worse(cand, s.items[0]) {
+		return
+	}
+	if s.pos == nil {
+		s.pos = make(map[string]int, s.capacity)
+	}
+	id := s.ix.entries[cand.row].ID
+	if i, ok := s.pos[id]; ok {
+		if s.worse(s.items[i], cand) {
+			s.items[i] = cand
+			s.down(i)
+		}
+		return
+	}
+	if !full {
 		s.items = append(s.items, cand)
+		s.pos[id] = len(s.items) - 1
 		s.up(len(s.items) - 1)
 		return
 	}
-	if s.worse(cand, s.items[0]) {
-		return
-	}
+	delete(s.pos, s.ix.entries[s.items[0].row].ID)
 	s.items[0] = cand
+	s.pos[id] = 0
 	s.down(0)
+}
+
+// swap 交换堆中两个位置并更新它们的 ID→位置记录。
+func (s *topKSelector) swap(i, j int) {
+	s.items[i], s.items[j] = s.items[j], s.items[i]
+	s.pos[s.ix.entries[s.items[i].row].ID] = i
+	s.pos[s.ix.entries[s.items[j].row].ID] = j
 }
 
 func (s *topKSelector) up(i int) {
@@ -652,7 +704,7 @@ func (s *topKSelector) up(i int) {
 		if !s.worse(s.items[i], s.items[parent]) {
 			return
 		}
-		s.items[i], s.items[parent] = s.items[parent], s.items[i]
+		s.swap(i, parent)
 		i = parent
 	}
 }
@@ -670,7 +722,7 @@ func (s *topKSelector) down(i int) {
 		if worst == i {
 			return
 		}
-		s.items[i], s.items[worst] = s.items[worst], s.items[i]
+		s.swap(i, worst)
 		i = worst
 	}
 }
