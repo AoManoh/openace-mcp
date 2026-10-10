@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 
@@ -191,7 +192,7 @@ func (c *Client) doRequest(ctx context.Context, query string, docs []Document) (
 			Message: fmt.Sprintf("rerank count mismatch: sent %d, got %d (response rejected)", len(docs), len(scored)),
 		}
 	}
-	// 按分数降序稳定排序；同分保持送审（RRF）顺序，保证确定性（暗坑 K27）。
+	// 按分数降序稳定排序；同分保留响应中的条目顺序，不推断 provider 的同分规则。
 	sort.SliceStable(hits, func(a, b int) bool { return hits[a].Score > hits[b].Score })
 	return hits, nil
 }
@@ -203,46 +204,56 @@ type scoredIndex struct {
 }
 
 // parseResponse 解析 voyage（data）/ Cohere/Jina（results）/ TEI（顶层数组）
-// 三种响应形状。
+// 三种响应形状。每条的 index 与分数都必须存在、不为 null，分数必须是有限
+// 数：字段解码为指针，缺失或 null 时是 nil，和合法的 index=0、score=0 区分
+// 开；否则缺失的 index 会被当成 0，缺失的分数会被当成 0 分，范围、唯一性
+// 和条数检查都发现不了。index 的范围、唯一性与条数由 doRequest 随后检查。
 func parseResponse(providerType string, raw []byte) ([]scoredIndex, error) {
 	malformed := func(err error) *reliability.CallError {
 		return &reliability.CallError{Class: reliability.ClassPermanent, Message: reliability.SanitizeMessage("malformed rerank response: " + err.Error())}
 	}
+	type item struct {
+		Index *int     `json:"index"`
+		Score *float64 `json:"score"`
+		// RelevanceScore 是 data/results 形状的分数字段。
+		RelevanceScore *float64 `json:"relevance_score"`
+	}
+	var source []item
+	scoreField := "relevance_score"
 	if providerType == ProviderTEI {
-		var items []struct {
-			Index int     `json:"index"`
-			Score float64 `json:"score"`
-		}
-		if err := json.Unmarshal(raw, &items); err != nil {
+		scoreField = "score"
+		if err := json.Unmarshal(raw, &source); err != nil {
 			return nil, malformed(err)
 		}
-		out := make([]scoredIndex, 0, len(items))
-		for _, item := range items {
-			out = append(out, scoredIndex{Index: item.Index, Score: item.Score})
+	} else {
+		var decoded struct {
+			Data    []item `json:"data"`
+			Results []item `json:"results"`
 		}
-		return out, nil
-	}
-	var decoded struct {
-		Data []struct {
-			Index          int     `json:"index"`
-			RelevanceScore float64 `json:"relevance_score"`
-		} `json:"data"`
-		Results []struct {
-			Index          int     `json:"index"`
-			RelevanceScore float64 `json:"relevance_score"`
-		} `json:"results"`
-	}
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		return nil, malformed(err)
-	}
-	source := decoded.Data
-	if len(source) == 0 && len(decoded.Results) > 0 {
-		// Cohere/Jina 兼容端点用 results 键；语义一致。
-		source = decoded.Results
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			return nil, malformed(err)
+		}
+		source = decoded.Data
+		if len(source) == 0 && len(decoded.Results) > 0 {
+			// Cohere/Jina 兼容端点用 results 键；语义一致。
+			source = decoded.Results
+		}
 	}
 	out := make([]scoredIndex, 0, len(source))
-	for _, item := range source {
-		out = append(out, scoredIndex{Index: item.Index, Score: item.RelevanceScore})
+	for position, entry := range source {
+		score := entry.RelevanceScore
+		if providerType == ProviderTEI {
+			score = entry.Score
+		}
+		switch {
+		case entry.Index == nil:
+			return nil, malformed(fmt.Errorf("item %d: missing or null index", position))
+		case score == nil:
+			return nil, malformed(fmt.Errorf("item %d: missing or null %s", position, scoreField))
+		case math.IsNaN(*score) || math.IsInf(*score, 0):
+			return nil, malformed(fmt.Errorf("item %d: non-finite %s", position, scoreField))
+		}
+		out = append(out, scoredIndex{Index: *entry.Index, Score: *score})
 	}
 	return out, nil
 }

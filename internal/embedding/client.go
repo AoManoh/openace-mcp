@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -411,7 +412,39 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 		}
 		out[item.Index] = item.Embedding
 	}
+	// 查询向量数值校验：查询向量要归一化后与索引做相似度，范数为零或含
+	// 非有限分量时无法检索。在这里判为无效响应，调用链在计入成功之前就
+	// 记录失败（查询熔断器不再显示 healthy），引擎按 allow/deny/strict 处理
+	// 查询嵌入失败。文档向量不做此校验：零文档向量由引擎记入持久化拒绝集。
+	// 维度未知的探测请求（Dimension==0）也不校验，启动期探测合同不变。
+	if inputType == InputQuery && c.cfg.Dimension > 0 {
+		for i, vec := range out {
+			if problem := queryVectorProblem(vec); problem != "" {
+				return nil, &reliability.CallError{
+					Class:   reliability.ClassPermanent,
+					Message: fmt.Sprintf("invalid query embedding at index %d: %s (query rejected)", i, problem),
+				}
+			}
+		}
+	}
 	return out, nil
+}
+
+// queryVectorProblem 检查查询向量能否用于相似度检索：每个分量都是有限数，
+// 且范数大于零。可用时返回空串，否则返回问题描述。
+func queryVectorProblem(vec []float32) string {
+	var sum float64
+	for i, value := range vec {
+		v := float64(value)
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Sprintf("non-finite value at position %d", i)
+		}
+		sum += v * v
+	}
+	if sum == 0 {
+		return "vector has zero norm"
+	}
+	return ""
 }
 
 // estimateTokens 是保守的 token 估算（字节/4，向上取整）。

@@ -102,7 +102,9 @@ func TestOpenAIShapeKeyless(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, authPresent = r.Header["Authorization"]
 		_ = json.NewDecoder(r.Body).Decode(&got)
-		respondEmbeddings(w, got.Input, dim)
+		// 本测试只核对请求形状；查询向量须非零才是有效响应（respondEmbeddings
+		// 给第 0 条返回全零向量），这里返回首元素为 1 的向量。
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{"index": 0, "embedding": vectorFor(dim, 1)}}})
 	}))
 	defer ts.Close()
 
