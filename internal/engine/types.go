@@ -55,15 +55,19 @@ type Result struct {
 	FileCount         int
 	Uploaded          int
 	Added             int
-	Deleted           int
-	MultiStatus       *MultiRetrievalStatus `json:"multi_status,omitempty"`
-	ServedBy          *runtimeinfo.ServedBy `json:"served_by,omitempty"`
+	// Deleted 是一次同步前后索引文件集合中被移除的路径数，包括改为忽略或
+	// 不再收录的文件；被改写文件的旧片段不算删除文件；没有发布新 revision
+	// 与首次构建为 0。检索结果只在同步与查询是同一 revision 时沿用该值。
+	Deleted     int
+	MultiStatus *MultiRetrievalStatus `json:"multi_status,omitempty"`
+	ServedBy    *runtimeinfo.ServedBy `json:"served_by,omitempty"`
 
-	// —— Stage 3 检索透明性字段（决策 11；全部 omitempty：legacy ACE 与
-	// 纯词法正常路径不填充，wire 不变，暗坑 K34）——
+	// 检索状态字段。模式由每次成功请求明确填写，未适用的可选字段省略。
 
-	// RetrievalMode 是本次检索实际执行的链路：lexical / hybrid /
-	// hybrid+rerank / lexical+rerank。
+	// RetrievalMode 在检索结果中是本次实际执行的链路：lexical / hybrid /
+	// hybrid+rerank / lexical+rerank，纯词法成功也显式为 lexical。在同步结果
+	// 中是所返回 revision 已建立的检索能力：没有语义或没有向量为 lexical，
+	// 有向量为 hybrid，不表示执行过查询或精排。
 	RetrievalMode string `json:"retrieval_mode,omitempty"`
 	// DegradedReason 非空表示结果处于降级（逗号分隔的稳定原因 token；
 	// 文本首行同步携带 [DEGRADED] 横幅）。

@@ -490,53 +490,45 @@ func (e *Engine) acquireWriteLock(workspaceKey string, store *index.Store) (*ind
 
 // Sync 实现 engine.Service：同步工作区索引，阻塞到构建完成。
 func (e *Engine) Sync(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
-	res, err := e.syncWorkspace(ctx, req.Workspace)
-	return e.withMigrationBlock(req.Workspace, res, err)
+	res, manifest, err := e.syncWorkspaceOutcome(ctx, req.Workspace, true)
+	if err != nil {
+		return res, err
+	}
+	return res, e.syncMigrationPolicy(manifest)
 }
 
 // SyncBackground 实现 engine.BackgroundSyncer，与 Sync 走同一路径。
 func (e *Engine) SyncBackground(ctx context.Context, req engine.SyncRequest) (engine.Result, error) {
-	res, err := e.syncWorkspace(ctx, req.Workspace)
-	return e.withMigrationBlock(req.Workspace, res, err)
+	res, manifest, err := e.syncWorkspaceOutcome(ctx, req.Workspace, true)
+	if err != nil {
+		return res, err
+	}
+	return res, e.syncMigrationPolicy(manifest)
 }
 
 // migrationBlockedReason 是语义迁移受阻（见 siblingPaidStateFor）在同步结果与
 // 检索横幅里的降级原因。
 const migrationBlockedReason = "semantic-migration-blocked"
 
-// withMigrationBlock 让语义迁移受阻在每次同步的结果里都可见，包括构建没有
-// 发布新 revision 的同步：原因取 active revision 记录的
-// SemanticMigrationBlock（跟踪器在 ready 时同步），DegradedReason 追加
-// semantic-migration-blocked，原因与恢复步骤在 workspace_status 的
-// semantic.last_error。
-// OPENACE_QUALITY_STRICT=on 或 OPENACE_RETRIEVAL_DEGRADE=deny 时改为返回带
-// 原因与恢复步骤的错误；词法 revision 已照常发布。只处理这一种原因，其余
-// 降级字段保持原样。
-func (e *Engine) withMigrationBlock(ref engine.WorkspaceRef, res engine.Result, err error) (engine.Result, error) {
-	if err != nil {
-		return res, err
+// syncMigrationPolicy 处理同步结果所描述 revision 记录的迁移暂停原因：原因
+// 取自该 revision 的 manifest（SemanticMigrationBlock），不在返回后读跟踪器
+// 可能已被其他 revision 更新的原因。结果的 DegradedReason 已由
+// revisionResult 带上 semantic-migration-blocked，原因与恢复步骤也在
+// workspace_status 的 semantic.last_error。
+// OPENACE_QUALITY_STRICT=on 或 OPENACE_RETRIEVAL_DEGRADE=deny 时返回带原因与
+// 恢复步骤的错误；词法 revision 已照常发布，结果仍随错误返回。
+func (e *Engine) syncMigrationPolicy(manifest *index.Manifest) error {
+	if manifest == nil || manifest.SemanticMigrationBlock == "" {
+		return nil
 	}
-	_, workspaceKey, resolveErr := e.resolveRoot(ref.DirectoryPath)
-	if resolveErr != nil {
-		return res, nil
-	}
-	reason := e.migrationBlockFor(workspaceKey)
-	if reason == "" {
-		return res, nil
-	}
-	if !strings.Contains(res.DegradedReason, migrationBlockedReason) {
-		if res.DegradedReason != "" {
-			res.DegradedReason += ","
-		}
-		res.DegradedReason += migrationBlockedReason
-	}
+	reason := manifest.SemanticMigrationBlock
 	if e.qualityStrict {
-		return res, fmt.Errorf("%s=on: 语义质量缺口 [%s]: %s", EnvQualityStrict, migrationBlockedReason, reason)
+		return fmt.Errorf("%s=on: 语义质量缺口 [%s]: %s", EnvQualityStrict, migrationBlockedReason, reason)
 	}
 	if e.retrievalDegrade == DegradeDeny {
-		return res, degradeDeniedError(migrationBlockedReason, errors.New(reason), EnvRetrievalDegrade)
+		return degradeDeniedError(migrationBlockedReason, errors.New(reason), EnvRetrievalDegrade)
 	}
-	return res, nil
+	return nil
 }
 
 // buildCall 是同一工作区并发构建请求共享的执行体：同时只有一个构建在跑，
@@ -548,7 +540,9 @@ type buildCall struct {
 	waiters   int
 	cancelled bool
 	result    engine.Result
-	err       error
+	// manifest 是 result 描述的 revision，Sync 据它判定迁移暂停原因。
+	manifest *index.Manifest
+	err      error
 	// startedAt 是本构建的创建时刻。调用方只加入创建时刻晚于自身到达时刻
 	// 的构建：更早创建的构建其扫描可能没有覆盖调用方到达前的写入，等它
 	// 结束后重新循环，自建或加入新一轮，保证 Sync 返回的索引包含调用前
@@ -752,18 +746,23 @@ func (e *Engine) freshnessShortcut(ref engine.WorkspaceRef) (engine.Result, bool
 	}
 	manifest := handle.manifest
 	e.releaseHandle(handle)
-	return engine.Result{
-		Engine: EngineID, IndexRevision: manifest.Revision,
-		FileCount: manifest.Counts.Files,
-	}, true
+	return e.revisionResult(manifest, manifest), true
 }
 
-// syncWorkspaceDetachable 是全部同步入口的共同实现。cancelOnLeave=false
-// 供有界查询等待使用：等待者超时离开时不递减 waiters，构建不会因为查询
-// 放弃等待而被取消；有界等待的意义就是查询先返回、构建继续。
+// syncWorkspaceDetachable 是查询与内部调用使用的同步入口，返回值见
+// syncWorkspaceOutcome，只是不带 manifest。
 func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.WorkspaceRef, cancelOnLeave bool) (engine.Result, error) {
+	res, _, err := e.syncWorkspaceOutcome(ctx, ref, cancelOnLeave)
+	return res, err
+}
+
+// syncWorkspaceOutcome 是全部同步入口的共同实现，返回同步结果与它描述的
+// revision 的 manifest（出错时为 nil）。cancelOnLeave=false 供有界查询等待
+// 使用：等待者超时离开时不递减 waiters，构建不会因为查询放弃等待而被取消；
+// 有界等待的意义就是查询先返回、构建继续。
+func (e *Engine) syncWorkspaceOutcome(ctx context.Context, ref engine.WorkspaceRef, cancelOnLeave bool) (engine.Result, *index.Manifest, error) {
 	if err := rejectProfileID(ref); err != nil {
-		return engine.Result{}, err
+		return engine.Result{}, nil, err
 	}
 	// 路径不存在或不是目录的请求在入口就按请求类错误返回。改动前这类
 	// 请求进入构建失败加有界等待，用户等 40 秒后得到 index-building 措辞
@@ -771,23 +770,23 @@ func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.Workspa
 	// 不存在的目标同样按不存在处理；没有读权限的目录 stat 能通过，交给
 	// 扫描阶段按既有错误处理。
 	if info, statErr := os.Stat(ref.DirectoryPath); statErr != nil {
-		return engine.Result{}, engine.AsInvalidRequest(fmt.Errorf("workspace directory does not exist: %s", ref.DirectoryPath))
+		return engine.Result{}, nil, engine.AsInvalidRequest(fmt.Errorf("workspace directory does not exist: %s", ref.DirectoryPath))
 	} else if !info.IsDir() {
-		return engine.Result{}, engine.AsInvalidRequest(fmt.Errorf("workspace path is not a directory: %s", ref.DirectoryPath))
+		return engine.Result{}, nil, engine.AsInvalidRequest(fmt.Errorf("workspace path is not a directory: %s", ref.DirectoryPath))
 	}
 	root, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
 	if err != nil {
-		return engine.Result{}, err
+		return engine.Result{}, nil, err
 	}
 	arrival := time.Now()
 	for {
 		if err := ctx.Err(); err != nil {
-			return engine.Result{}, err
+			return engine.Result{}, nil, err
 		}
 		e.mu.Lock()
 		if e.closed {
 			e.mu.Unlock()
-			return engine.Result{}, errors.New("local-hybrid 引擎已关闭")
+			return engine.Result{}, nil, errors.New("local-hybrid 引擎已关闭")
 		}
 		if call, ok := e.inflight[workspaceKey]; ok {
 			// 只加入创建时刻晚于自身到达时刻的构建。更早的构建其扫描可能
@@ -803,7 +802,7 @@ func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.Workspa
 				case <-done:
 					continue
 				case <-ctx.Done():
-					return engine.Result{}, ctx.Err()
+					return engine.Result{}, nil, ctx.Err()
 				}
 			}
 			call.waiters++
@@ -816,13 +815,13 @@ func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.Workspa
 		e.mu.Unlock()
 
 		go func() {
-			result, err := e.runBuild(runCtx, root, workspaceKey)
+			result, manifest, err := e.runBuild(runCtx, root, workspaceKey)
 			if err == nil {
 				e.mu.Lock()
 				e.lastSyncOK[workspaceKey] = time.Now()
 				e.mu.Unlock()
 			}
-			call.result, call.err = result, err
+			call.result, call.manifest, call.err = result, manifest, err
 			// 先在锁内摘除表项（核对确是本 call）再 close(done)：若先
 			// close，等待者会看到 done 已关闭而表里仍是本 call，进入忙转。
 			e.mu.Lock()
@@ -839,21 +838,21 @@ func (e *Engine) syncWorkspaceDetachable(ctx context.Context, ref engine.Workspa
 // waitBuild 等待共享构建完成。cancelOnLeave=true 时最后一个等待者取消即
 // 中止构建；有界查询等待传 false，离开时不记账，构建不会因为查询超时被
 // 取消，Close 仍会强停它。
-func (e *Engine) waitBuild(ctx context.Context, workspaceKey string, call *buildCall, cancelOnLeave bool) (engine.Result, error) {
+func (e *Engine) waitBuild(ctx context.Context, workspaceKey string, call *buildCall, cancelOnLeave bool) (engine.Result, *index.Manifest, error) {
 	select {
 	case <-call.done:
-		return call.result, call.err
+		return call.result, call.manifest, call.err
 	case <-ctx.Done():
 	}
 	// ctx 取消后再查一次 done：构建恰在此刻完成的有效结果不因取消竞态
 	// 被丢弃。
 	select {
 	case <-call.done:
-		return call.result, call.err
+		return call.result, call.manifest, call.err
 	default:
 	}
 	if !cancelOnLeave {
-		return engine.Result{}, ctx.Err()
+		return engine.Result{}, nil, ctx.Err()
 	}
 	e.mu.Lock()
 	// 递减前核对表里仍是本 call：本 call 已被摘除时不再记账，否则 waiters
@@ -866,7 +865,7 @@ func (e *Engine) waitBuild(ctx context.Context, workspaceKey string, call *build
 		}
 	}
 	e.mu.Unlock()
-	return engine.Result{}, ctx.Err()
+	return engine.Result{}, nil, ctx.Err()
 }
 
 // WorkspaceChanged 实现 engine.ChangeDetector：对比当前文件集与内容身份和

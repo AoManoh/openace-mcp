@@ -111,10 +111,10 @@ func projectedGarbageRatio(previous *index.Manifest, removed []string) float64 {
 //   - 选路：delta 只用于 manifest v2 前身之上的内容变更，且没有词法或向量
 //     修复请求、segment 数与预估垃圾比都低于 compaction 阈值；其余全走
 //     全量路径，成因经 fullBuildReason 写进 Result.BuildMode。
-func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, workspaceKey string) (result engine.Result, err error) {
+func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, workspaceKey string) (result engine.Result, manifest *index.Manifest, err error) {
 	store, err := e.storeFor(workspaceKey)
 	if err != nil {
-		return engine.Result{}, err
+		return engine.Result{}, nil, err
 	}
 	status := e.statusFor(root, workspaceKey)
 	status.begin()
@@ -130,7 +130,7 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	// 跨进程写锁：构建、GC、journal 都是写路径，必须独占；查询只读不经
 	// 此处。锁在引擎生命周期内持有并跨构建复用。
 	if _, err := e.acquireWriteLock(workspaceKey, store); err != nil {
-		return engine.Result{}, err
+		return engine.Result{}, nil, err
 	}
 
 	// 阶段 1：扫描。复用 workspace 包的文件选择与忽略规则，不另建第二套
@@ -139,7 +139,7 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	// 扫描期按进度回填文件数，大仓首扫时状态不再长期显示 files=0。
 	assets, scanStats, err := workspace.FileAssetSource{Cache: e.statCacheFor(workspaceKey), Progress: status.setScannedFiles}.LoadWithStats(ctx, root.CanonicalPath)
 	if err != nil {
-		return engine.Result{}, fmt.Errorf("扫描工作区: %w", err)
+		return engine.Result{}, nil, fmt.Errorf("扫描工作区: %w", err)
 	}
 	// 因无读权限或超过大小上限被跳过的文件数进入状态。
 	status.setPermissionSkipped(scanStats.PermissionSkippedFiles)
@@ -148,7 +148,7 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 
 	previous, _, resolveErr := store.ResolveUsable()
 	if resolveErr != nil && !isNoRevision(resolveErr) {
-		return engine.Result{}, resolveErr
+		return engine.Result{}, nil, resolveErr
 	}
 	contentChanged := previous == nil || assetsChanged(assets, previous)
 	repairRequested := e.consumeVectorRepair(workspaceKey)
@@ -170,11 +170,7 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 				circuitBackoff := e.semanticEnabled() && e.embedClient.CircuitSnapshot().State == "backoff"
 				if semanticSatisfied || circuitBackoff {
 					status.ready(previous, revisionCount(store, previous))
-					return engine.Result{
-						Engine:        EngineID,
-						IndexRevision: previous.Revision,
-						FileCount:     previous.Counts.Files,
-					}, nil
+					return e.revisionResult(previous, previous), previous, nil
 				}
 			}
 		} else {
@@ -410,9 +406,10 @@ func (e *Engine) newManifestSkeleton(root pathutil.WorkspaceRoot, revision strin
 //     journal 只在已付费未发布的窗口存在。清除失败不影响发布，条目留到
 //     下次发布再清。
 //   - Result.Added 是本轮实际写入 segment 的 chunk 数；BuildMode 写明构建
-//     形态与成因；配置了 embedding 时携带覆盖率，覆盖不完整给出降级原因
-//     semantic-coverage-partial（与查询路径同名），同步成功也不隐藏缺口。
-func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKey string, manifest *index.Manifest, staging string, discard func(), seman semanticOutcome, skippedFiles int, added int, buildMode string) (engine.Result, error) {
+//     形态与成因；其余状态字段由 revisionResult 从本 revision 得出，配置了
+//     embedding 时覆盖不完整给出 semantic-coverage-partial（与查询路径同名），
+//     同步成功也不隐藏缺口。返回的 manifest 就是结果描述的 revision。
+func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKey string, manifest *index.Manifest, staging string, discard func(), seman semanticOutcome, skippedFiles int, added int, buildMode string, syncStart *index.Manifest) (engine.Result, *index.Manifest, error) {
 	// 语义覆盖完整就没有被暂停的缺口，迁移暂停原因随本 revision 清除。
 	if manifest.SemanticComplete() {
 		manifest.SemanticMigrationBlock = ""
@@ -422,18 +419,18 @@ func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKe
 		if discard != nil {
 			discard()
 		}
-		return engine.Result{}, err
+		return engine.Result{}, nil, err
 	} else if err := lock.Verify(); err != nil {
 		if discard != nil {
 			discard()
 		}
-		return engine.Result{}, err
+		return engine.Result{}, nil, err
 	}
 	if err := store.Publish(manifest, staging); err != nil {
 		if discard != nil {
 			discard()
 		}
-		return engine.Result{}, fmt.Errorf("发布索引: %w", err)
+		return engine.Result{}, nil, fmt.Errorf("发布索引: %w", err)
 	}
 	e.retireHandles(workspaceKey, manifest.Revision, manifest.PreviousRevision)
 	e.gcRevisions(store, status, workspaceKey, manifest.Revision, manifest.PreviousRevision)
@@ -454,25 +451,13 @@ func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKe
 	// Added 是本轮实际写入 segment 的 chunk 数。改动前统一取
 	// manifest.Counts.Chunks，delta 构建被报成 revision 总量：1975 个文件的
 	// 仓库做一次小改动显示 Added=19028，被解读成升级触发了全量重嵌。
-	// BuildMode 写明构建形态与成因。
-	result := engine.Result{
-		Engine:             EngineID,
-		IndexRevision:      manifest.Revision,
-		FileCount:          manifest.Counts.Files,
-		Uploaded:           0,
-		Added:              added,
-		BuildMode:          buildMode,
-		CrossProfileReused: seman.crossProfileReused,
-	}
-	// 同步成功也不隐藏语义覆盖缺口：结果携带覆盖率，覆盖不完整给出与
-	// 查询路径同名的降级原因，Summary 里可见。
-	if e.semanticEnabled() {
-		result.SemanticCoverage = coveragePercent(manifest)
-		if !manifest.SemanticComplete() {
-			result.DegradedReason = "semantic-coverage-partial"
-		}
-	}
-	return result, nil
+	// BuildMode 写明构建形态与成因。覆盖率、模式、原因与 Deleted 由
+	// revisionResult 从本 revision 与同步开始时的 revision 得出。
+	result := e.revisionResult(manifest, syncStart)
+	result.Added = added
+	result.BuildMode = buildMode
+	result.CrossProfileReused = seman.crossProfileReused
+	return result, manifest, nil
 }
 
 // coveredPerFile 统计一个文件有向量的 chunk 数。查找键是 embedKey，与
@@ -502,7 +487,10 @@ func coveredPerFile(fileRecords []chunkRecord, coveredHash map[string]bool) int 
 //   - 内容未变、词法可用且向量没有实质增加时不发布新 revision，返回现有
 //     revision，缺口留在状态里，避免堆积没有变化的 revision。
 //   - 其余情况写 staging、组装单段 manifest v2、原子发布。
-func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, assets workspace.AssetSet, contentChanged bool, needsLexicalRebuild bool, buildMode string) (engine.Result, error) {
+func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, assets workspace.AssetSet, contentChanged bool, needsLexicalRebuild bool, buildMode string) (engine.Result, *index.Manifest, error) {
+	// syncStart 是本次同步开始时的 active revision，Deleted 相对它计算；
+	// 首建的词法中间发布会把 previous 换成中间 revision，不影响这里。
+	syncStart := previous
 	var previousChunks map[string][]chunkRecord
 	if previous != nil {
 		var err error
@@ -527,7 +515,7 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 	skippedFiles := 0
 	for _, asset := range assets {
 		if err := ctx.Err(); err != nil {
-			return engine.Result{}, err
+			return engine.Result{}, nil, err
 		}
 		var fileRecords []chunkRecord
 		reused := false
@@ -544,7 +532,7 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 			var err error
 			fileRecords, skipped, err = e.chunkAsset(ctx, asset)
 			if err != nil {
-				return engine.Result{}, err
+				return engine.Result{}, nil, err
 			}
 			// 切出 0 chunk 的文件与内容检查拒绝的同样跳过。全量单段路径
 			// 没有旧 chunk 复活的风险，但 ChunkCount 为 0 的 Files 条目是脏
@@ -601,7 +589,7 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 	}
 	seman, err := e.embedRecords(ctx, store, workspaceKey, prior, records, status)
 	if err != nil {
-		return engine.Result{}, err
+		return engine.Result{}, nil, err
 	}
 
 	// 内容未变、词法可用且向量没有实质增加时不发布新 revision，返回现有
@@ -613,18 +601,14 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 		seman.migrationBlock == previous.SemanticMigrationBlock {
 		status.setSemanticOutcome(seman.rejected, seman.lastError)
 		status.ready(previous, revisionCount(store, previous))
-		return engine.Result{
-			Engine:        EngineID,
-			IndexRevision: previous.Revision,
-			FileCount:     previous.Counts.Files,
-		}, nil
+		return e.revisionResult(previous, previous), previous, nil
 	}
 
 	// 阶段 3：写 staging。
 	status.setStage(engine.IndexStageIndexing)
 	artifacts, discard, err := e.buildSegmentStaging(ctx, store, records, seman)
 	if err != nil {
-		return engine.Result{}, err
+		return engine.Result{}, nil, err
 	}
 
 	// 阶段 4：组装单段 manifest v2 并原子发布。
@@ -656,7 +640,7 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 		manifest.VectorCount = seman.covered
 	}
 	manifest.SemanticMigrationBlock = seman.migrationBlock
-	return e.finishPublish(store, status, workspaceKey, manifest, artifacts.staging, discard, seman, skippedFiles, len(records), buildMode)
+	return e.finishPublish(store, status, workspaceKey, manifest, artifacts.staging, discard, seman, skippedFiles, len(records), buildMode, syncStart)
 }
 
 // buildDelta 是增量构建：只为变更文件切分、嵌入并产出一个 delta segment，
@@ -668,12 +652,12 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 //     检索。
 //   - manifest 沿用 previous 的 segment 列表，有记录时追加本次 delta 段；
 //     只有删除时 staging 为空，做 manifest-only 发布。
-func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, assets workspace.AssetSet) (engine.Result, error) {
+func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, assets workspace.AssetSet) (engine.Result, *index.Manifest, error) {
 	status.setStage(engine.IndexStageChunking)
 	changed, removed, currentPaths := diffDeltaAssets(previous, assets)
 	delta, err := e.chunkChangedAssets(ctx, changed)
 	if err != nil {
-		return engine.Result{}, err
+		return engine.Result{}, nil, err
 	}
 	records := delta.records
 	// 空 delta 不发布：变更集全部切出 0 chunk、没有删除、且这些路径本就
@@ -690,11 +674,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 		}
 		if !touchesManifest {
 			status.ready(previous, revisionCount(store, previous))
-			return engine.Result{
-				Engine:        EngineID,
-				IndexRevision: previous.Revision,
-				FileCount:     previous.Counts.Files,
-			}, nil
+			return e.revisionResult(previous, previous), previous, nil
 		}
 	}
 
@@ -712,7 +692,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 	}
 	seman, err := e.embedRecords(ctx, store, workspaceKey, prior, records, status)
 	if err != nil {
-		return engine.Result{}, err
+		return engine.Result{}, nil, err
 	}
 	coveredHash := make(map[string]bool, len(seman.entries))
 	for _, entry := range seman.entries {
@@ -739,7 +719,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 	if hasSegment {
 		artifacts, discard, err = e.buildSegmentStaging(ctx, store, records, seman)
 		if err != nil {
-			return engine.Result{}, err
+			return engine.Result{}, nil, err
 		}
 	}
 	for _, asset := range changed {
@@ -799,7 +779,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 	if hasSegment {
 		staging = artifacts.staging
 	}
-	return e.finishPublish(store, status, workspaceKey, manifest, staging, discard, seman, delta.skippedFiles, len(records), "delta")
+	return e.finishPublish(store, status, workspaceKey, manifest, staging, discard, seman, delta.skippedFiles, len(records), "delta", previous)
 }
 
 // diffDeltaAssets 对比 previous manifest 与当前资产集，返回变更文件（新增

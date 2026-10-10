@@ -760,6 +760,11 @@ func syncStructured(result engine.Result) map[string]any {
 	if result.BuildMode != "" {
 		fields["build_mode"] = result.BuildMode
 	}
+	// 同步的 retrieval_mode 是返回 revision 已建立的检索能力（lexical 或
+	// hybrid），不表示执行过查询或精排。
+	if result.RetrievalMode != "" {
+		fields["retrieval_mode"] = result.RetrievalMode
+	}
 	if result.CrossProfileReused > 0 {
 		fields["cross_profile_reused"] = result.CrossProfileReused
 	}

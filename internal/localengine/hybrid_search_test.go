@@ -500,17 +500,18 @@ func TestStaleIndexDeniedWhenConfigured(t *testing.T) {
 	}
 }
 
-// TestLexicalOnlyFieldsStayEmpty 是 K32：providers 未配置时透明性字段
-// 与文本均与 Stage 2 一致。
-func TestLexicalOnlyFieldsStayEmpty(t *testing.T) {
+// TestLexicalOnlyResultFields：providers 未配置时，正常词法检索显式返回
+// retrieval_mode=lexical，覆盖率与降级
+// 原因为空，正文没有横幅。
+func TestLexicalOnlyResultFields(t *testing.T) {
 	e := newTestEngine(t)
 	root := newFixtureWorkspace(t)
 	result, err := e.Search(context.Background(), searchRequest(root, "HandleLogin"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.RetrievalMode != "" || result.DegradedReason != "" || result.SemanticCoverage != "" {
-		t.Fatalf("纯词法正常路径不得填充新字段（K32/K34）: %+v", result)
+	if result.RetrievalMode != "lexical" || result.DegradedReason != "" || result.SemanticCoverage != "" {
+		t.Fatalf("纯词法正常路径应显式 lexical、无覆盖率与原因: %+v", result)
 	}
 	if strings.Contains(result.Text, "[DEGRADED]") {
 		t.Fatalf("不得出现横幅: %q", result.Text)

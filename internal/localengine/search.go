@@ -421,9 +421,10 @@ type retrieval struct {
 //     放行由 OPENACE_RETRIEVAL_DEGRADE / OPENACE_RERANK_DEGRADE 决定，不在
 //     任何情况下静默返回不完整结果。
 //   - 结果恒携带 Timings、Hits 与 QueryPlan（未触发为空，序列化时省略）。
-//   - RetrievalMode 等透明性字段只在配置了 provider 或发生降级时填充；
-//     纯词法且无降级时保持空值，输出形状与最初的纯词法版本完全一致，
-//     新旧进程混布时旧端仍能解析。
+//   - revision 与文件数取自本次查询实际持有的 revision；同步结果描述同一
+//     revision 时才沿用它的构建字段（见 servedResult）。
+//   - RetrievalMode 恒填写本次实际执行的检索链路，纯词法成功也显式为
+//     lexical；覆盖率、原因与质量字段按本次检索填写，没有时为空并省略。
 func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
 	// detail 是纯参数，在同步、建索引和查询嵌入之前校验：非法值不应先产生
 	// 模型请求再报错。调用本方法的单仓、多仓与异步任务入口都经过这里。
@@ -452,10 +453,8 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	if degradedReason != "" {
 		text = degradedBanner(degradedReason, out.mode, out.coverage) + text
 	}
-	result := out.syncResult
+	result := servedResult(out.syncResult, handle.manifest)
 	result.Text = text
-	result.Engine = EngineID
-	result.IndexRevision = handle.manifest.Revision
 	// 阶段耗时随每次检索结果返回，字段为 omitempty 的加性字段。
 	result.Timings = out.timings
 	// 结构化 hits 清单与展示统计：每个合并后的候选块一条，调用方可以按
@@ -468,19 +467,17 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	// 查询规划记录只要触发就携带（纯词法模式也一样），未触发保持空，
 	// 序列化时省略，旧调用方看到的形状不变。
 	result.QueryPlan = out.queryPlan
-	// 透明性字段只在配置了 provider 或发生降级时填充；纯词法且无降级时
-	// 保持空值，输出形状与最初的纯词法版本一致。
-	if e.semanticEnabled() || e.rerankClient != nil || degradedReason != "" {
-		result.RetrievalMode = out.mode
-		result.DegradedReason = degradedReason
-		result.SemanticCoverage = out.coverage
-		// 质量字段：实际送审精排数、查询嵌入是否失败、语义路身份指纹。
-		result.RerankSent = out.rerankSent
-		result.QueryEmbedFailed = out.queryEmbedFailed
-		if e.semanticEnabled() {
-			result.EmbeddingProfile = fmt.Sprintf("%s/%s/%d",
-				e.embedCfg.ProviderType, e.embedCfg.Model, e.embedCfg.Dimension)
-		}
+	// 模式恒显式填写（纯词法为 lexical），不再用“字段省略表示词法”。覆盖率、
+	// 原因与质量字段（实际送审精排数、查询嵌入是否失败、语义路身份指纹）
+	// 没有值时为空，序列化时省略。
+	result.RetrievalMode = out.mode
+	result.DegradedReason = degradedReason
+	result.SemanticCoverage = out.coverage
+	result.RerankSent = out.rerankSent
+	result.QueryEmbedFailed = out.queryEmbedFailed
+	if e.semanticEnabled() {
+		result.EmbeddingProfile = fmt.Sprintf("%s/%s/%d",
+			e.embedCfg.ProviderType, e.embedCfg.Model, e.embedCfg.Dimension)
 	}
 	return result, nil
 }

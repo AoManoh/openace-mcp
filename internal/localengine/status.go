@@ -175,20 +175,6 @@ func (e *Engine) seedMigrationBlockFromServed(tracker *wsStatus, workspaceKey st
 	tracker.mu.Unlock()
 }
 
-// migrationBlockFor 返回工作区 active revision 记录的语义迁移暂停原因；没有
-// 状态跟踪器或没有受阻时返回空串。
-func (e *Engine) migrationBlockFor(workspaceKey string) string {
-	e.mu.Lock()
-	status, ok := e.statuses[workspaceKey]
-	e.mu.Unlock()
-	if !ok {
-		return ""
-	}
-	status.mu.Lock()
-	defer status.mu.Unlock()
-	return status.migrationBlock
-}
-
 // setScannedFiles 在扫描期间与扫描完成时回填文件数。改动前构建期的
 // file_count 一直是 0，与不断增长的 embedded_chunks 并列显示，状态失真；
 // 发布时 ready 用 manifest 里的实际数覆盖。
