@@ -38,6 +38,14 @@ func TestWorkspaceReconcilerSyncsChangedSeenWorkspace(t *testing.T) {
 
 	status := engine.WorkspaceStatus{DirectoryPath: "/tmp/project"}
 	reconciler.Decorate(&status)
+	for deadline := time.Now().Add(2 * time.Second); status.WatchRunning && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+		status = engine.WorkspaceStatus{DirectoryPath: "/tmp/project"}
+		reconciler.Decorate(&status)
+	}
+	if status.WatchRunning {
+		t.Fatalf("background sync result was not recorded within 2s: %+v", status)
+	}
 	if !status.WatchEnabled {
 		t.Fatalf("unexpected watch status after successful background sync: %+v", status)
 	}
@@ -90,6 +98,14 @@ func TestWorkspaceReconcilerBacksOffAfterProbeError(t *testing.T) {
 
 	status := engine.WorkspaceStatus{DirectoryPath: "/tmp/project"}
 	reconciler.Decorate(&status)
+	for deadline := time.Now().Add(2 * time.Second); status.WatchRunning && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+		status = engine.WorkspaceStatus{DirectoryPath: "/tmp/project"}
+		reconciler.Decorate(&status)
+	}
+	if status.WatchRunning {
+		t.Fatalf("change probe result was not recorded within 2s: %+v", status)
+	}
 	if !status.WatchEnabled || !status.WatchScheduled {
 		t.Fatalf("failed probe should leave watch pending: %+v", status)
 	}
