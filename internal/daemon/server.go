@@ -315,6 +315,12 @@ func (s *Server) retrieve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "information_request is required")
 		return
 	}
+	// 与 MCP、异步任务和引擎同一套纯参数规则：非法 detail 或 artifact_kind
+	// 直接返回 400，不调用引擎。
+	if _, _, err := engine.NormalizeRetrievalOptions(req.Detail, req.ArtifactKind); err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
 	result, err := s.runRetrieve(r.Context(), req.DirectoryPath, req.ProviderProfileID, req.InformationRequest, req.FullResults, req.Detail, req.PathPrefix, req.ArtifactKind)
 	if err != nil {
 		writeUpstreamError(w, err)

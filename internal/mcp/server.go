@@ -707,7 +707,7 @@ func (s *Server) handleMultiRetrieval(ctx context.Context, id *json.RawMessage, 
 	if args.InformationRequest == "" {
 		return toolError(id, "information_request is required")
 	}
-	if err := validateArtifactKind(args.ArtifactKind); err != nil {
+	if _, _, err := engine.NormalizeRetrievalOptions(args.Detail, args.ArtifactKind); err != nil {
 		return toolError(id, err.Error())
 	}
 	paths, err := normalizeDirectoryPaths(args.DirectoryPaths)
@@ -822,7 +822,7 @@ func (s *Server) handleStartMultiRetrieval(ctx context.Context, id *json.RawMess
 	if args.InformationRequest == "" {
 		return toolError(id, "information_request is required")
 	}
-	if err := validateArtifactKind(args.ArtifactKind); err != nil {
+	if _, _, err := engine.NormalizeRetrievalOptions(args.Detail, args.ArtifactKind); err != nil {
 		return toolError(id, err.Error())
 	}
 	paths, err := normalizeDirectoryPaths(args.DirectoryPaths)
@@ -1035,18 +1035,13 @@ func normalizeRetrievalArgs(args *retrievalArgs) error {
 	if args.DirectoryPath == "" {
 		return fmt.Errorf("directory_path is required")
 	}
+	args.Detail = strings.TrimSpace(args.Detail)
 	args.ArtifactKind = strings.TrimSpace(args.ArtifactKind)
-	return validateArtifactKind(args.ArtifactKind)
-}
-
-// validateArtifactKind 在 wrapper 侧提前拒绝非法取值(异步任务也能在提交时
-// 报错,而不是等任务运行到引擎才失败);取值集合与引擎 parseArtifactKind 一致。
-func validateArtifactKind(value string) error {
-	switch value {
-	case "", "any", "code", "tests", "docs":
-		return nil
-	}
-	return fmt.Errorf("invalid artifact_kind %q; use any, code, tests or docs", value)
+	// detail 与 artifact_kind 按 engine.NormalizeRetrievalOptions 在 wrapper 侧
+	// 校验:同步检索不调用引擎、异步检索不提交任务就返回工具错误,规则与
+	// daemon、引擎相同。
+	_, _, err := engine.NormalizeRetrievalOptions(args.Detail, args.ArtifactKind)
+	return err
 }
 
 func validateMaxOutputLength(value int) error {
@@ -1252,9 +1247,9 @@ func retrievalTool() map[string]any {
 				"information_request": map[string]any{"type": "string", "description": informationRequestDescription},
 				"directory_path":      map[string]any{"type": "string", "description": "Absolute path of the workspace root to search."},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
-				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
+				"detail":              map[string]any{"type": "string", "enum": engine.DetailValues(), "description": detailDescription},
 				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
-				"artifact_kind":       map[string]any{"type": "string", "enum": []string{"any", "code", "tests", "docs"}, "description": artifactKindDescription},
+				"artifact_kind":       map[string]any{"type": "string", "enum": engine.ArtifactKindValues(), "description": artifactKindDescription},
 			},
 			"required": []string{"information_request", "directory_path"},
 		},
@@ -1274,9 +1269,9 @@ func multiRetrievalTool() map[string]any {
 					"items": map[string]any{"type": "string"},
 				},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
-				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
+				"detail":              map[string]any{"type": "string", "enum": engine.DetailValues(), "description": detailDescription},
 				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
-				"artifact_kind":       map[string]any{"type": "string", "enum": []string{"any", "code", "tests", "docs"}, "description": artifactKindDescription},
+				"artifact_kind":       map[string]any{"type": "string", "enum": engine.ArtifactKindValues(), "description": artifactKindDescription},
 			},
 			"required": []string{"information_request", "directory_paths"},
 		},
@@ -1308,9 +1303,9 @@ func startRetrievalTool() map[string]any {
 				"information_request": map[string]any{"type": "string", "description": informationRequestDescription},
 				"directory_path":      map[string]any{"type": "string"},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
-				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
+				"detail":              map[string]any{"type": "string", "enum": engine.DetailValues(), "description": detailDescription},
 				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
-				"artifact_kind":       map[string]any{"type": "string", "enum": []string{"any", "code", "tests", "docs"}, "description": artifactKindDescription},
+				"artifact_kind":       map[string]any{"type": "string", "enum": engine.ArtifactKindValues(), "description": artifactKindDescription},
 			},
 			"required": []string{"information_request", "directory_path"},
 		},
@@ -1330,9 +1325,9 @@ func startMultiRetrievalTool() map[string]any {
 					"items": map[string]any{"type": "string"},
 				},
 				"provider_profile_id": map[string]any{"type": "string", "description": "Optional provider profile ID (legacy engine only). Omit to use the daemon default provider state."},
-				"detail":              map[string]any{"type": "string", "enum": []string{"full", "paths"}, "description": detailDescription},
+				"detail":              map[string]any{"type": "string", "enum": engine.DetailValues(), "description": detailDescription},
 				"path_prefix":         map[string]any{"type": "string", "description": pathPrefixDescription},
-				"artifact_kind":       map[string]any{"type": "string", "enum": []string{"any", "code", "tests", "docs"}, "description": artifactKindDescription},
+				"artifact_kind":       map[string]any{"type": "string", "enum": engine.ArtifactKindValues(), "description": artifactKindDescription},
 			},
 			"required": []string{"information_request", "directory_paths"},
 		},

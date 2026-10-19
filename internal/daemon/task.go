@@ -889,6 +889,14 @@ func normalizeTaskRequest(req TaskRequest) (TaskRequest, error) {
 	default:
 		return TaskRequest{}, fmt.Errorf("unknown task kind: %s", req.Kind)
 	}
+	// 检索任务的 detail 与 artifact_kind 在接收时按 engine.NormalizeRetrievalOptions
+	// 校验：非法值返回请求类错误（HTTP 400），不生成任务、不调用引擎。同步任务
+	// 没有这两个参数的语义，不校验。
+	if req.Kind == TaskKindRetrieve || req.Kind == TaskKindMultiRetrieve {
+		if _, _, err := engine.NormalizeRetrievalOptions(req.Detail, req.ArtifactKind); err != nil {
+			return TaskRequest{}, err
+		}
+	}
 	if req.Kind == TaskKindMultiRetrieve {
 		paths, err := normalizeTaskDirectoryPaths(req.DirectoryPaths)
 		if err != nil {

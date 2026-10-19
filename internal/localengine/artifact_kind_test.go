@@ -51,20 +51,21 @@ func TestArtifactKindPathRules(t *testing.T) {
 }
 
 // TestParseArtifactKind:""/any 为不分组;三个类型原样接受;其余按请求类
-// 错误拒绝(daemon 面 400,MCP 面工具错误)。
+// 错误拒绝(daemon 面 400,MCP 面工具错误)。规则集中在
+// engine.NormalizeArtifactKind,引擎直接调用它。
 func TestParseArtifactKind(t *testing.T) {
 	for _, raw := range []string{"", "any", " any "} {
-		if got, err := parseArtifactKind(raw); err != nil || got != artifactAny {
+		if got, err := engine.NormalizeArtifactKind(raw); err != nil || got != artifactAny {
 			t.Fatalf("%q: want any, got %q err=%v", raw, got, err)
 		}
 	}
 	for _, raw := range []string{"code", "tests", "docs"} {
-		if got, err := parseArtifactKind(raw); err != nil || got != raw {
+		if got, err := engine.NormalizeArtifactKind(raw); err != nil || got != raw {
 			t.Fatalf("%q: want itself, got %q err=%v", raw, got, err)
 		}
 	}
 	for _, raw := range []string{"test", "documentation", "CODE", "*"} {
-		_, err := parseArtifactKind(raw)
+		_, err := engine.NormalizeArtifactKind(raw)
 		if err == nil || !engine.IsInvalidRequest(err) {
 			t.Fatalf("%q: should be rejected as invalid request, got %v", raw, err)
 		}

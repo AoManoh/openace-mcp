@@ -426,9 +426,10 @@ type retrieval struct {
 //   - RetrievalMode 恒填写本次实际执行的检索链路，纯词法成功也显式为
 //     lexical；覆盖率、原因与质量字段按本次检索填写，没有时为空并省略。
 func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.Result, error) {
-	// detail 是纯参数，在同步、建索引和查询嵌入之前校验：非法值不应先产生
-	// 模型请求再报错。调用本方法的单仓、多仓与异步任务入口都经过这里。
-	detail, err := parseDetail(req.Detail)
+	// detail 与 artifact_kind 是纯参数，按 engine.NormalizeRetrievalOptions 在
+	// 同步、建索引和查询嵌入之前校验：非法值不应先产生模型请求再报错。MCP
+	// 与 daemon 在接收请求时已用同一规则校验，这里覆盖直接调用本方法的入口。
+	detail, _, err := engine.NormalizeRetrievalOptions(req.Detail, req.ArtifactKind)
 	if err != nil {
 		return engine.Result{}, err
 	}
@@ -617,6 +618,11 @@ func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, dep
 	if err := rejectProfileID(req.Workspace); err != nil {
 		return RouteCandidates{}, err
 	}
+	// 与 Search 用同一套纯参数规则：非法 detail 或 artifact_kind 在同步与模型
+	// 请求之前拒绝，即使这里不渲染、不分组，也不接受 Search 会拒绝的请求。
+	if _, _, err := engine.NormalizeRetrievalOptions(req.Detail, req.ArtifactKind); err != nil {
+		return RouteCandidates{}, err
+	}
 	query := strings.TrimSpace(req.Query)
 	if query == "" {
 		return RouteCandidates{}, engine.AsInvalidRequest(errors.New("查询内容为空"))
@@ -694,7 +700,7 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	if err != nil {
 		return retrieval{}, err
 	}
-	artifact, err := parseArtifactKind(req.ArtifactKind)
+	artifact, err := engine.NormalizeArtifactKind(req.ArtifactKind)
 	if err != nil {
 		return retrieval{}, err
 	}
@@ -1309,25 +1315,14 @@ func anchorWithinWindow(ids []string, anchor string, window int) []string {
 // 产物类型（artifact kind）：只按路径的固定规则把候选分为代码、测试、文档
 // 三类，供调用方经 SearchRequest.ArtifactKind 明示意图时分组输出。引擎不
 // 从查询推断意图，分类也不参与打分。
+// 取值定义在 internal/engine（engine.ArtifactKindValues），这里只是本包内的
+// 短名，不另列一份。
 const (
-	artifactAny   = "any"
-	artifactCode  = "code"
-	artifactTests = "tests"
-	artifactDocs  = "docs"
+	artifactAny   = engine.ArtifactAny
+	artifactCode  = engine.ArtifactCode
+	artifactTests = engine.ArtifactTests
+	artifactDocs  = engine.ArtifactDocs
 )
-
-// parseArtifactKind 校验请求的产物类型：空或 any 表示不分组；code、tests、
-// docs 原样接受；其他值按请求类错误拒绝（daemon 返回 400，MCP 返回工具
-// 错误），不悄悄按 any 处理。
-func parseArtifactKind(raw string) (string, error) {
-	switch strings.TrimSpace(raw) {
-	case "", artifactAny:
-		return artifactAny, nil
-	case artifactCode, artifactTests, artifactDocs:
-		return strings.TrimSpace(raw), nil
-	}
-	return "", engine.AsInvalidRequest(fmt.Errorf("invalid artifact_kind %q; use any, code, tests or docs", raw))
-}
 
 // artifactKind 按相对路径判定产物类型，规则按顺序匹配，先命中先返回：
 //   - tests：路径中有 test、tests、spec、__tests__、testdata 目录段；或文件名
@@ -1643,22 +1638,11 @@ const rerankBoundaryMarker = "-- results below were not reranked (fused order) -
 
 // 输出详略模式。full：前 FullResults 个候选块带正文，其余只给头行；paths：
 // 全部候选只给 `## path:start-end symbol` 头行，内容由调用方按需 Read。
+// 取值定义在 internal/engine（engine.DetailValues），这里只是本包内的短名。
 const (
-	detailFull  = "full"
-	detailPaths = "paths"
+	detailFull  = engine.DetailFull
+	detailPaths = engine.DetailPaths
 )
-
-// parseDetail 校验 detail 参数：空值按 full；full、paths 原样接受；其他值
-// 按请求类错误拒绝（daemon 返回 400），不悄悄按默认处理。
-func parseDetail(raw string) (string, error) {
-	switch strings.TrimSpace(raw) {
-	case "", detailFull:
-		return detailFull, nil
-	case detailPaths:
-		return detailPaths, nil
-	}
-	return "", engine.AsInvalidRequest(fmt.Errorf("invalid detail %q; use full or paths", raw))
-}
 
 // renderedResult 是渲染产物：正文、结构化 hits 清单（每个合并后的块一条）
 // 与展示统计。候选有多少、展示了多少、几个带正文，调用方从统计字段就能

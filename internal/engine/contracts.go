@@ -79,7 +79,9 @@ type SearchRequest struct {
 	// wrapper 翻译为负值传入)。
 	FullResults int
 	// Detail 是输出详略:""/"full"=前 FullResults 个候选带正文、其余头行;
-	// "paths"=全部只回 path:range 头行,内容由调用方按需 Read。
+	// "paths"=全部只回 path:range 头行,内容由调用方按需 Read。首尾空白去掉
+	// 后比较,大小写不折叠;非法取值按 NormalizeRetrievalOptions 以请求类错误
+	// 拒绝,MCP、daemon、异步任务提交与引擎入口共用这一规则。
 	Detail string
 	// PathPrefix 可选索引相对路径前缀(如 internal/localengine):
 	// 融合后/rerank 前过滤候选,用于 repo_map 定向后的子树检索。
@@ -87,7 +89,9 @@ type SearchRequest struct {
 	// ArtifactKind 是调用方明示的产物类型:""/"any"=不分组(现行为);
 	// "code"/"tests"/"docs"=精排之后把该类型候选按原相对顺序排到最前,其余
 	// 候选原序跟随,不丢弃任何候选。类型按路径机械规则判定(见
-	// localengine.artifactKind),不做意图推断。非法取值按请求类错误拒绝。
+	// localengine.artifactKind),不做意图推断。合法取值见 ArtifactKindValues,
+	// 首尾空白去掉后比较,大小写不折叠;非法取值按 NormalizeRetrievalOptions
+	// 以请求类错误拒绝。
 	// 依据:2026-09-03 D1 H1 实验——django 400 条"找实现"查询,精排把测试/
 	// 文档排在实现之上,前五命中率因此低 8.75pp;伤害在精排窗口之内,只需
 	// 输出层按类型分组即可拿回。
