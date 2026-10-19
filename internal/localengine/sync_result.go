@@ -1,8 +1,6 @@
 package localengine
 
 import (
-	"strings"
-
 	"github.com/AoManoh/openace-mcp/internal/engine"
 	"github.com/AoManoh/openace-mcp/internal/index"
 )
@@ -18,8 +16,9 @@ import (
 //   - RetrievalMode 说明这个 revision 已建立的检索能力，不表示执行过查询或
 //     精排：未配置语义或 revision 没有任何向量时为 lexical，有向量时为
 //     hybrid。
-//   - 配置了语义时携带覆盖率；覆盖不完整给出 semantic-coverage-partial，
-//     revision 记录了迁移暂停原因时再追加 semantic-migration-blocked。
+//   - 配置了语义时携带覆盖率；原因来自 manifestGaps（与同步、查询的政策
+//     判定同源）：覆盖不完整为 semantic-coverage-partial，revision 记录了
+//     迁移暂停原因时再追加 semantic-migration-blocked。
 //
 // Added、BuildMode、CrossProfileReused 只在发布新 revision 时由调用方填写。
 func (e *Engine) revisionResult(manifest, previous *index.Manifest) engine.Result {
@@ -37,14 +36,7 @@ func (e *Engine) revisionResult(manifest, previous *index.Manifest) engine.Resul
 		result.RetrievalMode = "hybrid"
 	}
 	result.SemanticCoverage = coveragePercent(manifest)
-	var reasons []string
-	if !manifest.SemanticComplete() {
-		reasons = append(reasons, "semantic-coverage-partial")
-	}
-	if manifest.SemanticMigrationBlock != "" {
-		reasons = append(reasons, migrationBlockedReason)
-	}
-	result.DegradedReason = strings.Join(reasons, ",")
+	result.DegradedReason = gapReasons(e.manifestGaps(manifest))
 	return result
 }
 

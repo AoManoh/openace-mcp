@@ -599,15 +599,20 @@ func (e *Engine) DumpChunkRecords(ctx context.Context, ref engine.WorkspaceRef, 
 type RouteCandidates struct {
 	Lex   []CandidateRef
 	Dense []CandidateRef
-	// Reasons 是语义路的降级原因。Dense 为 nil 且 Reasons 为空表示语义路
-	// 未配置，或当前 revision 没有任何向量。
+	// Reasons 是本次候选的降级原因：所持 revision 的覆盖不足或迁移暂停
+	// 原因在前，语义路自身的原因在后。Dense 为 nil 且 Reasons 为空表示语义
+	// 路未配置，或当前 revision 没有任何 chunk；revision 有 chunk 却没有任何
+	// 向量时，Dense 为 nil，Reasons 含 semantic-coverage-partial。
 	Reasons []string
 }
 
 // SearchRoutes 返回融合前的两路候选，每路深度为 depth（≤0 时取
 // hybridRouteTopK），不融合、不精排、不渲染。句柄获取与存活过滤与
 // retrieve 相同；同步失败时直接返回错误，不像 retrieve 那样降级服务旧
-// revision。语义路的致命错误（ctx 取消或 deny 模式拒绝）原样返回。
+// revision。所持 revision 的 manifest 已能说明的缺口（manifestGaps：覆盖
+// 不足、迁移暂停）在召回与查询嵌入之前按 policyError 判定：deny 或 strict
+// 时返回错误，allow 时写进 Reasons。这里不做精排，不判定精排类原因。语义
+// 路的致命错误（ctx 取消或政策拒绝）原样返回。
 func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, depth int) (RouteCandidates, error) {
 	if err := rejectProfileID(req.Workspace); err != nil {
 		return RouteCandidates{}, err
@@ -631,6 +636,10 @@ func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, dep
 		return RouteCandidates{}, err
 	}
 	defer e.releaseHandle(handle)
+	revisionGaps := e.manifestGaps(handle.manifest)
+	if err := e.policyError(revisionGaps); err != nil {
+		return RouteCandidates{}, err
+	}
 
 	// 两路与 retrieve 用同一套候选规则（lexicalCandidates、denseRoute）：
 	// 词法路应用查询规划，按存活且不重复的 ID 计数；dense 路用原查询。
@@ -652,11 +661,11 @@ func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, dep
 		}
 	}
 	if e.semanticEnabled() {
-		denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, depth, nil, "")
+		denseIDs, denseGaps, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, depth, nil, "")
 		if denseErr != nil {
 			return RouteCandidates{}, denseErr
 		}
-		out.Reasons = reasons
+		out.Reasons = gapReasonList(append(revisionGaps, denseGaps...))
 		if denseIDs != nil {
 			out.Dense = make([]CandidateRef, 0, len(denseIDs))
 			for _, id := range denseIDs {
@@ -691,22 +700,21 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	}
 	timings := &engine.RetrievalTimings{}
 	started := time.Now()
-	handle, workspaceKey, syncResult, reasons, err := e.acquireQueryHandle(ctx, req.Workspace)
+	handle, workspaceKey, syncResult, gaps, err := e.acquireQueryHandle(ctx, req.Workspace)
 	timings.SyncMs = time.Since(started).Milliseconds()
 	if err != nil {
 		return retrieval{}, err
 	}
-	// 所服务 revision 记录的语义迁移暂停原因（见 siblingPaidStateFor）：检索
-	// 带上原因；deny 时与其他语义路失败一样返回可行动错误；strict 由
-	// checkQualityStrict 按原因报错。原因随 revision 持久化，重启后走首触快
-	// 路径服务旧 revision 时同样可见。
-	if reason := handle.manifest.SemanticMigrationBlock; reason != "" {
-		if e.retrievalDegrade == DegradeDeny {
-			e.releaseHandle(handle)
-			return retrieval{}, degradeDeniedError(migrationBlockedReason, errors.New(reason), EnvRetrievalDegrade)
-		}
-		reasons = append(reasons, migrationBlockedReason)
+	// 所服务 revision 的 manifest 已能说明的缺口（语义覆盖不足、迁移暂停原因，
+	// 见 manifestGaps）在词法召回与查询嵌入之前按政策判定：deny 或 strict
+	// 拒绝时不发出任何模型请求；放行时原因随结果返回。原因随 revision 持久
+	// 化，重启后走首触快路径服务旧 revision 时同样可见。
+	revisionGaps := e.manifestGaps(handle.manifest)
+	if err := e.policyError(revisionGaps); err != nil {
+		e.releaseHandle(handle)
+		return retrieval{}, err
 	}
+	gaps = append(gaps, revisionGaps...)
 
 	lexStart := time.Now()
 	lexHits, planLabel, err := e.lexicalRoute(ctx, handle, query, pathPrefix)
@@ -715,12 +723,12 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		e.releaseHandle(handle)
 		return retrieval{}, err
 	}
-	ordered, mode, coverage, fuseReasons, err := e.fuseRoutes(ctx, workspaceKey, handle, query, lexHits, timings, pathPrefix)
+	ordered, mode, coverage, denseGaps, err := e.fuseRoutes(ctx, workspaceKey, handle, query, lexHits, timings, pathPrefix)
 	if err != nil {
 		e.releaseHandle(handle)
 		return retrieval{}, err
 	}
-	reasons = append(reasons, fuseReasons...)
+	gaps = append(gaps, denseGaps...)
 	if pathPrefix != "" {
 		// path_prefix 已在词法与语义两路召回时下推过滤，正常情况下这里
 		// 一个候选也不会被去掉。保留这一步是为了在词法锚或融合实现改动
@@ -739,7 +747,7 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	rerankSent := 0
 	if e.rerankClient != nil && len(ordered) > 0 {
 		rerankStart := time.Now()
-		reordered, applied, sent, rerankReason, rerankErr := e.rerankOrder(ctx, handle, query, ordered)
+		reordered, applied, sent, rerankGaps, rerankErr := e.rerankOrder(ctx, handle, query, ordered)
 		timings.RerankMs = time.Since(rerankStart).Milliseconds()
 		if rerankErr != nil {
 			e.releaseHandle(handle)
@@ -751,16 +759,15 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 			rerankApplied = true
 			rerankSent = sent
 		}
-		if rerankReason != "" {
-			reasons = append(reasons, rerankReason)
-		}
+		gaps = append(gaps, rerankGaps...)
 	} else if e.semanticEnabled() && !e.rerankCfg.Enabled && e.rerankCfg.ProviderType != rerank.ProviderOff {
 		// 配置了 embedding 却没有配置 rerank（地址与模型都没给，而不是显式设为
 		// off）：结果按 RRF 融合序返回，但追加 rerank-unconfigured 原因进
-		// [DEGRADED] 横幅，让用户知道精排没有生效；OPENACE_QUALITY_STRICT=on 时
-		// checkQualityStrict 会把它升级为报错。显式 off 表示用户主动放弃精排，
-		// 不提示。未配置 embedding 的纯词法路径不进此分支。
-		reasons = append(reasons, "rerank-unconfigured(quality-first default; set "+rerank.EnvBaseURL+" and "+rerank.EnvModel+" (+ "+rerank.EnvAPIKey+"), or "+rerank.EnvAdapter+"=off to opt out)")
+		// [DEGRADED] 横幅，让用户知道精排没有生效；只有
+		// OPENACE_QUALITY_STRICT=on 会把它升级为报错，两个 deny 都不把“未配置”
+		// 当作调用失败。显式 off 表示用户主动放弃精排，不提示。未配置
+		// embedding 的纯词法路径不进此分支。
+		gaps = append(gaps, qualityGap{reason: "rerank-unconfigured(quality-first default; set " + rerank.EnvBaseURL + " and " + rerank.EnvModel + " (+ " + rerank.EnvAPIKey + "), or " + rerank.EnvAdapter + "=off to opt out)"})
 	}
 	// 碎片过滤是实验性开关：只在程序化 Options 开启 fragmentGate 时去掉行
 	// 窗口切分产生的纯日期、纯符号碎片块；生产环境没有对应 env，默认关闭，
@@ -781,6 +788,18 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		planLabel += "artifact_kind=" + artifact
 	}
 
+	// 最终判定与提前判定用同一个 policyError。配置了精排、有候选却没有生效
+	// 且没有对应精排原因时，追加 rerank-not-applied，只有 strict 据此拒绝，
+	// 不写进返回的原因。
+	finalGaps := gaps
+	if e.rerankClient != nil && !rerankApplied && len(ordered) > 0 && !hasRerankGap(gaps) {
+		finalGaps = append(append([]qualityGap(nil), gaps...), qualityGap{reason: "rerank-not-applied"})
+	}
+	if err := e.policyError(finalGaps); err != nil {
+		e.releaseHandle(handle)
+		return retrieval{}, err
+	}
+	reasons := gapReasonList(gaps)
 	out := retrieval{
 		handle: handle, ordered: ordered, mode: mode,
 		reasons: reasons, coverage: coverage, syncResult: syncResult,
@@ -790,26 +809,22 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		timings:          timings,
 		started:          started,
 	}
-	if err := e.checkQualityStrict(reasons, rerankApplied, len(ordered) > 0); err != nil {
-		e.releaseHandle(handle)
-		return retrieval{}, err
-	}
 	return out, nil
 }
 
 // acquireQueryHandle 完成查询前置：经 syncWorkspaceForQuery 按需同步（可能
 // 受 OPENACE_QUERY_BUILD_WAIT 限制等待时长），解析工作区键并取得当前
-// revision 的句柄。返回的 reasons 是本步产生的降级原因。
+// revision 的句柄。返回的缺口是本步产生的降级原因。
 //   - 同步成功：正常返回句柄与同步结果。
 //   - 同步失败且没有任何可用 revision：返回同步错误。
-//   - 同步失败但有可用 revision：OPENACE_RETRIEVAL_DEGRADE=allow（默认）时
-//     用旧索引服务并追加原因——一般失败记 stale-index，等待在建构建超时
-//     记 index-building，首次触达后台刷新记 index-refreshing；deny 时释放
-//     句柄并返回带恢复提示的错误。
+//   - 同步失败但有可用 revision：一般失败记 stale-index，等待在建构建超时
+//     记 index-building，首次触达后台刷新记 index-refreshing；按 policyError
+//     判定，OPENACE_RETRIEVAL_DEGRADE=allow（默认）且未开 strict 时用旧索引
+//     服务并带上原因，否则释放句柄并返回带恢复提示的错误。
 //   - ctx 已取消：原样返回 ctx 错误。
 //
 // 错误路径不持有句柄。
-func (e *Engine) acquireQueryHandle(ctx context.Context, ref engine.WorkspaceRef) (*revisionHandle, string, engine.Result, []string, error) {
+func (e *Engine) acquireQueryHandle(ctx context.Context, ref engine.WorkspaceRef) (*revisionHandle, string, engine.Result, []qualityGap, error) {
 	// 检索前先确保索引就绪，查询本身触发按需同步。
 	syncResult, syncErr := e.syncWorkspaceForQuery(ctx, ref)
 	if syncErr != nil && ctx.Err() != nil {
@@ -820,7 +835,7 @@ func (e *Engine) acquireQueryHandle(ctx context.Context, ref engine.WorkspaceRef
 		return nil, "", engine.Result{}, nil, err
 	}
 	handle, handleErr := e.acquireHandle(workspaceKey)
-	var reasons []string
+	var gaps []qualityGap
 	if syncErr != nil {
 		if handleErr != nil {
 			return nil, "", engine.Result{}, nil, syncErr
@@ -835,16 +850,17 @@ func (e *Engine) acquireQueryHandle(ctx context.Context, ref engine.WorkspaceRef
 			// deny 与 strict 配置在 syncWorkspaceForQuery 入口就不走这条路。
 			reason, label = "index-refreshing", "first-touch refresh in background"
 		}
-		if e.retrievalDegrade == DegradeDeny {
+		gap := qualityGap{reason: reason, detail: fmt.Errorf("%s: %w", label, syncErr)}
+		if err := e.policyError([]qualityGap{gap}); err != nil {
 			e.releaseHandle(handle)
-			return nil, "", engine.Result{}, nil, degradeDeniedError(label, syncErr, EnvRetrievalDegrade)
+			return nil, "", engine.Result{}, nil, err
 		}
-		reasons = append(reasons, reason)
+		gaps = append(gaps, gap)
 		syncResult = engine.Result{Engine: EngineID, FileCount: handle.manifest.Counts.Files}
 	} else if handleErr != nil {
 		return nil, "", engine.Result{}, nil, handleErr
 	}
-	return handle, workspaceKey, syncResult, reasons, nil
+	return handle, workspaceKey, syncResult, gaps, nil
 }
 
 // lexicalRoute 执行词法召回，返回存活命中、查询规划标签与错误。不负责
@@ -895,17 +911,18 @@ func (e *Engine) lexicalCandidates(ctx context.Context, handle *revisionHandle, 
 }
 
 // fuseRoutes 把词法命中与语义召回融合成最终候选序，返回（候选序、模式、
-// 覆盖率、降级原因、错误）。不负责句柄释放。
+// 覆盖率、语义路缺口、错误）。不负责句柄释放。
 //   - 未配置语义路：直接返回词法序，score 保留真实 BM25 分数，模式为
 //     lexical，覆盖率为空；渲染结果与纯词法版本完全一致。
 //   - 配置了语义路且 dense 召回执行成功（返回的候选切片非 nil，哪怕为
 //     空）：按 fusionParams 做加权 RRF 融合，再用 anchorWithinWindow 把词法
 //     首位放进精排窗口（词法锚，理由见函数体内注释），模式为 hybrid。
 //   - 配置了语义路但 dense 未执行（向量不可用、覆盖为空、查询嵌入失败）：
-//     按词法序输出，模式仍为 lexical，降级原因由 denseRoute 给出。
-//   - 语义覆盖不完整时追加 semantic-coverage-partial 原因。
-//   - denseRoute 的致命错误（ctx 取消或 deny 拒绝）原样返回。
-func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, lexHits []lexical.Hit, timings *engine.RetrievalTimings, pathPrefix string) ([]rankedHit, string, string, []string, error) {
+//     按词法序输出，模式仍为 lexical，缺口由 denseRoute 给出。
+//   - 覆盖不完整的原因由 retrieve 在召回前按 manifest 给出（manifestGaps），
+//     这里只返回覆盖率。
+//   - denseRoute 的致命错误（ctx 取消或政策拒绝）原样返回。
+func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, lexHits []lexical.Hit, timings *engine.RetrievalTimings, pathPrefix string) ([]rankedHit, string, string, []qualityGap, error) {
 	if !e.semanticEnabled() {
 		ordered := make([]rankedHit, 0, len(lexHits))
 		for _, hit := range lexHits {
@@ -913,7 +930,7 @@ func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *re
 		}
 		return ordered, "lexical", "", nil, nil
 	}
-	denseIDs, reasons, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, hybridRouteTopK, timings, pathPrefix)
+	denseIDs, gaps, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, hybridRouteTopK, timings, pathPrefix)
 	if denseErr != nil {
 		return nil, "", "", nil, denseErr
 	}
@@ -958,32 +975,7 @@ func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *re
 			ordered[i].source = fusion.SourceLexical
 		}
 	}
-	coverage := coveragePercent(handle.manifest)
-	if !handle.manifest.SemanticComplete() {
-		reasons = append(reasons, "semantic-coverage-partial")
-	}
-	return ordered, mode, coverage, reasons, nil
-}
-
-// checkQualityStrict 实现 OPENACE_QUALITY_STRICT=on 的检查：语义链路有任何
-// 缺口就返回错误，而不是带降级横幅放行。缺口包括每一条降级原因（覆盖
-// 不完整、查询嵌入失败、精排跳过、索引陈旧、向量不可用等），以及配置了
-// rerank、有候选却未生效且没有对应 rerank-skipped 原因的情况（记为
-// rerank-not-applied）。错误文本列出全部缺口 token 与 env 名，调用方据此
-// 定位。未开启 strict 时不做任何事。
-func (e *Engine) checkQualityStrict(reasons []string, rerankApplied bool, hasCandidates bool) error {
-	if !e.qualityStrict {
-		return nil
-	}
-	violations := append([]string(nil), reasons...)
-	if e.rerankClient != nil && !rerankApplied && hasCandidates && !containsRerankReason(reasons) {
-		violations = append(violations, "rerank-not-applied")
-	}
-	if len(violations) > 0 {
-		return fmt.Errorf("%s=on: 语义质量缺口 [%s],拒绝返回不完整结果(改用 %s=off 可降级放行)",
-			EnvQualityStrict, strings.Join(violations, ","), EnvQualityStrict)
-	}
-	return nil
+	return ordered, mode, coveragePercent(handle.manifest), gaps, nil
 }
 
 // hasQueryEmbedFailure 判定降级原因中是否含查询嵌入失败，结果进入
@@ -997,11 +989,11 @@ func hasQueryEmbedFailure(reasons []string) bool {
 	return false
 }
 
-// containsRerankReason 判定 reasons 是否已含 rerank-skipped 原因；已含时
-// checkQualityStrict 不再追加 rerank-not-applied，同一缺口只报一次。
-func containsRerankReason(reasons []string) bool {
-	for _, r := range reasons {
-		if strings.HasPrefix(r, "rerank-skipped") {
+// hasRerankGap 判定缺口里是否已有 rerank-skipped 原因；已有时不再追加
+// rerank-not-applied，同一缺口只报一次。
+func hasRerankGap(gaps []qualityGap) bool {
+	for _, gap := range gaps {
+		if strings.HasPrefix(gap.reason, "rerank-skipped") {
 			return true
 		}
 	}
@@ -1064,16 +1056,16 @@ func filterRankedByPathPrefix(handle *revisionHandle, ordered []rankedHit, prefi
 }
 
 // denseRoute 执行语义召回，返回最多 depth 个 dense 候选 ID（nil 表示语义
-// 路未执行）、降级原因与致命错误。
+// 路未执行）、缺口与致命错误。缺口按 policyError 判定，deny 或 strict 拒绝
+// 时直接返回错误，不再发出后续的模型请求。
 //   - 向量行数超过用户配置的内存预算：不标记修复（重建也超预算，没有
-//     用）；OPENACE_RETRIEVAL_DEGRADE=deny 时报错，allow 时记
-//     vector-envelope-exceeded 并只用词法结果。
-//   - 向量文件损坏或缺失：登记该工作区下次同步强制重建向量，deny 报错，
-//     allow 记 vector-data-unavailable。
+//     用）；记 vector-envelope-exceeded，放行时只用词法结果。
+//   - 向量文件损坏或缺失：登记该工作区下次同步强制重建向量，记
+//     vector-data-unavailable。
 //   - revision 一个向量也没有（例如 provider 长期故障后发布的零覆盖
-//     revision）：返回 nil 且不记原因，覆盖缺口由 fuseRoutes 按 manifest
-//     的覆盖率如实上报。
-//   - 查询嵌入失败：ctx 已取消则返回 ctx 错误；deny 报错；allow 记
+//     revision）：返回 nil 且不记原因，覆盖缺口由调用方（retrieve 与
+//     SearchRoutes）经 manifestGaps 按 manifest 如实上报。
+//   - 查询嵌入失败：ctx 已取消则返回 ctx 错误；否则记
 //     query-embedding-failed(失败类别)。
 //   - 正常路径：每个 segment 各做一次精确（非近似）检索，选择阶段就用
 //     candidatePredicate 跳过已删除或已被覆盖的 chunk 与 pathPrefix 之外的
@@ -1084,25 +1076,22 @@ func filterRankedByPathPrefix(handle *revisionHandle, ordered []rankedHit, prefi
 //     depth：全局去重后的前 depth 个 ID 中，每个 ID 在它最高分所在的段里
 //     排名也在前 depth 之内，所以每段取 depth 个再去重不会漏掉候选。
 //
-// 只有 ctx 取消、deny 拒绝与向量检索本身出错才返回 error。
-func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, depth int, timings *engine.RetrievalTimings, pathPrefix string) ([]string, []string, error) {
+// 只有 ctx 取消、政策拒绝与向量检索本身出错才返回 error。
+func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, depth int, timings *engine.RetrievalTimings, pathPrefix string) ([]string, []qualityGap, error) {
 	ixs, loadErr := handle.vectorIndexes(e.embedCfg.Dimension)
 	if loadErr != nil {
-		if errors.Is(loadErr, vector.ErrEnvelopeExceeded) {
-			// 超出内存预算是配置与规模的关系，重建向量文件改变不了行数，
-			// 因此不标记修复。
-			if e.retrievalDegrade == DegradeDeny {
-				return nil, nil, degradeDeniedError("semantic path unavailable", loadErr, EnvRetrievalDegrade)
-			}
-			return nil, []string{"vector-envelope-exceeded"}, nil
+		reason := "vector-envelope-exceeded"
+		if !errors.Is(loadErr, vector.ErrEnvelopeExceeded) {
+			// 向量文件损坏或缺失：登记该工作区，下次同步强制重建向量。超出
+			// 内存预算是配置与规模的关系，重建改变不了行数，因此不登记。
+			reason = "vector-data-unavailable"
+			e.markVectorRepair(workspaceKey)
 		}
-		// 向量文件损坏或缺失：登记该工作区，下次同步强制重建向量；本次
-		// 只用词法结果并如实上报。
-		e.markVectorRepair(workspaceKey)
-		if e.retrievalDegrade == DegradeDeny {
-			return nil, nil, degradeDeniedError("semantic path unavailable", loadErr, EnvRetrievalDegrade)
+		gaps := []qualityGap{{reason: reason, detail: fmt.Errorf("semantic path unavailable: %w", loadErr)}}
+		if err := e.policyError(gaps); err != nil {
+			return nil, nil, err
 		}
-		return nil, []string{"vector-data-unavailable"}, nil
+		return nil, gaps, nil
 	}
 	total := 0
 	for _, ix := range ixs {
@@ -1110,8 +1099,8 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 	}
 	if total == 0 {
 		// 一个向量也没有（如 provider 长期故障后发布的零覆盖 revision）：
-		// 语义路没有候选可召回，覆盖缺口由 fuseRoutes 按 manifest 如实上报，
-		// 这里不重复记原因。
+		// 语义路没有候选可召回，覆盖缺口由调用方经 manifestGaps 按 manifest
+		// 如实上报，这里不重复记原因。
 		return nil, nil, nil
 	}
 	embedStart := time.Now()
@@ -1123,10 +1112,11 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
-		if e.retrievalDegrade == DegradeDeny {
-			return nil, nil, degradeDeniedError("query embedding failed", embedErr, EnvRetrievalDegrade)
+		gaps := []qualityGap{{reason: "query-embedding-failed(" + failureClass(embedErr) + ")", detail: fmt.Errorf("query embedding failed: %w", embedErr)}}
+		if err := e.policyError(gaps); err != nil {
+			return nil, nil, err
 		}
-		return nil, []string{"query-embedding-failed(" + failureClass(embedErr) + ")"}, nil
+		return nil, gaps, nil
 	}
 	vectorStart := time.Now()
 	allow := candidatePredicate(handle, pathPrefix)
@@ -1165,20 +1155,22 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 }
 
 // rerankOrder 把 ordered 的头部送给 rerank provider 精排，返回（新序、是否
-// 生效、实际送审数、降级原因、错误）。任何路径下候选都不重复、不丢失。
+// 生效、实际送审数、缺口、错误）。任何路径下候选都不重复、不丢失。缺口按
+// policyError 判定，OPENACE_RERANK_DEGRADE=deny 或 strict 拒绝时返回错误。
 //   - 送审集是前 rerankHeadLimit 个候选，rerank 客户端再按
 //     OPENACE_RERANK_MAX_TOKENS 估算截断，实际送审数为 sent；未送审的候选
 //     按原序跟在精排结果之后。
 //   - 头部里不在存活集的候选（防御性路径，正常不发生）不送审、原位保留；
 //     docs 与送审候选逐项对应，避免错位造成条目重复或丢失。
-//   - provider 调用失败：ctx 已取消返回 ctx 错误；
-//     OPENACE_RERANK_DEGRADE=deny 返回带恢复提示的错误；allow 返回
-//     rerank-skipped(失败类别)，调用方保留融合序。sent 为 0（token 预算
-//     连第一条都装不下）记 rerank-skipped(token-budget)。
+//   - provider 调用失败或响应无效：ctx 已取消返回 ctx 错误；否则记
+//     rerank-skipped(失败类别)，放行时调用方保留融合序。
+//   - sent 为 0（token 预算连第一条都装不下）记 rerank-skipped(token-budget)，
+//     说明里写明 OPENACE_RERANK_MAX_TOKENS 的取值。至少送审一条时是有效精排，
+//     未送审的候选按原序跟随，不算缺口。
 //   - 已送审但 provider 未返回的候选按原序补回并记 rerank-partial-response
 //     （见 rerankAssembleOrder）。
 //   - 生效时每条候选带上 reranked/rerankScore/source。
-func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query string, ordered []rankedHit) ([]rankedHit, bool, int, string, error) {
+func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query string, ordered []rankedHit) ([]rankedHit, bool, int, []qualityGap, error) {
 	head := rerankHeadLimit
 	if head > len(ordered) {
 		head = len(ordered)
@@ -1193,7 +1185,7 @@ func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query 
 		}
 		record, err := handle.record(hit.id)
 		if err != nil {
-			return nil, false, 0, "", err
+			return nil, false, 0, nil, err
 		}
 		docs = append(docs, rerank.Document{ID: hit.id, Text: rerankDocText(record)})
 		included = append(included, hit)
@@ -1201,24 +1193,32 @@ func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query 
 	hits, sent, err := e.rerankClient.Rerank(ctx, query, docs)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, false, 0, "", ctx.Err()
+			return nil, false, 0, nil, ctx.Err()
 		}
-		if e.rerankDegrade == DegradeDeny {
-			return nil, false, 0, "", degradeDeniedError("rerank failed", err, EnvRerankDegrade)
+		gaps := []qualityGap{{reason: "rerank-skipped(" + failureClass(err) + ")", detail: fmt.Errorf("rerank failed: %w", err)}}
+		if perr := e.policyError(gaps); perr != nil {
+			return nil, false, 0, nil, perr
 		}
-		return nil, false, 0, "rerank-skipped(" + failureClass(err) + ")", nil
+		return nil, false, 0, gaps, nil
 	}
 	if sent == 0 {
-		return nil, false, 0, "rerank-skipped(token-budget)", nil
+		gaps := []qualityGap{{reason: "rerank-skipped(token-budget)", detail: fmt.Errorf("%s=%d cannot fit the first rerank candidate", rerank.EnvMaxTokens, e.rerankCfg.MaxTokens)}}
+		if perr := e.policyError(gaps); perr != nil {
+			return nil, false, 0, nil, perr
+		}
+		return nil, false, 0, gaps, nil
 	}
 	ids, missing := rerankAssembleOrder(hits, included, sent, skippedHead, ordered[head:])
-	reason := ""
+	var gaps []qualityGap
 	if missing > 0 {
 		// rerank 客户端已把条数与送审集不一致的响应整体按 malformed 拒绝，
 		// 正常路径 missing 恒为 0。此分支只在那道校验被绕过时生效：候选
 		// 已按原序补回，但精排只覆盖了部分送审集，必须上报，不得当成完
 		// 整精排返回。
-		reason = "rerank-partial-response"
+		gaps = []qualityGap{{reason: "rerank-partial-response", detail: fmt.Errorf("rerank provider returned %d of %d sent candidates", sent-missing, sent)}}
+		if perr := e.policyError(gaps); perr != nil {
+			return nil, false, 0, nil, perr
+		}
 	}
 	// 逐条标记：ids 的前 len(hits) 项是 provider 实际打分并返回的候选，
 	// 其后是按原序补回或跟随的未精排项；融合来源从原候选带过来。
@@ -1234,7 +1234,7 @@ func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query 
 			final[i].rerankScore = hits[i].Score
 		}
 	}
-	return final, true, sent, reason, nil
+	return final, true, sent, gaps, nil
 }
 
 // rerankAssembleOrder 组装精排后的最终 ID 序，依次为：provider 返回的重排

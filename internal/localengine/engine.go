@@ -494,7 +494,7 @@ func (e *Engine) Sync(ctx context.Context, req engine.SyncRequest) (engine.Resul
 	if err != nil {
 		return res, err
 	}
-	return res, e.syncMigrationPolicy(manifest)
+	return res, e.syncPolicy(manifest)
 }
 
 // SyncBackground 实现 engine.BackgroundSyncer，与 Sync 走同一路径。
@@ -503,32 +503,26 @@ func (e *Engine) SyncBackground(ctx context.Context, req engine.SyncRequest) (en
 	if err != nil {
 		return res, err
 	}
-	return res, e.syncMigrationPolicy(manifest)
+	return res, e.syncPolicy(manifest)
 }
 
 // migrationBlockedReason 是语义迁移受阻（见 siblingPaidStateFor）在同步结果与
 // 检索横幅里的降级原因。
 const migrationBlockedReason = "semantic-migration-blocked"
 
-// syncMigrationPolicy 处理同步结果所描述 revision 记录的迁移暂停原因：原因
-// 取自该 revision 的 manifest（SemanticMigrationBlock），不在返回后读跟踪器
-// 可能已被其他 revision 更新的原因。结果的 DegradedReason 已由
-// revisionResult 带上 semantic-migration-blocked，原因与恢复步骤也在
+// syncPolicy 按 policyError 判定同步结果所描述 revision 的缺口：语义覆盖
+// 不足与迁移暂停原因，都取自该 revision 的 manifest（manifestGaps），不在
+// 返回后读跟踪器可能已被其他 revision 更新的状态。结果的 DegradedReason
+// 已由 revisionResult 带上同样的原因，迁移原因与恢复步骤也在
 // workspace_status 的 semantic.last_error。
-// OPENACE_QUALITY_STRICT=on 或 OPENACE_RETRIEVAL_DEGRADE=deny 时返回带原因与
-// 恢复步骤的错误；词法 revision 已照常发布，结果仍随错误返回。
-func (e *Engine) syncMigrationPolicy(manifest *index.Manifest) error {
-	if manifest == nil || manifest.SemanticMigrationBlock == "" {
+// OPENACE_RETRIEVAL_DEGRADE=deny 或 OPENACE_QUALITY_STRICT=on 时返回写明原因
+// 与环境变量的错误；revision 已照常发布、跟踪器照常记为 ready，结果仍随
+// 错误返回，之后的检索与同步不受影响。未配置语义时没有这类缺口。
+func (e *Engine) syncPolicy(manifest *index.Manifest) error {
+	if manifest == nil {
 		return nil
 	}
-	reason := manifest.SemanticMigrationBlock
-	if e.qualityStrict {
-		return fmt.Errorf("%s=on: 语义质量缺口 [%s]: %s", EnvQualityStrict, migrationBlockedReason, reason)
-	}
-	if e.retrievalDegrade == DegradeDeny {
-		return degradeDeniedError(migrationBlockedReason, errors.New(reason), EnvRetrievalDegrade)
-	}
-	return nil
+	return e.policyError(e.manifestGaps(manifest))
 }
 
 // buildCall 是同一工作区并发构建请求共享的执行体：同时只有一个构建在跑，
