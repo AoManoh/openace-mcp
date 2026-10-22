@@ -143,7 +143,8 @@ type Engine struct {
 	firstTouchKicks sync.Map
 	// lastSyncOK 是每个工作区最近一次成功同步的完成时刻，只在成功路径
 	// 刷新，是新鲜度窗口与首触判定的依据。
-	lastSyncOK map[string]time.Time
+	lastSyncOK      map[string]time.Time
+	refreshFailures map[string]string
 	// locks 是每个工作区的跨进程写锁，首次构建时获取、Close 时释放。有了
 	// 锁，daemon 是唯一索引写入者就从假设变成机制：两个进程共享同一 cache
 	// 子树时不会互相覆盖。
@@ -187,6 +188,7 @@ func New(opts Options) (*Engine, error) {
 		journals:         make(map[string]*index.Journal),
 		statCaches:       make(map[string]*workspace.StatCache),
 		lastSyncOK:       make(map[string]time.Time),
+		refreshFailures:  make(map[string]string),
 		locks:            make(map[string]*index.ProcessLock),
 	}
 	if opts.LexicalWeights != nil {
@@ -551,11 +553,12 @@ var errQueryBuildWait = errors.New("query wait for index build exceeded")
 var errFirstTouchRefresh = errors.New("first touch refresh in background")
 
 // firstTouchFastPath 判定是否走首触快路径，需要时启动后台同步。返回
-// (errFirstTouchRefresh, true) 表示走快路径。条件：本 daemon 生命周期内该
-// 工作区还没有成功同步过，且磁盘上已有可服务的 revision。后台同步
-// goroutine 每个工作区最多一个（firstTouchKicks 登记），完成后清除登记；
-// 同步失败时下一次查询会再启动一次，与内联同步失败后的重试一致，失败
-// 原因经状态的 last_error 可见，不会一直静默用旧索引。
+// (errFirstTouchRefresh, true) 表示走快路径；本进程内最近一次已结束的刷新
+// 失败时返回 (该次失败的原文错误, true)，上层按 stale-index 应答。条件：
+// 本 daemon 生命周期内该工作区还没有成功同步过，且磁盘上已有可服务的
+// revision。后台同步 goroutine 每个工作区最多一个（firstTouchKicks 登记），
+// 完成后清除登记；同步失败时下一次查询会再启动一次，与内联同步失败后的
+// 重试一致，失败原因经状态的 last_error 可见，不会一直静默用旧索引。
 func (e *Engine) firstTouchFastPath(ref engine.WorkspaceRef) (error, bool) {
 	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
 	if err != nil {
@@ -563,6 +566,7 @@ func (e *Engine) firstTouchFastPath(ref engine.WorkspaceRef) (error, bool) {
 	}
 	e.mu.Lock()
 	_, synced := e.lastSyncOK[workspaceKey]
+	failure, failed := e.refreshFailures[workspaceKey]
 	e.mu.Unlock()
 	if synced || !e.hasServableRevision(ref) {
 		return nil, false
@@ -579,14 +583,17 @@ func (e *Engine) firstTouchFastPath(ref engine.WorkspaceRef) (error, bool) {
 			_, _ = e.syncWorkspaceDetachable(context.Background(), ref, false)
 		}()
 	}
+	if failed {
+		return errors.New(failure), true
+	}
 	return errFirstTouchRefresh, true
 }
 
 // syncWorkspaceForQuery 是查询路径的同步入口，依次尝试：
 //   - 新鲜度窗口内：直接用现有 revision 应答，不扫描。
 //   - 首触快路径（降级模式不是 deny 且未开严格档）：返回
-//     errFirstTouchRefresh，上层用磁盘上的旧 revision 应答，同步在后台
-//     进行。
+//     errFirstTouchRefresh（最近一次刷新失败时返回该次失败的错误），上层
+//     用磁盘上的旧 revision 应答，同步在后台进行。
 //   - OPENACE_QUERY_BUILD_WAIT 为 0：等到构建完成。
 //   - 配置了上界：分片等待，超界后返回 errQueryBuildWait。构建不被取消，
 //     错误文本带构建进度与环境变量名。
@@ -602,7 +609,8 @@ func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.Workspace
 	// 服务；改动前首次查询要内联全量扫描，大仓实测阻塞 43.6 秒（gradle
 	// 仓库 2.9 万文件）之后才用本就在盘上的 revision 应答。现在：该工作区
 	// 尚无成功同步且有可服务 revision 时，立即返回 errFirstTouchRefresh
-	// 让上层用旧 revision 应答（原因 index-refreshing，进 [DEGRADED] 横幅），
+	// 让上层用旧 revision 应答（原因 index-refreshing，进 [DEGRADED] 横幅；
+	// 本进程最近一次刷新失败时返回该次失败的错误，原因为 stale-index），
 	// 同时后台启动一次真实同步；同步成功后 lastSyncOK 置位，本路径不再
 	// 触发。不走的情况：显式 Sync；没有任何 revision 的工作区；降级模式
 	// deny（正确性优先）；严格档（它会把任何降级原因判为违规，走快路径
@@ -810,6 +818,11 @@ func (e *Engine) syncWorkspaceOutcome(ctx context.Context, ref engine.WorkspaceR
 			if err == nil {
 				e.mu.Lock()
 				e.lastSyncOK[workspaceKey] = time.Now()
+				delete(e.refreshFailures, workspaceKey)
+				e.mu.Unlock()
+			} else if !errors.Is(err, context.Canceled) {
+				e.mu.Lock()
+				e.refreshFailures[workspaceKey] = sanitizeError(err)
 				e.mu.Unlock()
 			}
 			call.result, call.manifest, call.err = result, manifest, err
