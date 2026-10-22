@@ -128,20 +128,10 @@ func (e *Engine) bulkEmbedMissing(ctx context.Context, journal *index.Journal, s
 	if err != nil {
 		return err
 	}
-	profile := e.embedCfg.ProfileHash()
-	if state.ProfileHash != "" && state.ProfileHash != profile {
-		return fmt.Errorf("批作业状态 %s 属于其他嵌入身份(%s != %s);该文件不应被手工搬运,清理后重跑 sync", statePath, state.ProfileHash, profile)
+	if err := e.checkBulkState(statePath, state); err != nil {
+		return err
 	}
-	state.ProfileHash = profile
-
-	// 未收尾的提交意向说明上一次运行可能已在服务端创建了作业却没记下
-	// 作业 id：创建成功与落盘之间崩溃，或提交调用报错时分不清"未创建"
-	// 与"已创建但响应丢失"。自动重提会让同一段输入计费两次，所以这里
-	// 停下来交给人工核对。
-	if intent := state.PendingIntent; intent != nil {
-		return fmt.Errorf("Batch API 路径存在未收尾的提交意向(%d 输入, keys_sha256=%s, 记录于 %s):请到 provider 控制台核对该时刻附近的批作业——不存在则删除 %s 中的 pending_intent 字段后重跑;存在则把该作业的 id/input_file_id/keys 手工补入 jobs 数组后重跑续轮询。引擎不自动重提该段(防双份计费)",
-			intent.Count, intent.KeysSHA256, intent.CreatedAt.Format(time.RFC3339), statePath)
-	}
+	state.ProfileHash = e.embedCfg.ProfileHash()
 
 	// 1) 恢复：状态文件里已登记作业覆盖的键不再提交，进程重启后接着处理
 	// 同一批作业，不为同一输入再付费。
@@ -184,9 +174,66 @@ func (e *Engine) bulkEmbedMissing(ctx context.Context, journal *index.Journal, s
 		}
 	}
 
+	return e.collectBulkJobs(ctx, journal, status, statePath, &state, reuse, out, len(missingHashes), false)
+}
+
+func (e *Engine) checkBulkState(statePath string, state bulkState) error {
+	profile := e.embedCfg.ProfileHash()
+	if state.ProfileHash != "" && state.ProfileHash != profile {
+		return fmt.Errorf("批作业状态 %s 属于其他嵌入身份(%s != %s);该文件不应被手工搬运,清理后重跑 sync", statePath, state.ProfileHash, profile)
+	}
+	if state.ProfileHash == "" && (len(state.Jobs) > 0 || state.PendingIntent != nil) {
+		return fmt.Errorf("批作业状态 %s 缺少嵌入身份(profile_hash),无法确认其中已付费作业属于当前身份;引擎暂停,不轮询、不下载、不发新请求,状态文件原样保留,核对后补全或移除该文件再重跑 sync", statePath)
+	}
+	for _, job := range state.Jobs {
+		if strings.TrimSpace(job.ID) == "" {
+			return fmt.Errorf("批作业状态 %s 有作业缺少 id,无法确认其已付费输入;引擎暂停,不轮询、不下载、不发新请求,状态文件原样保留", statePath)
+		}
+		if problem := unusableJobKeys(job.Keys); problem != "" {
+			return fmt.Errorf("批作业状态 %s 中作业 %s 的输入键不可用(%s),无法确认其已付费输入;引擎暂停,不轮询、不下载、不发新请求,状态文件原样保留", statePath, job.ID, problem)
+		}
+	}
+
+	// 未收尾的提交意向说明上一次运行可能已在服务端创建了作业却没记下
+	// 作业 id：创建成功与落盘之间崩溃，或提交调用报错时分不清"未创建"
+	// 与"已创建但响应丢失"。自动重提会让同一段输入计费两次，所以这里
+	// 停下来交给人工核对。
+	if intent := state.PendingIntent; intent != nil {
+		return fmt.Errorf("Batch API 路径存在未收尾的提交意向(%d 输入, keys_sha256=%s, 记录于 %s):请到 provider 控制台核对该时刻附近的批作业——不存在则删除 %s 中的 pending_intent 字段后重跑;存在则把该作业的 id/input_file_id/keys 手工补入 jobs 数组后重跑续轮询。引擎不自动重提该段(防双份计费)",
+			intent.Count, intent.KeysSHA256, intent.CreatedAt.Format(time.RFC3339), statePath)
+	}
+	return nil
+}
+
+func (e *Engine) recoverBulkState(ctx context.Context, journal *index.Journal, status *wsStatus, reuse map[string][]float32, out *semanticOutcome) (map[string]bool, error) {
+	statePath := bulkStatePath(journal)
+	if _, err := os.Stat(statePath); errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	state, err := loadBulkState(statePath)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.checkBulkState(statePath, state); err != nil {
+		return nil, err
+	}
+	processed := make(map[string]bool)
+	total := 0
+	for _, job := range state.Jobs {
+		total += len(job.Keys)
+		for _, key := range job.Keys {
+			processed[key] = true
+		}
+	}
+	if len(state.Jobs) == 0 {
+		return processed, nil
+	}
+	return processed, e.collectBulkJobs(ctx, journal, status, statePath, &state, reuse, out, total, true)
+}
+
+func (e *Engine) collectBulkJobs(ctx context.Context, journal *index.Journal, status *wsStatus, statePath string, state *bulkState, reuse map[string][]float32, out *semanticOutcome, total int, recovered bool) error {
 	// 3) 轮询与回收：逐作业等到终态。completed 的作业全量回收进 journal；
 	// 非 completed 终态先回收已产出的部分，再返回错误。
-	total := len(missingHashes)
 	ingested := 0
 	// ingest 对回收的向量做与同步路径相同的检查：L2 归一化失败（零向量或
 	// 含 NaN）的键写入持久化拒绝集，以后不再为它付费；provider 在结果文件
@@ -202,7 +249,11 @@ func (e *Engine) bulkEmbedMissing(ctx context.Context, journal *index.Journal, s
 			}
 			good[key] = vec
 		}
-		if err := journal.Append(good); err != nil {
+		appendGood := journal.Append
+		if recovered {
+			appendGood = journal.AppendRecovered
+		}
+		if err := appendGood(good); err != nil {
 			return 0, fmt.Errorf("批作业 %s 结果落 journal 失败: %w", jobID, err)
 		}
 		if err := journal.MarkRejected(normRejected); err != nil {
@@ -256,7 +307,7 @@ func (e *Engine) bulkEmbedMissing(ctx context.Context, journal *index.Journal, s
 				recovered = n
 			}
 			state.Jobs = state.Jobs[1:]
-			if saveErr := saveBulkState(statePath, state); saveErr != nil {
+			if saveErr := saveBulkState(statePath, *state); saveErr != nil {
 				return fmt.Errorf("批作业 %s 终态 %s 且状态落盘失败: %v (原始失败见前)", job.ID, jobStatus.Status, saveErr)
 			}
 			return fmt.Errorf("批作业 %s 终态 %s:已回收 %d 条已计费向量入 journal,其余 %d 条输入未产出向量;重跑 sync 只对缺口重新提交并计费(journal 复用保证已回收部分不重付),或改用同步嵌入路径(unset %s)",
@@ -270,7 +321,7 @@ func (e *Engine) bulkEmbedMissing(ctx context.Context, journal *index.Journal, s
 			return err
 		}
 		state.Jobs = state.Jobs[1:]
-		if err := saveBulkState(statePath, state); err != nil {
+		if err := saveBulkState(statePath, *state); err != nil {
 			return fmt.Errorf("批作业状态更新失败(作业 %s 已回收入 journal,重跑安全——journal 复用会跳过已付费键): %w", job.ID, err)
 		}
 	}

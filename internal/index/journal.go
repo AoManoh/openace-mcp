@@ -194,6 +194,14 @@ func encodeJournalRecord(hash string, vector []float32) []byte {
 
 // Append 落盘一批已付费向量（批成功即调用，D4）；每批一次 fsync。
 func (j *Journal) Append(vectors map[string][]float32) error {
+	return j.appendRecords(vectors, true)
+}
+
+func (j *Journal) AppendRecovered(vectors map[string][]float32) error {
+	return j.appendRecords(vectors, false)
+}
+
+func (j *Journal) appendRecords(vectors map[string][]float32, enforceBudget bool) error {
 	if len(vectors) == 0 {
 		return nil
 	}
@@ -212,7 +220,7 @@ func (j *Journal) Append(vectors map[string][]float32) error {
 	if len(buf) == 0 {
 		return nil
 	}
-	if j.maxBytes > 0 && (j.bytes > j.maxBytes || int64(len(buf)) > j.maxBytes-j.bytes) {
+	if enforceBudget && j.maxBytes > 0 && (j.bytes > j.maxBytes || int64(len(buf)) > j.maxBytes-j.bytes) {
 		// 预算拦截发生在写盘与付费链路继续之前:上层收到错误即停止
 		// 继续调用 provider,既有已付费条目原样保留(绝不丢弃)。
 		return fmt.Errorf("journal 字节预算耗尽: 现有 %d + 本批 %d 超过预算 %d;停止继续嵌入,提高 OPENACE_VECTOR_MEMORY_BUDGET 或等待发布压实后重试", j.bytes, len(buf), j.maxBytes)

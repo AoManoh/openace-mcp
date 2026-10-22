@@ -370,6 +370,27 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		missingHashes = append(missingHashes, key)
 		missingTexts = append(missingTexts, embedDocText(record))
 	}
+	if len(missingHashes) > 0 || len(unloadedKeys) > 0 {
+		processed, err := e.recoverBulkState(ctx, journal, status, reuse, &out)
+		if err != nil {
+			return out, err
+		}
+		if len(processed) > 0 {
+			var keptHashes, keptTexts, keptUnloaded []string
+			for i, key := range missingHashes {
+				if !processed[key] {
+					keptHashes = append(keptHashes, key)
+					keptTexts = append(keptTexts, missingTexts[i])
+				}
+			}
+			for _, key := range unloadedKeys {
+				if !processed[key] {
+					keptUnloaded = append(keptUnloaded, key)
+				}
+			}
+			missingHashes, missingTexts, unloadedKeys = keptHashes, keptTexts, keptUnloaded
+		}
+	}
 	if len(unloadedKeys) > 0 {
 		return out, e.unloadedPauseError(len(unloadedKeys))
 	}
