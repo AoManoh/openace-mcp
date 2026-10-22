@@ -110,13 +110,14 @@ type priorVectors struct {
 	// activeLoadedSegments 是 active revision 实际通过校验装载的段数，
 	// activeExpectedSegments 是其 manifest 宣称的段数；两者不等说明 manifest
 	// 完整但向量文件损坏或缺失，构建与嵌入计划据此决定是否并入旧切分版本
-	// 子树的向量。activeLoadedRows 与 loadedRows 分别是 active revision 与两个
-	// revision 合计装载（按行选读时为实际读出）的行数，只供测试核对装载策略，
-	// 生产代码不读。
+	// 子树的向量。activeLoadedRows 是 active revision 装载的行数，只供测试核对
+	// 装载策略；loadedRows 是两个 revision 与兄弟子树合计装载（按行选读时为
+	// 实际读出）的行数，配置了向量内存预算时兄弟子树按它扣减剩余行数。
 	activeLoadedRows       int
 	activeLoadedSegments   int
 	activeExpectedSegments int
 	loadedRows             int
+	unloaded               map[string]bool
 	// indexes 持有底层数据：整段装载时是 *vector.Index，各 byHash 表的值
 	// 是其数据的子切片，可能指向 mmap 页；按行选读时是 *vector.RowReader，
 	// 表值是独立拷贝。构建方用完 prior 必须调用 release，否则映射与文件
@@ -138,8 +139,8 @@ func (p *priorVectors) release() {
 // 向量文件损坏的 segment 被跳过，缺口由本次新嵌入补齐。
 //
 // needed 决定装载策略：
-//   - nil：整段装载，做数据文件的全文件 checksum 校验。用于全量构建、
-//     compaction 与兄弟子树复用这些几乎全部行都要复用的场景。
+//   - nil：整段装载，做数据文件的全文件 checksum 校验。用于未配置向量内存
+//     预算时的全量构建、compaction 与兄弟子树复用这些几乎全部行都要复用的场景。
 //   - 非 nil：按行选读，只读出键命中 needed 的行。delta 构建实际复用的
 //     行数约等于变更 chunk 数，为几十行整读 GiB 级的段不划算。按行路径
 //     的完整性检查是 idx 文件 checksum 加每行范数探针，不做数据文件的
@@ -147,18 +148,28 @@ func (p *priorVectors) release() {
 //
 // 两种策略下 activeLoadedRows/activeLoadedSegments 口径一致：段结构校验
 // 通过即计入全段可寻址行，表示完整性，不表示读出的行数。用户配置了向量
-// 内存预算（vectorMaxResident>0）时，累计行数达到预算即停止装载后续段。
+// 内存预算时，累计行数达到预算即停止装载后续段；此后各段中本次构建需要
+// 的键记入 unloaded，由 embedRecords 暂停本次构建，不当作缺失键重新付费。
 func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest, needed map[string]bool) priorVectors {
+	return e.loadPriorVectorsFor(store, previous, needed, false)
+}
+
+func (e *Engine) loadPriorVectorsFor(store *index.Store, previous *index.Manifest, needed map[string]bool, verify bool) priorVectors {
+	return e.loadPriorVectorsFrom(store, previous, needed, verify, 0)
+}
+
+func (e *Engine) loadPriorVectorsFrom(store *index.Store, previous *index.Manifest, needed map[string]bool, verify bool, loadedRows int) priorVectors {
 	prior := priorVectors{
 		activeByHash:       map[string][]float32{},
 		olderByHash:        map[string][]float32{},
 		crossProfileByHash: map[string][]float32{},
+		unloaded:           map[string]bool{},
+		loadedRows:         loadedRows,
 	}
 	dimension := e.embedCfg.Dimension
 	manifest := previous
 	seenSegments := make(map[string]bool)
-	loadedRows := 0
-	limit := e.vectorMaxResident // 0 表示不限（默认）；>0 来自 OPENACE_VECTOR_MEMORY_BUDGET 折算的行数
+	limit, limited := e.residentRowLimit() // limited 为 false 表示不限（默认）；为 true 时 limit 是 OPENACE_VECTOR_MEMORY_BUDGET 折算的行数，预算不足一行时为 0
 	if previous != nil {
 		for _, segment := range previous.Segments {
 			if segment.VectorsChecksum != "" {
@@ -172,20 +183,28 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest, 
 				continue
 			}
 			seenSegments[segment.ID] = true
+			if needed != nil && verify {
+				loadedRows = loadPriorRowsVerified(&prior, store, segment, dimension, hop, needed, limit, limited, loadedRows)
+				continue
+			}
 			remaining := 0
-			if limit > 0 {
+			if limited {
 				remaining = limit - loadedRows
 				if remaining <= 0 {
-					break
+					markUnloadedKeys(&prior, store, segment, dimension, needed)
+					continue
 				}
 			}
 			if needed != nil {
-				loadedRows = e.loadPriorRowsSelective(&prior, store, segment, dimension, hop, needed, limit, loadedRows)
+				loadedRows = e.loadPriorRowsSelective(&prior, store, segment, dimension, hop, needed, limit, limited, loadedRows)
 				continue
 			}
 			ix, err := vector.Load(store.SegmentPathFor(segment.ID), dimension,
 				segment.VectorsChecksum, segment.VectorsIndexChecksum, remaining)
 			if err != nil {
+				if errors.Is(err, vector.ErrEnvelopeExceeded) {
+					markUnloadedKeys(&prior, store, segment, dimension, needed)
+				}
 				continue
 			}
 			prior.indexes = append(prior.indexes, ix)
@@ -205,7 +224,7 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest, 
 				}
 			}
 		}
-		if manifest.PreviousRevision == "" || (limit > 0 && loadedRows >= limit) {
+		if manifest.PreviousRevision == "" {
 			break
 		}
 		older, err := store.LoadManifest(manifest.PreviousRevision)
@@ -221,8 +240,9 @@ func (e *Engine) loadPriorVectors(store *index.Store, previous *index.Manifest, 
 // segment 的处理：打开按行读取器，只对键命中 needed 且目标表尚无该键的行
 // 读取向量。返回累计
 // 读出的行数。段打不开或某行读出损坏时跳过，与整段装载遇到损坏的处理
-// 一致，缺口由新嵌入补齐；累计行数达到内存预算即停止。
-func (e *Engine) loadPriorRowsSelective(prior *priorVectors, store *index.Store, segment index.SegmentRef, dimension int, hop int, needed map[string]bool, limit int, loadedRows int) int {
+// 一致，缺口由新嵌入补齐；累计行数达到内存预算即停止读取，其余命中且尚无
+// 向量的键记入 unloaded。
+func (e *Engine) loadPriorRowsSelective(prior *priorVectors, store *index.Store, segment index.SegmentRef, dimension int, hop int, needed map[string]bool, limit int, limited bool, loadedRows int) int {
 	reader, err := vector.OpenRowReader(store.SegmentPathFor(segment.ID), dimension, segment.VectorsIndexChecksum)
 	if err != nil {
 		return loadedRows
@@ -244,8 +264,12 @@ func (e *Engine) loadPriorRowsSelective(prior *priorVectors, store *index.Store,
 		if _, ok := target[entry.ContentHash]; ok {
 			continue
 		}
-		if limit > 0 && loadedRows >= limit {
-			break
+		if _, ok := prior.activeByHash[entry.ContentHash]; ok {
+			continue
+		}
+		if limited && loadedRows >= limit {
+			prior.unloaded[entry.ContentHash] = true
+			continue
 		}
 		row, err := reader.ReadRow(i)
 		if err != nil {
@@ -274,7 +298,7 @@ func (e *Engine) loadPriorRowsSelective(prior *priorVectors, store *index.Store,
 //     的向量照常入盘，缺口如实进入覆盖率。只有 ctx 取消与本地落盘失败才
 //     返回错误。
 //   - 语义路未配置或 records 为空时直接返回只带 enabled 标志的空产物。
-func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspaceKey string, prior priorVectors, records []chunkRecord, status *wsStatus) (semanticOutcome, error) {
+func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspaceKey string, prior priorVectors, records []chunkRecord, status *wsStatus, retainedRows int64) (semanticOutcome, error) {
 	out := semanticOutcome{enabled: e.semanticEnabled()}
 	if !out.enabled || len(records) == 0 {
 		return out, nil
@@ -320,6 +344,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	var missingHashes []string
 	var missingTexts []string
 	reusedRows := 0
+	var unloadedKeys []string
 	seen := make(map[string]bool, len(records))
 	for _, record := range records {
 		key := embedKey(record)
@@ -334,12 +359,19 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 			}
 			continue
 		}
+		if prior.unloaded[key] {
+			unloadedKeys = append(unloadedKeys, key)
+			continue
+		}
 		if journal.Rejected(key) {
 			out.rejected++
 			continue
 		}
 		missingHashes = append(missingHashes, key)
 		missingTexts = append(missingTexts, embedDocText(record))
+	}
+	if len(unloadedKeys) > 0 {
+		return out, e.unloadedPauseError(len(unloadedKeys))
 	}
 
 	// 送审前只读检查同一 embedding 身份旧子树里与这些缺口有关的已付费状态
@@ -380,15 +412,15 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	}
 
 	// 付费前的预算拦截，仅在用户配置了 OPENACE_VECTOR_MEMORY_BUDGET 时生效
-	// （默认不限）。发布后常驻向量行数的投影 = 已复用行数 + 待新嵌行数；
-	// 超出预算就在任何 provider 调用之前停止：已复用部分照常入盘发布，缺口
-	// 行保持未覆盖并写明原因。若先付费、发布后才在查询期发现装不下，钱
-	// 已花掉而向量用不上。delta 构建时物理段的行数可能高于此投影（被删除
-	// chunk 的死行在 compaction 阈值前仍保留），这部分由查询侧装载时的累计
-	// 预算校验处理。
-	if limit := e.vectorMaxResident; limit > 0 && len(missingHashes) > 0 {
-		if projected := reusedRows + len(missingHashes); projected > limit {
-			out.lastError = fmt.Sprintf("vector memory budget exceeded before embedding: projected %d rows > budget %d rows (%s); missing chunks left uncovered explicitly", projected, limit, EnvVectorMemoryBudget)
+	// （默认不限）。发布后物理向量行数的投影 = 保留分段的物理行数（delta 为
+	// 全部保留段，full 为 0）+ 本次每个 record 可能写入的一行；journal 的投影
+	// = 现有有效编码字节 + 本次全部新键的记录长度。任一超出预算就在任何
+	// provider 调用（同步请求、文件上传或 Batch 提交）之前停止：已复用部分
+	// 照常入盘发布，缺口行保持未覆盖并写明原因。若先付费、发布后才在查询期
+	// 发现装不下，钱已花掉而向量用不上。
+	if len(missingHashes) > 0 {
+		if reason := e.budgetBlock(journal, retainedRows, len(records), missingHashes); reason != "" {
+			out.lastError = reason
 			status.setEmbedProgress(len(missingHashes), 0)
 			return e.assembleSemanticOutcome(records, reuse, activeUsable, out), nil
 		}

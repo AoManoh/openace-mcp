@@ -240,9 +240,9 @@ func (h *revisionHandle) vectorIndexes(dimension int) ([]*vector.Index, error) {
 			return
 		}
 		total := 0
-		limit := 0 // 0 表示不限（默认）；>0 来自 OPENACE_VECTOR_MEMORY_BUDGET 折算的行数。
+		limit, limited := 0, false // limited 为 false 表示不限（默认）；为 true 时 limit 是 OPENACE_VECTOR_MEMORY_BUDGET 折算的行数，预算不足一行时为 0。
 		if h.engine != nil {
-			limit = h.engine.vectorMaxResident
+			limit, limited = h.engine.residentRowLimit()
 		}
 		indexes := make([]*vector.Index, 0, len(h.manifest.Segments))
 		keys := make([]string, 0, len(h.manifest.Segments))
@@ -251,7 +251,7 @@ func (h *revisionHandle) vectorIndexes(dimension int) ([]*vector.Index, error) {
 				continue
 			}
 			remaining := 0
-			if limit > 0 {
+			if limited {
 				remaining = limit - total
 				if remaining <= 0 {
 					h.vecErr = fmt.Errorf("%w: cumulative segment rows exceed %d", vector.ErrEnvelopeExceeded, limit)

@@ -269,7 +269,7 @@ embedding 地址、模型、维度和内置嵌入模板都没变时,新子树只
 | `OPENACE_RENDER_LINE_NUMBERS` | `1` = 检索结果围栏内逐行携带真实文件行号(`cat -n` 形状,Read-parity 试验面);默认关闭 |
 | `OPENACE_FULL_RESULTS` | `detail=full` 时带正文返回的候选块数(按排名取前 N 个,其余只给标题行),默认 `20`;`0`=全部只给标题行。这是使用者侧配置,不是 AI 的调用参数;改动后重启 MCP 会话生效,不需要重启 daemon |
 | `OPENACE_FRESHNESS_WINDOW` | 查询前复用最近一次扫描结果的时长(如 `30s`),期间不重扫工作区;留空(默认)每次查询都扫描;不接受 `0` |
-| `OPENACE_VECTOR_MEMORY_BUDGET` | 可寻址向量数据的字节预算;留空(默认)不限。旧 400K 行默认上限已于 2026-08-26 移除 |
+| `OPENACE_VECTOR_MEMORY_BUDGET` | 可寻址向量数据的字节预算;留空(默认)不限,构建与查询的行为不变。旧 400K 行默认上限已于 2026-08-26 移除。设置后,构建只读取新 revision 要复用的已付费向量,以堆内存拷贝持有,合计不超过预算(`OPENACE_VECTOR_MMAP` 开或关都一样);新向量放不下时在付费前停止,查询显式降级(`vector-envelope-exceeded`)。重建需要的已付费向量超过预算时构建暂停:不发新的模型请求,当前 revision 继续服务,词法与语义内容在提高预算之前都不再更新;同步调用返回原因,`workspace_status` 的 `last_error` 写明原因,`OPENACE_RETRIEVAL_DEGRADE=deny` 时检索也直接返回该原因。提高预算后重跑会直接复用这些向量,不重复付费 |
 | `OPENACE_MAX_FILE_BYTES` / `OPENACE_MAX_TEXT_FILE_BYTES` | 单文件索引上限:一般文件默认 1 MiB,纯文本文件默认 4 MiB,超过整篇不索引 |
 | `OPENACE_CACHE_DIR` | 索引缓存根目录;默认用户缓存目录下的 `openace-mcp` |
 | `OPENACE_TOOL_TIMEOUT` | 单次 MCP 工具调用的处理超时,默认 `110s` |

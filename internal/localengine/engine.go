@@ -120,9 +120,10 @@ type Engine struct {
 	// 持有它的句柄数引用计数，归零即释放。
 	vectorMu       sync.Mutex
 	vectorSegments map[string]*sharedVectorIndex
-	// vectorMaxResident 是常驻向量行数上限，0 表示不限（默认：能力默认
-	// 不设限，资源约束由用户显式配置）。大于 0 时由
-	// OPENACE_VECTOR_MEMORY_BUDGET 的字节预算按 维度×4 字节折算。
+	// vectorMaxResident 是常驻向量行数上限，由 OPENACE_VECTOR_MEMORY_BUDGET
+	// 的字节预算按 维度×4 字节折算。vectorMemoryBudget 为 0 时不限（默认：
+	// 能力默认不设限，资源约束由用户显式配置）；预算不足一行时为 0，表示
+	// 一行也不能装载。
 	vectorMaxResident int
 	// vectorMemoryBudget 是用户配置的原始字节预算，journal 也按它封顶。
 	vectorMemoryBudget int64
@@ -239,11 +240,7 @@ func New(opts Options) (*Engine, error) {
 	// 只计向量数据本身；条目与元数据另有开销。
 	// journalFor 用同一预算封顶 journal 字节数。
 	if opts.VectorMemoryBudget > 0 && opts.Embedding.Dimension > 0 {
-		rows := opts.VectorMemoryBudget / int64(opts.Embedding.Dimension*4)
-		if rows < 1 {
-			rows = 1
-		}
-		e.vectorMaxResident = int(rows)
+		e.vectorMaxResident = vectorRowsWithin(opts.VectorMemoryBudget, opts.Embedding.Dimension)
 		e.vectorMemoryBudget = opts.VectorMemoryBudget
 	}
 	if opts.Embedding.Enabled {

@@ -176,8 +176,9 @@ func (e *Engine) planLiveRecords(ctx context.Context, workspaceKey string, root 
 func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *index.Store, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, records []chunkRecord, fn func(EmbedJob) error) error {
 	var prior priorVectors
 	defer func() { prior.release() }()
+	needed := e.budgetedKeys(records)
 	if previous != nil {
-		prior = e.loadPriorVectors(store, previous, nil)
+		prior = e.loadPriorVectorsFor(store, previous, needed, needed != nil)
 	}
 	// 并入旧 chunk profile 子树向量的条件必须与 buildFull 逐字一致：首建、
 	// 语义未完整或 active 段物理不全时并入，语义完整的 revision 不并入。
@@ -189,7 +190,7 @@ func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *ind
 	// 复用 profile_reuse.go 的实现；并入的索引归 prior 持有，随 defer 统一
 	// 释放。
 	if previous == nil || !previous.SemanticComplete() || prior.activeLoadedSegments != prior.activeExpectedSegments {
-		e.mergeSiblingProfileVectors(store, root, &prior)
+		e.mergeSiblingProfileVectorsFor(store, root, &prior, needed)
 	}
 	journal, err := e.journalFor(workspaceKey, store)
 	if err != nil {
@@ -198,6 +199,7 @@ func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *ind
 	journalKeys := journal.Snapshot()
 	seen := make(map[string]bool, len(records))
 	var pending []chunkRecord
+	unloaded := 0
 	for _, record := range records {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -228,11 +230,18 @@ func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *ind
 			plan.Reusable++
 			continue
 		}
+		if prior.unloaded[key] {
+			unloaded++
+			continue
+		}
 		if journal.Rejected(key) {
 			plan.Rejected++
 			continue
 		}
 		pending = append(pending, record)
+	}
+	if unloaded > 0 {
+		return e.unloadedPauseError(unloaded)
 	}
 	// 与 embedRecords 同一检查：旧子树 journal 里已付费的键算复用，旧拒绝集
 	// 里的键算拒绝；旧状态无法确认或尚未回收时在线构建不会为缺口送审，计划

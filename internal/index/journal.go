@@ -212,7 +212,7 @@ func (j *Journal) Append(vectors map[string][]float32) error {
 	if len(buf) == 0 {
 		return nil
 	}
-	if j.maxBytes > 0 && j.bytes+int64(len(buf)) > j.maxBytes {
+	if j.maxBytes > 0 && (j.bytes > j.maxBytes || int64(len(buf)) > j.maxBytes-j.bytes) {
 		// 预算拦截发生在写盘与付费链路继续之前:上层收到错误即停止
 		// 继续调用 provider,既有已付费条目原样保留(绝不丢弃)。
 		return fmt.Errorf("journal 字节预算耗尽: 现有 %d + 本批 %d 超过预算 %d;停止继续嵌入,提高 OPENACE_VECTOR_MEMORY_BUDGET 或等待发布压实后重试", j.bytes, len(buf), j.maxBytes)
@@ -230,6 +230,39 @@ func (j *Journal) Append(vectors map[string][]float32) error {
 	}
 	j.bytes += int64(len(buf))
 	return nil
+}
+
+func JournalRecordBytes(key string, dimension int) int64 {
+	fixed := 14 + int64(len(key))
+	if dimension < 0 || int64(dimension) > (math.MaxInt64-fixed)/4 {
+		return math.MaxInt64
+	}
+	return fixed + 4*int64(dimension)
+}
+
+func (j *Journal) CapacityFor(keys []string) (int64, int64, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var needed int64
+	seen := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if _, exists := j.entries[key]; exists {
+			continue
+		}
+		size := JournalRecordBytes(key, j.dimension)
+		if size == math.MaxInt64 || needed > math.MaxInt64-size {
+			return j.bytes, math.MaxInt64, false
+		}
+		needed += size
+	}
+	if j.maxBytes <= 0 {
+		return j.bytes, needed, true
+	}
+	return j.bytes, needed, j.bytes <= j.maxBytes && needed <= j.maxBytes-j.bytes
 }
 
 // LimitBytes 设置 journal 字节预算(0=不限,默认不限)。引擎在用户配置

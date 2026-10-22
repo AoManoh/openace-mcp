@@ -325,6 +325,90 @@ func loadHeap(dataPath string, header indexHeader, wantDataChecksum string) (*In
 	return &Index{dimension: header.Dimension, entries: header.Entries, data: data}, nil
 }
 
+type Rows struct {
+	Count   int
+	Entries []Entry
+	Data    [][]float32
+	Skipped []Entry
+}
+
+func LoadRows(dir string, wantDimension int, wantDataChecksum string, wantIndexChecksum string, want func(Entry) bool, maxRows int) (Rows, error) {
+	idxBytes, err := os.ReadFile(filepath.Join(dir, IndexFileName))
+	if err != nil {
+		return Rows{}, fmt.Errorf("读取 %s: %w", IndexFileName, err)
+	}
+	if wantIndexChecksum != "" && checksumBytes(idxBytes) != wantIndexChecksum {
+		return Rows{}, fmt.Errorf("%s checksum 不符（文件损坏）", IndexFileName)
+	}
+	var header indexHeader
+	if err := json.Unmarshal(idxBytes, &header); err != nil {
+		return Rows{}, fmt.Errorf("解析 %s: %w", IndexFileName, err)
+	}
+	if header.SchemaVersion != indexSchemaVersion {
+		return Rows{}, fmt.Errorf("%s schema version %d 不受支持（期望 %d）", IndexFileName, header.SchemaVersion, indexSchemaVersion)
+	}
+	if header.Dimension != wantDimension {
+		return Rows{}, fmt.Errorf("向量维度 %d 与当前 profile %d 不符（禁止混用，K24）", header.Dimension, wantDimension)
+	}
+	if wantDimension <= 0 || int64(wantDimension) > math.MaxInt64/4 {
+		return Rows{}, fmt.Errorf("向量维度 %d 无效", wantDimension)
+	}
+	if header.Count != len(header.Entries) {
+		return Rows{}, fmt.Errorf("%s count %d 与条目数 %d 不符", IndexFileName, header.Count, len(header.Entries))
+	}
+	dataPath := filepath.Join(dir, DataFileName)
+	info, err := os.Stat(dataPath)
+	if err != nil {
+		return Rows{}, fmt.Errorf("读取 %s: %w", DataFileName, err)
+	}
+	rowBytes := int64(header.Dimension) * 4
+	if int64(header.Count) > math.MaxInt64/rowBytes || info.Size() != int64(header.Count)*rowBytes {
+		return Rows{}, fmt.Errorf("%s 尺寸 %d 与 count×dim×4 不符（count=%d, dim=%d, K24）", DataFileName, info.Size(), header.Count, header.Dimension)
+	}
+	out := Rows{Count: header.Count}
+	selected := make([]bool, len(header.Entries))
+	wanted := 0
+	for i, entry := range header.Entries {
+		if want(entry) {
+			selected[i] = true
+			wanted++
+		}
+	}
+	if wanted == 0 {
+		return out, nil
+	}
+	f, err := os.Open(dataPath)
+	if err != nil {
+		return Rows{}, fmt.Errorf("读取 %s: %w", DataFileName, err)
+	}
+	defer f.Close()
+	hash := sha256.New()
+	reader := io.TeeReader(bufio.NewReaderSize(f, 4<<20), hash)
+	raw := make([]byte, rowBytes)
+	for i, entry := range header.Entries {
+		if _, err := io.ReadFull(reader, raw); err != nil {
+			return Rows{}, fmt.Errorf("读取 %s: %w", DataFileName, err)
+		}
+		if !selected[i] {
+			continue
+		}
+		if maxRows >= 0 && len(out.Data) >= maxRows {
+			out.Skipped = append(out.Skipped, entry)
+			continue
+		}
+		row := make([]float32, header.Dimension)
+		for j := range row {
+			row[j] = math.Float32frombits(binary.LittleEndian.Uint32(raw[j*4:]))
+		}
+		out.Entries = append(out.Entries, entry)
+		out.Data = append(out.Data, row)
+	}
+	if wantDataChecksum != "" && hex.EncodeToString(hash.Sum(nil)) != wantDataChecksum {
+		return Rows{}, fmt.Errorf("%s checksum 不符（文件损坏）", DataFileName)
+	}
+	return out, nil
+}
+
 // hostLittleEndian 在进程启动时判定主机字节序;磁盘格式固定小端,大端
 // 主机走 heap 解码保证正确性(目标发布平台 amd64/arm64 均为小端)。
 var hostLittleEndian = func() bool {

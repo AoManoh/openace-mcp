@@ -47,6 +47,10 @@ type compatibleProfileCandidate struct {
 //   - 采纳的候选其数据被 prior 的哈希表引用，索引归 prior 持有，随构建
 //     收尾统一释放；落选候选立即释放。
 func (e *Engine) mergeSiblingProfileVectors(current *index.Store, root pathutil.WorkspaceRoot, prior *priorVectors) {
+	e.mergeSiblingProfileVectorsFor(current, root, prior, nil)
+}
+
+func (e *Engine) mergeSiblingProfileVectorsFor(current *index.Store, root pathutil.WorkspaceRoot, prior *priorVectors, needed map[string]bool) {
 	if !e.semanticEnabled() || current == nil || prior == nil {
 		return
 	}
@@ -81,7 +85,12 @@ func (e *Engine) mergeSiblingProfileVectors(current *index.Store, root pathutil.
 		return candidates[i].manifest.ActivatedAt.After(candidates[j].manifest.ActivatedAt)
 	})
 	for _, candidate := range candidates {
-		loaded := e.loadPriorVectors(candidate.store, candidate.manifest, nil)
+		var loaded priorVectors
+		if needed == nil {
+			loaded = e.loadPriorVectors(candidate.store, candidate.manifest, nil)
+		} else {
+			loaded = e.loadSiblingRows(candidate.store, candidate.manifest, prior, needed)
+		}
 		// 候选 active 段必须全部加载成功且至少有一段：部分损坏的候选若
 		// 因为还剩几条向量就被采纳，后面健康的候选就没有机会了。
 		if loaded.activeLoadedSegments != loaded.activeExpectedSegments || loaded.activeLoadedSegments == 0 {
@@ -98,6 +107,15 @@ func (e *Engine) mergeSiblingProfileVectors(current *index.Store, root pathutil.
 			if _, ok := prior.crossProfileByHash[key]; !ok {
 				prior.crossProfileByHash[key] = vec
 			}
+		}
+		if needed != nil {
+			if prior.unloaded == nil {
+				prior.unloaded = make(map[string]bool)
+			}
+			for key := range loaded.unloaded {
+				prior.unloaded[key] = true
+			}
+			prior.loadedRows = loaded.loadedRows
 		}
 		// 采纳：crossProfileByHash 的值引用候选的向量数据，底层索引归 prior
 		// 持有，随构建收尾统一释放。
