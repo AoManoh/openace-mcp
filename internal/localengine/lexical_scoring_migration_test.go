@@ -49,7 +49,8 @@ func tfidfEraFingerprint(o Options) string {
 		"engine-profile-v3",
 		embedComponent,
 		rerankComponent,
-		string(normalizeDegrade(o.RetrievalDegrade)),
+		// 旧二进制还有检索降级开关；Options 已没有这一项，按它的默认值 allow 重算。
+		string(DegradeAllow),
 		string(normalizeDegrade(o.RerankDegrade)),
 		strictComponent,
 		bulkComponent,
@@ -297,14 +298,14 @@ func TestStoreProfileCarriesLexicalScoring(t *testing.T) {
 // TF-IDF 评分的旧 daemon 当成兼容实例复用；纯词法零值配置同样适用。
 func TestFingerprintReflectsLexicalScoring(t *testing.T) {
 	semantic := embedOptions("http://127.0.0.1:1/v1", 8, 8, "fake-model")
-	deny := semantic
-	deny.RetrievalDegrade = DegradeDeny
+	rerankDeny := semantic
+	rerankDeny.RerankDegrade = DegradeDeny
 	strict := semantic
 	strict.QualityStrict = true
 	cases := map[string]Options{
 		"lexical-only": {},
 		"semantic":     semantic,
-		"deny":         deny,
+		"rerank-deny":  rerankDeny,
 		"strict":       strict,
 	}
 	seen := map[string]string{}

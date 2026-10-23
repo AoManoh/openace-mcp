@@ -71,12 +71,11 @@ type Engine struct {
 	// 配置后不会静默连上仍按旧配置运行的 daemon。
 	fingerprint string
 
-	embedCfg         embedding.Config
-	embedClient      *embedding.Client
-	rerankCfg        rerank.Config
-	rerankClient     *rerank.Client
-	retrievalDegrade DegradeMode
-	rerankDegrade    DegradeMode
+	embedCfg      embedding.Config
+	embedClient   *embedding.Client
+	rerankCfg     rerank.Config
+	rerankClient  *rerank.Client
+	rerankDegrade DegradeMode
 	// lexWeights 是词法各子句（内容、路径、符号等）的权重，默认
 	// lexical.DefaultWeights()；评测程序 openace-bench 经 Options 覆盖做
 	// 权重扫描，定值后冻结进 DefaultWeights。
@@ -155,7 +154,7 @@ var (
 )
 
 // New 创建 local-hybrid 引擎。opts 为零值时是纯词法行为：不配置 embedding
-// 与 rerank，降级模式为 allow。
+// 与 rerank，精排降级模式为 allow。
 //   - OPENACE_QUALITY_STRICT=on 但没有可用的 embedding provider：构造期报错。
 //     严格档承诺完整的语义质量，没有 provider 时每次查询都会因缺口失败，
 //     在启动时指出配置错误比查询期反复失败更早暴露问题。
@@ -166,21 +165,20 @@ var (
 //   - 配置了 rerank：创建客户端。
 func New(opts Options) (*Engine, error) {
 	e := &Engine{
-		profile:          chunk.DefaultProfile(),
-		retrievalDegrade: normalizeDegrade(opts.RetrievalDegrade),
-		rerankDegrade:    normalizeDegrade(opts.RerankDegrade),
-		lexWeights:       lexical.DefaultWeights(),
-		inflight:         make(map[string]*buildCall),
-		statuses:         make(map[string]*wsStatus),
-		stores:           make(map[string]*index.Store),
-		handles:          make(map[string]*revisionHandle),
-		vectorSegments:   make(map[string]*sharedVectorIndex),
-		repair:           make(map[string]bool),
-		journals:         make(map[string]*index.Journal),
-		statCaches:       make(map[string]*workspace.StatCache),
-		lastSyncOK:       make(map[string]time.Time),
-		refreshFailures:  make(map[string]string),
-		locks:            make(map[string]*index.ProcessLock),
+		profile:         chunk.DefaultProfile(),
+		rerankDegrade:   normalizeDegrade(opts.RerankDegrade),
+		lexWeights:      lexical.DefaultWeights(),
+		inflight:        make(map[string]*buildCall),
+		statuses:        make(map[string]*wsStatus),
+		stores:          make(map[string]*index.Store),
+		handles:         make(map[string]*revisionHandle),
+		vectorSegments:  make(map[string]*sharedVectorIndex),
+		repair:          make(map[string]bool),
+		journals:        make(map[string]*index.Journal),
+		statCaches:      make(map[string]*workspace.StatCache),
+		lastSyncOK:      make(map[string]time.Time),
+		refreshFailures: make(map[string]string),
+		locks:           make(map[string]*index.ProcessLock),
 	}
 	if opts.LexicalWeights != nil {
 		e.lexWeights = *opts.LexicalWeights
@@ -485,14 +483,15 @@ func (e *Engine) SyncBackground(ctx context.Context, req engine.SyncRequest) (en
 // 检索横幅里的降级原因。
 const migrationBlockedReason = "semantic-migration-blocked"
 
-// syncPolicy 按 policyError 判定同步结果所描述 revision 的缺口：语义覆盖
-// 不足与迁移暂停原因，都取自该 revision 的 manifest（manifestGaps），不在
-// 返回后读跟踪器可能已被其他 revision 更新的状态。结果的 DegradedReason
-// 已由 revisionResult 带上同样的原因，迁移原因与恢复步骤也在
-// workspace_status 的 semantic.last_error。
-// OPENACE_RETRIEVAL_DEGRADE=deny 或 OPENACE_QUALITY_STRICT=on 时返回写明原因
-// 与环境变量的错误；revision 已照常发布、跟踪器照常记为 ready，结果仍随
-// 错误返回，之后的检索与同步不受影响。未配置语义时没有这类缺口。
+// syncPolicy 按 policyError 判定同步结果所描述 revision 的缺口：没有任何
+// 向量、语义覆盖不足与迁移暂停原因，都取自该 revision 的 manifest
+// （manifestGaps），不在返回后读跟踪器可能已被其他 revision 更新的状态。
+// 结果的 DegradedReason 已由 revisionResult 带上同样的原因，迁移原因与恢复
+// 步骤也在 workspace_status 的 semantic.last_error。
+// revision 一个向量也没有时总是返回错误（这样的 revision 不能用于语义检索）；
+// OPENACE_QUALITY_STRICT=on 时任何缺口都返回错误。revision 已照常发布、跟踪器
+// 照常记为 ready，结果仍随错误返回，之后的检索与同步不受影响。未配置语义时
+// 没有这类缺口。
 func (e *Engine) syncPolicy(manifest *index.Manifest) error {
 	if manifest == nil {
 		return nil
@@ -567,7 +566,7 @@ func (e *Engine) firstTouchFastPath(ref engine.WorkspaceRef) (error, bool) {
 
 // syncWorkspaceForQuery 是查询路径的同步入口，依次尝试：
 //   - 新鲜度窗口内：直接用现有 revision 应答，不扫描。
-//   - 首触快路径（降级模式不是 deny 且未开严格档）：返回
+//   - 首触快路径（未开严格档）：返回
 //     errFirstTouchRefresh（最近一次刷新失败时返回该次失败的错误），上层
 //     用磁盘上的旧 revision 应答，同步在后台进行。
 //   - OPENACE_QUERY_BUILD_WAIT 为 0：等到构建完成。
@@ -588,10 +587,9 @@ func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.Workspace
 	// 让上层用旧 revision 应答（原因 index-refreshing，进 [DEGRADED] 横幅；
 	// 本进程最近一次刷新失败时返回该次失败的错误，原因为 stale-index），
 	// 同时后台启动一次真实同步；同步成功后 lastSyncOK 置位，本路径不再
-	// 触发。不走的情况：显式 Sync；没有任何 revision 的工作区；降级模式
-	// deny（正确性优先）；严格档（它会把任何降级原因判为违规，走快路径
-	// 只会必然报错）。
-	if e.retrievalDegrade != DegradeDeny && !e.qualityStrict {
+	// 触发。不走的情况：显式 Sync；没有任何 revision 的工作区；严格档（它
+	// 会把任何降级原因判为违规，走快路径只会必然报错）。
+	if !e.qualityStrict {
 		if err, ok := e.firstTouchFastPath(ref); ok {
 			return engine.Result{}, err
 		}

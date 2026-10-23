@@ -48,7 +48,7 @@ func TestLocalHybridInvalidProviderEnvRejected(t *testing.T) {
 	t.Setenv("OPENACE_EMBEDDING_ADAPTER", "")
 	t.Setenv("OPENACE_RETRIEVAL_DEGRADE", "silent")
 	if _, err := buildLocalService(context.Background()); err == nil || !strings.Contains(err.Error(), "OPENACE_RETRIEVAL_DEGRADE") {
-		t.Fatalf("非法降级值应在启动显式报错: %v", err)
+		t.Fatalf("已退役的检索降级变量应在启动显式报错: %v", err)
 	}
 }
 

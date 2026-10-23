@@ -159,8 +159,10 @@ func TestSearchRoutesExposesBothRoutes(t *testing.T) {
 	}
 }
 
-// TestQueryEmbeddingFailureAllowDegradesToLexical 是 D8(a) allow 路径。
-func TestQueryEmbeddingFailureAllowDegradesToLexical(t *testing.T) {
+// TestQueryEmbeddingFailureReturnsError：配置了 embedding、索引全覆盖，只有
+// 查询嵌入失败时返回错误，不返回纯词法结果；错误写明失败类别与查询路熔断器
+// 状态（下次允许请求的时刻）。
+func TestQueryEmbeddingFailureReturnsError(t *testing.T) {
 	const dim = 8
 	server := newEmbedServer(t, dim)
 	e := newTestEngineWith(t, embedOptions(server.ts.URL, dim, 16, "fake-model"))
@@ -168,47 +170,21 @@ func TestQueryEmbeddingFailureAllowDegradesToLexical(t *testing.T) {
 	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
 		t.Fatal(err)
 	}
-	// 全覆盖后仅查询 embedding 失败。
 	server.setFailWhen(func(texts []string) bool {
 		return len(texts) == 1 && strings.Contains(texts[0], "HandleLogin-query")
 	})
 	result, err := e.Search(context.Background(), searchRequest(root, "HandleLogin-query HandleLogin"))
-	if err != nil {
-		t.Fatalf("allow 模式不得报错: %v", err)
-	}
-	if !strings.HasPrefix(result.Text, "[DEGRADED] query-embedding-failed(") {
-		t.Fatalf("首行应为 DEGRADED 横幅: %q", result.Text)
-	}
-	if result.RetrievalMode != "lexical" || !strings.Contains(result.DegradedReason, "query-embedding-failed") {
-		t.Fatalf("透明性字段不符: %+v", result)
-	}
-	if !strings.Contains(result.Text, "HandleLogin") {
-		t.Fatalf("词法结果必须仍然可用（核心理念 3）: %q", result.Text)
-	}
-	if !strings.Contains(result.Text, "mode=lexical") || !strings.Contains(result.Text, "semantic_coverage=100%") {
-		t.Fatalf("横幅应含 mode 与 coverage: %q", strings.SplitN(result.Text, "\n", 2)[0])
-	}
-}
-
-// TestQueryEmbeddingFailureDenyErrors 是 D8(a) deny 路径（K33）。
-func TestQueryEmbeddingFailureDenyErrors(t *testing.T) {
-	const dim = 8
-	server := newEmbedServer(t, dim)
-	opts := embedOptions(server.ts.URL, dim, 16, "fake-model")
-	opts.RetrievalDegrade = DegradeDeny
-	e := newTestEngineWith(t, opts)
-	root := newFixtureWorkspace(t)
-	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
-		t.Fatal(err)
-	}
-	server.setFailWhen(func(texts []string) bool { return len(texts) == 1 })
-	_, err := e.Search(context.Background(), searchRequest(root, "HandleLogin"))
 	if err == nil {
-		t.Fatalf("deny 模式应报错")
+		t.Fatalf("查询嵌入失败时不得返回纯词法结果: %+v", result)
 	}
 	message := err.Error()
-	if !strings.Contains(message, "OPENACE_RETRIEVAL_DEGRADE") || !strings.Contains(message, "allow") {
-		t.Fatalf("错误应指明恢复路径（K33）: %v", err)
+	for _, want := range []string{"semantic retrieval unavailable", "query-embedding-failed(", "query path state="} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("错误应包含 %q: %v", want, err)
+		}
+	}
+	if result.Text != "" || len(result.Hits) != 0 {
+		t.Fatalf("报错时不得附带结果: %+v", result)
 	}
 }
 
@@ -397,8 +373,10 @@ func TestRerankFailureDenyErrors(t *testing.T) {
 	}
 }
 
-// TestVectorCorruptionDegradesThenSelfHeals 是暗坑 K25 的端到端闭环。
-func TestVectorCorruptionDegradesThenSelfHeals(t *testing.T) {
+// TestVectorCorruptionFailsThenSelfHeals 是暗坑 K25 的端到端路径：向量文件
+// 损坏后查询返回错误并登记修复，不返回纯词法结果；下一次 sync 重建向量后
+// 恢复 hybrid。
+func TestVectorCorruptionFailsThenSelfHeals(t *testing.T) {
 	const dim = 8
 	server := newEmbedServer(t, dim)
 	e := newTestEngineWith(t, embedOptions(server.ts.URL, dim, 16, "fake-model"))
@@ -417,16 +395,9 @@ func TestVectorCorruptionDegradesThenSelfHeals(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 查询：词法照常 + 显式降级 + 登记自愈。
 	result, err := e.Search(context.Background(), searchRequest(root, "HandleLogin"))
-	if err != nil {
-		t.Fatalf("向量损坏不得影响词法可用性（K25）: %v", err)
-	}
-	if !strings.Contains(result.DegradedReason, "vector-data-unavailable") || result.RetrievalMode != "lexical" {
-		t.Fatalf("应显式降级: %+v", result)
-	}
-	if !strings.Contains(result.Text, "HandleLogin") {
-		t.Fatalf("词法结果应可用: %q", result.Text)
+	if err == nil || !strings.Contains(err.Error(), "vector-data-unavailable") || !strings.Contains(err.Error(), "repair is scheduled") {
+		t.Fatalf("向量损坏时应报错并说明已登记修复: result=%+v err=%v", result, err)
 	}
 
 	// 下一次 sync 自愈：发布新 revision 且覆盖完整。
@@ -474,29 +445,6 @@ func TestStaleIndexServedOnSyncFailure(t *testing.T) {
 	}
 	if result.DegradedReason != "stale-index" || result.RetrievalMode != "lexical" {
 		t.Fatalf("透明性字段不符: %+v", result)
-	}
-}
-
-// TestStaleIndexDeniedWhenConfigured 是 D8(d) deny。
-func TestStaleIndexDeniedWhenConfigured(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root 不受权限位约束，无法注入扫描失败")
-	}
-	e := newTestEngineWith(t, Options{RetrievalDegrade: DegradeDeny})
-	root := newFixtureWorkspace(t)
-	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
-		t.Fatal(err)
-	}
-	// 目录级权限错误注入(同上,M1 后单文件错误不再致命)。
-	writeFixture(t, root, "blocked/extra.py", "def extra():\n    return 1\n")
-	target := filepath.Join(root, "blocked")
-	if err := os.Chmod(target, 0o000); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(target, 0o700) })
-	_, err := e.Search(context.Background(), searchRequest(root, "HandleLogin"))
-	if err == nil || !strings.Contains(err.Error(), "OPENACE_RETRIEVAL_DEGRADE") {
-		t.Fatalf("deny 应报错并指明恢复路径: %v", err)
 	}
 }
 

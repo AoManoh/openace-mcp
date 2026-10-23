@@ -15,9 +15,9 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/rerank"
 )
 
-// DegradeMode 决定语义路（向量检索）或精排（rerank）失败时的行为。取值
-// 由用户经环境变量决定；两种取值下失败都会被看到，没有静默回退到词法
-// 结果的形态。
+// DegradeMode 决定精排（rerank）失败时的行为，取值由用户经
+// OPENACE_RERANK_DEGRADE 决定；两种取值下失败都会被看到。语义路（向量检索）
+// 没有对应开关：配置了 embedding 后语义路跑不了一律报错，见 policyError。
 type DegradeMode string
 
 const (
@@ -29,6 +29,11 @@ const (
 
 // 本包读取的环境变量名。
 const (
+	// EnvRetrievalDegrade 是已退役的检索降级开关，只用于启动时报错。它的
+	// allow 档让查询嵌入失败、revision 没有向量、向量文件不可用时返回纯词法
+	// 结果；纯词法的召回只有语义检索的四分之一左右，调用方会把没找到当成
+	// 不存在。现在这三种情况在配置了 embedding 时一律报错；部分覆盖与索引
+	// 不新鲜照常作答并写明原因，需要它们也报错时用 OPENACE_QUALITY_STRICT=on。
 	EnvRetrievalDegrade = "OPENACE_RETRIEVAL_DEGRADE"
 	EnvRerankDegrade    = "OPENACE_RERANK_DEGRADE"
 	// EnvFreshnessWindow 是查询期的新鲜度窗口：上次成功同步距今不足该
@@ -65,12 +70,11 @@ const (
 const defaultQueryBuildWait = 40 * time.Second
 
 // Options 是 local-hybrid 引擎的完整构造配置。零值是纯词法行为：不配置
-// embedding 与 rerank，降级模式 allow，每次查询都扫描，一直等到构建完成。
+// embedding 与 rerank，精排降级模式 allow，每次查询都扫描，一直等到构建完成。
 type Options struct {
-	Embedding        embedding.Config
-	Rerank           rerank.Config
-	RetrievalDegrade DegradeMode
-	RerankDegrade    DegradeMode
+	Embedding     embedding.Config
+	Rerank        rerank.Config
+	RerankDegrade DegradeMode
 	// LexicalWeights 覆盖词法各子句的权重，nil 表示 lexical.DefaultWeights()。
 	// 只有评测程序 openace-bench 做权重扫描时使用，没有对应环境变量；
 	// 定值结果冻结进 DefaultWeights，不长期依赖本覆盖。
@@ -95,9 +99,9 @@ type Options struct {
 	FragmentGate bool
 }
 
-// OptionsFromEnv 从环境变量解析引擎配置：embedding 与 rerank provider、两个
-// 降级开关、新鲜度窗口、质量严格档、查询等待上界、向量内存预算。任一
-// 变量取值非法即返回错误，指出变量名。
+// OptionsFromEnv 从环境变量解析引擎配置：embedding 与 rerank provider、精排
+// 降级开关、新鲜度窗口、质量严格档、查询等待上界。任一变量取值非法即返回
+// 错误，指出变量名；设置了已退役的变量同样报错。
 func OptionsFromEnv() (Options, error) {
 	embedCfg, err := embedding.ConfigFromEnv()
 	if err != nil {
@@ -107,9 +111,10 @@ func OptionsFromEnv() (Options, error) {
 	if err != nil {
 		return Options{}, err
 	}
-	retrievalDegrade, err := parseDegrade(EnvRetrievalDegrade)
-	if err != nil {
-		return Options{}, err
+	// 任何取值都报错，包括原默认值 allow：allow 原本表示语义路失败时返回
+	// 纯词法结果，这一行为已经取消，静默接受会让用户以为它仍然生效。
+	if raw := strings.TrimSpace(os.Getenv(EnvRetrievalDegrade)); raw != "" {
+		return Options{}, fmt.Errorf("%s is no longer supported (value %q): remove it; when an embedding provider is configured, queries now fail instead of returning lexical-only results whenever the semantic path cannot run (query embedding failed, no vectors yet, vector data unavailable); set %s=on to also reject partial coverage and stale indexes", EnvRetrievalDegrade, raw, EnvQualityStrict)
 	}
 	rerankDegrade, err := parseDegrade(EnvRerankDegrade)
 	if err != nil {
@@ -148,13 +153,12 @@ func OptionsFromEnv() (Options, error) {
 	// 算指纹，daemon 还会走 New，两处必须一致才能复用判定。
 	embedCfg.TemplateVersion = embedTemplateVersion
 	return Options{
-		Embedding:        embedCfg,
-		Rerank:           rerankCfg,
-		RetrievalDegrade: retrievalDegrade,
-		RerankDegrade:    rerankDegrade,
-		FreshnessWindow:  freshness,
-		QualityStrict:    strict,
-		QueryBuildWait:   buildWait,
+		Embedding:       embedCfg,
+		Rerank:          rerankCfg,
+		RerankDegrade:   rerankDegrade,
+		FreshnessWindow: freshness,
+		QualityStrict:   strict,
+		QueryBuildWait:  buildWait,
 	}, nil
 }
 
@@ -191,7 +195,7 @@ func normalizeDegrade(mode DegradeMode) DegradeMode {
 // Fingerprint 计算引擎配置指纹，wrapper 与 daemon 各自计算后比对，不一致
 // 即拒绝复用 daemon，用户改了配置不会静默继续用旧配置的 daemon。指纹
 // 覆盖会改变检索语义的项：词法评分模型、embedding ProfileHash、rerank 身份、
-// 两个降级开关、质量严格档、批量嵌入模式。不含凭据（key 不进任何指纹、状态或
+// 精排降级开关、质量严格档、批量嵌入模式。不含凭据（key 不进任何指纹、状态或
 // 日志，换 key 也不该判成不同引擎）与运维参数（批大小、并发、超时、
 // 预算，它们不改变检索语义）。Embedding.Enabled=false 时嵌入身份记为 off，
 // 其他指纹项相同才会得到相同指纹。OpenAI-compatible 服务允许不带 key，
@@ -227,13 +231,13 @@ func (o Options) Fingerprint() string {
 	// 词法评分模型决定词法路的分数与排序，不由 env 配置，但必须进指纹：
 	// 未设置评分模型、实际按 TF-IDF 评分的旧 daemon 与 BM25 的 wrapper 即使
 	// env 完全相同也不能互相复用。加入该项时前缀从 v3 升到 v4，纯词法零值
-	// 配置的指纹同样随之改变。
+	// 配置的指纹同样随之改变。检索降级开关退役后前缀升到 v5：旧 daemon 在
+	// 语义路失败时返回纯词法结果，新 wrapper 不能复用它。
 	sum := sha256.Sum256([]byte(strings.Join([]string{
-		"engine-profile-v4",
+		"engine-profile-v5",
 		"lexical-" + lexical.ScoringModel,
 		embedComponent,
 		rerankComponent,
-		string(normalizeDegrade(o.RetrievalDegrade)),
 		string(normalizeDegrade(o.RerankDegrade)),
 		strictComponent,
 		bulkComponent,

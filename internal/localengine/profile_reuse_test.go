@@ -195,8 +195,8 @@ func TestVectorRepairReusesHealthySiblingProfile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(store.SegmentPathFor(segment.ID), vector.DataFileName), []byte("corrupt"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if res, err := e7.Search(context.Background(), searchRequest(root, "HandleLogin")); err != nil || !strings.Contains(res.DegradedReason, "vector-data-unavailable") {
-		t.Fatalf("损坏查询应降级并登记 repair: %+v err=%v", res, err)
+	if res, err := e7.Search(context.Background(), searchRequest(root, "HandleLogin")); err == nil || !strings.Contains(err.Error(), "vector-data-unavailable") || !strings.Contains(err.Error(), "repair is scheduled") {
+		t.Fatalf("损坏查询应报错并登记 repair: %+v err=%v", res, err)
 	}
 	server.mu.Lock()
 	before := server.calls

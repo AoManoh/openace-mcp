@@ -98,7 +98,8 @@ func TestSyncDeletedCountsRemovedPaths(t *testing.T) {
 
 // TestSyncModeShowsRevisionCapability：Sync 的 retrieval_mode 说明返回的
 // revision 已建立的检索能力：未配置语义为 lexical；有向量为 hybrid；配置了
-// 语义但一个向量也没有时为 lexical。
+// 语义但一个向量也没有时为 lexical，原因为 semantic-index-empty，同步照常
+// 发布并返回结果，同时返回错误（这样的 revision 不能用于语义检索）。
 func TestSyncModeShowsRevisionCapability(t *testing.T) {
 	lexical := newTestEngine(t)
 	root := newFixtureWorkspace(t)
@@ -118,8 +119,8 @@ func TestSyncModeShowsRevisionCapability(t *testing.T) {
 	zero.zeroWhen = func(string) bool { return true }
 	none := newTestEngineWith(t, embedOptions(zero.ts.URL, 8, 16, "result-model"))
 	res, err = none.Sync(context.Background(), syncRequest(newFixtureWorkspace(t)))
-	if err != nil || res.RetrievalMode != "lexical" || res.SemanticCoverage != "0%" || res.DegradedReason != "semantic-coverage-partial" {
-		t.Fatalf("配置了语义但没有向量的 revision 应为 lexical 且报告 0%% 覆盖: %+v err=%v", res, err)
+	if err == nil || !strings.Contains(err.Error(), semanticIndexEmptyReason) || res.IndexRevision == "" || res.RetrievalMode != "lexical" || res.SemanticCoverage != "0%" || res.DegradedReason != semanticIndexEmptyReason {
+		t.Fatalf("配置了语义但没有向量的 revision 应为 lexical、报告 0%% 覆盖并返回错误: %+v err=%v", res, err)
 	}
 }
 

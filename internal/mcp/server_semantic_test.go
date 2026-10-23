@@ -141,10 +141,10 @@ func TestSemanticHybridEndToEnd(t *testing.T) {
 	}
 }
 
-// TestSemanticDegradeAllowViaMCP 是 D8(a) allow 的 MCP 面验收：
-// provider 查询期故障时词法结果照常返回，首行 [DEGRADED] 横幅
-// 让宿主 AI 可见降级事实（决策 11 输出契约）。
-func TestSemanticDegradeAllowViaMCP(t *testing.T) {
+// TestSemanticQueryFailureViaMCP 是配置了 embedding 时查询期故障的 MCP 面
+// 验收：provider 查询嵌入失败时返回可行动的工具错误，写明原因与重试信息，
+// 不返回纯词法结果（K33）。
+func TestSemanticQueryFailureViaMCP(t *testing.T) {
 	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
 	t.Setenv("OPENACE_CACHE_NAMESPACE", "e2e")
 	const dim = 8
@@ -164,46 +164,16 @@ func TestSemanticDegradeAllowViaMCP(t *testing.T) {
 	}
 	failQuery.Store(true)
 	retrieval := runMCP(t, server, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"information_request":"establishUserSession qqxx","directory_path":`+jsonString(root)+`}}}`)
-	if strings.Contains(retrieval, `"isError":true`) {
-		t.Fatalf("allow 模式不得报错: %s", retrieval)
-	}
-	if !strings.Contains(retrieval, `[DEGRADED] query-embedding-failed(`) || !strings.Contains(retrieval, "mode=lexical") {
-		t.Fatalf("应携带 DEGRADED 横幅与模式: %s", retrieval)
-	}
-	if !strings.Contains(retrieval, "establishUserSession") {
-		t.Fatalf("词法结果必须仍然可用: %s", retrieval)
-	}
-}
-
-// TestSemanticDegradeDenyViaMCP 是 D8(a) deny 的 MCP 面验收（K33）：
-// 返回可行动工具错误而非空结果。
-func TestSemanticDegradeDenyViaMCP(t *testing.T) {
-	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
-	t.Setenv("OPENACE_CACHE_NAMESPACE", "e2e")
-	const dim = 8
-	var calls atomic.Int32
-	var failQuery atomic.Bool
-	provider := newSemanticFakeProvider(t, dim, &failQuery, &calls)
-	root := writeSemanticFixture(t)
-
-	opts := semanticOptions(provider.URL, dim)
-	opts.RetrievalDegrade = localengine.DegradeDeny
-	service, err := localengine.New(opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = service.Close(context.Background()) })
-	server := NewServer(service)
-	if sync := runMCP(t, server, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sync_workspace","arguments":{"directory_path":`+jsonString(root)+`}}}`); strings.Contains(sync, `"isError":true`) {
-		t.Fatalf("sync 不应报错: %s", sync)
-	}
-	failQuery.Store(true)
-	retrieval := runMCP(t, server, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codebase_retrieval","arguments":{"information_request":"establishUserSession qqxx","directory_path":`+jsonString(root)+`}}}`)
 	if !strings.Contains(retrieval, `"isError":true`) {
-		t.Fatalf("deny 模式应返回工具错误: %s", retrieval)
+		t.Fatalf("查询嵌入失败应返回工具错误: %s", retrieval)
 	}
-	if !strings.Contains(retrieval, "OPENACE_RETRIEVAL_DEGRADE") {
-		t.Fatalf("错误应指明恢复路径（K33）: %s", retrieval)
+	for _, want := range []string{"semantic retrieval unavailable", "query-embedding-failed(", "query path state="} {
+		if !strings.Contains(retrieval, want) {
+			t.Fatalf("错误应包含 %q: %s", want, retrieval)
+		}
+	}
+	if strings.Contains(retrieval, "mode=lexical") {
+		t.Fatalf("不得返回纯词法结果: %s", retrieval)
 	}
 }
 

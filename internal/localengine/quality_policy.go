@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/index"
+	"github.com/AoManoh/openace-mcp/internal/reliability"
 )
 
 // qualityGap 是一条降级原因：reason 是写进 degraded_reason 的稳定原因
@@ -15,27 +17,37 @@ type qualityGap struct {
 	detail error
 }
 
-// 原因的归属开关，见 gapSwitch。
+// 原因的归属，见 gapSwitch。
 const (
-	gapRetrieval  = "retrieval"
-	gapRerank     = "rerank"
-	gapStrictOnly = "strict-only"
+	gapSemanticUnavailable = "semantic-unavailable"
+	gapRetrieval           = "retrieval"
+	gapRerank              = "rerank"
+	gapStrictOnly          = "strict-only"
 )
 
-// gapSwitch 返回一条原因由哪个开关决定是否拒绝：
+// semanticIndexEmptyReason 表示所服务的 revision 一个向量也没有（首次构建
+// 先发布的词法中间版本，或嵌入全部失败后发布的零覆盖 revision）。
+const semanticIndexEmptyReason = "semantic-index-empty"
+
+// gapSwitch 返回一条原因归哪一类：
+//   - semantic-unavailable：语义路跑不了，包括向量文件不可用
+//     （vector-data-unavailable）、查询嵌入失败（query-embedding-failed(类别)）
+//     与 revision 没有任何向量（semantic-index-empty）。配置了 embedding 时
+//     这类原因总是拒绝，见 policyError。
 //   - rerank（OPENACE_RERANK_DEGRADE）：精排调用失败、无效响应或 token 预算
 //     连第一条候选都装不下（rerank-skipped(类别)），精排响应不完整
 //     （rerank-partial-response）。
 //   - 只由 OPENACE_QUALITY_STRICT 拒绝：rerank-unconfigured(...) 与
 //     rerank-not-applied。未配置精排不是调用失败；显式 rerank off 是用户的
 //     选择，不产生原因。
-//   - 其余都归 retrieval（OPENACE_RETRIEVAL_DEGRADE）：索引同步失败
-//     （stale-index、index-building、index-refreshing）、向量不可用
-//     （vector-data-unavailable）、查询嵌入失败
-//     （query-embedding-failed(类别)）、语义覆盖不足
-//     （semantic-coverage-partial）、语义迁移暂停（semantic-migration-blocked）。
+//   - 其余归 retrieval，照常作答并随结果写明，只有 OPENACE_QUALITY_STRICT
+//     拒绝：索引不新鲜（stale-index、index-building、index-refreshing）、语义
+//     覆盖不足（semantic-coverage-partial）、语义迁移暂停
+//     （semantic-migration-blocked）。
 func gapSwitch(reason string) string {
 	switch {
+	case reason == "vector-data-unavailable", reason == semanticIndexEmptyReason, strings.HasPrefix(reason, "query-embedding-failed"):
+		return gapSemanticUnavailable
 	case strings.HasPrefix(reason, "rerank-skipped"), reason == "rerank-partial-response":
 		return gapRerank
 	case strings.HasPrefix(reason, "rerank-"):
@@ -45,20 +57,28 @@ func gapSwitch(reason string) string {
 	}
 }
 
-// policyError 按已批准的降级政策判定一组缺口是否必须拒绝。提前拒绝（同步
-// 失败、manifest 已知的覆盖不足与迁移暂停、向量与查询嵌入失败、精排失败）
-// 与最终返回都调用它，不另维护一套判定：
+// policyError 判定一组缺口是否必须拒绝。提前拒绝（同步失败、manifest 已知
+// 的缺口、向量与查询嵌入失败、精排失败）与最终返回都调用它，不另维护一套
+// 判定：
+//   - 有 semantic-unavailable 类缺口：总是拒绝。配置了 embedding 就只用语义
+//     检索的结果作答：纯词法结果的召回只有语义检索的四分之一左右（R02、R03
+//     评测），调用方会把没找到当成不存在；精确关键词搜索调用方自己的 grep
+//     更完整。错误列出全部原因与说明。
 //   - OPENACE_QUALITY_STRICT=on：任何缺口都拒绝，错误列出全部原因与说明。
-//   - OPENACE_RETRIEVAL_DEGRADE=deny：有 retrieval 类缺口时拒绝。
 //   - OPENACE_RERANK_DEGRADE=deny：有 rerank 类缺口时拒绝。
 //   - 其余情况放行，返回 nil，原因随结果返回。
 //
-// 同时满足多条时依次按 strict、retrieval deny、rerank deny 返回第一个错误，
-// 错误写明原因 token 与对应环境变量。拒绝只影响这次响应：已发布的
-// revision、已付费的向量与状态跟踪都不改动。
+// 同时满足多条时依次按以上顺序返回第一个错误。拒绝只影响这次响应：已发布
+// 的 revision、已付费的向量与状态跟踪都不改动。
 func (e *Engine) policyError(gaps []qualityGap) error {
 	if len(gaps) == 0 {
 		return nil
+	}
+	for _, gap := range gaps {
+		if gapSwitch(gap.reason) == gapSemanticUnavailable {
+			return fmt.Errorf("semantic retrieval unavailable [%s]: %s; an embedding provider is configured, so openACE does not answer with lexical-only results; retry after the cause above is resolved, or search with your own tools meanwhile",
+				gapReasons(gaps), gapDetails(gaps))
+		}
 	}
 	if e.qualityStrict {
 		details := gapDetails(gaps)
@@ -68,45 +88,40 @@ func (e *Engine) policyError(gaps []qualityGap) error {
 		return fmt.Errorf("%s=on: 语义质量缺口 [%s],拒绝返回不完整结果(改用 %s=off 可降级放行)%s",
 			EnvQualityStrict, gapReasons(gaps), EnvQualityStrict, details)
 	}
-	rules := []struct {
-		deny  bool
-		class string
-		env   string
-	}{
-		{e.retrievalDegrade == DegradeDeny, gapRetrieval, EnvRetrievalDegrade},
-		{e.rerankDegrade == DegradeDeny, gapRerank, EnvRerankDegrade},
-	}
-	for _, rule := range rules {
-		if !rule.deny {
-			continue
-		}
+	if e.rerankDegrade == DegradeDeny {
 		var matched []qualityGap
 		for _, gap := range gaps {
-			if gapSwitch(gap.reason) == rule.class {
+			if gapSwitch(gap.reason) == gapRerank {
 				matched = append(matched, gap)
 			}
 		}
-		if len(matched) == 0 {
-			continue
+		if len(matched) > 0 {
+			cause := gapDetails(matched)
+			if cause == "" {
+				cause = "see degraded_reason"
+			}
+			return degradeDeniedError(gapReasons(matched), errors.New(cause), EnvRerankDegrade)
 		}
-		cause := gapDetails(matched)
-		if cause == "" {
-			cause = "see degraded_reason"
-		}
-		return degradeDeniedError(gapReasons(matched), errors.New(cause), rule.env)
 	}
 	return nil
 }
 
-// manifestGaps 返回从 revision 的 manifest 就能知道的缺口：语义覆盖不足与
-// 迁移暂停原因；未配置语义时为空。同步结果与查询共用：同步据此给出原因
-// 并判定拒绝，查询据此在发出查询嵌入之前判定。
+// manifestGaps 返回从 revision 的 manifest 就能知道的缺口：没有任何向量
+// （semantic-index-empty）或语义覆盖不足，以及迁移暂停原因；未配置语义时
+// 为空。同步结果与查询共用：同步据此给出原因并判定拒绝，查询据此在发出
+// 查询嵌入之前判定。没有 chunk 的空工作区不算缺口。
 func (e *Engine) manifestGaps(m *index.Manifest) []qualityGap {
 	if !e.semanticEnabled() {
 		return nil
 	}
 	var gaps []qualityGap
-	if !m.SemanticComplete() {
+	switch {
+	case m.Counts.Chunks > 0 && m.VectorCount == 0:
+		gaps = append(gaps, qualityGap{
+			reason: semanticIndexEmptyReason,
+			detail: fmt.Errorf("revision %s has no vectors yet (0 of %d live chunks embedded)", m.Revision, m.Counts.Chunks),
+		})
+	case !m.SemanticComplete():
 		gaps = append(gaps, qualityGap{
 			reason: "semantic-coverage-partial",
 			detail: fmt.Errorf("semantic_coverage=%s (%d of %d live chunks have vectors)", coveragePercent(m), m.VectorCount, m.Counts.Chunks),
@@ -116,6 +131,38 @@ func (e *Engine) manifestGaps(m *index.Manifest) []qualityGap {
 		gaps = append(gaps, qualityGap{reason: migrationBlockedReason, detail: errors.New(m.SemanticMigrationBlock)})
 	}
 	return gaps
+}
+
+// withBuildProgress 给 semantic-index-empty 缺口的说明补上该工作区的构建
+// 进度与索引嵌入熔断器状态。调用方据此判断要等多久，或先用自己的工具。
+func (e *Engine) withBuildProgress(gaps []qualityGap, workspaceKey string) []qualityGap {
+	for i, gap := range gaps {
+		if gap.reason != semanticIndexEmptyReason {
+			continue
+		}
+		extra := "build progress: " + e.buildProgressLabel(workspaceKey)
+		if snap := e.embedClient.CircuitSnapshot(); snap.State != "healthy" {
+			extra += "; embedding provider " + circuitLabel(snap)
+		}
+		gaps[i].detail = fmt.Errorf("%v; %s", gap.detail, extra)
+	}
+	return gaps
+}
+
+// circuitLabel 把熔断器快照写成一句说明：状态、下次允许请求的时刻、连续
+// 失败次数与最后错误。
+func circuitLabel(snap reliability.CircuitSnapshot) string {
+	label := "state=" + snap.State
+	if !snap.BackoffUntil.IsZero() {
+		label += " next_attempt_after=" + snap.BackoffUntil.UTC().Format(time.RFC3339)
+	}
+	if snap.ConsecutiveFailures > 0 {
+		label += fmt.Sprintf(" consecutive_failures=%d", snap.ConsecutiveFailures)
+	}
+	if snap.LastError != "" {
+		label += " last_error=" + snap.LastError
+	}
+	return label
 }
 
 // gapReasons 用逗号连接原因 token，与 degraded_reason 的格式一致。

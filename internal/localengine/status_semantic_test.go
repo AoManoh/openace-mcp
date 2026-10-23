@@ -87,8 +87,8 @@ func TestStatusBackoffVisibility(t *testing.T) {
 	opts.Embedding.APIKey = "canary-status-key"
 	e := newTestEngineWith(t, opts)
 	root := newFixtureWorkspace(t)
-	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
-		t.Fatal(err)
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err == nil || !strings.Contains(err.Error(), semanticIndexEmptyReason) || strings.Contains(err.Error(), "canary-status-key") {
+		t.Fatalf("provider 全故障时同步应报告没有向量且不含 key: %v", err)
 	}
 	status, err := e.WorkspaceStatus(context.Background(), engineRef(root))
 	if err != nil {

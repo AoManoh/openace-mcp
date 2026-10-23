@@ -36,17 +36,14 @@ func TestQualityFieldsOnHappyPath(t *testing.T) {
 	if res.RerankSent <= 0 {
 		t.Fatalf("rerank_sent 应大于 0: %+v", res)
 	}
-	if res.QueryEmbedFailed {
-		t.Fatalf("query_embed_failed 应为 false: %+v", res)
-	}
 	if !strings.Contains(res.EmbeddingProfile, "fake-model") || !strings.Contains(res.EmbeddingProfile, "8") {
 		t.Fatalf("embedding_profile 应含模型与维度: %q", res.EmbeddingProfile)
 	}
 }
 
-// TestQueryEmbedFailedFieldAndStrict:查询嵌入失败——allow 下降级并置位
-// 字段;strict 下显式报错并指名 env。
-func TestQueryEmbedFailedFieldAndStrict(t *testing.T) {
+// TestQueryEmbedFailureErrorsWithAndWithoutStrict:查询嵌入失败时默认与
+// strict 下都显式报错并写明缺口 token,不返回纯词法结果。
+func TestQueryEmbedFailureErrorsWithAndWithoutStrict(t *testing.T) {
 	const dim = 8
 	es := newEmbedServer(t, dim)
 	defer es.ts.Close()
@@ -61,12 +58,10 @@ func TestQueryEmbedFailedFieldAndStrict(t *testing.T) {
 	es.failWhen = func(texts []string) bool { return len(texts) == 1 }
 	es.mu.Unlock()
 
-	res, err := e.Search(context.Background(), searchRequest(root, "HandleLogin"))
-	if err != nil {
-		t.Fatalf("allow 下应降级放行: %v", err)
-	}
-	if !res.QueryEmbedFailed {
-		t.Fatalf("query_embed_failed 应置位: %+v", res)
+	if res, err := e.Search(context.Background(), searchRequest(root, "HandleLogin")); err == nil {
+		t.Fatalf("默认配置下查询嵌入失败应报错: %+v", res)
+	} else if !strings.Contains(err.Error(), "semantic retrieval unavailable") || !strings.Contains(err.Error(), "query-embedding-failed") {
+		t.Fatalf("错误应写明缺口 token: %v", err)
 	}
 
 	strict := embedOptions(es.ts.URL, dim, 16, "fake-model")
@@ -74,8 +69,8 @@ func TestQueryEmbedFailedFieldAndStrict(t *testing.T) {
 	es2 := newTestEngineWith(t, strict)
 	if _, err := es2.Search(context.Background(), searchRequest(root, "HandleLogin")); err == nil {
 		t.Fatal("strict 下查询嵌入失败应显式报错")
-	} else if !strings.Contains(err.Error(), EnvQualityStrict) || !strings.Contains(err.Error(), "query-embedding-failed") {
-		t.Fatalf("错误应指名 env 与缺口 token: %v", err)
+	} else if !strings.Contains(err.Error(), "query-embedding-failed") {
+		t.Fatalf("错误应写明缺口 token: %v", err)
 	}
 }
 

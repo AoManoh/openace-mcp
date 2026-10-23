@@ -247,9 +247,11 @@ func TestMigrationBlocksWhenSiblingStateCannotBeChecked(t *testing.T) {
 				t.Skip("当前用户可无视权限位（root/CAP_DAC_OVERRIDE），无法构造检查失败，跳过")
 			}
 			callsBefore := f.server.callCount()
+			// 旧子树读不出来时一个向量也复用不了，新 revision 没有向量：同步照常
+			// 发布并返回结果，同时返回 semantic-index-empty 错误。
 			res, err := current.Sync(ctx, syncRequest(f.root))
-			if err != nil {
-				t.Fatalf("同步: %v", err)
+			if err == nil || !strings.Contains(err.Error(), semanticIndexEmptyReason) || !strings.Contains(err.Error(), "semantic-migration-blocked") || res.IndexRevision == "" {
+				t.Fatalf("同步应发布 revision 并返回没有向量的错误: res=%+v err=%v", res, err)
 			}
 			if docs := documentTexts(f.server, callsBefore); len(docs) != 0 {
 				t.Fatalf("无法检查旧子树时文档嵌入请求必须为 0: %q", docs)
@@ -474,15 +476,14 @@ func TestSiblingBatchJobWithUnknownKeysBlocksSends(t *testing.T) {
 	}
 }
 
-// TestSiblingBatchJobWithUnknownKeysUnderDenyStrict：旧作业 keys 无法确定时，
-// deny 与 strict 下同步返回带原因的错误，文档嵌入请求为 0。
-func TestSiblingBatchJobWithUnknownKeysUnderDenyStrict(t *testing.T) {
+// TestSiblingBatchJobWithUnknownKeysUnderStrict：旧作业 keys 无法确定时，
+// strict 下同步返回带原因的错误，文档嵌入请求为 0。
+func TestSiblingBatchJobWithUnknownKeysUnderStrict(t *testing.T) {
 	modes := []struct {
 		name    string
 		mutate  func(o *Options)
 		wantEnv string
 	}{
-		{"deny", func(o *Options) { o.RetrievalDegrade = DegradeDeny }, EnvRetrievalDegrade},
 		{"strict", func(o *Options) { o.QualityStrict = true }, EnvQualityStrict},
 	}
 	for _, mode := range modes {
@@ -715,11 +716,19 @@ func TestMigrationBlockDiagnosticUpdatesAcrossRestart(t *testing.T) {
 	if n := parseConfigTexts(f, callsBefore); n != 0 {
 		t.Fatalf("暂停期间不得发送旧作业登记的内容: %d", n)
 	}
-	// 移走状态文件，但 provider 全部失败：暂停解除，覆盖仍不完整。
+	// 移走状态文件，但 provider 的文档嵌入全部失败（查询嵌入正常，重启后的
+	// 查询才能作答）：暂停解除，覆盖仍不完整。
 	if err := os.Remove(f.bulkPath()); err != nil {
 		t.Fatal(err)
 	}
-	f.server.setFailWhen(func([]string) bool { return true })
+	f.server.setFailWhen(func(texts []string) bool {
+		for _, text := range texts {
+			if strings.HasPrefix(text, docTextPrefix) {
+				return true
+			}
+		}
+		return false
+	})
 	third, e := syncWith("暂停解除但 provider 失败")
 	if strings.Contains(third.DegradedReason, "semantic-migration-blocked") || third.SemanticCoverage == "100%" {
 		t.Fatalf("暂停解除后不应再带暂停原因，覆盖仍不完整: %+v", third)
@@ -838,18 +847,17 @@ func TestSiblingJournalKeysReusedForLaterEdits(t *testing.T) {
 	t.Logf("later_edit_journal_reuse document_requests=0 cross_profile_reused=%d", delta.CrossProfileReused)
 }
 
-// TestMigrationBlockVisibleUnderAllowDenyStrict：迁移受阻在三种配置下都可见。
-// allow：每次同步（包括没有发布新 revision 的同步）与检索结果都带
-// semantic-migration-blocked；deny 与 strict：同步与检索返回带原因的错误。
-// 三种配置下文档嵌入请求都是 0；allow 的检索另有查询嵌入请求，单独计数。
-func TestMigrationBlockVisibleUnderAllowDenyStrict(t *testing.T) {
+// TestMigrationBlockVisibleByDefaultAndUnderStrict：迁移受阻在两种配置下都
+// 可见。默认：每次同步（包括没有发布新 revision 的同步）与检索结果都带
+// semantic-migration-blocked；strict：同步与检索返回带原因的错误。两种配置下
+// 文档嵌入请求都是 0；默认配置的检索另有查询嵌入请求，单独计数。
+func TestMigrationBlockVisibleByDefaultAndUnderStrict(t *testing.T) {
 	modes := []struct {
 		name    string
 		mutate  func(o *Options)
 		wantErr string
 	}{
-		{"allow", func(o *Options) {}, ""},
-		{"deny", func(o *Options) { o.RetrievalDegrade = DegradeDeny }, EnvRetrievalDegrade},
+		{"default", func(o *Options) {}, ""},
 		{"strict", func(o *Options) { o.QualityStrict = true }, EnvQualityStrict},
 	}
 	for _, mode := range modes {
@@ -878,16 +886,16 @@ func TestMigrationBlockVisibleUnderAllowDenyStrict(t *testing.T) {
 			if mode.wantErr == "" {
 				for i, res := range []engine.Result{first, second} {
 					if i == 0 && firstErr != nil || i == 1 && secondErr != nil {
-						t.Fatalf("allow 下同步不应失败: %v %v", firstErr, secondErr)
+						t.Fatalf("默认配置下同步不应失败: %v %v", firstErr, secondErr)
 					}
 					if !strings.Contains(res.DegradedReason, "semantic-migration-blocked") {
-						t.Fatalf("allow 第 %d 次同步应带阻止原因: %+v", i+1, res)
+						t.Fatalf("默认配置第 %d 次同步应带阻止原因: %+v", i+1, res)
 					}
 				}
 				if searchErr != nil || !strings.Contains(result.DegradedReason, "semantic-migration-blocked") || !strings.Contains(result.Text, "semantic-migration-blocked") {
-					t.Fatalf("allow 下检索应带阻止原因与横幅: err=%v reason=%q", searchErr, result.DegradedReason)
+					t.Fatalf("默认配置下检索应带阻止原因与横幅: err=%v reason=%q", searchErr, result.DegradedReason)
 				}
-				t.Logf("allow document_requests=0 query_requests=%d sync_reasons=%q|%q search_reason=%q", queries, first.DegradedReason, second.DegradedReason, result.DegradedReason)
+				t.Logf("default document_requests=0 query_requests=%d sync_reasons=%q|%q search_reason=%q", queries, first.DegradedReason, second.DegradedReason, result.DegradedReason)
 				return
 			}
 			for i, err := range []error{firstErr, secondErr, searchErr} {

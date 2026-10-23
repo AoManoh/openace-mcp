@@ -334,9 +334,11 @@ func TestBackoffPreventsRebuildStorm(t *testing.T) {
 	e := newTestEngineWith(t, embedOptions(server.ts.URL, dim, 16, "fake-model"))
 	root := newFixtureWorkspace(t)
 
+	// provider 全故障时词法 revision 仍发布（§10.2），同步同时返回没有向量的
+	// 错误：这样的 revision 不能用于语义检索。
 	first, err := e.Sync(context.Background(), syncRequest(root))
-	if err != nil {
-		t.Fatalf("provider 全故障时词法仍须发布（§10.2）: %v", err)
+	if err == nil || !strings.Contains(err.Error(), semanticIndexEmptyReason) || first.IndexRevision == "" {
+		t.Fatalf("应发布零覆盖 revision 并返回没有向量的错误: %+v err=%v", first, err)
 	}
 	manifest, _ := loadActiveManifest(t, e, root)
 	if manifest.VectorCount != 0 || !manifest.HasVectors() {
@@ -348,8 +350,8 @@ func TestBackoffPreventsRebuildStorm(t *testing.T) {
 	}
 	for i := 0; i < 5; i++ {
 		result, err := e.Sync(context.Background(), syncRequest(root))
-		if err != nil || result.IndexRevision != first.IndexRevision {
-			t.Fatalf("退避期 sync 应 no-op: %+v err=%v", result, err)
+		if err == nil || !strings.Contains(err.Error(), semanticIndexEmptyReason) || result.IndexRevision != first.IndexRevision {
+			t.Fatalf("退避期 sync 应 no-op 并照常报告没有向量: %+v err=%v", result, err)
 		}
 	}
 	if server.callCount() != callsAfterFirst {
@@ -369,8 +371,8 @@ func TestWorkspaceChangedReportsSemanticGap(t *testing.T) {
 	server.setFailWhen(func([]string) bool { return true })
 	e := newTestEngineWith(t, embedOptions(server.ts.URL, dim, 16, "fake-model"))
 	root := newFixtureWorkspace(t)
-	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
-		t.Fatal(err)
+	if _, err := e.Sync(context.Background(), syncRequest(root)); err == nil || !strings.Contains(err.Error(), semanticIndexEmptyReason) {
+		t.Fatalf("provider 全故障时同步应报告没有向量: %v", err)
 	}
 	// fresh circuit（healthy）+ 覆盖缺口 → 需要同步。
 	server.setFailWhen(nil)

@@ -16,13 +16,13 @@ func TestSyncResultCarriesCoverageOnEmbedFailure(t *testing.T) {
 	e := newTestEngineWith(t, embedOptions(server.ts.URL, 8, 4, "fake-model"))
 	root := newFixtureWorkspace(t)
 	result, err := e.Sync(context.Background(), syncRequest(root))
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), semanticIndexEmptyReason) {
+		t.Fatalf("没有任何向量的 revision 应让 Sync 返回错误: %v", err)
 	}
 	if result.SemanticCoverage != "0%" {
 		t.Fatalf("Sync Result 应携带覆盖率 0%%,得到 %q", result.SemanticCoverage)
 	}
-	if !strings.Contains(result.DegradedReason, "semantic-coverage-partial") {
+	if !strings.Contains(result.DegradedReason, semanticIndexEmptyReason) {
 		t.Fatalf("Sync Result 应携带降级原因,得到 %q", result.DegradedReason)
 	}
 	summary := result.Summary()

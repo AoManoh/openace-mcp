@@ -9,26 +9,25 @@ import (
 	"testing"
 )
 
-// 模型响应有效性：适配器判断响应是否有效，引擎按用户配置的降级策略决定
-// 返回错误还是带原因继续。
+// 模型响应有效性：适配器判断响应是否有效。查询嵌入无效时语义路跑不了，
+// 引擎返回错误；精排响应无效时按用户配置的精排降级策略决定返回错误还是
+// 带原因继续。
 
 const validityQuery = "HandleLogin"
 
-// TestZeroQueryVectorFollowsDegradePolicy：索引正常建好后，查询嵌入返回维度
-// 正确的零向量。allow 返回词法结果并带 query-embedding-failed(permanent)；
-// retrieval deny 与 strict 返回错误。HTTP 503 对照得到 transient 原因。
-func TestZeroQueryVectorFollowsDegradePolicy(t *testing.T) {
+// TestInvalidQueryVectorReturnsError：索引正常建好后，查询嵌入返回维度正确的
+// 零向量，默认与 strict 下都返回带 query-embedding-failed(permanent) 的错误，
+// 不返回纯词法结果，零向量计入查询熔断器失败。HTTP 503 对照得到 transient。
+func TestInvalidQueryVectorReturnsError(t *testing.T) {
 	cases := []struct {
-		name    string
-		mutate  func(o *Options)
-		zero    bool
-		wantErr string
-		reason  string
+		name   string
+		mutate func(o *Options)
+		zero   bool
+		reason string
 	}{
-		{"allow 零向量", func(o *Options) {}, true, "", "query-embedding-failed(permanent)"},
-		{"deny 零向量", func(o *Options) { o.RetrievalDegrade = DegradeDeny }, true, EnvRetrievalDegrade, ""},
-		{"strict 零向量", func(o *Options) { o.QualityStrict = true }, true, EnvQualityStrict, ""},
-		{"allow 503 对照", func(o *Options) {}, false, "", "query-embedding-failed(transient)"},
+		{"默认 零向量", func(o *Options) {}, true, "query-embedding-failed(permanent)"},
+		{"strict 零向量", func(o *Options) { o.QualityStrict = true }, true, "query-embedding-failed(permanent)"},
+		{"默认 503 对照", func(o *Options) {}, false, "query-embedding-failed(transient)"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -49,17 +48,11 @@ func TestZeroQueryVectorFollowsDegradePolicy(t *testing.T) {
 			}
 			server.mu.Unlock()
 			res, err := e.Search(context.Background(), searchRequest(root, validityQuery))
-			if tc.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("应返回带 %s 的错误: res=%+v err=%v", tc.wantErr, res.DegradedReason, err)
-				}
-				return
+			if err == nil || !strings.Contains(err.Error(), "semantic retrieval unavailable") || !strings.Contains(err.Error(), tc.reason) {
+				t.Fatalf("应返回带 %s 的错误且不附带结果: res=%+v err=%v", tc.reason, res, err)
 			}
-			if err != nil {
-				t.Fatalf("allow 下应返回词法结果: %v", err)
-			}
-			if !strings.Contains(res.DegradedReason, tc.reason) || !res.QueryEmbedFailed || len(res.Hits) == 0 || res.Hits[0].Path != "main.go" {
-				t.Fatalf("应返回词法命中并带 %s: reason=%q failed=%v hits=%+v", tc.reason, res.DegradedReason, res.QueryEmbedFailed, res.Hits)
+			if len(res.Hits) != 0 {
+				t.Fatalf("报错时不得附带命中: %+v", res.Hits)
 			}
 			if tc.zero {
 				if state := e.embedClient.QueryCircuitSnapshot().State; state == "healthy" {

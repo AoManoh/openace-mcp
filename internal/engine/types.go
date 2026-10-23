@@ -84,8 +84,6 @@ type Result struct {
 	// 词法路实际使用的结构 token 变体(零命中回退时追加 " fallback=original"),
 	// 未触发为空——原查询本身永不被改写或丢弃(调研护栏 7/8)。
 	QueryPlan string `json:"query_plan,omitempty"`
-	// QueryEmbedFailed 表示本次查询嵌入失败（语义路仅缺查询侧）。
-	QueryEmbedFailed bool `json:"query_embed_failed,omitempty"`
 	// EmbeddingProfile 是语义路身份短指纹（provider/model/dimension）。
 	EmbeddingProfile string `json:"embedding_profile,omitempty"`
 	// BuildMode 是本次 sync 的构建形态与成因(灰度反馈四 §6.1:重建

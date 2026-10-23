@@ -152,7 +152,7 @@ embedding 地址、模型、维度和内置嵌入模板都没变时,新子树只
 - 待送审的内容登记在旧子树尚未回收结果的 Batch 作业里(开着 `OPENACE_EMBEDDING_BATCH_API` 时在批作业中途升级),或旧子树有一条未收尾的提交意向。
 - 旧子树登记的某个 Batch 作业没有可用的输入键清单(`keys` 缺失、为空,或有一项不是 64 位小写十六进制),无法确定它覆盖哪些内容。
 
-采用默认 `allow` 策略时,暂停期间词法检索和已复用的向量继续可用。同步结果和检索横幅带 `semantic-migration-blocked`,`workspace_status` 的 `semantic.last_error` 写明涉及的文件、实际错误和恢复办法。设了 `OPENACE_RETRIEVAL_DEGRADE=deny` 或 `OPENACE_QUALITY_STRICT=on` 时,同步和检索直接返回错误。
+暂停期间已复用的向量照常参与检索,结果照常返回,同步结果和检索横幅带 `semantic-migration-blocked`,`workspace_status` 的 `semantic.last_error` 写明涉及的文件、实际错误和恢复办法。一个向量也没能复用、新索引里没有任何向量时,同步和检索返回错误,不以纯词法结果作答。设了 `OPENACE_QUALITY_STRICT=on` 时,只要暂停就直接返回错误。
 
 暂停原因随当前索引版本一起保存,进程重启后不用等同步就能看到。增量构建只检查本次变更,其他文件的暂停原因会继续保留;全量构建重新检查后确认原因已解除,或语义覆盖补齐时,新发布的版本清除该原因。
 
@@ -164,10 +164,11 @@ embedding 地址、模型、维度和内置嵌入模板都没变时,新子树只
 
 ### 行为与边界(如实声明)
 
-- **词法路径永远可用**:无 key、断网、模型服务故障时 BM25 检索继续完整工作;未配置模型服务时与纯词法模式完全一致,不出现降级标记。
+- **不配模型服务也能用**:没有配置 embedding 时 BM25 检索零凭据、零出网完整工作,不出现降级标记。
+- **配置了 embedding 就只用语义检索的结果作答**:查询嵌入失败(模型服务不可达、超时、响应无效)、索引里还没有任何向量(首次建索引期间)、向量文件损坏时,检索返回写明原因的错误,不返回纯词法结果;查询嵌入失败时错误里带熔断状态和下次允许请求的时刻,没有向量时带构建进度,向量文件损坏时已登记修复、下次同步重建。原因:同一组 12 个仓库的评测里,纯词法的核心召回率是 0.18,混合检索加精排是 0.80;只拿词法结果,调用方容易把没找到当成不存在,而精确关键词搜索用调用方自己的 grep 更完整。
 - **词法评分与已知限制**:词法路用 Bleve v2.5.7 自带的 BM25(k1=1.2、b=0.75,未调参)。评分模型写在每个索引段里,打开时逐段核对,评分模型不符的段按损坏处理,不会和 BM25 段混在一起排序。增量更新会让一个索引版本暂时由多个段组成,文档数、含词文档数和平均字段长度按段各自统计,跨段的词法分数并不严格可比;合并(compaction)会改变这些统计,排名也可能随之变化。Bleve 的平均字段长度取"字段词典基数 ÷ 文档数"向上取整,不是平均词数。各词法子句的权重是在实际 TF-IDF 打分下调出来的,改用 BM25 后沿用原值,没有重新调参。
-- **降级完全显式,由你支配**:语义路/精排失败或索引覆盖不完整时,结果首行出现 `[DEGRADED] <原因>; mode=...; semantic_coverage=...` 横幅,结构化字段同步携带 `retrieval_mode`/`degraded_reason`/`semantic_coverage`。默认 `allow` 放行可用结果并写明原因。`OPENACE_RETRIEVAL_DEGRADE=deny` 拒绝索引同步失败、向量不可用、查询嵌入失败、语义覆盖不足(包括被 provider 永久拒绝的片段造成的缺口)和语义迁移暂停,同步、后台同步与查询一致;未配置语义的纯词法检索不受影响。`OPENACE_RERANK_DEGRADE=deny` 拒绝精排调用失败、无效响应和 token 预算连一条候选都装不下的情况;预算只容纳部分候选时,至少一条有效精排即算生效。配置了 embedding 而没有配置精排时只给 `rerank-unconfigured` 提示,只有 `OPENACE_QUALITY_STRICT=on` 拒绝;显式 `OPENACE_RERANK_ADAPTER=off` 不算缺口。覆盖不足与迁移暂停能从索引提前判定,deny 或 strict 下查询在发出查询嵌入之前就返回错误。拒绝只影响这次响应,错误写明原因与对应环境变量,已发布的索引和已付费的向量不受影响。不存在静默降级。
-- **成本边界**:embedding/rerank 的调用与计费发生在你自己的模型服务上。索引期按变更内容付费——未变更 chunk 跨 revision 复用向量,不重复付费;查询期每次消耗一次 query embedding(启用 rerank 时另加一次精排调用)。预算护栏建议设在你的服务/账户侧。大额首建(万级 chunk 以上)可开 `OPENACE_EMBEDDING_BATCH_API=on` 走批作业:同样的向量,费用少三分之一,代价是服务端排队(上限 12 小时,实测通常快得多);排队期间词法检索照常可用,daemon 重启会接着等同一个作业,不会重复交钱。
+- **其余缺口显式标出,由你支配**:语义覆盖不完整(部分片段缺向量)、索引不是最新(`stale-index`、`index-building`、`index-refreshing`)、语义迁移暂停或精排失败时,照常返回结果,首行出现 `[DEGRADED] <原因>; mode=...; semantic_coverage=...` 横幅,结构化字段同步携带 `retrieval_mode`/`degraded_reason`/`semantic_coverage`。`OPENACE_RERANK_DEGRADE=deny` 拒绝精排调用失败、无效响应和 token 预算连一条候选都装不下的情况;预算只容纳部分候选时,至少一条有效精排即算生效。配置了 embedding 而没有配置精排时只给 `rerank-unconfigured` 提示。`OPENACE_QUALITY_STRICT=on` 拒绝以上任何缺口;显式 `OPENACE_RERANK_ADAPTER=off` 不算缺口。能从索引提前判定的缺口(没有向量、覆盖不足、迁移暂停)在发出查询嵌入之前就判定。拒绝只影响这次响应,错误写明原因与对应环境变量,已发布的索引和已付费的向量不受影响。不存在静默降级。
+- **成本边界**:embedding/rerank 的调用与计费发生在你自己的模型服务上。索引期按变更内容付费——未变更 chunk 跨 revision 复用向量,不重复付费;查询期每次消耗一次 query embedding(启用 rerank 时另加一次精排调用)。预算护栏建议设在你的服务/账户侧。大额首建(万级 chunk 以上)可开 `OPENACE_EMBEDDING_BATCH_API=on` 走批作业:同样的向量,费用少三分之一,代价是服务端排队(上限 12 小时,实测通常快得多);首建排队期间还没有向量,检索返回带进度的错误,已有索引的工作区照常用当前索引作答;daemon 重启会接着等同一个作业,不会重复交钱。
 - **数据边界**:索引在本机 cache 目录保存被索引文件的明文片段副本(权限仅当前用户);启用 embedding 时 chunk 内容会发送到你配置的模型服务。使用任何**托管**服务前请自行核实其数据保留与训练条款(多数托管服务默认可将数据用于训练,需显式退出);自部署端点无此顾虑。`.openaceignore` 与内置敏感文件 denylist 先于一切生效。
 - **向量身份隔离**:模型/维度/端点、内置嵌入模板版本或切分器版本(如新增 AST 语言批次)任一变化,创建平行索引子树并全量重建(一次 corpus 全量嵌入费用,旧子树保留可回退);换 key 不触发重建。
 - **增量索引**:首建后编辑只重建变更文件,删除/重命名立即从结果消失;旧段里已删除的内容和同一片段的重复记录都不占召回名额。嵌入费用有界于变更量。delta 链自动本地合并(compaction,零模型调用);索引只保留最近两个 revision,内容按需读取不常驻内存。
@@ -262,9 +263,10 @@ embedding 地址、模型、维度和内置嵌入模板都没变时,新子树只
 | `OPENACE_EMBEDDING_BATCH_API` | 离线批车道:`on` = 大额嵌入改走服务商的 Batch API(目前只有 Voyage 形状支持;费用 -33%,服务端 12h 完成窗,崩溃后续作业不重复付费);默认 `off`。adapter 不支持批接口时启动即报错;旧取值 `voyage` 报迁移错误 |
 | `OPENACE_EMBEDDING_BATCH_MIN_CHUNKS` | 批车道触发阈值(默认 `2000`):缺失量低于此走同步车道——几百个 chunk 分钟级就完了,不值得排 12h 窗 |
 | `OPENACE_RERANK_BASE_URL` `_MODEL` `_API_KEY` | 精排的三项,规则与 embedding 相同、彼此独立(不共享 key 或地址)。形状:已知托管服务与未知地址都按通用 rerank 形状(`documents` → `results`/`data`,覆盖 Voyage、Cohere、Jina 与多数网关);自部署 TEI 需显式 `OPENACE_RERANK_ADAPTER=tei`(此时模型 id 可留空,由端点决定);`off` 显式放弃精排。语义已配而精排未配时结果携带 `rerank-unconfigured` 提示(`OPENACE_QUALITY_STRICT=on` 下升级为报错)。`_MAX_TOKENS` 是单请求送审 token 上限(默认 200000),超限候选按融合序跟随不送审 |
-| `OPENACE_RETRIEVAL_DEGRADE` / `OPENACE_RERANK_DEGRADE` | 降级策略:`allow`(默认,放行并标 `[DEGRADED]`)/ `deny`(返回写明原因与环境变量的错误)。retrieval 管索引同步失败、向量不可用、查询嵌入失败、语义覆盖不足与迁移暂停,对同步与查询都生效;rerank 管精排调用失败、无效响应与 token 预算连一条都装不下。`rerank-unconfigured` 不归两者管 |
-| `OPENACE_QUALITY_STRICT` | `on` = 质量严格档:语义链路任一缺口(覆盖 <100%、查询嵌入失败、已配置的 rerank 未生效、rerank 未配置等)直接报错,同步与查询一致;显式 `OPENACE_RERANK_ADAPTER=off` 不算缺口;要求已配置 embedding。默认 `off`。结构化结果携带 `rerank_sent`/`query_embed_failed`/`embedding_profile` |
-| `OPENACE_QUERY_BUILD_WAIT` | 查询等待在建索引的上界,**默认 `40s`**(先于主流 MCP 客户端的请求超时,冷仓首建期间的同步检索返回带构建进度的可行动错误,而非裸超时):超时后有旧索引按 allow/deny 降级,无旧索引返回带进度的错误;显式 `0` = 等到构建完成 |
+| `OPENACE_RERANK_DEGRADE` | 精排降级策略:`allow`(默认,放行并标 `[DEGRADED]`)/ `deny`(返回写明原因与环境变量的错误)。管精排调用失败、无效响应与 token 预算连一条都装不下;`rerank-unconfigured` 不归它管 |
+| `OPENACE_RETRIEVAL_DEGRADE` | 已移除。配置了 embedding 后,查询嵌入失败、索引没有向量、向量文件不可用时检索一律报错,不再有返回纯词法结果的档位。设置为任何值时启动报错,删除该行即可;需要覆盖不足、索引不新鲜也报错时用 `OPENACE_QUALITY_STRICT=on` |
+| `OPENACE_QUALITY_STRICT` | `on` = 质量严格档:语义链路任一缺口(覆盖 <100%、索引不是最新、语义迁移暂停、已配置的 rerank 未生效、rerank 未配置等)直接报错,同步与查询一致;显式 `OPENACE_RERANK_ADAPTER=off` 不算缺口;要求已配置 embedding。默认 `off`。结构化结果携带 `rerank_sent`/`embedding_profile` |
+| `OPENACE_QUERY_BUILD_WAIT` | 查询等待在建索引的上界,**默认 `40s`**(先于主流 MCP 客户端的请求超时,冷仓首建期间的同步检索返回带构建进度的可行动错误,而非裸超时):超时后用已有索引作答并标 `index-building`;没有索引,或已有索引还没有任何向量(首建中)时返回带进度的错误;显式 `0` = 等到构建完成 |
 | `OPENACE_MCP_TOOLS` | MCP 工具面:未设 = 只暴露 `codebase_retrieval`;`all` = 完整能力面;或逗号清单指定 |
 | `OPENACE_RENDER_LINE_NUMBERS` | `1` = 检索结果围栏内逐行携带真实文件行号(`cat -n` 形状,Read-parity 试验面);默认关闭 |
 | `OPENACE_FULL_RESULTS` | `detail=full` 时带正文返回的候选块数(按排名取前 N 个,其余只给标题行),默认 `20`;`0`=全部只给标题行。这是使用者侧配置,不是 AI 的调用参数;改动后重启 MCP 会话生效,不需要重启 daemon |
@@ -298,7 +300,7 @@ wrapper 与 daemon 的一致性分两层,行为刻意不同:
 
 环境变量的说明见上表与 `.env.example`,这里只给三组常用组合。
 
-- **结果完整性优先**——审计、事实核查这类"宁可报错,不要部分结果"的任务。设 `OPENACE_RETRIEVAL_DEGRADE=deny`,检索类降级(包括语义覆盖不足)直接变报错,精排类降级另由 `OPENACE_RERANK_DEGRADE=deny` 控制;要求更严就 `OPENACE_QUALITY_STRICT=on`,语义链路差一点都不放行。代价是含永久拒绝片段的工作区在 deny 下会持续报错,这类工作区需要明确改回 `allow`。为什么要设:默认档是降级放行,key 失效那天词法结果照样返回,顶部一行 `[DEGRADED]` 横幅是唯一警示——只看文件列表、不看横幅的调用方,会把词法结果当成完整语义检索用。
+- **结果完整性优先**——审计、事实核查这类"宁可报错,不要部分结果"的任务。配置了 embedding 后,语义路跑不了本来就报错;再设 `OPENACE_QUALITY_STRICT=on`,语义覆盖不足、索引不是最新、精排没有生效也直接报错。只想让精排失败报错时设 `OPENACE_RERANK_DEGRADE=deny`。代价是含被模型服务永久拒绝片段的工作区在 strict 下会持续报错。
 - **大仓高频查询**——每次查询前有一轮内联重扫,成本随文件数线性涨,接近十万文件的仓库实测 1.5 秒起步。设 `OPENACE_FRESHNESS_WINDOW=30s`,窗口内的查询跳过重扫,同档实测 p50 降到 0.4 秒。代价明码标价:窗口内的磁盘改动最多延迟 30 秒可见,自己权衡。
 - **候选被噪声淹没**——运行日志、构建产物、实验残留这类目录一多,宽泛查询的候选位就被它们挤掉。用 `.openaceignore` 逐目录排掉,偶尔要查再用 `!pattern` 精确放行。这些规则决定索引面,比事后在查询里过滤省得多。
 

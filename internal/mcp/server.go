@@ -669,9 +669,6 @@ func retrievalStructured(result engine.Result) map[string]any {
 	if result.QueryPlan != "" {
 		fields["query_plan"] = result.QueryPlan
 	}
-	if result.QueryEmbedFailed {
-		fields["query_embed_failed"] = true
-	}
 	if result.EmbeddingProfile != "" {
 		fields["embedding_profile"] = result.EmbeddingProfile
 	}

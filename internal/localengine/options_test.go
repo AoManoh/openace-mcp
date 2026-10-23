@@ -57,8 +57,8 @@ func TestOptionsFromEnvDefaults(t *testing.T) {
 	if opts.Embedding.Enabled || opts.Rerank.Enabled {
 		t.Fatalf("无 key 时两个 provider 均不启用: %+v", opts)
 	}
-	if opts.RetrievalDegrade != DegradeAllow || opts.RerankDegrade != DegradeAllow {
-		t.Fatalf("降级默认 allow: %+v", opts)
+	if opts.RerankDegrade != DegradeAllow {
+		t.Fatalf("精排降级默认 allow: %+v", opts)
 	}
 	// 无 key 的默认 env 与零值 Options 指纹一致（旧 daemon 兼容基线，D11）。
 	if opts.Fingerprint() != (Options{}).Fingerprint() {
@@ -68,15 +68,34 @@ func TestOptionsFromEnvDefaults(t *testing.T) {
 
 func TestOptionsFromEnvDegradeParsing(t *testing.T) {
 	clearProviderEnv(t)
-	t.Setenv(EnvRetrievalDegrade, "deny")
-	t.Setenv(EnvRerankDegrade, "ALLOW")
+	t.Setenv(EnvRerankDegrade, "DENY")
 	opts, err := OptionsFromEnv()
-	if err != nil || opts.RetrievalDegrade != DegradeDeny || opts.RerankDegrade != DegradeAllow {
-		t.Fatalf("降级解析: %+v err=%v", opts, err)
+	if err != nil || opts.RerankDegrade != DegradeDeny {
+		t.Fatalf("精排降级解析: %+v err=%v", opts, err)
 	}
-	t.Setenv(EnvRetrievalDegrade, "maybe")
-	if _, err := OptionsFromEnv(); err == nil || !strings.Contains(err.Error(), EnvRetrievalDegrade) {
-		t.Fatalf("非法降级值应报错: %v", err)
+	t.Setenv(EnvRerankDegrade, "maybe")
+	if _, err := OptionsFromEnv(); err == nil || !strings.Contains(err.Error(), EnvRerankDegrade) {
+		t.Fatalf("非法精排降级值应报错: %v", err)
+	}
+}
+
+// TestOptionsFromEnvRetiredRetrievalDegrade：检索降级开关已退役。未设置照常
+// 放行；任何取值（包括原默认值 allow）都在启动时报错，写明变量名与
+// OPENACE_QUALITY_STRICT 的替代用法。
+func TestOptionsFromEnvRetiredRetrievalDegrade(t *testing.T) {
+	clearProviderEnv(t)
+	for _, value := range []string{"", "  "} {
+		t.Setenv(EnvRetrievalDegrade, value)
+		if _, err := OptionsFromEnv(); err != nil {
+			t.Fatalf("unset value %q must be accepted: %v", value, err)
+		}
+	}
+	for _, value := range []string{"allow", "deny", "maybe"} {
+		t.Setenv(EnvRetrievalDegrade, value)
+		_, err := OptionsFromEnv()
+		if err == nil || !strings.Contains(err.Error(), EnvRetrievalDegrade) || !strings.Contains(err.Error(), "no longer supported") || !strings.Contains(err.Error(), EnvQualityStrict) {
+			t.Fatalf("value %q must be rejected with the variable name and the strict replacement: %v", value, err)
+		}
 	}
 }
 
@@ -109,9 +128,9 @@ func TestFingerprintSensitivity(t *testing.T) {
 		t.Fatalf("rerank 配置必须改变指纹")
 	}
 	deny := base
-	deny.RetrievalDegrade = DegradeDeny
+	deny.RerankDegrade = DegradeDeny
 	if deny.Fingerprint() == fp {
-		t.Fatalf("降级开关必须改变指纹")
+		t.Fatalf("精排降级开关必须改变指纹")
 	}
 	bulk := base
 	bulk.Embedding.BatchAPIMode = embedding.ProviderVoyage

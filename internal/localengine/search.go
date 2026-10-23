@@ -377,13 +377,11 @@ type retrieval struct {
 	reasons    []string
 	coverage   string
 	syncResult engine.Result
-	// rerankSent 是实际送审精排的候选数，queryEmbedFailed 表示本次查询嵌入
-	// 失败，两者复制进 Result 的质量字段；rerankApplied 表示精排结果已生效，
-	// 只决定 mode 的 "+rerank" 后缀并作为 OPENACE_QUALITY_STRICT 判定的输入，
-	// 不进入 Result。
-	rerankSent       int
-	rerankApplied    bool
-	queryEmbedFailed bool
+	// rerankSent 是实际送审精排的候选数，复制进 Result 的质量字段；
+	// rerankApplied 表示精排结果已生效，只决定 mode 的 "+rerank" 后缀并作为
+	// OPENACE_QUALITY_STRICT 判定的输入，不进入 Result。
+	rerankSent    int
+	rerankApplied bool
 	// queryPlan 记录本次查询的规划：词法路改用结构 token 查询时为该查询
 	// 串（零命中回退时追加 " fallback=original"），另追加 path_prefix=… 与
 	// artifact_kind=… 标签；全部未触发时为空。
@@ -396,9 +394,11 @@ type retrieval struct {
 // Search 实现 engine.Service：按需同步索引后执行检索并渲染正文。检索链
 // 为词法召回，配置了 embedding provider 时加语义召回并做 RRF 融合，配置
 // 了 rerank provider 时对头部候选精排。
-//   - 任一降级原因存在时，正文首行加 [DEGRADED] 横幅，原因逐条写出；是否
-//     放行由 OPENACE_RETRIEVAL_DEGRADE / OPENACE_RERANK_DEGRADE 决定，不在
-//     任何情况下静默返回不完整结果。
+//   - 配置了 embedding 而语义路跑不了（查询嵌入失败、revision 没有向量、
+//     向量文件不可用）时返回错误，不返回纯词法结果（见 policyError）。
+//   - 其余降级原因存在时，正文首行加 [DEGRADED] 横幅，原因逐条写出；精排
+//     类原因是否放行由 OPENACE_RERANK_DEGRADE 决定，OPENACE_QUALITY_STRICT=on
+//     时任何原因都报错，不在任何情况下静默返回不完整结果。
 //   - 结果恒携带 Timings、Hits 与 QueryPlan（未触发为空，序列化时省略）。
 //   - revision 与文件数取自本次查询实际持有的 revision；同步结果描述同一
 //     revision 时才沿用它的构建字段（见 servedResult）。
@@ -448,13 +448,12 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	// 序列化时省略，旧调用方看到的形状不变。
 	result.QueryPlan = out.queryPlan
 	// 模式恒显式填写（纯词法为 lexical），不再用“字段省略表示词法”。覆盖率、
-	// 原因与质量字段（实际送审精排数、查询嵌入是否失败、语义路身份指纹）
-	// 没有值时为空，序列化时省略。
+	// 原因与质量字段（实际送审精排数、语义路身份指纹）没有值时为空，序列化
+	// 时省略。查询嵌入失败时整次检索报错，不会出现在成功结果里。
 	result.RetrievalMode = out.mode
 	result.DegradedReason = degradedReason
 	result.SemanticCoverage = out.coverage
 	result.RerankSent = out.rerankSent
-	result.QueryEmbedFailed = out.queryEmbedFailed
 	if e.semanticEnabled() {
 		result.EmbeddingProfile = fmt.Sprintf("%s/%s/%d",
 			e.embedCfg.ProviderType, e.embedCfg.Model, e.embedCfg.Dimension)
@@ -581,18 +580,18 @@ type RouteCandidates struct {
 	Dense []CandidateRef
 	// Reasons 是本次候选的降级原因：所持 revision 的覆盖不足或迁移暂停
 	// 原因在前，语义路自身的原因在后。Dense 为 nil 且 Reasons 为空表示语义
-	// 路未配置，或当前 revision 没有任何 chunk；revision 有 chunk 却没有任何
-	// 向量时，Dense 为 nil，Reasons 含 semantic-coverage-partial。
+	// 路未配置，或当前 revision 没有任何 chunk。revision 有 chunk 却没有任何
+	// 向量时 SearchRoutes 返回错误（semantic-index-empty），不返回候选。
 	Reasons []string
 }
 
 // SearchRoutes 返回融合前的两路候选，每路深度为 depth（≤0 时取
 // hybridRouteTopK），不融合、不精排、不渲染。句柄获取与存活过滤与
 // retrieve 相同；同步失败时直接返回错误，不像 retrieve 那样降级服务旧
-// revision。所持 revision 的 manifest 已能说明的缺口（manifestGaps：覆盖
-// 不足、迁移暂停）在召回与查询嵌入之前按 policyError 判定：deny 或 strict
-// 时返回错误，allow 时写进 Reasons。这里不做精排，不判定精排类原因。语义
-// 路的致命错误（ctx 取消或政策拒绝）原样返回。
+// revision。所持 revision 的 manifest 已能说明的缺口（manifestGaps：没有
+// 向量、覆盖不足、迁移暂停）在召回与查询嵌入之前按 policyError 判定：没有
+// 向量或 strict 时返回错误，其余写进 Reasons。这里不做精排，不判定精排类
+// 原因。语义路的致命错误（ctx 取消或政策拒绝）原样返回。
 func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, depth int) (RouteCandidates, error) {
 	if err := rejectProfileID(req.Workspace); err != nil {
 		return RouteCandidates{}, err
@@ -621,7 +620,7 @@ func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, dep
 		return RouteCandidates{}, err
 	}
 	defer e.releaseHandle(handle)
-	revisionGaps := e.manifestGaps(handle.manifest)
+	revisionGaps := e.withBuildProgress(e.manifestGaps(handle.manifest), workspaceKey)
 	if err := e.policyError(revisionGaps); err != nil {
 		return RouteCandidates{}, err
 	}
@@ -646,11 +645,11 @@ func (e *Engine) SearchRoutes(ctx context.Context, req engine.SearchRequest, dep
 		}
 	}
 	if e.semanticEnabled() {
-		denseIDs, denseGaps, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, depth, nil, "")
+		denseIDs, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, depth, nil, "")
 		if denseErr != nil {
 			return RouteCandidates{}, denseErr
 		}
-		out.Reasons = gapReasonList(append(revisionGaps, denseGaps...))
+		out.Reasons = gapReasonList(revisionGaps)
 		if denseIDs != nil {
 			out.Dense = make([]CandidateRef, 0, len(denseIDs))
 			for _, id := range denseIDs {
@@ -690,11 +689,12 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	if err != nil {
 		return retrieval{}, err
 	}
-	// 所服务 revision 的 manifest 已能说明的缺口（语义覆盖不足、迁移暂停原因，
-	// 见 manifestGaps）在词法召回与查询嵌入之前按政策判定：deny 或 strict
-	// 拒绝时不发出任何模型请求；放行时原因随结果返回。原因随 revision 持久
-	// 化，重启后走首触快路径服务旧 revision 时同样可见。
-	revisionGaps := e.manifestGaps(handle.manifest)
+	// 所服务 revision 的 manifest 已能说明的缺口（没有向量、语义覆盖不足、
+	// 迁移暂停原因，见 manifestGaps）在词法召回与查询嵌入之前按政策判定：
+	// 没有向量或 strict 时拒绝，不发出任何模型请求，没有向量时错误带构建
+	// 进度；放行时原因随结果返回。原因随 revision 持久化，重启后走首触快
+	// 路径服务旧 revision 时同样可见。
+	revisionGaps := e.withBuildProgress(e.manifestGaps(handle.manifest), workspaceKey)
 	if err := e.policyError(revisionGaps); err != nil {
 		e.releaseHandle(handle)
 		return retrieval{}, err
@@ -708,12 +708,11 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		e.releaseHandle(handle)
 		return retrieval{}, err
 	}
-	ordered, mode, coverage, denseGaps, err := e.fuseRoutes(ctx, workspaceKey, handle, query, lexHits, timings, pathPrefix)
+	ordered, mode, coverage, err := e.fuseRoutes(ctx, workspaceKey, handle, query, lexHits, timings, pathPrefix)
 	if err != nil {
 		e.releaseHandle(handle)
 		return retrieval{}, err
 	}
-	gaps = append(gaps, denseGaps...)
 	if pathPrefix != "" {
 		// path_prefix 已在词法与语义两路召回时下推过滤，正常情况下这里
 		// 一个候选也不会被去掉。保留这一步是为了在词法锚或融合实现改动
@@ -784,15 +783,13 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		e.releaseHandle(handle)
 		return retrieval{}, err
 	}
-	reasons := gapReasonList(gaps)
 	out := retrieval{
 		handle: handle, ordered: ordered, mode: mode,
-		reasons: reasons, coverage: coverage, syncResult: syncResult,
+		reasons: gapReasonList(gaps), coverage: coverage, syncResult: syncResult,
 		rerankSent: rerankSent, rerankApplied: rerankApplied,
-		queryEmbedFailed: hasQueryEmbedFailure(reasons),
-		queryPlan:        planLabel,
-		timings:          timings,
-		started:          started,
+		queryPlan: planLabel,
+		timings:   timings,
+		started:   started,
 	}
 	return out, nil
 }
@@ -804,8 +801,8 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 //   - 同步失败且没有任何可用 revision：返回同步错误。
 //   - 同步失败但有可用 revision：一般失败记 stale-index，等待在建构建超时
 //     记 index-building，首次触达后台刷新记 index-refreshing；按 policyError
-//     判定，OPENACE_RETRIEVAL_DEGRADE=allow（默认）且未开 strict 时用旧索引
-//     服务并带上原因，否则释放句柄并返回带恢复提示的错误。
+//     判定，未开 strict 时用旧索引服务并带上原因，否则释放句柄并返回带恢复
+//     提示的错误。旧 revision 没有向量时由 retrieve 的 manifestGaps 判定拒绝。
 //   - ctx 已取消：原样返回 ctx 错误。
 //
 // 错误路径不持有句柄。
@@ -896,28 +893,29 @@ func (e *Engine) lexicalCandidates(ctx context.Context, handle *revisionHandle, 
 }
 
 // fuseRoutes 把词法命中与语义召回融合成最终候选序，返回（候选序、模式、
-// 覆盖率、语义路缺口、错误）。不负责句柄释放。
+// 覆盖率、错误）。不负责句柄释放。
 //   - 未配置语义路：直接返回词法序，score 保留真实 BM25 分数，模式为
 //     lexical，覆盖率为空；渲染结果与纯词法版本完全一致。
 //   - 配置了语义路且 dense 召回执行成功（返回的候选切片非 nil，哪怕为
 //     空）：按 fusionParams 做加权 RRF 融合，再用 anchorWithinWindow 把词法
 //     首位放进精排窗口（词法锚，理由见函数体内注释），模式为 hybrid。
-//   - 配置了语义路但 dense 未执行（向量不可用、覆盖为空、查询嵌入失败）：
-//     按词法序输出，模式仍为 lexical，缺口由 denseRoute 给出。
+//   - 配置了语义路但 dense 未执行：只剩 revision 没有任何 chunk 的空工作区，
+//     按词法序输出（为空），模式为 lexical。向量不可用、没有向量与查询嵌入
+//     失败在 denseRoute 与 retrieve 里已按 policyError 返回错误。
 //   - 覆盖不完整的原因由 retrieve 在召回前按 manifest 给出（manifestGaps），
 //     这里只返回覆盖率。
 //   - denseRoute 的致命错误（ctx 取消或政策拒绝）原样返回。
-func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, lexHits []lexical.Hit, timings *engine.RetrievalTimings, pathPrefix string) ([]rankedHit, string, string, []qualityGap, error) {
+func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, lexHits []lexical.Hit, timings *engine.RetrievalTimings, pathPrefix string) ([]rankedHit, string, string, error) {
 	if !e.semanticEnabled() {
 		ordered := make([]rankedHit, 0, len(lexHits))
 		for _, hit := range lexHits {
 			ordered = append(ordered, rankedHit{id: hit.ID, score: hit.Score, source: fusion.SourceLexical})
 		}
-		return ordered, "lexical", "", nil, nil
+		return ordered, "lexical", "", nil
 	}
-	denseIDs, gaps, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, hybridRouteTopK, timings, pathPrefix)
+	denseIDs, denseErr := e.denseRoute(ctx, workspaceKey, handle, query, hybridRouteTopK, timings, pathPrefix)
 	if denseErr != nil {
-		return nil, "", "", nil, denseErr
+		return nil, "", "", denseErr
 	}
 	lexIDs := make([]string, 0, len(lexHits))
 	for _, hit := range lexHits {
@@ -960,18 +958,7 @@ func (e *Engine) fuseRoutes(ctx context.Context, workspaceKey string, handle *re
 			ordered[i].source = fusion.SourceLexical
 		}
 	}
-	return ordered, mode, coveragePercent(handle.manifest), gaps, nil
-}
-
-// hasQueryEmbedFailure 判定降级原因中是否含查询嵌入失败，结果进入
-// Result.QueryEmbedFailed。
-func hasQueryEmbedFailure(reasons []string) bool {
-	for _, r := range reasons {
-		if strings.HasPrefix(r, "query-embedding-failed") {
-			return true
-		}
-	}
-	return false
+	return ordered, mode, coveragePercent(handle.manifest), nil
 }
 
 // hasRerankGap 判定缺口里是否已有 rerank-skipped 原因；已有时不再追加
@@ -1041,15 +1028,17 @@ func filterRankedByPathPrefix(handle *revisionHandle, ordered []rankedHit, prefi
 }
 
 // denseRoute 执行语义召回，返回最多 depth 个 dense 候选 ID（nil 表示语义
-// 路未执行）、缺口与致命错误。缺口按 policyError 判定，deny 或 strict 拒绝
-// 时直接返回错误，不再发出后续的模型请求。
-//   - 向量文件损坏或缺失：登记该工作区下次同步强制重建向量，记
-//     vector-data-unavailable。
-//   - revision 一个向量也没有（例如 provider 长期故障后发布的零覆盖
-//     revision）：返回 nil 且不记原因，覆盖缺口由调用方（retrieve 与
-//     SearchRoutes）经 manifestGaps 按 manifest 如实上报。
-//   - 查询嵌入失败：ctx 已取消则返回 ctx 错误；否则记
-//     query-embedding-failed(失败类别)。
+// 路未执行）与错误。语义路跑不了的缺口按 policyError 总是返回错误，不再
+// 发出后续的模型请求。
+//   - 向量文件损坏或缺失：登记该工作区下次同步强制重建向量，以
+//     vector-data-unavailable 返回错误。
+//   - 载入的向量为 0 行：manifest 也记录 0 个向量时，是没有 chunk 的空工作区
+//     （有 chunk 而没有向量的 revision 已由调用方经 manifestGaps 拒绝），返回
+//     nil 且不记原因；manifest 记录有向量而文件里一行也没有时，按向量文件
+//     不可用处理。
+//   - 查询嵌入失败：ctx 已取消则返回 ctx 错误；否则以
+//     query-embedding-failed(失败类别) 返回错误，说明里带查询路熔断器状态
+//     与下次允许请求的时刻。
 //   - 正常路径：每个 segment 各做一次精确（非近似）检索，选择阶段就用
 //     candidatePredicate 跳过已删除或已被覆盖的 chunk 与 pathPrefix 之外的
 //     chunk；合并后按分数降序、ID 升序排序，同一查询多次执行结果逐位相同。
@@ -1060,27 +1049,24 @@ func filterRankedByPathPrefix(handle *revisionHandle, ordered []rankedHit, prefi
 //     排名也在前 depth 之内，所以每段取 depth 个再去重不会漏掉候选。
 //
 // 只有 ctx 取消、政策拒绝与向量检索本身出错才返回 error。
-func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, depth int, timings *engine.RetrievalTimings, pathPrefix string) ([]string, []qualityGap, error) {
+func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, depth int, timings *engine.RetrievalTimings, pathPrefix string) ([]string, error) {
 	ixs, loadErr := handle.vectorIndexes(e.embedCfg.Dimension)
-	if loadErr != nil {
-		// 向量文件损坏或缺失：登记该工作区，下次同步强制重建向量。
-		reason := "vector-data-unavailable"
-		e.markVectorRepair(workspaceKey)
-		gaps := []qualityGap{{reason: reason, detail: fmt.Errorf("semantic path unavailable: %w", loadErr)}}
-		if err := e.policyError(gaps); err != nil {
-			return nil, nil, err
-		}
-		return nil, gaps, nil
-	}
 	total := 0
 	for _, ix := range ixs {
 		total += ix.Count()
 	}
+	if loadErr == nil && total == 0 && handle.manifest.VectorCount > 0 {
+		loadErr = fmt.Errorf("revision %s records %d vectors but its vector files hold none", handle.manifest.Revision, handle.manifest.VectorCount)
+	}
+	if loadErr != nil {
+		// 向量文件损坏或缺失：登记该工作区，下次同步强制重建向量。
+		e.markVectorRepair(workspaceKey)
+		gaps := []qualityGap{{reason: "vector-data-unavailable", detail: fmt.Errorf("semantic path unavailable: %w; vector repair is scheduled and the next sync rebuilds the vectors", loadErr)}}
+		return nil, e.policyError(gaps)
+	}
 	if total == 0 {
-		// 一个向量也没有（如 provider 长期故障后发布的零覆盖 revision）：
-		// 语义路没有候选可召回，覆盖缺口由调用方经 manifestGaps 按 manifest
-		// 如实上报，这里不重复记原因。
-		return nil, nil, nil
+		// 没有 chunk 的空工作区：语义路没有候选可召回，也不是缺口。
+		return nil, nil
 	}
 	embedStart := time.Now()
 	queryVector, embedErr := e.embedClient.EmbedQuery(ctx, query)
@@ -1089,13 +1075,13 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 	}
 	if embedErr != nil {
 		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
+			return nil, ctx.Err()
 		}
-		gaps := []qualityGap{{reason: "query-embedding-failed(" + failureClass(embedErr) + ")", detail: fmt.Errorf("query embedding failed: %w", embedErr)}}
-		if err := e.policyError(gaps); err != nil {
-			return nil, nil, err
-		}
-		return nil, gaps, nil
+		gaps := []qualityGap{{
+			reason: "query-embedding-failed(" + failureClass(embedErr) + ")",
+			detail: fmt.Errorf("query embedding failed: %w; query path %s", embedErr, circuitLabel(e.embedClient.QueryCircuitSnapshot())),
+		}}
+		return nil, e.policyError(gaps)
 	}
 	vectorStart := time.Now()
 	allow := candidatePredicate(handle, pathPrefix)
@@ -1105,7 +1091,7 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 		copy(queryCopy, queryVector)
 		segmentHits, searchErr := ix.SearchFiltered(ctx, queryCopy, depth, allow)
 		if searchErr != nil {
-			return nil, nil, searchErr
+			return nil, searchErr
 		}
 		merged = append(merged, segmentHits...)
 	}
@@ -1130,7 +1116,7 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 	if timings != nil {
 		timings.VectorMs = time.Since(vectorStart).Milliseconds()
 	}
-	return ids, nil, nil
+	return ids, nil
 }
 
 // rerankOrder 把 ordered 的头部送给 rerank provider 精排，返回（新序、是否

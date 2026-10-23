@@ -71,17 +71,14 @@ func TestColdBuildPublishesLexicalFirst(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// 构建中查询:应以词法 revision 降级放行(index-building),
-	// 命中词法内容,远快于全量构建。
+	// 构建中查询:词法中间 revision 一个向量也没有,配置了 embedding 时不以
+	// 纯词法结果作答,返回带构建进度的错误,远早于全量构建结束。
 	res, err := e.Search(context.Background(), searchRequest(root, "HandleLogin"))
-	if err != nil {
-		t.Fatalf("词法先行后构建中查询应可服务: %v", err)
+	if err == nil {
+		t.Fatalf("构建中查询不得返回纯词法结果: %+v", res)
 	}
-	if !strings.Contains(res.Text, "HandleLogin") {
-		t.Fatalf("词法结果应命中: %q", res.Text)
-	}
-	if !strings.Contains(res.DegradedReason, "index-building") && !strings.Contains(res.DegradedReason, "semantic-coverage-partial") {
-		t.Fatalf("语义缺口必须显式: %+v", res.DegradedReason)
+	if !strings.Contains(err.Error(), semanticIndexEmptyReason) || !strings.Contains(err.Error(), "build progress: stage=") {
+		t.Fatalf("错误应写明没有向量与构建进度: %v", err)
 	}
 
 	// 放行嵌入,Sync 返回语义完整;最终 revision 覆盖 100%。

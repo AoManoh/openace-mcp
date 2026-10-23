@@ -155,36 +155,11 @@ func TestFirstTouchConvergesToChangedContent(t *testing.T) {
 	}
 }
 
-// TestFirstTouchSkippedWhenDenyOrStrictOrCold:deny/strict/真冷仓三边界
-// 均不走快路径。
-func TestFirstTouchSkippedWhenDenyOrStrictOrCold(t *testing.T) {
+// TestFirstTouchSkippedWhenStrictOrCold:strict/真冷仓两边界均不走快路径。
+func TestFirstTouchSkippedWhenStrictOrCold(t *testing.T) {
 	const dim = 8
 	server := newEmbedServer(t, dim)
 	defer server.ts.Close()
-
-	t.Run("deny", func(t *testing.T) {
-		opts := embedOptions(server.ts.URL, dim, 8, "t1-deny")
-		opts.RetrievalDegrade = DegradeDeny
-		t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
-		t.Setenv("OPENACE_CACHE_NAMESPACE", "t1deny")
-		root := newFixtureWorkspace(t)
-		e1, err := New(opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := e1.Sync(context.Background(), syncRequest(root)); err != nil {
-			t.Fatal(err)
-		}
-		_ = e1.Close(context.Background())
-		e2 := restartedEngine(t, opts)
-		result, err := e2.Search(context.Background(), searchRequest(root, "parse_config"))
-		if err != nil {
-			t.Fatalf("deny 小仓首触应内联同步成功: %v", err)
-		}
-		if strings.Contains(result.DegradedReason, "index-refreshing") {
-			t.Fatalf("deny 不得走快路径: %q", result.DegradedReason)
-		}
-	})
 
 	t.Run("strict", func(t *testing.T) {
 		opts := embedOptions(server.ts.URL, dim, 8, "t1-strict")

@@ -13,10 +13,10 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/rerank"
 )
 
-// 降级政策：OPENACE_RETRIEVAL_DEGRADE=deny 拒绝检索类缺口（含语义覆盖不足），
-// OPENACE_RERANK_DEGRADE=deny 拒绝精排类缺口（含 token 预算连一条都装不下），
-// OPENACE_QUALITY_STRICT=on 拒绝任何缺口；rerank 未配置只有 strict 拒绝，
-// 显式 rerank off 不算缺口。
+// 降级政策：语义覆盖不足照常作答并写明原因；OPENACE_RERANK_DEGRADE=deny 拒绝
+// 精排类缺口（含 token 预算连一条都装不下），OPENACE_QUALITY_STRICT=on 拒绝任何
+// 缺口；rerank 未配置只有 strict 拒绝，显式 rerank off 不算缺口。语义路跑不了
+// 的情况见 semantic_required_test.go。
 
 const policyQuery = "HandleLogin"
 
@@ -40,46 +40,36 @@ func partialCoverageServer(t *testing.T) *embedServer {
 	return s
 }
 
-// TestRetrievalDenyRejectsPartialCoverage：覆盖不足时 retrieval deny 下 Sync、
-// SyncBackground 与查询都返回写明原因与环境变量的错误；revision 照常发布，
-// 状态仍是 ready；查询在发出查询嵌入之前就拒绝。
-func TestRetrievalDenyRejectsPartialCoverage(t *testing.T) {
+// TestPartialCoverageAnsweredWithReason：部分 chunk 被 provider 永久拒绝、覆盖
+// 率 80% 时，Sync、SyncBackground 与查询都照常返回并写明
+// semantic-coverage-partial；查询走 hybrid，状态为 ready。
+func TestPartialCoverageAnsweredWithReason(t *testing.T) {
 	s := partialCoverageServer(t)
-	opts := embedOptions(s.ts.URL, 8, 16, "policy-model")
-	opts.RetrievalDegrade = DegradeDeny
-	e := newTestEngineWith(t, opts)
+	e := newTestEngineWith(t, embedOptions(s.ts.URL, 8, 16, "policy-model"))
 	root := newFixtureWorkspace(t)
 	ctx := context.Background()
 
 	res, err := e.Sync(ctx, syncRequest(root))
-	if err == nil || !strings.Contains(err.Error(), EnvRetrievalDegrade) || !strings.Contains(err.Error(), "semantic-coverage-partial") || !strings.Contains(err.Error(), "semantic_coverage=80%") {
-		t.Fatalf("deny 下覆盖不足的 Sync 应报错: res=%+v err=%v", res, err)
+	if err != nil || res.SemanticCoverage != "80%" || !strings.Contains(res.DegradedReason, "semantic-coverage-partial") {
+		t.Fatalf("覆盖不足的 Sync 应照常返回并写明原因: res=%+v err=%v", res, err)
 	}
-	if res.IndexRevision == "" || res.SemanticCoverage != "80%" {
-		t.Fatalf("Sync 报错时仍返回已发布 revision 的结果: %+v", res)
-	}
-	if _, bgErr := e.SyncBackground(ctx, syncRequest(root)); bgErr == nil || !strings.Contains(bgErr.Error(), EnvRetrievalDegrade) {
-		t.Fatalf("SyncBackground 应同样拒绝: %v", bgErr)
+	if _, bgErr := e.SyncBackground(ctx, syncRequest(root)); bgErr != nil {
+		t.Fatalf("SyncBackground 应照常返回: %v", bgErr)
 	}
 	status, err := e.WorkspaceStatus(ctx, engine.WorkspaceRef{DirectoryPath: root})
 	if err != nil || status.Stage != engine.IndexStageReady || status.IndexRevision != res.IndexRevision {
-		t.Fatalf("拒绝响应不得把已发布的 revision 标成失败: status=%+v err=%v", status, err)
+		t.Fatalf("状态应为 ready: status=%+v err=%v", status, err)
 	}
-
-	before := s.callCount()
-	_, err = e.Search(ctx, searchRequest(root, policyQuery))
-	if err == nil || !strings.Contains(err.Error(), EnvRetrievalDegrade) || !strings.Contains(err.Error(), "semantic-coverage-partial") {
-		t.Fatalf("deny 下覆盖不足的查询应报错: %v", err)
-	}
-	if n := queryEmbedCalls(s, before); n != 0 {
-		t.Fatalf("覆盖不足可由 manifest 提前判定，不应发出查询嵌入，实际 %d 次", n)
+	got, err := e.Search(ctx, searchRequest(root, policyQuery))
+	if err != nil || got.RetrievalMode != "hybrid" || !strings.Contains(got.DegradedReason, "semantic-coverage-partial") {
+		t.Fatalf("覆盖不足的查询应走 hybrid 并写明原因: %+v err=%v", got, err)
 	}
 }
 
-// TestRetrievalDenyAllowsLexicalWithoutSemantic：未配置语义时 deny 不因此
-// 拒绝，Sync 与查询正常返回 lexical。
-func TestRetrievalDenyAllowsLexicalWithoutSemantic(t *testing.T) {
-	e := newTestEngineWith(t, Options{RetrievalDegrade: DegradeDeny, RerankDegrade: DegradeDeny})
+// TestLexicalOnlyEngineAnswersNormally：未配置语义时，即使开了精排 deny，
+// Sync 与查询也正常返回 lexical，没有任何原因。
+func TestLexicalOnlyEngineAnswersNormally(t *testing.T) {
+	e := newTestEngineWith(t, Options{RerankDegrade: DegradeDeny})
 	root := newFixtureWorkspace(t)
 	res, err := e.Sync(context.Background(), syncRequest(root))
 	if err != nil || res.RetrievalMode != "lexical" {
@@ -190,7 +180,7 @@ func TestRerankDenyAcceptsPartialBudget(t *testing.T) {
 }
 
 // TestRerankUnconfiguredOnlyStrictRejects：配置了语义、没有配置精排时带
-// rerank-unconfigured 提示；两个 deny 都不拒绝，strict 拒绝。
+// rerank-unconfigured 提示；精排 deny 不拒绝，strict 拒绝。
 func TestRerankUnconfiguredOnlyStrictRejects(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -198,7 +188,7 @@ func TestRerankUnconfiguredOnlyStrictRejects(t *testing.T) {
 		reject bool
 	}{
 		{"allow", func(o *Options) {}, false},
-		{"deny", func(o *Options) { o.RetrievalDegrade = DegradeDeny; o.RerankDegrade = DegradeDeny }, false},
+		{"rerank-deny", func(o *Options) { o.RerankDegrade = DegradeDeny }, false},
 		{"strict", func(o *Options) { o.QualityStrict = true }, true},
 	}
 	for _, tc := range cases {
@@ -227,7 +217,7 @@ func TestRerankUnconfiguredOnlyStrictRejects(t *testing.T) {
 // 都不要求精排。
 func TestRerankExplicitOffIsNotAGap(t *testing.T) {
 	for _, mutate := range []func(o *Options){
-		func(o *Options) { o.RetrievalDegrade = DegradeDeny; o.RerankDegrade = DegradeDeny },
+		func(o *Options) { o.RerankDegrade = DegradeDeny },
 		func(o *Options) { o.QualityStrict = true },
 	} {
 		s := newEmbedServer(t, 8)
