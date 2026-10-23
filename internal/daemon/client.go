@@ -364,6 +364,14 @@ func (c *Client) authorize(req *http.Request) {
 const maxResponseBodyBytes = 4 << 20
 
 func (c *Client) do(req *http.Request, path string, out any) error {
+	// 把调用方剩余的时间告诉 daemon：daemon 据此在截止前返回带构建进度的
+	// 错误。没有这个头时 daemon 不知道 wrapper 的工具超时，检索会一直等到
+	// wrapper 这边超时，调用方只看到 context deadline exceeded。
+	if deadline, ok := req.Context().Deadline(); ok {
+		if remaining := time.Until(deadline).Milliseconds(); remaining > 0 {
+			req.Header.Set(callerTimeoutHeader, strconv.FormatInt(remaining, 10))
+		}
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err

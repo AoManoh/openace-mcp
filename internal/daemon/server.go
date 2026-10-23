@@ -21,6 +21,22 @@ import (
 
 const DefaultAddr = "127.0.0.1:8765"
 
+// callerTimeoutHeader 携带 wrapper 调用剩余的毫秒数。daemon 给请求上下文设
+// 同样的截止时间，引擎的查询等待据此在截止前返回带构建进度的错误。HTTP 不会
+// 把客户端的超时传给服务端；没有这个头时请求上下文只在连接断开时取消。
+const callerTimeoutHeader = "X-Openace-Timeout-Ms"
+
+// withCallerDeadline 按 callerTimeoutHeader 给请求上下文设截止时间；头缺失
+// 或取值不是正整数时原样返回。
+func withCallerDeadline(r *http.Request) (*http.Request, context.CancelFunc) {
+	ms, err := strconv.ParseInt(r.Header.Get(callerTimeoutHeader), 10, 64)
+	if err != nil || ms <= 0 {
+		return r, func() {}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(ms)*time.Millisecond)
+	return r.WithContext(ctx), cancel
+}
+
 type Server struct {
 	service      engine.Service
 	tasks        *TaskStore
@@ -197,6 +213,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/v1/tasks/", s.taskItem)
 	if s.authToken == "" {
 		return s.withRequestLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r, cancel := withCallerDeadline(r)
+			defer cancel()
 			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 			mux.ServeHTTP(w, r)
 		}))
@@ -209,6 +227,8 @@ func (s *Server) routes() http.Handler {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
+		r, cancel := withCallerDeadline(r)
+		defer cancel()
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		mux.ServeHTTP(w, r)
 	}))

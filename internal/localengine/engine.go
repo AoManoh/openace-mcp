@@ -534,9 +534,13 @@ type buildCall struct {
 }
 
 // errQueryBuildWait 表示查询等待在建索引超过了 OPENACE_QUERY_BUILD_WAIT
-// 上界。构建继续在后台推进；调用方有旧 revision 时降级应答（原因
-// index-building），没有则报错。
+// 上界或调用方截止时间前的余量。构建继续在后台推进；调用方有旧 revision
+// 时降级应答（原因 index-building），没有则报错。
 var errQueryBuildWait = errors.New("query wait for index build exceeded")
+
+// queryWaitMargin 是查询等待在调用方截止时间之前留出的余量：带构建进度的
+// 错误要在截止前返回，调用方才收得到。
+const queryWaitMargin = 2 * time.Second
 
 // errFirstTouchRefresh 表示走了首触快路径：磁盘上的 revision 立即可服务，
 // 真实同步已在后台进行；上层以 index-refreshing 原因用旧索引应答。
@@ -584,9 +588,11 @@ func (e *Engine) firstTouchFastPath(ref engine.WorkspaceRef) (error, bool) {
 //   - 首触快路径（未开严格档）：返回
 //     errFirstTouchRefresh（最近一次刷新失败时返回该次失败的错误），上层
 //     用磁盘上的旧 revision 应答，同步在后台进行。
-//   - OPENACE_QUERY_BUILD_WAIT 为 0：等到构建完成。
-//   - 配置了上界：分片等待，超界后返回 errQueryBuildWait。构建不被取消，
+//   - 等待上界取 OPENACE_QUERY_BUILD_WAIT 与调用方截止时间减去
+//     queryWaitMargin 中较早的一个：分片等待，到界后返回 errQueryBuildWait，
 //     错误文本带构建进度与环境变量名。
+//   - 上界为 0 且调用方没有截止时间：等到构建完成。
+//   - 任何情况下查询离开都不取消构建。
 func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.WorkspaceRef) (engine.Result, error) {
 	// 新鲜度窗口只作用于查询期的内联同步；显式 Sync 每次都真实扫描，
 	// 编辑后 sync 立即可见，不受窗口影响。
@@ -609,18 +615,29 @@ func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.Workspace
 			return engine.Result{}, err
 		}
 	}
-	if e.queryBuildWait <= 0 {
-		return e.syncWorkspace(ctx, ref)
+	// 等待上界取 OPENACE_QUERY_BUILD_WAIT 与调用方截止时间减去 queryWaitMargin
+	// 中较早的一个。MCP 工具调用带 110 秒截止时间（daemon 模式经请求头传给
+	// daemon）。上界为 0 或长于截止时间时，改动前查询一直等到截止，调用方只
+	// 看到 context deadline exceeded、看不到构建进度，而且只有这个查询在等的
+	// 构建会随它离开被取消。现在查询离开一律不取消构建；没有截止时间且上界
+	// 为 0 时才一直等到构建完成。
+	budget := e.queryBuildWait
+	if callerDeadline, ok := ctx.Deadline(); ok {
+		if limit := time.Until(callerDeadline) - queryWaitMargin; budget <= 0 || limit < budget {
+			budget = max(limit, time.Nanosecond)
+		}
+	} else if budget <= 0 {
+		return e.syncWorkspaceDetachable(ctx, ref, false)
 	}
 	// 分片等待：把预算切成 buildWaitSlice 长的片，每片结束核对构建 ETA。
 	// ETA 超出剩余预算且有旧 revision 可答时立即返回，让上层用旧索引降级
 	// 应答，不再等满整个预算。ETA 未知（首批尚未完成）或没有旧 revision
 	// 时与整段等待行为一致。
-	deadline := time.Now().Add(e.queryBuildWait)
+	deadline := time.Now().Add(budget)
 	for {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return engine.Result{}, e.queryBuildWaitError(ref, fmt.Sprintf("%s=%s 超界,构建继续后台推进", EnvQueryBuildWait, e.queryBuildWait))
+			return engine.Result{}, e.queryBuildWaitError(ref, fmt.Sprintf("等待 %s 后返回(%s=%s,调用方截止时间也限制等待),构建继续后台推进", budget.Round(time.Millisecond), EnvQueryBuildWait, e.queryBuildWait))
 		}
 		slice := e.buildWaitSlice
 		if slice <= 0 || slice > remaining {
