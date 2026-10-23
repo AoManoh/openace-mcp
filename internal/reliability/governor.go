@@ -3,16 +3,29 @@ package reliability
 import (
 	"context"
 	"math"
+	"slices"
 	"sync"
 	"time"
 )
 
 const (
-	governorRateMDFactor    = 0.5
-	governorRateAIFraction  = 0.02
+	// governorRateMDFactor 是一次限速后目标速率相对限速前速率的倍数。取 0.7，
+	// 与 AWS SDK adaptive retry 模式（botocore CubicCalculator 的 _BETA）和
+	// TCP CUBIC（RFC 9438 的 β_cubic）相同。
+	governorRateMDFactor    = 0.7
 	governorRateFloorTokens = 40_000
 	governorPauseFallback   = 30 * time.Second
-	operationBytes          = 16 << 10
+	// governorRateWindow 是速率学习统计已发送 token 的时间窗：provider 的 TPM
+	// 限额按分钟计数，一个请求被接受后的一分钟内都占用额度。
+	governorRateWindow = time.Minute
+	// governorRateRecover 与 governorRateProbe 是恢复系数：一个 governorRateWindow
+	// 内没有新的限速、且有请求因目标速率等待时，目标低于限速前速率则乘 1.5
+	// （从 0.7 倍一步回到限速前速率，不超过它），已达到则乘 1.1 试探更高的额度。
+	governorRateRecover = 1.5
+	governorRateProbe   = 1.1
+	// governorLatencySamples 是计算请求耗时中位数所保留的最近成功请求数。
+	governorLatencySamples = 64
+	operationBytes         = 16 << 10
 )
 
 type GovernorOutcome int
@@ -49,32 +62,63 @@ type throughputSample struct {
 	settling                                            int
 }
 
+// rateEntry 是速率窗口里的一个已登记请求。
+type rateEntry struct {
+	at     time.Time
+	id     uint64
+	tokens int
+}
+
 // Governor 由全部工作区共享。window 是当前请求窗口，没有固定并发上限。
 // 索引请求逐次取得许可，等待和重试不持许可；查询仅共用显式预算。
 // 429 沿用独立的速率学习，窗口按完整样本组的吞吐和过载调整。
 type Governor struct {
-	mu                                         sync.Mutex
-	window, inFlight, operations               int
-	inFlightBytes                              int64
-	inFlightTokens                             int64
-	nextID, epoch                              uint64
-	active                                     map[uint64]indexAttempt
-	waiters                                    []chan struct{}
-	changed                                    chan struct{}
-	sample                                     throughputSample
-	verifiedWindow                             int
-	verifiedRate, verifiedTokens               float64
-	fine                                       bool
-	cooldown                                   int
-	resource                                   resourceSnapshot
-	resourceReason, lastAdjustment             string
-	sampleResources                            func() resourceSnapshot
-	rateLearning                               bool
-	targetTokensPerMin, bucketTokens           float64
-	lastRefill, pausedUntil, recentWindowStart time.Time
-	recentWindowTokens                         float64
-	now                                        func() time.Time
-	sleep                                      func(context.Context, time.Duration) error
+	mu                             sync.Mutex
+	window, inFlight, operations   int
+	inFlightBytes                  int64
+	inFlightTokens                 int64
+	nextID, epoch                  uint64
+	active                         map[uint64]indexAttempt
+	waiters                        []chan struct{}
+	changed                        chan struct{}
+	sample                         throughputSample
+	verifiedWindow                 int
+	verifiedRate, verifiedTokens   float64
+	fine                           bool
+	cooldown                       int
+	resource                       resourceSnapshot
+	resourceReason, lastAdjustment string
+	sampleResources                func() resourceSnapshot
+	// 速率学习：第一次收到 429 后开启，进程内不再关闭。targetTokensPerMin
+	// 是学到的目标，近 governorRateWindow 内登记的 token 不超过它时才发新
+	// 请求。rateMax 是最近一次限速时的速率，恢复时先回到它再往上试探。
+	rateLearning       bool
+	targetTokensPerMin float64
+	rateMax            float64
+	// rateLog 是近 governorRateWindow 内登记、已成功或仍在处理中的请求，按
+	// 登记时间排列，不论是否学习速率都记录：第一次 429 到达时要据此估计
+	// provider 已接受的量。以失败结束的请求移出，provider 没有接受它。
+	rateLog []rateEntry
+	// rateCutThrough 是最近一次减速时已登记的最大许可编号，编号不大于它的
+	// 请求迟到的 429 属于同一次限速。rateCutEstimated 表示那次限速是进入
+	// 学习的第一次，目标按已接受量估计，同一次限速后续的 429 继续下调估计。
+	rateCutThrough   uint64
+	rateCutEstimated bool
+	// rateChangedAt 是目标最近一次变化的时刻；rateBound 表示此后有请求因
+	// 目标速率等待过，即需求超过目标，上调才有依据。
+	rateChangedAt time.Time
+	rateBound     bool
+	pausedUntil   time.Time
+	// 进程内累计的观测计数，见 GovernorSnapshot。rateWaiting 是正在等限速
+	// 暂停或目标速率的请求数，rateWaitSince 是它从 0 变为 1 的时刻。
+	requests, rateLimited uint64
+	rateWaiting           int
+	rateWaitSince         time.Time
+	rateWait              time.Duration
+	latencies             []time.Duration
+	latencyNext           int
+	now                   func() time.Time
+	sleep                 func(context.Context, time.Duration) error
 }
 
 // NewGovernor 的参数只确定初始窗口。资源状态未知时不自动扩张并报告原因，
@@ -110,24 +154,29 @@ func (g *Governor) AcquireIndexWithBudget(ctx context.Context, tokens int, bytes
 		g.resource = resources
 		now := g.now()
 		g.measureWindowUseLocked(now)
+		g.pruneRateLogLocked(now)
 		wait := g.pausedUntil.Sub(now)
+		rateWait := wait > 0
 		if wait <= 0 && !g.resourceFitsLocked(bytes, true) {
 			wait = 100 * time.Millisecond
 		}
 		if wait <= 0 && g.rateLearning {
-			g.refillLocked(now)
-			need := math.Min(float64(tokens), g.targetTokensPerMin)
-			if g.bucketTokens < need {
-				wait = time.Duration((need - g.bucketTokens) / g.targetTokensPerMin * float64(time.Minute))
-				if wait < 50*time.Millisecond {
-					wait = 50 * time.Millisecond
-				}
+			g.raiseRateLocked(now)
+			if wait = g.rateLimitWaitLocked(now, tokens); wait > 0 {
+				g.rateBound, rateWait = true, true
 			}
 		}
 		if wait > 0 {
+			if rateWait {
+				g.beginRateWaitLocked(now)
+			}
 			g.wakeWaitersLocked()
 			g.mu.Unlock()
-			if err := g.sleep(ctx, wait); err != nil {
+			err := g.sleep(ctx, wait)
+			if rateWait {
+				g.endRateWait()
+			}
+			if err != nil {
 				return IndexPermit{}, err
 			}
 			continue
@@ -147,9 +196,6 @@ func (g *Governor) AcquireIndexWithBudget(ctx context.Context, tokens int, bytes
 				}
 				continue
 			}
-			if g.rateLearning {
-				g.bucketTokens -= float64(tokens)
-			}
 			// 完全空闲后的新工作不混入前次尾批与空闲时间。
 			if g.inFlight == 0 && g.sample.outstanding == 0 && g.sample.admitted < g.window {
 				g.sample = throughputSample{}
@@ -165,6 +211,8 @@ func (g *Governor) AcquireIndexWithBudget(ctx context.Context, tokens int, bytes
 			}
 			g.nextID++
 			p := IndexPermit{owner: g, id: g.nextID}
+			g.rateLog = append(g.rateLog, rateEntry{at: now, id: p.id, tokens: tokens})
+			g.requests++
 			g.active[p.id] = indexAttempt{epoch: g.epoch, tokens: tokens, bytes: bytes, sampled: sampled}
 			g.inFlight++
 			g.inFlightBytes += bytes
@@ -206,14 +254,20 @@ func (g *Governor) Observe(p IndexPermit, outcome GovernorOutcome, latency, retr
 	if g.sample.settling > 0 && p.id <= g.sample.settleThrough {
 		g.sample.settling--
 	}
+	// 速率窗口只保留成功或仍在处理中的请求：429、连接失败与其他错误的请求
+	// 没有被 provider 接受。连接失败的请求留在窗口里，第一次 429 时会把
+	// provider 实际接受的量估高（本机受控实验里监听队列满被拒的连接就是
+	// 这样），恢复到这个估计时再次超限。
+	if outcome != OutcomeSuccess {
+		g.removeRateEntryLocked(p.id)
+	}
 	switch outcome {
 	case OutcomeSuccess:
-		g.trackThroughputLocked(now, a.tokens)
-		if g.rateLearning {
-			g.targetTokensPerMin *= 1 + governorRateAIFraction
-		}
+		g.recordLatencyLocked(latency)
 	case OutcomeRateLimited:
-		g.onRateLimitedLocked(now, retryAfter)
+		g.rateLimited++
+		g.pruneRateLogLocked(now)
+		g.onRateLimitedLocked(now, p.id, retryAfter)
 	}
 	// 样本组决定观察何时结束，吞吐必须计算这段时间内的全部完成量。
 	// 持续投放时，窗口改变前已开始的请求和组外补充请求仍会成功完成；
@@ -402,6 +456,14 @@ type GovernorSnapshot struct {
 	InFlight           int       `json:"in_flight,omitempty"`
 	ResourceReason     string    `json:"resource_reason,omitempty"`
 	LastAdjustment     string    `json:"last_adjustment,omitempty"`
+	// 进程内累计：Requests 是登记的索引请求尝试数（含重试），RateLimited 是
+	// 其中收到 429 的次数，RateWait 是至少有一个索引请求在等限速暂停或学到
+	// 的目标速率的墙钟时长（含正在进行的等待）。LatencyP50 是最近至多
+	// governorLatencySamples 个成功请求的耗时中位数。
+	Requests    uint64        `json:"requests,omitempty"`
+	RateLimited uint64        `json:"rate_limited,omitempty"`
+	RateWait    time.Duration `json:"rate_wait,omitempty"`
+	LatencyP50  time.Duration `json:"latency_p50,omitempty"`
 }
 
 func (g *Governor) Snapshot() GovernorSnapshot {
@@ -410,7 +472,18 @@ func (g *Governor) Snapshot() GovernorSnapshot {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return GovernorSnapshot{RateLearning: g.rateLearning, TargetTokensPerMin: int(g.targetTokensPerMin), PausedUntil: g.pausedUntil, Window: g.window, InFlight: g.inFlight, ResourceReason: g.resourceReason, LastAdjustment: g.lastAdjustment}
+	rateWait := g.rateWait
+	if g.rateWaiting > 0 {
+		rateWait += g.now().Sub(g.rateWaitSince)
+	}
+	var p50 time.Duration
+	if n := len(g.latencies); n > 0 {
+		sorted := slices.Clone(g.latencies)
+		slices.Sort(sorted)
+		p50 = sorted[n/2]
+	}
+	return GovernorSnapshot{RateLearning: g.rateLearning, TargetTokensPerMin: int(g.targetTokensPerMin), PausedUntil: g.pausedUntil, Window: g.window, InFlight: g.inFlight, ResourceReason: g.resourceReason, LastAdjustment: g.lastAdjustment,
+		Requests: g.requests, RateLimited: g.rateLimited, RateWait: rateWait, LatencyP50: p50}
 }
 func (g *Governor) wakeWaitersLocked() {
 	free := g.window - g.inFlight
@@ -432,51 +505,132 @@ func (g *Governor) abandonWaiter(ready chan struct{}) {
 	g.wakeWaitersLocked()
 }
 
-func (g *Governor) refillLocked(now time.Time) {
-	if g.lastRefill.IsZero() {
-		g.lastRefill = now
-		return
+// pruneRateLogLocked 移除登记已满 governorRateWindow 的请求：provider 的分钟
+// 额度里已不再计入它们。
+func (g *Governor) pruneRateLogLocked(now time.Time) {
+	expired := 0
+	for expired < len(g.rateLog) && now.Sub(g.rateLog[expired].at) >= governorRateWindow {
+		expired++
 	}
-	elapsed := now.Sub(g.lastRefill)
-	if elapsed <= 0 {
-		return
+	if expired > 0 {
+		g.rateLog = append(g.rateLog[:0], g.rateLog[expired:]...)
 	}
-	g.bucketTokens += g.targetTokensPerMin * elapsed.Minutes()
-	// 余额上限为一分钟的额度。有配额的服务按滑动窗口计数，长时间空闲攒
-	// 出的余额一次发出去会立刻收到 429。
-	if g.bucketTokens > g.targetTokensPerMin {
-		g.bucketTokens = g.targetTokensPerMin
-	}
-	g.lastRefill = now
 }
 
-func (g *Governor) trackThroughputLocked(now time.Time, tokens int) {
-	if g.recentWindowStart.IsZero() || now.Sub(g.recentWindowStart) > time.Minute {
-		g.recentWindowStart = now
-		g.recentWindowTokens = 0
+// acceptedTokensLocked 返回近 governorRateWindow 内登记、且没有收到 429 的
+// token 数，包括仍在处理中的请求：provider 接受请求时就计入了额度。
+func (g *Governor) acceptedTokensLocked() int {
+	total := 0
+	for _, entry := range g.rateLog {
+		total += entry.tokens
 	}
-	g.recentWindowTokens += float64(tokens)
+	return total
 }
 
-func (g *Governor) onRateLimitedLocked(now time.Time, retryAfter time.Duration) {
-	if !g.rateLearning {
-		// 第一个 429：进入学习态。初始目标取实测最近吞吐乘下降因子，从
-		// 实测出发而不是从常数猜起。没有实测数据（刚启动就收到 429）时
-		// 落到下限 governorRateFloorTokens。
-		g.rateLearning = true
-		observed := g.recentWindowTokens
-		if elapsed := now.Sub(g.recentWindowStart); elapsed > time.Second && elapsed < time.Minute {
-			// 窗口已过 1s 到 1min 之间时按已过时长折算成每分钟速率；不满 1s
-			// 不折算，避免用极短时长做除数得到虚高的速率。
-			observed = g.recentWindowTokens / elapsed.Minutes()
+// rateLimitWaitLocked 返回按学到的目标还要等多久才能发出 tokens：近
+// governorRateWindow 内已登记的 token 加上本次不超过目标即可发出，否则等
+// 最早的那些请求移出窗口。单个请求就超过目标时，等窗口里没有其他请求再发，
+// 不会永远发不出去。按滑动窗口计数而不是按速率续充：provider 按分钟计数时，
+// 刚被接受的一批请求在一分钟内一直占用额度，续充式的令牌桶在这一分钟里
+// 最多会放出两倍目标的 token。
+func (g *Governor) rateLimitWaitLocked(now time.Time, tokens int) time.Duration {
+	used := g.acceptedTokensLocked()
+	if used == 0 || float64(used+tokens) <= g.targetTokensPerMin {
+		return 0
+	}
+	for _, entry := range g.rateLog {
+		used -= entry.tokens
+		if used == 0 || float64(used+tokens) <= g.targetTokensPerMin {
+			return max(entry.at.Add(governorRateWindow).Sub(now), 50*time.Millisecond)
 		}
-		g.targetTokensPerMin = math.Max(observed*governorRateMDFactor, governorRateFloorTokens)
-		g.bucketTokens = 0
-		g.lastRefill = now
+	}
+	return 50 * time.Millisecond
+}
+
+// raiseRateLocked 在目标上次变化后过了一个 governorRateWindow、期间没有新的
+// 限速、且有请求因目标速率等待过时上调目标：低于限速前速率时乘
+// governorRateRecover（不超过限速前速率），之后乘 governorRateProbe。没有请求
+// 等待说明目标不是瓶颈，上调没有依据。改动前每个成功请求只把目标提高 2%，
+// 学到的目标在每分钟两三个请求的低速下要几十分钟才能恢复。
+func (g *Governor) raiseRateLocked(now time.Time) {
+	if !g.rateBound || now.Sub(g.rateChangedAt) < governorRateWindow {
+		return
+	}
+	if g.targetTokensPerMin < g.rateMax {
+		g.targetTokensPerMin = math.Min(g.rateMax, g.targetTokensPerMin*governorRateRecover)
 	} else {
+		g.targetTokensPerMin *= governorRateProbe
+	}
+	g.rateChangedAt, g.rateBound = now, false
+}
+
+// removeRateEntryLocked 把收到 429 的请求移出速率窗口。
+func (g *Governor) removeRateEntryLocked(id uint64) {
+	for i, entry := range g.rateLog {
+		if entry.id == id {
+			g.rateLog = append(g.rateLog[:i], g.rateLog[i+1:]...)
+			return
+		}
+	}
+}
+
+func (g *Governor) beginRateWaitLocked(now time.Time) {
+	if g.rateWaiting == 0 {
+		g.rateWaitSince = now
+	}
+	g.rateWaiting++
+}
+
+func (g *Governor) endRateWait() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.rateWaiting--
+	if g.rateWaiting == 0 {
+		g.rateWait += g.now().Sub(g.rateWaitSince)
+	}
+}
+
+func (g *Governor) recordLatencyLocked(latency time.Duration) {
+	if len(g.latencies) < governorLatencySamples {
+		g.latencies = append(g.latencies, latency)
+		return
+	}
+	g.latencies[g.latencyNext] = latency
+	g.latencyNext = (g.latencyNext + 1) % governorLatencySamples
+}
+
+// onRateLimitedLocked 处理一次 429，被拒的请求已由 Observe 移出速率窗口。
+// 一次限速只减速一次，做法与 TCP NewReno 对同一窗口内的多处丢包只减一次
+// 窗口相同（RFC 6582）：
+//   - 第一次 429（进入速率学习）：限速前的速率取近一分钟 provider 已接受的
+//     token（含仍在处理中的请求），目标取它的 governorRateMDFactor 倍。构建
+//     开始时整批并发请求同时发出，429 往往先于任何成功返回；改动前按已完成
+//     请求估计，得到 0，目标直接落到下限。
+//   - 减速之后才登记的请求被拒：按新目标发送仍超限，是新的一次限速。限速前
+//     速率记为当前目标，目标再乘 governorRateMDFactor。
+//   - 减速之前登记的请求迟到的 429：属于同一次限速，不再减速。改动前每个
+//     429 都把目标减半，一批并发请求同时被拒时连续减半，几次就到下限。若
+//     这次限速是进入学习的那次，按移出被拒请求后的已接受量下调估计：第一个
+//     429 到达时，同批其余将被拒的请求还算在已接受量里。
+//
+// 目标不低于 governorRateFloorTokens。暂停取 Retry-After，没有时取
+// governorPauseFallback，多个 429 只把暂停延到最晚的那个。
+func (g *Governor) onRateLimitedLocked(now time.Time, id uint64, retryAfter time.Duration) {
+	switch {
+	case !g.rateLearning:
+		g.rateLearning, g.rateCutEstimated = true, true
+		g.rateMax = float64(g.acceptedTokensLocked())
+		g.targetTokensPerMin = math.Max(g.rateMax*governorRateMDFactor, governorRateFloorTokens)
+		g.rateCutThrough, g.rateChangedAt, g.rateBound = g.nextID, now, false
+	case id > g.rateCutThrough:
+		g.rateCutEstimated = false
+		g.rateMax = g.targetTokensPerMin
 		g.targetTokensPerMin = math.Max(g.targetTokensPerMin*governorRateMDFactor, governorRateFloorTokens)
-		if g.bucketTokens > g.targetTokensPerMin {
-			g.bucketTokens = g.targetTokensPerMin
+		g.rateCutThrough, g.rateChangedAt, g.rateBound = g.nextID, now, false
+	case g.rateCutEstimated:
+		if accepted := float64(g.acceptedTokensLocked()); accepted < g.rateMax {
+			g.rateMax = accepted
+			g.targetTokensPerMin = math.Max(accepted*governorRateMDFactor, governorRateFloorTokens)
 		}
 	}
 	pause := retryAfter

@@ -70,6 +70,24 @@ type wsStatus struct {
 	// 结束随进度一并归零。只有 pending 数没有速率时，等待方判断不出构建
 	// 是否在推进、还要多久。
 	embedStartedAt *time.Time
+	// embedRequests、embedRateLimited 与 embedRateWait 是最近一次发出嵌入请求
+	// 的构建在嵌入阶段的请求尝试数、429 次数与因限速等待的墙钟时长，取吞吐
+	// 治理器累计计数在该阶段前后的差；构建结束后保留，下一次发出嵌入请求的
+	// 构建覆盖。
+	embedRequests    int
+	embedRateLimited int
+	embedRateWait    time.Duration
+}
+
+// setEmbedRequestStats 记录一次嵌入阶段的请求计数：before、after 是该阶段
+// 前后吞吐治理器的快照。
+func (s *wsStatus) setEmbedRequestStats(before, after reliability.GovernorSnapshot) {
+	s.mu.Lock()
+	s.embedRequests = int(after.Requests - before.Requests)
+	s.embedRateLimited = int(after.RateLimited - before.RateLimited)
+	s.embedRateWait = after.RateWait - before.RateWait
+	s.updatedAt = time.Now().UTC()
+	s.mu.Unlock()
 }
 
 // setBulkJob 更新在途批量嵌入作业标签，空串表示清除。
@@ -413,6 +431,9 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 			semantic.EmbeddedChunks = tracker.embedDone
 			semantic.EmbedRatePerMin, semantic.EmbedETASeconds = tracker.embedRateETALocked(time.Now().UTC())
 			semantic.BulkJob = tracker.bulkJob
+			semantic.LastEmbedRequests = tracker.embedRequests
+			semantic.LastEmbedRateLimited = tracker.embedRateLimited
+			semantic.LastEmbedRateWaitSeconds = int(tracker.embedRateWait.Round(time.Second) / time.Second)
 			tracker.mu.Unlock()
 			// journal 条数从已打开的 journal 实时读取；journal 尚未打开时不
 			// 显示。
@@ -453,6 +474,7 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 		semantic.GovernorResourceReason = governor.ResourceReason
 		semantic.GovernorAdjustment = governor.LastAdjustment
 		semantic.GovernorInFlight = governor.InFlight
+		semantic.GovernorLatencyP50Ms = int(governor.LatencyP50.Milliseconds())
 		if !governor.PausedUntil.IsZero() {
 			paused := governor.PausedUntil
 			semantic.GovernorPausedUntil = &paused

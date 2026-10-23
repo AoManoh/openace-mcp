@@ -83,46 +83,19 @@ func TestGovernor429EntersLearningAndPauses(t *testing.T) {
 	}
 	g.Observe(p, OutcomeOther, 0, 0)
 }
+
+// TestGovernorRepeated429HitsFloor：每次都是减速之后才登记的请求被拒（新的
+// 一次限速），目标逐次乘 0.7，最终停在下限。
 func TestGovernorRepeated429HitsFloor(t *testing.T) {
 	g, _ := governed(1)
 	g.rateLearning = true
 	g.targetTokensPerMin = 2_000_000
-	g.bucketTokens = 2_000_000
 	for i := 0; i < 12; i++ {
 		p := mustAcquire(t, g, 1000)
 		g.Observe(p, OutcomeRateLimited, 0, time.Millisecond)
 	}
 	if !g.AtRateFloor() {
 		t.Fatalf("既有速率规则未生效: %+v", g.Snapshot())
-	}
-}
-func TestGovernorOversizedRequestProgressesWithDebt(t *testing.T) {
-	g, clock := governed(1)
-	g.rateLearning = true
-	g.targetTokensPerMin = 40_000
-	g.bucketTokens = 40_000
-	g.lastRefill = clock.now()
-	p := mustAcquire(t, g, 65_536)
-	if g.bucketTokens != -25_536 {
-		t.Fatalf("债务错误: %f", g.bucketTokens)
-	}
-	g.Observe(p, OutcomeOther, 0, 0)
-	start := clock.now()
-	p = mustAcquire(t, g, 1000)
-	if clock.now().Sub(start) < 39*time.Second {
-		t.Fatal("未偿还超额 token 债务")
-	}
-	g.Observe(p, OutcomeOther, 0, 0)
-}
-func TestGovernorSuccessRaisesLearnedRate(t *testing.T) {
-	g, _ := governed(1)
-	g.rateLearning = true
-	g.targetTokensPerMin = 50_000
-	g.bucketTokens = 50_000
-	p := mustAcquire(t, g, 1000)
-	g.Observe(p, OutcomeSuccess, time.Second, 0)
-	if g.Snapshot().TargetTokensPerMin != 51_000 {
-		t.Fatalf("速率恢复: %+v", g.Snapshot())
 	}
 }
 func TestGovernorGrowsBeyondInitialWindow(t *testing.T) {

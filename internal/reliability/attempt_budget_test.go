@@ -26,13 +26,12 @@ func TestGovernorBudgetWaitDoesNotHoldPermit(t *testing.T) {
 	if err := l.Acquire(context.Background(), 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	g.rateLearning, g.targetTokensPerMin, g.bucketTokens = true, 60_000, 60_000
-	g.lastRefill = clock.now()
+	g.rateLearning, g.targetTokensPerMin = true, 60_000
 	waits := 0
 	l.sleep = func(ctx context.Context, d time.Duration) error {
 		waits++
-		if g.Snapshot().InFlight != 0 || g.bucketTokens != 60_000 {
-			t.Fatal("预算等待占了名额或重复扣了已学习速率令牌")
+		if g.Snapshot().InFlight != 0 || len(g.rateLog) != 0 {
+			t.Fatal("预算等待占了名额或提前登记了速率窗口")
 		}
 		if d != time.Minute {
 			t.Fatalf("预算窗口等待 = %s", d)
@@ -43,8 +42,8 @@ func TestGovernorBudgetWaitDoesNotHoldPermit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if waits != 1 || l.usedReqs != 1 || g.Snapshot().InFlight != 1 || g.bucketTokens != 59_900 {
-		t.Fatalf("跨窗口准入必须只登记一次: waits=%d requests=%d governor=%+v tokens=%f", waits, l.usedReqs, g.Snapshot(), g.bucketTokens)
+	if waits != 1 || l.usedReqs != 1 || g.Snapshot().InFlight != 1 || len(g.rateLog) != 1 || g.rateLog[0].tokens != 100 {
+		t.Fatalf("跨窗口准入必须只登记一次: waits=%d requests=%d governor=%+v rate_log=%+v", waits, l.usedReqs, g.Snapshot(), g.rateLog)
 	}
 	g.Observe(permit, OutcomeOther, 0, 0)
 }

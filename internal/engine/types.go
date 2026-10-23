@@ -248,6 +248,16 @@ type SemanticStatus struct {
 	GovernorAdjustment     string     `json:"governor_adjustment,omitempty"`
 	GovernorInFlight       int        `json:"governor_in_flight,omitempty"`
 	GovernorPausedUntil    *time.Time `json:"governor_paused_until,omitempty"`
+	// GovernorLatencyP50Ms 是最近至多 64 个成功的索引嵌入请求的耗时中位数
+	// （毫秒，进程内全部工作区共享）。
+	GovernorLatencyP50Ms int `json:"governor_latency_p50_ms,omitempty"`
+	// LastEmbed* 是该工作区最近一次发出嵌入请求的构建在嵌入阶段的请求尝试数
+	// （含重试）、其中收到 429 的次数与因限速等待的秒数。构建慢时据此区分
+	// 请求多、被限速还是单个请求慢。计数取自进程内共享的吞吐治理器，几个
+	// 工作区同时构建时包含彼此的请求。
+	LastEmbedRequests        int `json:"last_embed_requests,omitempty"`
+	LastEmbedRateLimited     int `json:"last_embed_rate_limited,omitempty"`
+	LastEmbedRateWaitSeconds int `json:"last_embed_rate_wait_seconds,omitempty"`
 
 	// Rerank* 描述精排 provider（未配置时 RerankDisabledReason 解释原因）。
 	RerankProvider       string `json:"rerank_provider,omitempty"`

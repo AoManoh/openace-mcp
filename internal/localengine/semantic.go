@@ -430,6 +430,9 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	)
 	workCtx, cancelWork := context.WithCancel(ctx)
 	defer cancelWork()
+	// 嵌入阶段前后吞吐治理器累计计数之差进状态（last_embed_*）：构建慢时
+	// 据此区分请求多、被限速还是单个请求慢。
+	governorBefore := e.embedClient.GovernorSnapshot()
 	recordFatal := func(err error) {
 		embedMu.Lock()
 		if fatalErr == nil {
@@ -562,6 +565,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		}
 	}
 	wg.Wait()
+	status.setEmbedRequestStats(governorBefore, e.embedClient.GovernorSnapshot())
 	if fatalErr != nil {
 		return out, fatalErr
 	}
