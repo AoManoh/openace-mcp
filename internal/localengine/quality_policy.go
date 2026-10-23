@@ -135,12 +135,20 @@ func (e *Engine) manifestGaps(m *index.Manifest) []qualityGap {
 
 // withBuildProgress 给 semantic-index-empty 缺口的说明补上该工作区的构建
 // 进度与索引嵌入熔断器状态。调用方据此判断要等多久，或先用自己的工具。
+// 没有构建在进行时只写明这一点：上次构建结束后计数器已归零，照常写出
+// “已嵌入 0、待嵌入 0”会让人误以为没有内容等待嵌入。
 func (e *Engine) withBuildProgress(gaps []qualityGap, workspaceKey string) []qualityGap {
 	for i, gap := range gaps {
 		if gap.reason != semanticIndexEmptyReason {
 			continue
 		}
-		extra := "build progress: " + e.buildProgressLabel(workspaceKey)
+		e.mu.Lock()
+		_, building := e.inflight[workspaceKey]
+		e.mu.Unlock()
+		extra := "no build in progress"
+		if building {
+			extra = "build progress: " + e.buildProgressLabel(workspaceKey)
+		}
 		if snap := e.embedClient.CircuitSnapshot(); snap.State != "healthy" {
 			extra += "; embedding provider " + circuitLabel(snap)
 		}
