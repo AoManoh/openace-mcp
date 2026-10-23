@@ -166,7 +166,7 @@ func TestSyncEmbedsAllChunks(t *testing.T) {
 		t.Fatalf("EngineVersion 应为 stage4: %q", manifest.EngineVersion)
 	}
 	// 向量文件可按 manifest 校验载入（K24/K25 链路）。
-	ix, err := vector.Load(store.SegmentPathFor(segment.ID), dim, segment.VectorsChecksum, segment.VectorsIndexChecksum, 0)
+	ix, err := vector.Load(store.SegmentPathFor(segment.ID), dim, segment.VectorsChecksum, segment.VectorsIndexChecksum)
 	if err != nil || ix.Count() != manifest.VectorCount {
 		t.Fatalf("向量载入: count=%v err=%v", ix, err)
 	}
@@ -179,42 +179,6 @@ func TestSyncEmbedsAllChunks(t *testing.T) {
 	}
 	if result.IndexRevision != manifest.Revision {
 		t.Fatalf("结果 revision 不符")
-	}
-}
-
-// TestVectorBudgetInterceptsBeforeProvider 是 2026-08-26 裁决的付费前
-// 拦截:配置 OPENACE_VECTOR_MEMORY_BUDGET 且投影行数超预算时,一次
-// provider 调用都不许发生(绝不"先付费,查询期才发现装不下");词法路
-// 照常发布,语义缺口显式留在状态里。
-func TestVectorBudgetInterceptsBeforeProvider(t *testing.T) {
-	const dim = 8
-	server := newEmbedServer(t, dim)
-	opts := embedOptions(server.ts.URL, dim, 16, "fake-model")
-	opts.VectorMemoryBudget = int64(dim * 4) // 折算行数=1,fixture 仓 chunk 数远超
-	e := newTestEngineWith(t, opts)
-	root := newFixtureWorkspace(t)
-	if _, err := e.Sync(context.Background(), syncRequest(root)); err != nil {
-		t.Fatal(err)
-	}
-	if calls := server.callCount(); calls != 0 {
-		t.Fatalf("超预算必须在任何 provider 调用之前拦截,实际发生 %d 次调用", calls)
-	}
-	status, err := e.WorkspaceStatus(context.Background(), engineRef(root))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status.Stage != "ready" {
-		t.Fatalf("词法路必须照常可用: stage=%s", status.Stage)
-	}
-	semantic := status.Semantic
-	if semantic == nil || !semantic.Enabled {
-		t.Fatalf("语义块应存在且 enabled: %+v", status)
-	}
-	if semantic.CoveredChunks != 0 {
-		t.Fatalf("超预算不应产生任何新覆盖: %+v", semantic)
-	}
-	if !strings.Contains(semantic.LastError, "budget") {
-		t.Fatalf("缺口原因必须显式指向预算: %q", semantic.LastError)
 	}
 }
 
@@ -262,7 +226,7 @@ func TestVectorReuseBitExact(t *testing.T) {
 	}
 	firstManifest, store := loadActiveManifest(t, e, root)
 	firstSegment := firstManifest.NewestSegment()
-	firstIx, err := vector.Load(store.SegmentPathFor(firstSegment.ID), dim, firstSegment.VectorsChecksum, firstSegment.VectorsIndexChecksum, 0)
+	firstIx, err := vector.Load(store.SegmentPathFor(firstSegment.ID), dim, firstSegment.VectorsChecksum, firstSegment.VectorsIndexChecksum)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +246,7 @@ func TestVectorReuseBitExact(t *testing.T) {
 	if deltaSegment.ID == firstSegment.ID {
 		t.Fatalf("变更应产生新 delta segment")
 	}
-	deltaIx, err := vector.Load(store.SegmentPathFor(deltaSegment.ID), dim, deltaSegment.VectorsChecksum, deltaSegment.VectorsIndexChecksum, 0)
+	deltaIx, err := vector.Load(store.SegmentPathFor(deltaSegment.ID), dim, deltaSegment.VectorsChecksum, deltaSegment.VectorsIndexChecksum)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -711,7 +675,7 @@ func TestProfileSubtreeIsolation(t *testing.T) {
 		t.Fatalf("profile hash 应随模型变化")
 	}
 	// A 子树不受 B 影响，仍可校验载入。
-	if _, err := vector.Load(storeA.SegmentPath(manifestA), dim, manifestA.VectorsChecksum, manifestA.VectorsIndexChecksum, 0); err != nil {
+	if _, err := vector.Load(storeA.SegmentPath(manifestA), dim, manifestA.VectorsChecksum, manifestA.VectorsIndexChecksum); err != nil {
 		t.Fatalf("A 子树应保持完整: %v", err)
 	}
 }

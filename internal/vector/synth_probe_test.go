@@ -75,7 +75,7 @@ func probeOnce(t *testing.T, rows, dim int) {
 	runtime.ReadMemStats(&before)
 	rssBefore := vmRSSMiB(t)
 	loadStart := time.Now()
-	ix, err := Load(dir, dim, dataSum, idxSum, 0)
+	ix, err := Load(dir, dim, dataSum, idxSum)
 	if err != nil {
 		t.Fatal(err)
 	}

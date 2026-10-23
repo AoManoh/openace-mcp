@@ -576,19 +576,18 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 	// 完成；构建返回时统一释放，包括提前返回与错误路径。
 	defer func() { prior.release() }()
 	if e.semanticEnabled() {
-		needed := e.budgetedKeys(records)
 		if previous != nil {
-			prior = e.loadPriorVectorsFor(store, previous, needed, needed != nil)
+			prior = e.loadPriorVectors(store, previous, nil)
 		}
 		// 同工作区旧 chunk profile 子树的向量是最低优先级来源，active 与
 		// previous 始终优先。语义完整的 revision 不再载入兄弟子树的大向量
 		// 集，否则 compaction 期间常驻内存翻倍；只在首建、语义未完整或
 		// active 段物理不全时并入。
 		if previous == nil || !previous.SemanticComplete() || prior.activeLoadedSegments != prior.activeExpectedSegments {
-			e.mergeSiblingProfileVectorsFor(store, root, &prior, needed)
+			e.mergeSiblingProfileVectors(store, root, &prior)
 		}
 	}
-	seman, err := e.embedRecords(ctx, store, workspaceKey, prior, records, status, 0)
+	seman, err := e.embedRecords(ctx, store, workspaceKey, prior, records, status)
 	if err != nil {
 		return engine.Result{}, nil, err
 	}
@@ -691,11 +690,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 		}
 		prior = e.loadPriorVectors(store, previous, needed)
 	}
-	var retainedRows int64
-	for _, segment := range previous.Segments {
-		retainedRows = saturatingAdd(retainedRows, int64(segment.VectorCount))
-	}
-	seman, err := e.embedRecords(ctx, store, workspaceKey, prior, records, status, retainedRows)
+	seman, err := e.embedRecords(ctx, store, workspaceKey, prior, records, status)
 	if err != nil {
 		return engine.Result{}, nil, err
 	}

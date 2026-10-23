@@ -120,13 +120,6 @@ type Engine struct {
 	// 持有它的句柄数引用计数，归零即释放。
 	vectorMu       sync.Mutex
 	vectorSegments map[string]*sharedVectorIndex
-	// vectorMaxResident 是常驻向量行数上限，由 OPENACE_VECTOR_MEMORY_BUDGET
-	// 的字节预算按 维度×4 字节折算。vectorMemoryBudget 为 0 时不限（默认：
-	// 能力默认不设限，资源约束由用户显式配置）；预算不足一行时为 0，表示
-	// 一行也不能装载。
-	vectorMaxResident int
-	// vectorMemoryBudget 是用户配置的原始字节预算，journal 也按它封顶。
-	vectorMemoryBudget int64
 	// repair 记录查询期发现向量文件损坏或缺失的工作区（键为 workspaceKey），
 	// 下次同步强制全量重建向量；构建开始时取走标记。
 	repair map[string]bool
@@ -166,8 +159,6 @@ var (
 //   - OPENACE_QUALITY_STRICT=on 但没有可用的 embedding provider：构造期报错。
 //     严格档承诺完整的语义质量，没有 provider 时每次查询都会因缺口失败，
 //     在启动时指出配置错误比查询期反复失败更早暴露问题。
-//   - 配置了向量内存预算且 embedding 维度已知：按 维度×4 字节把预算折算
-//     成常驻行数上限，最少 1 行；journal 在 journalFor 里按同一预算封顶。
 //   - 索引子树名带词法评分标记（+lex-bm25），评分模型变化同样进入新子树
 //     全量重建，旧子树保留。
 //   - 配置了 embedding：创建客户端，索引子树名追加 embedding 身份与模板
@@ -238,13 +229,6 @@ func New(opts Options) (*Engine, error) {
 		opts.Embedding = resolved
 	}
 	e.embedCfg = opts.Embedding
-	// 常驻向量默认不限。用户配置字节预算时按 维度×4 字节折算行数上限，
-	// 只计向量数据本身；条目与元数据另有开销。
-	// journalFor 用同一预算封顶 journal 字节数。
-	if opts.VectorMemoryBudget > 0 && opts.Embedding.Dimension > 0 {
-		e.vectorMaxResident = vectorRowsWithin(opts.VectorMemoryBudget, opts.Embedding.Dimension)
-		e.vectorMemoryBudget = opts.VectorMemoryBudget
-	}
 	if opts.Embedding.Enabled {
 		client, err := embedding.NewClient(opts.Embedding)
 		if err != nil {
@@ -331,10 +315,8 @@ func (e *Engine) vectorRepairPending(workspaceKey string) bool {
 	return e.repair[workspaceKey]
 }
 
-// journalFor 返回该工作区的 embedding journal，没有则打开。用户配置了向量
-// 内存预算时 journal 按同一字节数封顶：预算只拦截新的付费写入，不丢弃
-// 已有条目。两次加锁之间可能有并发调用先打开了 journal，此时关闭自己
-// 打开的、返回已登记的那个。
+// journalFor 返回该工作区的 embedding journal，没有则打开。两次加锁之间
+// 可能有并发调用先打开了 journal，此时关闭自己打开的、返回已登记的那个。
 func (e *Engine) journalFor(workspaceKey string, store *index.Store) (*index.Journal, error) {
 	e.mu.Lock()
 	if journal, ok := e.journals[workspaceKey]; ok {
@@ -346,12 +328,6 @@ func (e *Engine) journalFor(workspaceKey string, store *index.Store) (*index.Jou
 	journal, err := index.OpenJournal(store, e.embedCfg.Dimension)
 	if err != nil {
 		return nil, err
-	}
-	if e.vectorMemoryBudget > 0 {
-		// journal 与常驻向量共用同一字节预算，在付费前拦截。journal 每条
-		// 记录另有 78 字节头部，同样字节数下可容条数略少于 revision 的常驻
-		// 行数，偏保守。
-		journal.LimitBytes(e.vectorMemoryBudget)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()

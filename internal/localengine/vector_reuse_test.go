@@ -42,7 +42,7 @@ func TestCrossStoreVectorReuse(t *testing.T) {
 			continue
 		}
 		ix, err := vector.Load(storeA.SegmentPathFor(segment.ID), 8,
-			segment.VectorsChecksum, segment.VectorsIndexChecksum, 0)
+			segment.VectorsChecksum, segment.VectorsIndexChecksum)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -903,7 +903,7 @@ func dumpVectorsFromStore(root string, out string) error {
 			continue
 		}
 		ix, err := vector.Load(store.SegmentPathFor(segment.ID), manifest.EmbeddingDimension,
-			segment.VectorsChecksum, segment.VectorsIndexChecksum, 0)
+			segment.VectorsChecksum, segment.VectorsIndexChecksum)
 		if err != nil {
 			return fmt.Errorf("segment %s: %w", segment.ID, err)
 		}

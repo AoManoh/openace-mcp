@@ -2,7 +2,6 @@ package localengine
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 
@@ -28,28 +27,6 @@ func writeHandleVectorSegment(t *testing.T, count, dim int, prefix string) (stri
 	return dir, index.SegmentRef{
 		ID: prefix, VectorsChecksum: dataSum, VectorsIndexChecksum: indexSum,
 		VectorCount: count, Counts: index.Counts{Chunks: count},
-	}
-}
-
-// 累计 envelope 必须在第二段完整数据分配前拒绝,并释放首段缓存引用。
-func TestRevisionHandleChecksCumulativeVectorEnvelopeBeforeLoad(t *testing.T) {
-	const dim = 4
-	dir1, seg1 := writeHandleVectorSegment(t, 6, dim, "one")
-	dir2, seg2 := writeHandleVectorSegment(t, 6, dim, "two")
-	e := &Engine{vectorSegments: make(map[string]*sharedVectorIndex), vectorMaxResident: 10}
-	h := &revisionHandle{
-		engine:      e,
-		manifest:    &index.Manifest{VectorCount: 12, Segments: []index.SegmentRef{seg1, seg2}},
-		segmentDirs: []string{dir1, dir2},
-	}
-	if _, err := h.vectorIndexes(dim); !errors.Is(err, vector.ErrEnvelopeExceeded) {
-		t.Fatalf("累计 12>10 应在第二段分配前拒绝: %v", err)
-	}
-	e.vectorMu.Lock()
-	cached := len(e.vectorSegments)
-	e.vectorMu.Unlock()
-	if cached != 0 {
-		t.Fatalf("失败路径应释放已取得段引用: cached=%d", cached)
 	}
 }
 

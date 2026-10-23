@@ -2,6 +2,8 @@ package localengine
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -27,13 +29,29 @@ func TestFirstTouchAfterFailedRefreshReportsStaleIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFixture(t, root, "multi.go", strings.Replace(original, "return 3", "return 30", 1))
-	limited := opts
-	limited.VectorMemoryBudget = dim * 4
-	current, err := New(limited)
+	current, err := New(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = current.Close(ctx) }()
+	// 让后台刷新持续失败：当前子树的 Batch 状态登记了作业却缺少 profile_hash，
+	// 改动的声明需要嵌入时同步会暂停并保留状态文件，等待人工核对。
+	_, key, err := current.resolveRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := current.storeFor(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := current.journalFor(key, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := `{"jobs":[{"id":"job-without-identity","keys":["` + strings.Repeat("a", 64) + `"]}]}`
+	if err := os.WriteFile(filepath.Join(journal.Dir(), bulkStateFileName), []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	first, err := current.Search(ctx, searchRequest(root, "Gamma"))
 	if err != nil || !strings.Contains(first.DegradedReason, "index-refreshing") {
 		t.Fatalf("first touch without any finished refresh must report index-refreshing: %+v err=%v", first.DegradedReason, err)
@@ -69,13 +87,13 @@ func TestFirstTouchAfterFailedRefreshReportsStaleIndex(t *testing.T) {
 	if !strings.HasPrefix(banner, "[DEGRADED] ") || reasonSegment != second.DegradedReason {
 		t.Fatalf("the banner reason segment must equal degraded_reason: banner=%q reason=%q", banner, second.DegradedReason)
 	}
-	if !strings.Contains(failed.LastError, EnvVectorMemoryBudget) {
+	if !strings.Contains(failed.LastError, "profile_hash") {
 		t.Fatalf("workspace_status.last_error must keep the failure text: %q", failed.LastError)
 	}
 	again := waitFailed("background refresh started by the second query")
 	repeated, err := current.Search(ctx, searchRequest(root, "Gamma"))
 	t.Logf("third query reason=%q last_error_after_second_attempt=%q", repeated.DegradedReason, again.LastError)
-	if err != nil || repeated.DegradedReason != second.DegradedReason || !strings.Contains(again.LastError, EnvVectorMemoryBudget) {
+	if err != nil || repeated.DegradedReason != second.DegradedReason || !strings.Contains(again.LastError, "profile_hash") {
 		t.Fatalf("repeated queries must keep the plain stale-index token while last_error is written again after each failed attempt: %q err=%v", repeated.DegradedReason, err)
 	}
 	waitFailed("background refresh started by the third query")

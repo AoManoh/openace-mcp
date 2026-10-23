@@ -63,7 +63,7 @@ func coldProbeOnce(t *testing.T, rows, dim int) {
 	}
 	entries, vectors, backing = nil, nil, nil
 	_ = backing
-	ix, err := load(dir, dim, dataSum, idxSum, 0, true)
+	ix, err := load(dir, dim, dataSum, idxSum, true)
 	if err != nil {
 		t.Fatal(err)
 	}

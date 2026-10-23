@@ -20,10 +20,8 @@ import (
 // revision（暗坑 K41），journal 只在"已付费未发布"窗口存在。
 //
 // 规模政策（2026-08-26 用户裁决）：journal 里每一条都是已付费向量，
-// 默认没有条数/字节上限，重开时永不压实丢弃——丢弃等于下轮重新付费。
-// 资源受限环境经 LimitBytes 注入 opt-in 字节预算（引擎从
-// OPENACE_VECTOR_MEMORY_BUDGET 派生），预算语义是"付费前拦截新增"，
-// 永不作用于既有条目；磁盘/重开内存代价见 A&Q 文档。
+// 没有条数/字节上限，重开时永不压实丢弃——丢弃等于下轮重新付费；
+// 发布后由 CompactAfterPublish 清理已进入 revision 的条目。
 //
 // vectors.journal 记录格式（小端）：
 //
@@ -40,11 +38,6 @@ type Journal struct {
 	entries   map[string][]float32
 	rejected  map[string]bool
 	bytes     int64
-	// maxBytes 是 opt-in 字节预算(0=不限,默认)。历史上这里是一对写死的
-	// 400K 条/2GiB 上限(K40 时代随 envelope 上调),超限重开时压实丢最旧
-	// ——那会静默丢弃已付费向量。2026-08-26 裁决后默认无上限,预算改由
-	// 引擎按用户配置注入,且只拦截新增付费,见 LimitBytes。
-	maxBytes int64
 }
 
 const (
@@ -194,14 +187,6 @@ func encodeJournalRecord(hash string, vector []float32) []byte {
 
 // Append 落盘一批已付费向量（批成功即调用，D4）；每批一次 fsync。
 func (j *Journal) Append(vectors map[string][]float32) error {
-	return j.appendRecords(vectors, true)
-}
-
-func (j *Journal) AppendRecovered(vectors map[string][]float32) error {
-	return j.appendRecords(vectors, false)
-}
-
-func (j *Journal) appendRecords(vectors map[string][]float32, enforceBudget bool) error {
 	if len(vectors) == 0 {
 		return nil
 	}
@@ -220,11 +205,6 @@ func (j *Journal) appendRecords(vectors map[string][]float32, enforceBudget bool
 	if len(buf) == 0 {
 		return nil
 	}
-	if enforceBudget && j.maxBytes > 0 && (j.bytes > j.maxBytes || int64(len(buf)) > j.maxBytes-j.bytes) {
-		// 预算拦截发生在写盘与付费链路继续之前:上层收到错误即停止
-		// 继续调用 provider,既有已付费条目原样保留(绝不丢弃)。
-		return fmt.Errorf("journal 字节预算耗尽: 现有 %d + 本批 %d 超过预算 %d;停止继续嵌入,提高 OPENACE_VECTOR_MEMORY_BUDGET 或等待发布压实后重试", j.bytes, len(buf), j.maxBytes)
-	}
 	if _, err := j.file.Write(buf); err != nil {
 		return err
 	}
@@ -238,48 +218,6 @@ func (j *Journal) appendRecords(vectors map[string][]float32, enforceBudget bool
 	}
 	j.bytes += int64(len(buf))
 	return nil
-}
-
-func JournalRecordBytes(key string, dimension int) int64 {
-	fixed := 14 + int64(len(key))
-	if dimension < 0 || int64(dimension) > (math.MaxInt64-fixed)/4 {
-		return math.MaxInt64
-	}
-	return fixed + 4*int64(dimension)
-}
-
-func (j *Journal) CapacityFor(keys []string) (int64, int64, bool) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	var needed int64
-	seen := make(map[string]bool, len(keys))
-	for _, key := range keys {
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		if _, exists := j.entries[key]; exists {
-			continue
-		}
-		size := JournalRecordBytes(key, j.dimension)
-		if size == math.MaxInt64 || needed > math.MaxInt64-size {
-			return j.bytes, math.MaxInt64, false
-		}
-		needed += size
-	}
-	if j.maxBytes <= 0 {
-		return j.bytes, needed, true
-	}
-	return j.bytes, needed, j.bytes <= j.maxBytes && needed <= j.maxBytes-j.bytes
-}
-
-// LimitBytes 设置 journal 字节预算(0=不限,默认不限)。引擎在用户配置
-// OPENACE_VECTOR_MEMORY_BUDGET 时注入;预算只做"付费前拦截"(Append 报错
-// 停止新付费),永不触发对既有已付费条目的丢弃。
-func (j *Journal) LimitBytes(max int64) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	j.maxBytes = max
 }
 
 // Snapshot 返回当前条目视图（复用源；调用方不得修改向量）。

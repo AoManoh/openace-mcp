@@ -48,17 +48,11 @@ const (
 	// 默认 defaultQueryBuildWait；显式设为 0 表示一直等到构建完成。显式
 	// sync 与后台任务不受约束。
 	EnvQueryBuildWait = "OPENACE_QUERY_BUILD_WAIT"
-	// EnvVectorMemoryBudget 是可寻址向量数据的字节预算，用户自愿开启；空
-	// 或 0 表示不限（默认）。默认不限的原因：早先写死的 40 万行上限让
-	// 大仓失去语义检索，能力不该默认受限，资源受限的环境自行配置。约束
-	// 对象是单个 revision 的向量数据（行数×维度×4 字节）、构建期复用装载
-	// 的向量与 journal（已付费但尚未进入 revision 的向量暂存文件）字节数，
-	// 不是引擎全局总量。超限行为都可见：查询路降级并记
-	// vector-envelope-exceeded，构建路在调用 provider 付费前拦截。预算约束
-	// 的是向量字节数而不是进程 RSS：默认 mmap 驻留形态（OPENACE_VECTOR_MMAP）
-	// 下向量页是内核可回收的文件后备页，实际常驻通常远低于预算值；
-	// OPENACE_VECTOR_MMAP=off 的堆加载形态下同样字节数是不可回收的匿名
-	// 内存。1024 维 float32 的每百万行向量数据为 4,096,000,000 字节。
+	// EnvVectorMemoryBudget 是已移除的向量内存预算变量，只用于启动时报错。
+	// 移除原因：预算超出时会关闭整个工作区的语义检索、不再嵌入新内容，
+	// 合并与换子树构建也会暂停，检索漏掉的内容会让调用方误以为不存在。
+	// 向量数据默认以 mmap 驻留，内存紧张时由内核回收文件页，只会变慢，
+	// 结果不变，不需要用降低召回换内存。
 	EnvVectorMemoryBudget = "OPENACE_VECTOR_MEMORY_BUDGET"
 )
 
@@ -91,9 +85,6 @@ type Options struct {
 	// QueryBuildWait 是查询等待在建索引的上界，0 表示一直等到构建完成。
 	// OptionsFromEnv 在环境变量未设置时填入 defaultQueryBuildWait。
 	QueryBuildWait time.Duration
-	// VectorMemoryBudget 是常驻向量的字节预算，0 表示不限（默认）。运维
-	// 参数，不参与 Fingerprint：它只决定资源上限，不改变检索语义。
-	VectorMemoryBudget int64
 	// DisableLexicalFirst 关闭首次构建时先发布只有词法索引的中间 revision
 	// 的行为；只供测试与诊断在程序内覆盖，没有环境变量，生产默认 false
 	// （即启用中间发布）。
@@ -147,23 +138,23 @@ func OptionsFromEnv() (Options, error) {
 			buildWait = parsed
 		}
 	}
-	vectorBudget, err := reliability.IntEnv(EnvVectorMemoryBudget, 0, 0)
-	if err != nil {
-		return Options{}, err
+	// 空值与 0 原本就表示不限，与现行为一致，照常放行；其余取值原本会限制
+	// 检索，继续运行会让用户以为限制仍然生效，因此在启动时报错。
+	if raw := strings.TrimSpace(os.Getenv(EnvVectorMemoryBudget)); raw != "" && raw != "0" {
+		return Options{}, fmt.Errorf("%s is no longer supported (value %q): remove it; vectors are memory-mapped and the kernel reclaims their pages under memory pressure, so retrieval stays complete and only gets slower", EnvVectorMemoryBudget, raw)
 	}
 	// TemplateVersion 参与 ProfileHash，而 ProfileHash 又进入 Fingerprint：
 	// 这里与 New 都注入同一常量 embedTemplateVersion，wrapper 只走本函数
 	// 算指纹，daemon 还会走 New，两处必须一致才能复用判定。
 	embedCfg.TemplateVersion = embedTemplateVersion
 	return Options{
-		Embedding:          embedCfg,
-		Rerank:             rerankCfg,
-		RetrievalDegrade:   retrievalDegrade,
-		RerankDegrade:      rerankDegrade,
-		FreshnessWindow:    freshness,
-		QualityStrict:      strict,
-		QueryBuildWait:     buildWait,
-		VectorMemoryBudget: int64(vectorBudget),
+		Embedding:        embedCfg,
+		Rerank:           rerankCfg,
+		RetrievalDegrade: retrievalDegrade,
+		RerankDegrade:    rerankDegrade,
+		FreshnessWindow:  freshness,
+		QualityStrict:    strict,
+		QueryBuildWait:   buildWait,
 	}, nil
 }
 

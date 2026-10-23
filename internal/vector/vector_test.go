@@ -43,7 +43,7 @@ func writeAndLoad(t *testing.T, entries []Entry, vectors [][]float32, dim int) *
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	ix, err := Load(dir, dim, dataSum, idxSum, 0)
+	ix, err := Load(dir, dim, dataSum, idxSum)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -240,19 +240,6 @@ func TestSearchCancellation(t *testing.T) {
 	}
 }
 
-func TestEnvelopeExceeded(t *testing.T) {
-	const dim = 4
-	entries, vectors := makeVectors(t, 11, dim, 5)
-	dir := t.TempDir()
-	dataSum, idxSum, err := Write(dir, dim, entries, vectors)
-	if err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if _, err := Load(dir, dim, dataSum, idxSum, 10); !errors.Is(err, ErrEnvelopeExceeded) {
-		t.Fatalf("超 envelope 应显式拒绝（§18）: %v", err)
-	}
-}
-
 func TestLoadRejectsCorruption(t *testing.T) {
 	const dim = 4
 	entries, vectors := makeVectors(t, 8, dim, 6)
@@ -269,7 +256,7 @@ func TestLoadRejectsCorruption(t *testing.T) {
 	if err := os.WriteFile(dataPath, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(dir, dim, dataSum, idxSum, 0); err == nil || !strings.Contains(err.Error(), "checksum") {
+	if _, err := Load(dir, dim, dataSum, idxSum); err == nil || !strings.Contains(err.Error(), "checksum") {
 		t.Fatalf("篡改应被 checksum 拦截: %v", err)
 	}
 
@@ -277,7 +264,7 @@ func TestLoadRejectsCorruption(t *testing.T) {
 	if err := os.WriteFile(dataPath, raw[:len(raw)-4], 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(dir, dim, "", idxSum, 0); err == nil || !strings.Contains(err.Error(), "尺寸") {
+	if _, err := Load(dir, dim, "", idxSum); err == nil || !strings.Contains(err.Error(), "尺寸") {
 		t.Fatalf("尺寸不符应被拦截: %v", err)
 	}
 }
@@ -290,7 +277,7 @@ func TestLoadRejectsDimensionMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if _, err := Load(dir, 8, dataSum, idxSum, 0); err == nil || !strings.Contains(err.Error(), "维度") {
+	if _, err := Load(dir, 8, dataSum, idxSum); err == nil || !strings.Contains(err.Error(), "维度") {
 		t.Fatalf("维度不符应拒绝（K24 禁止混用）: %v", err)
 	}
 }
@@ -333,7 +320,7 @@ func TestEmptyIndexRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("空集应合法（K10 同族）: %v", err)
 	}
-	ix, err := Load(dir, 4, dataSum, idxSum, 0)
+	ix, err := Load(dir, 4, dataSum, idxSum)
 	if err != nil || ix.Count() != 0 {
 		t.Fatalf("空索引载入: count=%d err=%v", ix.Count(), err)
 	}
@@ -364,12 +351,12 @@ func TestMappedAndHeapModesBitIdentical(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mapped, err := load(dir, dim, dataSum, idxSum, 0, true)
+	mapped, err := load(dir, dim, dataSum, idxSum, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer mapped.Close()
-	heap, err := load(dir, dim, dataSum, idxSum, 0, false)
+	heap, err := load(dir, dim, dataSum, idxSum, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +408,7 @@ func TestMappedModeRejectsCorruption(t *testing.T) {
 	if err := os.WriteFile(dataPath, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := load(dir, dim, dataSum, idxSum, 0, true); err == nil || !strings.Contains(err.Error(), "checksum") {
+	if _, err := load(dir, dim, dataSum, idxSum, true); err == nil || !strings.Contains(err.Error(), "checksum") {
 		t.Fatalf("映射形态篡改应被 checksum 拦截: %v", err)
 	}
 }
@@ -436,7 +423,7 @@ func TestRowReaderMatchesLoadBits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ix, err := Load(dir, dim, dataSum, idxSum, 0)
+	ix, err := Load(dir, dim, dataSum, idxSum)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,7 +504,7 @@ func TestCloseThenDeleteAndUseAfterClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ix, err := Load(dir, dim, dataSum, idxSum, 0)
+	ix, err := Load(dir, dim, dataSum, idxSum)
 	if err != nil {
 		t.Fatal(err)
 	}

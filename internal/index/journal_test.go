@@ -132,32 +132,6 @@ func TestJournalReopenNeverDropsPaidEntries(t *testing.T) {
 	}
 }
 
-// TestJournalAppendRespectsConfiguredByteBudget 是预算语义(opt-in):
-// 预算只在"付费前拦截"新增,绝不丢弃既有条目;拦截必须显式报错。
-func TestJournalAppendRespectsConfiguredByteBudget(t *testing.T) {
-	store := newV2TestStore(t)
-	journal := openTestJournal(t, store, 4)
-	first := map[string][]float32{"paid-1": {1, 0, 0, 0}}
-	if err := journal.Append(first); err != nil {
-		t.Fatal(err)
-	}
-	journal.LimitBytes(journal.bytes + 10) // 预算只够现有条目,容不下下一批
-	err := journal.Append(map[string][]float32{"paid-2": {0, 1, 0, 0}})
-	if err == nil {
-		t.Fatal("超预算追加必须显式报错,不得静默接受或丢弃")
-	}
-	if got := journal.Snapshot(); len(got) != 1 || got["paid-1"] == nil {
-		t.Fatalf("拦截不得影响既有已付费条目: %v", got)
-	}
-	if err := journal.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reopened := openTestJournal(t, store, 4)
-	if got := reopened.Snapshot(); len(got) != 1 || got["paid-1"] == nil {
-		t.Fatalf("拦截批不得部分落盘: %v", got)
-	}
-}
-
 // TestJournalRejectedPersistence 是 K35 修订：拒绝史跨打开生效。
 func TestJournalRejectedPersistence(t *testing.T) {
 	store := newV2TestStore(t)

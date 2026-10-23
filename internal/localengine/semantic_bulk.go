@@ -174,7 +174,7 @@ func (e *Engine) bulkEmbedMissing(ctx context.Context, journal *index.Journal, s
 		}
 	}
 
-	return e.collectBulkJobs(ctx, journal, status, statePath, &state, reuse, out, len(missingHashes), false)
+	return e.collectBulkJobs(ctx, journal, status, statePath, &state, reuse, out, len(missingHashes))
 }
 
 func (e *Engine) checkBulkState(statePath string, state bulkState) error {
@@ -228,10 +228,10 @@ func (e *Engine) recoverBulkState(ctx context.Context, journal *index.Journal, s
 	if len(state.Jobs) == 0 {
 		return processed, nil
 	}
-	return processed, e.collectBulkJobs(ctx, journal, status, statePath, &state, reuse, out, total, true)
+	return processed, e.collectBulkJobs(ctx, journal, status, statePath, &state, reuse, out, total)
 }
 
-func (e *Engine) collectBulkJobs(ctx context.Context, journal *index.Journal, status *wsStatus, statePath string, state *bulkState, reuse map[string][]float32, out *semanticOutcome, total int, recovered bool) error {
+func (e *Engine) collectBulkJobs(ctx context.Context, journal *index.Journal, status *wsStatus, statePath string, state *bulkState, reuse map[string][]float32, out *semanticOutcome, total int) error {
 	// 3) 轮询与回收：逐作业等到终态。completed 的作业全量回收进 journal；
 	// 非 completed 终态先回收已产出的部分，再返回错误。
 	ingested := 0
@@ -249,11 +249,7 @@ func (e *Engine) collectBulkJobs(ctx context.Context, journal *index.Journal, st
 			}
 			good[key] = vec
 		}
-		appendGood := journal.Append
-		if recovered {
-			appendGood = journal.AppendRecovered
-		}
-		if err := appendGood(good); err != nil {
+		if err := journal.Append(good); err != nil {
 			return 0, fmt.Errorf("批作业 %s 结果落 journal 失败: %w", jobID, err)
 		}
 		if err := journal.MarkRejected(normRejected); err != nil {

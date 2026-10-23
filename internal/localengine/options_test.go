@@ -29,22 +29,22 @@ func clearProviderEnv(t *testing.T) {
 	}
 }
 
-// TestOptionsFromEnvVectorMemoryBudget(A2',2026-08-26 裁决):字节预算
-// 解析——空=0=不限(默认),正整数生效,负数显式报错。
-func TestOptionsFromEnvVectorMemoryBudget(t *testing.T) {
+// TestOptionsFromEnvRetiredVectorMemoryBudget：向量内存预算已移除。空值与 0
+// 原本就表示不限，照常放行；会限制检索的取值在启动时报错并给出变量名。
+func TestOptionsFromEnvRetiredVectorMemoryBudget(t *testing.T) {
 	clearProviderEnv(t)
-	opts, err := OptionsFromEnv()
-	if err != nil || opts.VectorMemoryBudget != 0 {
-		t.Fatalf("默认应为 0(不限): budget=%d err=%v", opts.VectorMemoryBudget, err)
+	for _, value := range []string{"", "0", " 0 "} {
+		t.Setenv(EnvVectorMemoryBudget, value)
+		if _, err := OptionsFromEnv(); err != nil {
+			t.Fatalf("value %q means unlimited and must be accepted: %v", value, err)
+		}
 	}
-	t.Setenv(EnvVectorMemoryBudget, "1638400000")
-	opts, err = OptionsFromEnv()
-	if err != nil || opts.VectorMemoryBudget != 1_638_400_000 {
-		t.Fatalf("预算解析: budget=%d err=%v", opts.VectorMemoryBudget, err)
-	}
-	t.Setenv(EnvVectorMemoryBudget, "-1")
-	if _, err := OptionsFromEnv(); err == nil || !strings.Contains(err.Error(), EnvVectorMemoryBudget) {
-		t.Fatalf("负值必须显式报错: %v", err)
+	for _, value := range []string{"1638400000", "-1", "abc"} {
+		t.Setenv(EnvVectorMemoryBudget, value)
+		_, err := OptionsFromEnv()
+		if err == nil || !strings.Contains(err.Error(), EnvVectorMemoryBudget) || !strings.Contains(err.Error(), "no longer supported") {
+			t.Fatalf("value %q must be rejected with the variable name: %v", value, err)
+		}
 	}
 }
 

@@ -31,7 +31,7 @@ const (
 //     选择，不产生原因。
 //   - 其余都归 retrieval（OPENACE_RETRIEVAL_DEGRADE）：索引同步失败
 //     （stale-index、index-building、index-refreshing）、向量不可用
-//     （vector-envelope-exceeded、vector-data-unavailable）、查询嵌入失败
+//     （vector-data-unavailable）、查询嵌入失败
 //     （query-embedding-failed(类别)）、语义覆盖不足
 //     （semantic-coverage-partial）、语义迁移暂停（semantic-migration-blocked）。
 func gapSwitch(reason string) string {

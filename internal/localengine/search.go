@@ -152,13 +152,13 @@ func vectorSegmentKey(dir string, dimension int, dataChecksum string, indexCheck
 // acquireVectorSegment 从 Engine 级缓存取得一个 segment 的向量索引并增加
 // 一个引用。active 与 previous 两个 revision 共享同一 segment 时只常驻一份。
 //   - 缓存已有该段：在锁内加引用，在锁外等待 ready，不持锁等磁盘加载。
-//     加载失败或行数超过 maxVectors 时归还引用并返回错误。
+//     加载失败时归还引用并返回错误。
 //   - 缓存没有该段：先登记占位再在锁外加载，加载结束写回结果并关闭
 //     ready；加载失败时删除占位，后续调用会重新加载。
 //
 // 缓存键含目录、维度与数据/索引两个 checksum，文件内容变化后不会命中
 // 旧条目。
-func (e *Engine) acquireVectorSegment(dir string, dimension int, dataChecksum string, indexChecksum string, maxVectors int) (*vector.Index, string, error) {
+func (e *Engine) acquireVectorSegment(dir string, dimension int, dataChecksum string, indexChecksum string) (*vector.Index, string, error) {
 	key := vectorSegmentKey(dir, dimension, dataChecksum, indexChecksum)
 	e.vectorMu.Lock()
 	if shared, ok := e.vectorSegments[key]; ok {
@@ -169,17 +169,13 @@ func (e *Engine) acquireVectorSegment(dir string, dimension int, dataChecksum st
 			e.releaseVectorSegments([]string{key})
 			return nil, "", shared.err
 		}
-		if maxVectors > 0 && shared.ix.Count() > maxVectors {
-			e.releaseVectorSegments([]string{key})
-			return nil, "", fmt.Errorf("%w: %d > %d", vector.ErrEnvelopeExceeded, shared.ix.Count(), maxVectors)
-		}
 		return shared.ix, key, nil
 	}
 	shared := &sharedVectorIndex{ready: make(chan struct{}), refs: 1}
 	e.vectorSegments[key] = shared
 	e.vectorMu.Unlock()
 
-	ix, err := vector.Load(dir, dimension, dataChecksum, indexChecksum, maxVectors)
+	ix, err := vector.Load(dir, dimension, dataChecksum, indexChecksum)
 	e.vectorMu.Lock()
 	shared.ix, shared.err = ix, err
 	close(shared.ready)
@@ -230,19 +226,11 @@ func (e *Engine) releaseVectorSegments(keys []string) {
 //     词法检索照常。
 //   - 有 engine 时经 Engine 级段缓存取段，active 与 previous 共享的段只常驻
 //     一份；engine 为 nil（测试直连）时直接 vector.Load。
-//   - 用户配置了 OPENACE_VECTOR_MEMORY_BUDGET 时，每段加载前把剩余行数预算
-//     传给加载器，累计超出即停止并返回 vector.ErrEnvelopeExceeded，不会先
-//     把全部段读进内存再发现超预算。默认不限。
 func (h *revisionHandle) vectorIndexes(dimension int) ([]*vector.Index, error) {
 	h.vecOnce.Do(func() {
 		if !h.manifest.HasVectors() {
 			h.vecErr = errors.New("revision 无向量数据")
 			return
-		}
-		total := 0
-		limit, limited := 0, false // limited 为 false 表示不限（默认）；为 true 时 limit 是 OPENACE_VECTOR_MEMORY_BUDGET 折算的行数，预算不足一行时为 0。
-		if h.engine != nil {
-			limit, limited = h.engine.residentRowLimit()
 		}
 		indexes := make([]*vector.Index, 0, len(h.manifest.Segments))
 		keys := make([]string, 0, len(h.manifest.Segments))
@@ -250,29 +238,20 @@ func (h *revisionHandle) vectorIndexes(dimension int) ([]*vector.Index, error) {
 			if segment.VectorsChecksum == "" {
 				continue
 			}
-			remaining := 0
-			if limited {
-				remaining = limit - total
-				if remaining <= 0 {
-					h.vecErr = fmt.Errorf("%w: cumulative segment rows exceed %d", vector.ErrEnvelopeExceeded, limit)
-					break
-				}
-			}
 			var ix *vector.Index
 			var key string
 			var err error
 			if h.engine != nil {
 				ix, key, err = h.engine.acquireVectorSegment(h.segmentDirs[i], dimension,
-					segment.VectorsChecksum, segment.VectorsIndexChecksum, remaining)
+					segment.VectorsChecksum, segment.VectorsIndexChecksum)
 			} else {
 				ix, err = vector.Load(h.segmentDirs[i], dimension,
-					segment.VectorsChecksum, segment.VectorsIndexChecksum, remaining)
+					segment.VectorsChecksum, segment.VectorsIndexChecksum)
 			}
 			if err != nil {
 				h.vecErr = err
 				break
 			}
-			total += ix.Count()
 			indexes = append(indexes, ix)
 			if key != "" {
 				keys = append(keys, key)
@@ -1064,8 +1043,6 @@ func filterRankedByPathPrefix(handle *revisionHandle, ordered []rankedHit, prefi
 // denseRoute 执行语义召回，返回最多 depth 个 dense 候选 ID（nil 表示语义
 // 路未执行）、缺口与致命错误。缺口按 policyError 判定，deny 或 strict 拒绝
 // 时直接返回错误，不再发出后续的模型请求。
-//   - 向量行数超过用户配置的内存预算：不标记修复（重建也超预算，没有
-//     用）；记 vector-envelope-exceeded，放行时只用词法结果。
 //   - 向量文件损坏或缺失：登记该工作区下次同步强制重建向量，记
 //     vector-data-unavailable。
 //   - revision 一个向量也没有（例如 provider 长期故障后发布的零覆盖
@@ -1086,13 +1063,9 @@ func filterRankedByPathPrefix(handle *revisionHandle, ordered []rankedHit, prefi
 func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, depth int, timings *engine.RetrievalTimings, pathPrefix string) ([]string, []qualityGap, error) {
 	ixs, loadErr := handle.vectorIndexes(e.embedCfg.Dimension)
 	if loadErr != nil {
-		reason := "vector-envelope-exceeded"
-		if !errors.Is(loadErr, vector.ErrEnvelopeExceeded) {
-			// 向量文件损坏或缺失：登记该工作区，下次同步强制重建向量。超出
-			// 内存预算是配置与规模的关系，重建改变不了行数，因此不登记。
-			reason = "vector-data-unavailable"
-			e.markVectorRepair(workspaceKey)
-		}
+		// 向量文件损坏或缺失：登记该工作区，下次同步强制重建向量。
+		reason := "vector-data-unavailable"
+		e.markVectorRepair(workspaceKey)
 		gaps := []qualityGap{{reason: reason, detail: fmt.Errorf("semantic path unavailable: %w", loadErr)}}
 		if err := e.policyError(gaps); err != nil {
 			return nil, nil, err

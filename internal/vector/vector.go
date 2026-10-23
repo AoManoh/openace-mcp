@@ -42,16 +42,6 @@ const (
 	cancelCheckRows = 2048
 )
 
-// ErrEnvelopeExceeded 表示向量行数超出用户配置的内存预算
-// （OPENACE_VECTOR_MEMORY_BUDGET 折算的行数上限），语义路应显式降级。
-//
-// 历史：这里曾有写死的 DefaultMaxResidentVectors 默认上限（250K→400K，
-// annbench 实测 p50 86→~128ms、常驻 ≈1.6GB，记录在 sealed 报告），超限
-// 一律降级词法。2026-08-26 用户裁决移除默认上限：仓库越大反而失去语义
-// 检索与产品目标矛盾，能力默认不设限；资源受限环境自行配置预算，规模
-// 对应的内存/延迟实测数据见 A&Q 文档。
-var ErrEnvelopeExceeded = errors.New("vector index exceeds configured memory budget")
-
 // Entry 是一行向量对应的 chunk 身份；ContentHash 是历史字段名，当前
 // 子树承载 localengine embedKey(模板/path/symbol/language/content hash)，
 // 供跨 revision/profile 复用；具体键语义由 profile/template 身份约束。
@@ -205,18 +195,16 @@ type Index struct {
 	file      *os.File  // 映射期间必须存活的文件句柄
 }
 
-// Load 读取并校验向量文件（暗坑 K24/K25）：checksum、schema、尺寸对齐、
-// 可选内存预算。maxVectors ≤ 0 = 不限（默认，2026-08-26 裁决：上限只
-// 来自用户配置的字节预算折算）；>0 且行数超出时返回 ErrEnvelopeExceeded。
-// 任何校验失败返回错误，由调用方决定语义路降级。
+// Load 读取并校验向量文件（暗坑 K24/K25）：checksum、schema、尺寸对齐。
+// 任何校验失败返回错误，由调用方决定语义路如何处理。
 //
 // 数据驻留形态由进程级 OPENACE_VECTOR_MMAP 决定(默认 mmap;详见
 // loadUseMmap),两种形态的校验语义与检索结果逐位一致。
-func Load(dir string, wantDimension int, wantDataChecksum string, wantIndexChecksum string, maxVectors int) (*Index, error) {
-	return load(dir, wantDimension, wantDataChecksum, wantIndexChecksum, maxVectors, loadUseMmap())
+func Load(dir string, wantDimension int, wantDataChecksum string, wantIndexChecksum string) (*Index, error) {
+	return load(dir, wantDimension, wantDataChecksum, wantIndexChecksum, loadUseMmap())
 }
 
-func load(dir string, wantDimension int, wantDataChecksum string, wantIndexChecksum string, maxVectors int, useMmap bool) (*Index, error) {
+func load(dir string, wantDimension int, wantDataChecksum string, wantIndexChecksum string, useMmap bool) (*Index, error) {
 	idxBytes, err := os.ReadFile(filepath.Join(dir, IndexFileName))
 	if err != nil {
 		return nil, fmt.Errorf("读取 %s: %w", IndexFileName, err)
@@ -236,9 +224,6 @@ func load(dir string, wantDimension int, wantDataChecksum string, wantIndexCheck
 	}
 	if header.Count != len(header.Entries) {
 		return nil, fmt.Errorf("%s count %d 与条目数 %d 不符", IndexFileName, header.Count, len(header.Entries))
-	}
-	if maxVectors > 0 && header.Count > maxVectors {
-		return nil, fmt.Errorf("%w: %d > %d", ErrEnvelopeExceeded, header.Count, maxVectors)
 	}
 	dataPath := filepath.Join(dir, DataFileName)
 	info, err := os.Stat(dataPath)
@@ -323,90 +308,6 @@ func loadHeap(dataPath string, header indexHeader, wantDataChecksum string) (*In
 		return nil, fmt.Errorf("%s checksum 不符（文件损坏）", DataFileName)
 	}
 	return &Index{dimension: header.Dimension, entries: header.Entries, data: data}, nil
-}
-
-type Rows struct {
-	Count   int
-	Entries []Entry
-	Data    [][]float32
-	Skipped []Entry
-}
-
-func LoadRows(dir string, wantDimension int, wantDataChecksum string, wantIndexChecksum string, want func(Entry) bool, maxRows int) (Rows, error) {
-	idxBytes, err := os.ReadFile(filepath.Join(dir, IndexFileName))
-	if err != nil {
-		return Rows{}, fmt.Errorf("读取 %s: %w", IndexFileName, err)
-	}
-	if wantIndexChecksum != "" && checksumBytes(idxBytes) != wantIndexChecksum {
-		return Rows{}, fmt.Errorf("%s checksum 不符（文件损坏）", IndexFileName)
-	}
-	var header indexHeader
-	if err := json.Unmarshal(idxBytes, &header); err != nil {
-		return Rows{}, fmt.Errorf("解析 %s: %w", IndexFileName, err)
-	}
-	if header.SchemaVersion != indexSchemaVersion {
-		return Rows{}, fmt.Errorf("%s schema version %d 不受支持（期望 %d）", IndexFileName, header.SchemaVersion, indexSchemaVersion)
-	}
-	if header.Dimension != wantDimension {
-		return Rows{}, fmt.Errorf("向量维度 %d 与当前 profile %d 不符（禁止混用，K24）", header.Dimension, wantDimension)
-	}
-	if wantDimension <= 0 || int64(wantDimension) > math.MaxInt64/4 {
-		return Rows{}, fmt.Errorf("向量维度 %d 无效", wantDimension)
-	}
-	if header.Count != len(header.Entries) {
-		return Rows{}, fmt.Errorf("%s count %d 与条目数 %d 不符", IndexFileName, header.Count, len(header.Entries))
-	}
-	dataPath := filepath.Join(dir, DataFileName)
-	info, err := os.Stat(dataPath)
-	if err != nil {
-		return Rows{}, fmt.Errorf("读取 %s: %w", DataFileName, err)
-	}
-	rowBytes := int64(header.Dimension) * 4
-	if int64(header.Count) > math.MaxInt64/rowBytes || info.Size() != int64(header.Count)*rowBytes {
-		return Rows{}, fmt.Errorf("%s 尺寸 %d 与 count×dim×4 不符（count=%d, dim=%d, K24）", DataFileName, info.Size(), header.Count, header.Dimension)
-	}
-	out := Rows{Count: header.Count}
-	selected := make([]bool, len(header.Entries))
-	wanted := 0
-	for i, entry := range header.Entries {
-		if want(entry) {
-			selected[i] = true
-			wanted++
-		}
-	}
-	if wanted == 0 {
-		return out, nil
-	}
-	f, err := os.Open(dataPath)
-	if err != nil {
-		return Rows{}, fmt.Errorf("读取 %s: %w", DataFileName, err)
-	}
-	defer f.Close()
-	hash := sha256.New()
-	reader := io.TeeReader(bufio.NewReaderSize(f, 4<<20), hash)
-	raw := make([]byte, rowBytes)
-	for i, entry := range header.Entries {
-		if _, err := io.ReadFull(reader, raw); err != nil {
-			return Rows{}, fmt.Errorf("读取 %s: %w", DataFileName, err)
-		}
-		if !selected[i] {
-			continue
-		}
-		if maxRows >= 0 && len(out.Data) >= maxRows {
-			out.Skipped = append(out.Skipped, entry)
-			continue
-		}
-		row := make([]float32, header.Dimension)
-		for j := range row {
-			row[j] = math.Float32frombits(binary.LittleEndian.Uint32(raw[j*4:]))
-		}
-		out.Entries = append(out.Entries, entry)
-		out.Data = append(out.Data, row)
-	}
-	if wantDataChecksum != "" && hex.EncodeToString(hash.Sum(nil)) != wantDataChecksum {
-		return Rows{}, fmt.Errorf("%s checksum 不符（文件损坏）", DataFileName)
-	}
-	return out, nil
 }
 
 // hostLittleEndian 在进程启动时判定主机字节序;磁盘格式固定小端,大端
