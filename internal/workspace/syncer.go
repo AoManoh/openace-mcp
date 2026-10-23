@@ -163,7 +163,7 @@ func scanWithProgress(ctx context.Context, root string, cache *StatCache, progre
 					return err
 				}
 				name := blobName(rel, content)
-				cache.store(rel, info.Size(), info.ModTime(), name)
+				cache.store(rel, info.Size(), info.ModTime(), name, scanStart)
 				seen[rel] = true
 				files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: name})
 				report()

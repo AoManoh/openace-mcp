@@ -62,18 +62,67 @@ func TestStatCacheDetectsChanges(t *testing.T) {
 }
 
 // TestStatCacheRacyWindowAlwaysRehashes mtime 落在 racy 窗口内的文件
-// 不走短路:同秒内"改内容但 stat 不变"的编辑不会漏检。
+// 不走短路:同秒内"改内容但 stat 不变"的编辑不会漏检。哈希时仍在窗口内
+// 的结果不存入,窗口过去之后也不会命中。
 func TestStatCacheRacyWindowAlwaysRehashes(t *testing.T) {
 	cache := NewStatCache()
 	now := time.Now()
-	cache.store("a.go", 10, now, "blob-1")
+	cache.store("a.go", 10, now, "blob-1", now)
 	if _, ok := cache.lookup("a.go", 10, now, now); ok {
 		t.Fatal("racy 窗口内不得命中")
 	}
+	if _, ok := cache.lookup("a.go", 10, now, now.Add(time.Hour)); ok {
+		t.Fatal("哈希时仍在窗口内的结果不得在窗口过去后命中")
+	}
 	past := now.Add(-time.Hour)
-	cache.store("b.go", 10, past, "blob-2")
+	cache.store("b.go", 10, past, "blob-2", now)
 	if hit, ok := cache.lookup("b.go", 10, past, now); !ok || hit != "blob-2" {
 		t.Fatalf("窗口外应命中: %v %q", ok, hit)
+	}
+	cache.store("b.go", 10, now, "blob-3", now)
+	if _, ok := cache.lookup("b.go", 10, past, now.Add(time.Hour)); ok {
+		t.Fatal("同一路径窗口内重新哈希后,旧记录应删除")
+	}
+}
+
+// TestScanRehashesFileHashedInsideRacyWindow 文件在 racy 窗口内被哈希后,
+// 又在同一时间刻内被等长改写(内容变了,大小与修改时间都没变):窗口过去
+// 之后的扫描必须重新读内容。与 git racy-git 的规则同向:哈希时修改时间
+// 还在窗口内的结果不能当作以后可信的缓存记录。
+func TestScanRehashesFileHashedInsideRacyWindow(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "a.go")
+	v1 := []byte("package a // v1\n")
+	v2 := []byte("package a // v2\n")
+	if err := os.WriteFile(path, v1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 修改时间设在扫描前 1 秒,落在 2 秒窗口内。
+	mtime := time.Now().Add(-time.Second)
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	cache := NewStatCache()
+	first, err := scanWithCache(context.Background(), root, cache)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first scan: %v %d", err, len(first))
+	}
+	if first[0].BlobName != blobName("a.go", v1) {
+		t.Fatal("第一次扫描应读到 v1")
+	}
+	if err := os.WriteFile(path, v2, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Until(mtime.Add(racyWindow + 200*time.Millisecond)))
+	second, err := scanWithCache(context.Background(), root, cache)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("second scan: %v %d", err, len(second))
+	}
+	if second[0].BlobName != blobName("a.go", v2) {
+		t.Fatal("窗口内哈希的记录被当作有效缓存,等长改写没有检出")
 	}
 }
 
@@ -81,7 +130,7 @@ func TestStatCacheRacyWindowAlwaysRehashes(t *testing.T) {
 func TestStatCachePrunesMissing(t *testing.T) {
 	cache := NewStatCache()
 	past := time.Now().Add(-time.Hour)
-	cache.store("gone.go", 10, past, "blob-old")
+	cache.store("gone.go", 10, past, "blob-old", time.Now())
 	cache.prune(map[string]bool{})
 	if _, ok := cache.lookup("gone.go", 10, past, time.Now()); ok {
 		t.Fatal("被清理路径不得命中")

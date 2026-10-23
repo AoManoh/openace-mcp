@@ -13,8 +13,13 @@ import (
 //   - 命中条件 = size 与 mtimeNs 均一致;
 //   - mtime 落在当前时刻 racyWindow 内的文件永远重哈希——防"同秒内
 //     改内容且尺寸不变"漏检(文件系统 mtime 粒度);
+//   - 哈希时 mtime 距扫描开始不足 racyWindow 的结果不存入:哈希之后同一
+//     时间刻内的等长改写不改变 size 与 mtime,存入的记录在窗口过去后会被
+//     当作有效命中,这次改写要等文件再次变化才被发现。git 对 mtime 不早于
+//     index 写入时刻的条目同样不信任 stat 信息(racy-git 文档);
 //   - 主动回拨 mtime 且保持尺寸不变的改动不可检测,属接受的边界
-//     (与 git 相同),内容门禁语义不受影响(缓存只收录可索引文件)。
+//     (git 默认还比较 ctime,能发现这类改动;这里只比较 size 与 mtime),
+//     内容门禁语义不受影响(缓存只收录可索引文件)。
 //
 // 并发:Engine 每 workspace 一个实例,构建持写锁串行,仍加锁自卫。
 type StatCache struct {
@@ -53,14 +58,19 @@ func (c *StatCache) lookup(rel string, size int64, mtime time.Time, now time.Tim
 	return entry.blobName, true
 }
 
-// store 记录一次真实哈希结果。
-func (c *StatCache) store(rel string, size int64, mtime time.Time, blobName string) {
+// store 记录一次真实哈希结果。now 是本轮扫描开始时刻;mtime 距 now 不足
+// racyWindow 时不存入,并删掉该路径的旧记录,下次扫描重新读内容。
+func (c *StatCache) store(rel string, size int64, mtime time.Time, blobName string, now time.Time) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if now.Sub(mtime) < racyWindow {
+		delete(c.entries, rel)
+		return
+	}
 	c.entries[rel] = statEntry{size: size, mtimeNs: mtime.UnixNano(), blobName: blobName}
-	c.mu.Unlock()
 }
 
 // prune 丢弃本轮未见路径(删除/改名/变为不可索引的文件),防陈条目
