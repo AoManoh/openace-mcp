@@ -42,6 +42,11 @@ type semanticOutcome struct {
 	// 评分模型的子树，revision 向量与 journal 条目都算）复用到的唯一键数，
 	// 进入同步结果供调用方核对升级后的复用效果。
 	crossProfileReused int
+	// sharedReused 是从共享向量库（同一 embedding 身份下其他工作区付过费的
+	// 向量）复用到的唯一键数；sharedError 是本次读写共享库的最后一个错误，
+	// 读写失败只影响复用，缺口照常送审。
+	sharedReused int
+	sharedError  string
 	// migrationBlock 非空时，同一 embedding 身份旧子树里的已付费状态无法
 	// 确认或尚未回收（见 siblingPaidStateFor），本次没有为缺口发任何文档
 	// 嵌入请求；值是原因与恢复步骤，同时写进 lastError。
@@ -352,6 +357,15 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		}
 	}
 
+	// 共享向量库：同一 embedding 身份下其他工作区（同一仓库的其他 worktree
+	// 或副本）为同样的送审文本付过费的向量，校验后直接复用。放在旧子树检查
+	// 之前：迁移受阻时不送审，共享库里已有的向量仍能补上缺口。
+	if len(missingHashes) > 0 {
+		before := len(missingHashes)
+		missingHashes, missingTexts = e.reuseSharedVectors(missingHashes, missingTexts, reuse, &out)
+		reusedRows += before - len(missingHashes)
+	}
+
 	// 送审前只读检查同一 embedding 身份旧子树里与这些缺口有关的已付费状态
 	// （换子树后它们仍留在旧子树）：journal 里已付费的向量直接复用；旧拒绝
 	// 集里的键不送审，并写进当前子树的拒绝集；旧状态无法确认或尚未回收时，
@@ -492,7 +506,13 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 			recordFatal(fmt.Errorf("journal 拒绝集落盘: %w", err))
 			return
 		}
+		// 同一批向量再记进共享向量库，其他工作区遇到同样的内容不再付费。
+		// 写入失败不影响本次构建：向量已在本工作区的 journal 里。
+		sharedErr := e.appendSharedVectors(batchGood)
 		embedMu.Lock()
+		if sharedErr != nil {
+			out.sharedError = sanitizeError(sharedErr)
+		}
 		for _, key := range batchRejected {
 			out.markRejected(key)
 		}

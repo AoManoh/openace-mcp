@@ -26,6 +26,21 @@ func tfidfEraStoreProfile(current string) string {
 	return strings.Replace(current, "+lex-bm25", "", 1)
 }
 
+// dropSharedVectors 删除测试 cache 里的共享向量库，模拟旧子树由还没有共享
+// 向量库的旧版本建出。迁移测试要验证的是旧子树自身的已付费状态（journal、
+// 拒绝集、Batch 作业）；测试里扮演旧版本的引擎会顺带写入共享库，这些记录
+// 会在旧子树检查之前补上缺口，原本要验证的路径就测不到了。
+func dropSharedVectors(t *testing.T, e *Engine) {
+	t.Helper()
+	dir, err := e.sharedVectorsDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // tfidfEraFingerprint 按 TF-IDF 时代的组成项（前缀 engine-profile-v3，不含
 // 词法评分）重算配置指纹，即升级前 daemon 广播的 engine_profile。
 func tfidfEraFingerprint(o Options) string {
@@ -348,6 +363,7 @@ func TestBM25MigrationReusesVectorsAndKeepsTFIDFSubtree(t *testing.T) {
 	if err := legacy.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
+	dropSharedVectors(t, legacy)
 	rewriteStoreAsTFIDF(t, legacyStore)
 	before := snapshotTree(t, legacyStore.Root())
 	callsBefore := server.callCount()
@@ -463,6 +479,7 @@ func TestBM25MigrationLexicalOnlyRebuildsWithoutCredentials(t *testing.T) {
 	if err := legacy.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
+	dropSharedVectors(t, legacy)
 	rewriteStoreAsTFIDF(t, legacyStore)
 	before := snapshotTree(t, legacyStore.Root())
 

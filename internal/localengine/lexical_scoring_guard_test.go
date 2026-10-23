@@ -96,6 +96,7 @@ func newGuardFixture(t *testing.T, failFile string, failContent string, failMark
 	if err := legacy.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
+	dropSharedVectors(t, legacy)
 	byFile, err := loadLiveChunkRecordsByFile(store, manifest)
 	if err != nil {
 		t.Fatal(err)

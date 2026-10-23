@@ -447,6 +447,7 @@ func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKe
 	}
 	status.setSkippedFiles(skippedFiles)
 	status.setSemanticOutcome(seman.rejected, seman.lastError)
+	status.setSharedVectors(seman.sharedReused, seman.sharedError)
 	status.ready(manifest, revisionCount(store, manifest))
 	// Added 是本轮实际写入 segment 的 chunk 数。改动前统一取
 	// manifest.Counts.Chunks，delta 构建被报成 revision 总量：1975 个文件的
@@ -457,6 +458,7 @@ func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKe
 	result.Added = added
 	result.BuildMode = buildMode
 	result.CrossProfileReused = seman.crossProfileReused
+	result.SharedReused = seman.sharedReused
 	return result, manifest, nil
 }
 
@@ -610,6 +612,7 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 	if previous != nil && !contentChanged && !needsLexicalRebuild && !seman.improved() &&
 		seman.migrationBlock == previous.SemanticMigrationBlock {
 		status.setSemanticOutcome(seman.rejected, seman.lastError)
+		status.setSharedVectors(seman.sharedReused, seman.sharedError)
 		status.ready(previous, revisionCount(store, previous))
 		return e.revisionResult(previous, previous), previous, nil
 	}

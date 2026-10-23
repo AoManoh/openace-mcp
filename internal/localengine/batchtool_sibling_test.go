@@ -38,6 +38,7 @@ func TestPlanEmbedJobsCountsSiblingProfileVectorsAsReusable(t *testing.T) {
 	if err := e7.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	dropSharedVectors(t, e7)
 	callsAfterV7 := server.callCount()
 	if callsAfterV7 == 0 {
 		t.Fatal("v7 首建应调用 provider")
@@ -130,6 +131,7 @@ func TestPlanEmbedJobsSkipsSiblingWhenCurrentRevisionComplete(t *testing.T) {
 	if err := e7.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	dropSharedVectors(t, e7)
 
 	// v8 现役 revision 语义完整且物理健全:新文件的 chunk 必须报缺口,
 	// 兄弟子树不参与(在线 delta 构建亦会为其付费)。

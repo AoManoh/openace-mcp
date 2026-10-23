@@ -254,6 +254,10 @@ func (e *Engine) collectBulkJobs(ctx context.Context, journal *index.Journal, st
 		if err := journal.MarkRejected(normRejected); err != nil {
 			return 0, fmt.Errorf("批作业 %s 拒绝集落盘失败: %w", jobID, err)
 		}
+		// 与同步路径相同，回收的向量也记进共享向量库；写入失败只影响复用。
+		if err := e.appendSharedVectors(good); err != nil {
+			out.sharedError = sanitizeError(err)
+		}
 		for key, vec := range good {
 			reuse[key] = vec
 			out.newlyEmbedded++

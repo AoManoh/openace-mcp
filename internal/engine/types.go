@@ -102,6 +102,9 @@ type Result struct {
 	// CrossProfileReused 是本次构建从同 workspace 兼容旧 profile 子树
 	// 自动复用的唯一向量键数。升级成本透明;0 省略。
 	CrossProfileReused int `json:"cross_profile_reused,omitempty"`
+	// SharedReused 是本次构建从共享向量库（同一 embedding 身份下其他工作区
+	// 付过费的向量）复用的唯一向量键数；0 省略。
+	SharedReused int `json:"shared_reused,omitempty"`
 	// Timings 是检索阶段耗时分解(框架 18.3/灰度候选 (e):热检索
 	// 13.1s 无法归因是 sync、embed、rerank 还是渲染)。检索路径恒填,
 	// sync 路径为空;加性 omitempty。
@@ -175,6 +178,9 @@ func (r Result) Summary() string {
 		}
 		if r.CrossProfileReused > 0 {
 			summary += fmt.Sprintf(" cross_profile_reused=%d", r.CrossProfileReused)
+		}
+		if r.SharedReused > 0 {
+			summary += fmt.Sprintf(" shared_reused=%d", r.SharedReused)
 		}
 		// P8:同步面的语义覆盖如实外显(覆盖率恒随语义路携带;降级原因
 		// 仅缺口时出现),direct/daemon 两形态同文案。
@@ -258,6 +264,14 @@ type SemanticStatus struct {
 	LastEmbedRequests        int `json:"last_embed_requests,omitempty"`
 	LastEmbedRateLimited     int `json:"last_embed_rate_limited,omitempty"`
 	LastEmbedRateWaitSeconds int `json:"last_embed_rate_wait_seconds,omitempty"`
+	// SharedReused 是该工作区最近一次构建从共享向量库复用的唯一键数；
+	// SharedVectorsBytes 是当前 embedding 身份的共享向量库在磁盘上的字节数
+	// （不自动删除，用户可整目录删除，已发布的索引不受影响）；
+	// SharedVectorsError 是最近一次构建读写共享库的错误，读写失败只影响复用，
+	// 缺口照常送审。
+	SharedReused       int    `json:"shared_reused,omitempty"`
+	SharedVectorsBytes int64  `json:"shared_vectors_bytes,omitempty"`
+	SharedVectorsError string `json:"shared_vectors_error,omitempty"`
 
 	// Rerank* 描述精排 provider（未配置时 RerankDisabledReason 解释原因）。
 	RerankProvider       string `json:"rerank_provider,omitempty"`

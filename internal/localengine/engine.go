@@ -142,6 +142,11 @@ type Engine struct {
 	// 子树时不会互相覆盖。
 	locks  map[string]*index.ProcessLock
 	closed bool
+	// sharedMu 保护 shared：按 embedding 身份共享的向量库（见
+	// shared_vectors.go），配置了 embedding 时第一次构建用到才打开，Close
+	// 时关闭本进程的段文件。
+	sharedMu sync.Mutex
+	shared   *index.SharedVectors
 }
 
 // 编译期断言：Engine 实现全部引擎契约接口。
@@ -989,5 +994,14 @@ func (e *Engine) Close(ctx context.Context) error {
 	for _, lock := range locks {
 		lock.Release()
 	}
+	// 构建都已退出，不会再追加共享向量库，关闭本进程的段文件。
+	e.sharedMu.Lock()
+	if e.shared != nil {
+		if err := e.shared.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		e.shared = nil
+	}
+	e.sharedMu.Unlock()
 	return firstErr
 }

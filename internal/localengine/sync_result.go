@@ -67,6 +67,7 @@ func servedResult(synced engine.Result, served *index.Manifest) engine.Result {
 		result.Deleted = synced.Deleted
 		result.BuildMode = synced.BuildMode
 		result.CrossProfileReused = synced.CrossProfileReused
+		result.SharedReused = synced.SharedReused
 	}
 	return result
 }

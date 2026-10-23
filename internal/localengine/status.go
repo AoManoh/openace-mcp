@@ -77,6 +77,19 @@ type wsStatus struct {
 	embedRequests    int
 	embedRateLimited int
 	embedRateWait    time.Duration
+	// sharedReused 与 sharedError 是最近一次构建从共享向量库复用的键数与
+	// 读写共享库的错误。
+	sharedReused int
+	sharedError  string
+}
+
+// setSharedVectors 记录最近一次构建使用共享向量库的结果。
+func (s *wsStatus) setSharedVectors(reused int, errText string) {
+	s.mu.Lock()
+	s.sharedReused = reused
+	s.sharedError = errText
+	s.updatedAt = time.Now().UTC()
+	s.mu.Unlock()
 }
 
 // setEmbedRequestStats 记录一次嵌入阶段的请求计数：before、after 是该阶段
@@ -434,6 +447,8 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 			semantic.LastEmbedRequests = tracker.embedRequests
 			semantic.LastEmbedRateLimited = tracker.embedRateLimited
 			semantic.LastEmbedRateWaitSeconds = int(tracker.embedRateWait.Round(time.Second) / time.Second)
+			semantic.SharedReused = tracker.sharedReused
+			semantic.SharedVectorsError = tracker.sharedError
 			tracker.mu.Unlock()
 			// journal 条数从已打开的 journal 实时读取；journal 尚未打开时不
 			// 显示。
@@ -475,6 +490,7 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 		semantic.GovernorAdjustment = governor.LastAdjustment
 		semantic.GovernorInFlight = governor.InFlight
 		semantic.GovernorLatencyP50Ms = int(governor.LatencyP50.Milliseconds())
+		semantic.SharedVectorsBytes = e.sharedVectorsBytes()
 		if !governor.PausedUntil.IsZero() {
 			paused := governor.PausedUntil
 			semantic.GovernorPausedUntil = &paused

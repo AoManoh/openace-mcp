@@ -95,6 +95,7 @@ func TestBM25MigrationReusesInterruptedTFIDFJournal(t *testing.T) {
 	if err := legacy.Close(closeCtx); err != nil {
 		t.Fatal(err)
 	}
+	dropSharedVectors(t, legacy)
 	if err := <-syncDone; err == nil {
 		t.Fatal("被打断的 TF-IDF 时代首建不应成功")
 	}
@@ -230,6 +231,7 @@ func TestBM25MigrationBlockedBySiblingBatchJobs(t *testing.T) {
 	if err := legacy.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
+	dropSharedVectors(t, legacy)
 	byFile, err := loadLiveChunkRecordsByFile(legacyStore, legacyManifest)
 	if err != nil || len(byFile["util.py"]) == 0 {
 		t.Fatalf("前置：应能读到 util.py 的 chunk: %v", err)
@@ -347,6 +349,7 @@ func TestSiblingJournalOfOtherEmbeddingIdentityIsNotReused(t *testing.T) {
 	if err := old.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
+	dropSharedVectors(t, old)
 	byFile, err := loadLiveChunkRecordsByFile(oldStore, oldManifest)
 	if err != nil {
 		t.Fatal(err)
