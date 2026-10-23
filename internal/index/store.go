@@ -340,6 +340,12 @@ func errOrNoRevision(err error) error {
 	return ErrNoUsableRevision
 }
 
+// WriteFileAtomic 把 writeFileAtomic 提供给 index 包之外同样需要持久性的
+// 状态文件，例如 localengine 的 Batch 作业状态 bulk-jobs.json。
+func WriteFileAtomic(path string, data []byte) error {
+	return writeFileAtomic(path, data)
+}
+
 // writeFileAtomic 以"同目录 temp + Sync + rename + 父目录 fsync"写文件，
 // 保证读者要么看到旧内容要么看到完整新内容（暗坑 K1）。
 func writeFileAtomic(path string, data []byte) error {

@@ -88,16 +88,15 @@ func loadBulkState(path string) (bulkState, error) {
 	return state, nil
 }
 
+// saveBulkState 用与 manifest 相同的“临时文件、fsync、改名、fsync 目录”写入。
+// 提交意向必须在提交请求发出前真正落盘：只写页缓存再改名时，断电或虚拟机
+// 被强制中断后意向与作业记录都可能丢失，重启后同一批输入会再提交、再计费。
 func saveBulkState(path string, state bulkState) error {
 	raw, err := json.MarshalIndent(state, "", " ")
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return index.WriteFileAtomic(path, raw)
 }
 
 // bulkEligible 判定本次缺失数是否走批作业路径：embedding 客户端支持批接
