@@ -13,11 +13,16 @@ func TestMain(m *testing.M) {
 	if os.Getenv("OPENACE_DAEMON_TOKEN") == "" {
 		os.Setenv("OPENACE_DAEMON_TOKEN", "off")
 	}
+	cleanup := func() {}
 	if os.Getenv("XDG_CACHE_HOME") == "" {
 		if dir, err := os.MkdirTemp("", "openace-daemon-test-cache-*"); err == nil {
 			os.Setenv("XDG_CACHE_HOME", dir)
-			defer os.RemoveAll(dir)
+			cleanup = func() { os.RemoveAll(dir) }
 		}
 	}
-	os.Exit(m.Run())
+	code := m.Run()
+	// os.Exit 不执行 defer：临时缓存目录要在退出前显式删除，否则每次运行
+	// 都在 /tmp 留下一个 openace-daemon-test-cache-* 目录。
+	cleanup()
+	os.Exit(code)
 }
