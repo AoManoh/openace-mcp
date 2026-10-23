@@ -212,14 +212,12 @@ func New(opts Options) (*Engine, error) {
 	// daemon 算出的指纹会不一致。
 	opts.Embedding.TemplateVersion = embedTemplateVersion
 	// 维度未显式配置时在这里探测一次（先查 cache 根目录的缓存，命中则零调用）：
-	// 索引身份与向量预算都依赖真实维度。探测失败按配置错误返回，错误文本提示
-	// 可设 OPENACE_EMBEDDING_DIMENSION 跳过探测；不会静默退到词法。
+	// 索引子树名含维度，定不下维度就无从打开或建立索引。探测失败返回
+	// *embedding.DimensionProbeError，错误文本提示可设 OPENACE_EMBEDDING_DIMENSION
+	// 跳过探测；不会静默退到词法。daemon 与 MCP direct 模式经 NewService 构造，
+	// 探测失败时服务照常启动并在后台重试（见 service.go）。
 	if opts.Embedding.Enabled && opts.Embedding.DimensionAuto {
-		cacheDir := ""
-		if snap, err := workspace.CurrentCacheSnapshot(); err == nil {
-			cacheDir = snap.Dir
-		}
-		resolved, err := embedding.ResolveDimension(context.Background(), opts.Embedding, cacheDir)
+		resolved, err := embedding.ResolveDimension(context.Background(), opts.Embedding, dimensionCacheDir())
 		var warn *embedding.CacheWriteWarning
 		if err != nil && !errors.As(err, &warn) {
 			return nil, err
@@ -247,8 +245,25 @@ func New(opts Options) (*Engine, error) {
 		}
 		e.rerankClient = client
 	}
-	e.fingerprint = opts.Fingerprint()
+	e.fingerprint = engineFingerprint(opts)
 	return e, nil
+}
+
+// engineFingerprint 返回 New 构造出的引擎会报告的配置指纹：模板版本取
+// embedTemplateVersion 后计算，与 OptionsFromEnv 的做法相同。维度未显式配置时
+// 指纹只记 auto，不含探测结果，所以维度探测成功前后指纹不变。
+func engineFingerprint(opts Options) string {
+	opts.Embedding.TemplateVersion = embedTemplateVersion
+	return opts.Fingerprint()
+}
+
+// dimensionCacheDir 返回维度探测缓存所在的 cache 根目录；取不到时返回空，
+// ResolveDimension 收到空目录时只探测、不读写缓存。
+func dimensionCacheDir() string {
+	if snap, err := workspace.CurrentCacheSnapshot(); err == nil {
+		return snap.Dir
+	}
+	return ""
 }
 
 // embeddingSubtreeSuffix 是索引子树名里的 embedding 身份段

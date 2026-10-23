@@ -27,7 +27,7 @@ func clearProviderEnv(t *testing.T) {
 func TestLocalHybridStartsWithoutCredentials(t *testing.T) {
 	clearProviderEnv(t)
 	t.Setenv("OPENACE_ENGINE", "local-hybrid")
-	service, err := buildLocalService(context.Background())
+	service, err := buildLocalService(context.Background(), "openace-mcp")
 	if err != nil {
 		t.Fatalf("local-hybrid 无凭据应可启动: %v", err)
 	}
@@ -42,12 +42,12 @@ func TestLocalHybridInvalidProviderEnvRejected(t *testing.T) {
 	clearProviderEnv(t)
 	t.Setenv("OPENACE_ENGINE", "local-hybrid")
 	t.Setenv("OPENACE_EMBEDDING_ADAPTER", "azure-openai")
-	if _, err := buildLocalService(context.Background()); err == nil || !strings.Contains(err.Error(), "OPENACE_EMBEDDING_ADAPTER") {
+	if _, err := buildLocalService(context.Background(), "openace-mcp"); err == nil || !strings.Contains(err.Error(), "OPENACE_EMBEDDING_ADAPTER") {
 		t.Fatalf("非法 adapter 应在启动显式报错: %v", err)
 	}
 	t.Setenv("OPENACE_EMBEDDING_ADAPTER", "")
 	t.Setenv("OPENACE_RETRIEVAL_DEGRADE", "silent")
-	if _, err := buildLocalService(context.Background()); err == nil || !strings.Contains(err.Error(), "OPENACE_RETRIEVAL_DEGRADE") {
+	if _, err := buildLocalService(context.Background(), "openace-mcp"); err == nil || !strings.Contains(err.Error(), "OPENACE_RETRIEVAL_DEGRADE") {
 		t.Fatalf("已退役的检索降级变量应在启动显式报错: %v", err)
 	}
 }
@@ -57,7 +57,7 @@ func TestLocalHybridInvalidProviderEnvRejected(t *testing.T) {
 func TestDefaultEngineIsLocalHybrid(t *testing.T) {
 	clearProviderEnv(t)
 	t.Setenv("OPENACE_ENGINE", "")
-	service, err := buildLocalService(context.Background())
+	service, err := buildLocalService(context.Background(), "openace-mcp")
 	if err != nil {
 		t.Fatalf("默认路径构建失败: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestDefaultEngineIsLocalHybrid(t *testing.T) {
 // 显式报可行动错误,不静默回退。
 func TestExplicitACERemoved(t *testing.T) {
 	t.Setenv("OPENACE_ENGINE", "ace")
-	_, err := buildLocalService(context.Background())
+	_, err := buildLocalService(context.Background(), "openace-mcp")
 	if err == nil || !strings.Contains(err.Error(), "Stage 7") {
 		t.Fatalf("ace 选项应显式报 Stage 7 移除: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestExplicitACERemoved(t *testing.T) {
 
 func TestInvalidEngineRejected(t *testing.T) {
 	t.Setenv("OPENACE_ENGINE", "bleve-only")
-	if _, err := buildLocalService(context.Background()); err == nil || !strings.Contains(err.Error(), "OPENACE_ENGINE") {
+	if _, err := buildLocalService(context.Background(), "openace-mcp"); err == nil || !strings.Contains(err.Error(), "OPENACE_ENGINE") {
 		t.Fatalf("非法引擎值应显式报错: %v", err)
 	}
 }

@@ -40,9 +40,11 @@ const uncoveredFilesLimit = 50
 
 // gapSwitch 返回一条原因归哪一类：
 //   - semantic-unavailable：语义路跑不了，包括向量文件不可用
-//     （vector-data-unavailable）、查询嵌入失败（query-embedding-failed(类别)）
-//     与 revision 没有任何向量（semantic-index-empty）。配置了 embedding 时
-//     这类原因总是拒绝，见 policyError。
+//     （vector-data-unavailable）、查询嵌入失败（query-embedding-failed(类别)）、
+//     revision 没有任何向量（semantic-index-empty）、缺向量的文件多到列不下
+//     （semantic-coverage-insufficient）与维度探测尚未成功
+//     （embedding-dimension-unresolved）。配置了 embedding 时这类原因总是拒绝，
+//     见 policyError。
 //   - rerank（OPENACE_RERANK_DEGRADE）：精排调用失败、无效响应或 token 预算
 //     连第一条候选都装不下（rerank-skipped(类别)），精排响应不完整
 //     （rerank-partial-response）。
@@ -55,7 +57,7 @@ const uncoveredFilesLimit = 50
 //     （semantic-migration-blocked）。
 func gapSwitch(reason string) string {
 	switch {
-	case reason == "vector-data-unavailable", reason == semanticIndexEmptyReason, reason == coverageInsufficientReason, strings.HasPrefix(reason, "query-embedding-failed"):
+	case reason == "vector-data-unavailable", reason == semanticIndexEmptyReason, reason == coverageInsufficientReason, reason == dimensionUnresolvedReason, strings.HasPrefix(reason, "query-embedding-failed"):
 		return gapSemanticUnavailable
 	case strings.HasPrefix(reason, "rerank-skipped"), reason == "rerank-partial-response":
 		return gapRerank
@@ -85,8 +87,7 @@ func (e *Engine) policyError(gaps []qualityGap) error {
 	}
 	for _, gap := range gaps {
 		if gapSwitch(gap.reason) == gapSemanticUnavailable {
-			return fmt.Errorf("semantic retrieval unavailable [%s]: %s; an embedding provider is configured, so openACE does not answer with lexical-only results; retry after the cause above is resolved, or search with your own tools meanwhile",
-				gapReasons(gaps), gapDetails(gaps))
+			return semanticUnavailableError(gaps)
 		}
 	}
 	if e.qualityStrict {
@@ -113,6 +114,13 @@ func (e *Engine) policyError(gaps []qualityGap) error {
 		}
 	}
 	return nil
+}
+
+// semanticUnavailableError 是语义路跑不了时的统一错误，列出全部原因与说明。
+// 维度待定的服务（deferredEngine）也用它，调用方看到的格式一致。
+func semanticUnavailableError(gaps []qualityGap) error {
+	return fmt.Errorf("semantic retrieval unavailable [%s]: %s; an embedding provider is configured, so openACE does not answer with lexical-only results; retry after the cause above is resolved, or search with your own tools meanwhile",
+		gapReasons(gaps), gapDetails(gaps))
 }
 
 // manifestGaps 返回从 revision 的 manifest 就能知道的缺口：没有任何向量

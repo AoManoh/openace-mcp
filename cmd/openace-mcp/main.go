@@ -87,7 +87,7 @@ func versionString() string {
 func buildService(ctx context.Context) (engine.Service, error) {
 	switch openaceMode() {
 	case "direct":
-		return buildLocalService(ctx)
+		return buildLocalService(ctx, "openace-mcp")
 	case "manual-daemon":
 		return daemon.NewClient(daemonAddr()), nil
 	case "auto":
@@ -121,7 +121,9 @@ func daemonAddr() string {
 	return daemon.DefaultAddr
 }
 
-func buildLocalService(ctx context.Context) (engine.Service, error) {
+// buildLocalService 构造进程内引擎；logPrefix 是写到 stderr 的日志前缀
+// (direct 模式为 openace-mcp,daemon 子命令为 openace-daemon)。
+func buildLocalService(ctx context.Context, logPrefix string) (engine.Service, error) {
 	_ = ctx
 	// Stage 7:legacy ACE 引擎已删除,唯一引擎 = local-hybrid;
 	// NormalizeEngineID 对 "ace" 给出可行动错误。零凭据可启动
@@ -133,7 +135,11 @@ func buildLocalService(ctx context.Context) (engine.Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return localengine.New(opts)
+	// 维度探测失败时服务照常启动、后台重试,探测失败与恢复写进 stderr
+	// (managed daemon 的 stderr 即其日志文件)。
+	return localengine.NewService(opts, func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, logPrefix+": "+format+"\n", args...)
+	})
 }
 
 func runDaemon() {
@@ -148,7 +154,7 @@ func runDaemon() {
 		addr = daemon.DefaultAddr
 	}
 
-	service, err := buildLocalService(ctx)
+	service, err := buildLocalService(ctx, "openace-daemon")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "openace-daemon: %v\n", err)
 		os.Exit(1)

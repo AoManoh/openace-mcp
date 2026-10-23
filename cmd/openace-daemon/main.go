@@ -49,5 +49,8 @@ func buildLocalService(ctx context.Context) (engine.Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return localengine.New(opts)
+	// 维度探测失败时服务照常启动、后台重试,探测失败与恢复写进 stderr。
+	return localengine.NewService(opts, func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, "openace-daemon: "+format+"\n", args...)
+	})
 }

@@ -257,7 +257,7 @@ embedding 地址、模型、维度和内置嵌入模板都没变时,新子树只
 | 变量 | 说明 |
 |------|------|
 | `OPENACE_EMBEDDING_BASE_URL` `_MODEL` `_API_KEY` | 语义路的三项:地址、模型 id、key(自部署可空)。地址与模型都给 = 启用;都不给 = 纯词法(状态显示未配置);只给一项或只给 key = 启动报配置错误。请求形状按地址识别(`api.voyageai.com` → Voyage 形状,其余 → OpenAI 兼容形状),可用 `OPENACE_EMBEDDING_ADAPTER=openai\|voyage\|off` 覆盖。地址、模型或维度变化触发平行索引全量重建 |
-| `OPENACE_EMBEDDING_DIMENSION` | 向量维度。留空 = 启动后向端点发一条最短文本探测一次并缓存(缓存文件 `embedding-dimensions.json` 在 cache 根目录);显式写则跳过探测,返回向量长度与之不符时报错 |
+| `OPENACE_EMBEDDING_DIMENSION` | 向量维度。留空 = 启动后向端点发一条最短文本探测一次并缓存(缓存文件 `embedding-dimensions.json` 在 cache 根目录);显式写则跳过探测,返回向量长度与之不符时报错。启动时探测失败(端点不可达、超时或报错)服务照常启动:检索、同步和 `repo_map` 返回 `embedding-dimension-unresolved` 错误,写明失败原因和下次探测时间,`workspace_status` 照常可用;后台继续探测,认证或额度错误每 15 分钟一次,其余从 30 秒起翻倍、最长 5 分钟,成功后自动开始建索引 |
 | `OPENACE_EMBEDDING_BATCH_SIZE` `_RPM_BUDGET` `_TPM_BUDGET` | 索引调用参数，默认 128 / 不限 / 不限。显式 RPM/TPM 预算按每次请求尝试计数，文档与查询的重试也计入；预算等待与重试退避不占索引并发名额。单笔需求超过预算且当前分钟尚无用量时，允许该单笔执行，避免请求永久等待。 |
 | `OPENACE_EMBEDDING_MAX_CONCURRENCY` | 已于 v0.5.0（2026-09-14）退役。启用语义 provider 时设置非空值会报错，请移除此变量。索引从有限窗口开始，按完整样本组的吞吐与过载调整，没有固定并发上限。 |
 | `OPENACE_THROUGHPUT_GOVERNOR` | 接受空值或 `on`；`off` 报迁移错误，请移除。429 按既有规则降低发送速率并尊重 Retry-After，查询与索引各持独立熔断器。Linux 上检查内存和文件描述符余量；资源不足时等待且不扣预算，资源数据未知时保持当前窗口并在状态中报告 `resource-unknown`。 |

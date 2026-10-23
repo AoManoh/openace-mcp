@@ -21,7 +21,8 @@ const probeText = "openACE embedding dimension probe"
 // ResolveDimension 把 DimensionAuto 的配置补成带真实维度的配置：先查缓存
 // （key = adapter|地址|模型），没有则向 provider 发一次单文本嵌入请求取向量长度，
 // 成功后写缓存。显式配置了维度的配置原样返回。
-//   - 探测失败返回错误（含变量名提示）：用户可设 OPENACE_EMBEDDING_DIMENSION 跳过探测。
+//   - 探测失败返回 *DimensionProbeError（含变量名提示）：用户可设
+//     OPENACE_EMBEDDING_DIMENSION 跳过探测。
 //   - cacheDir 为空时不读写缓存，只探测。
 func ResolveDimension(ctx context.Context, cfg Config, cacheDir string) (Config, error) {
 	if !cfg.Enabled || !cfg.DimensionAuto || cfg.Dimension > 0 {
@@ -34,7 +35,7 @@ func ResolveDimension(ctx context.Context, cfg Config, cacheDir string) (Config,
 	}
 	dim, err := ProbeDimension(ctx, cfg)
 	if err != nil {
-		return Config{}, fmt.Errorf("embedding dimension probe against %s (%s) failed: %w; set %s to skip the probe", cfg.BaseURL, cfg.Model, err, EnvDimension)
+		return Config{}, &DimensionProbeError{BaseURL: cfg.BaseURL, Model: cfg.Model, Err: err}
 	}
 	cfg.Dimension = dim
 	if writeErr := writeDimensionCache(cacheDir, key, dim); writeErr != nil {
@@ -43,6 +44,21 @@ func ResolveDimension(ctx context.Context, cfg Config, cacheDir string) (Config,
 	}
 	return cfg, nil
 }
+
+// DimensionProbeError 表示维度探测请求失败（provider 不可达、超时、返回错误
+// 或没有向量）。调用方据类型区分它与配置错误：引擎服务遇到它照常启动并在
+// 后台重试探测，配置错误仍让启动失败。
+type DimensionProbeError struct {
+	BaseURL string
+	Model   string
+	Err     error
+}
+
+func (e *DimensionProbeError) Error() string {
+	return fmt.Sprintf("embedding dimension probe against %s (%s) failed: %v; set %s to skip the probe", e.BaseURL, e.Model, e.Err, EnvDimension)
+}
+
+func (e *DimensionProbeError) Unwrap() error { return e.Err }
 
 // CacheWriteWarning 表示探测成功但缓存写入失败；调用方应记日志并继续使用返回的配置。
 type CacheWriteWarning struct{ Err error }
