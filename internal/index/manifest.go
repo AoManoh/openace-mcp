@@ -50,6 +50,10 @@ type FileEntry struct {
 	// CoveredChunks 是该文件有向量的 chunk 数（v2；delta 构建的覆盖
 	// 口径基础，暗坑 K31/K51：VectorCount = Σ 存活 CoveredChunks）。
 	CoveredChunks int `json:"covered_chunks,omitempty"`
+	// RejectedChunks 是该文件被 provider 永久拒绝（返回零向量或含 NaN）的
+	// chunk 数。这些 chunk 不会再送审，不计入语义覆盖率的分母；旧 manifest
+	// 没有该字段时按 0 读取。
+	RejectedChunks int `json:"rejected_chunks,omitempty"`
 }
 
 // SegmentRef 描述 revision 引用的一个不可变 segment（v2 起）。
@@ -116,6 +120,10 @@ type Manifest struct {
 	// Counts.Chunks（暗坑 K31，读取时计算不落盘防口径漂移）。
 	// v2 语义：存活（newest-wins）chunk 中有向量者的计数。
 	VectorCount int `json:"vector_count,omitempty"`
+	// RejectedCount 是存活 chunk 中被 provider 永久拒绝的行数（= Σ 存活
+	// FileEntry.RejectedChunks），语义覆盖率的分母扣除这部分；旧 manifest
+	// 没有该字段时按 0 读取。
+	RejectedCount int `json:"rejected_count,omitempty"`
 	// SemanticMigrationBlock 是可选的诊断字段：发布本 revision 时，同一
 	// embedding 身份旧子树里的已付费状态无法确认或尚未回收，有语义缺口
 	// 没有送审，值是原因与恢复步骤。它随 revision 原子发布，进程重启后从
@@ -201,7 +209,13 @@ func (m *Manifest) HasVectors() bool {
 
 // SemanticComplete 报告语义覆盖是否完整（空仓库按完整计）。
 func (m *Manifest) SemanticComplete() bool {
-	return m.VectorCount >= m.Counts.Chunks
+	return m.VectorCount >= m.EmbeddableChunks()
+}
+
+// EmbeddableChunks 是语义覆盖率的分母：存活 chunk 数减去被 provider 永久
+// 拒绝的行数。
+func (m *Manifest) EmbeddableChunks() int {
+	return m.Counts.Chunks - m.RejectedCount
 }
 
 // Validate 检查 manifest 自身的结构完整性（按版本分支；未知版本显式

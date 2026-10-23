@@ -463,6 +463,16 @@ func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKe
 // coveredPerFile 统计一个文件有向量的 chunk 数。查找键是 embedKey，与
 // seman.entries 的键一致；覆盖率的分子分母都按存活 chunk 计，复用来的
 // 向量与新嵌入的同样计入。
+// liveRejected 求存活文件被 provider 永久拒绝的 chunk 总数（manifest 的
+// RejectedCount）。
+func liveRejected(files map[string]index.FileEntry) int {
+	total := 0
+	for _, entry := range files {
+		total += entry.RejectedChunks
+	}
+	return total
+}
+
 func coveredPerFile(fileRecords []chunkRecord, coveredHash map[string]bool) int {
 	covered := 0
 	for _, record := range fileRecords {
@@ -621,6 +631,7 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 		entry.SegmentID = artifacts.buildID
 		if seman.enabled {
 			entry.CoveredChunks = coveredPerFile(recordsByFile[path], coveredHash)
+			entry.RejectedChunks = coveredPerFile(recordsByFile[path], seman.rejectedKeys)
 		}
 		files[path] = entry
 	}
@@ -638,6 +649,7 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 	}}
 	if seman.enabled {
 		manifest.VectorCount = seman.covered
+		manifest.RejectedCount = liveRejected(files)
 	}
 	manifest.SemanticMigrationBlock = seman.migrationBlock
 	return e.finishPublish(store, status, workspaceKey, manifest, artifacts.staging, discard, seman, skippedFiles, len(records), buildMode, syncStart)
@@ -740,6 +752,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 		}
 		if seman.enabled {
 			entry.CoveredChunks = coveredPerFile(fileRecords, coveredHash)
+			entry.RejectedChunks = coveredPerFile(fileRecords, seman.rejectedKeys)
 		}
 		files[asset.RelPath] = entry
 	}
@@ -767,6 +780,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 	}
 	if e.semanticEnabled() {
 		manifest.VectorCount = vectorCount
+		manifest.RejectedCount = liveRejected(files)
 	}
 	// delta 只判定变更文件的缺口：本次受阻就记本次的原因；本次不受阻不代表
 	// 其他文件的旧缺口已解除，沿用前一 revision 记录的原因，留给全量构建

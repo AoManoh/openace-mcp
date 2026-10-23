@@ -25,27 +25,35 @@ func routeIDs(refs []CandidateRef) []string {
 // 全部 chunk 都没有向量时总是在查询嵌入前拒绝（semantic-index-empty），不返回
 // 只有词法路的候选。
 func TestSearchRoutesCoverageGapPolicy(t *testing.T) {
-	partial := func(text string) bool { return strings.Contains(text, "util.py") }
+	// 部分覆盖：util.py 的片段（parse_config）嵌入请求失败，批大小 1。被拒绝
+	// （零向量）的片段不计入覆盖率分母，只用来制造“全部没有向量”。
+	partial := func(texts []string) bool { return len(texts) == 1 && strings.Contains(texts[0], "parse_config") }
 	none := func(string) bool { return true }
 	strict := func(o *Options) { o.QualityStrict = true }
 	cases := []struct {
 		name       string
+		fail       func([]string) bool
 		zero       func(string) bool
 		mutate     func(*Options)
 		wantReject string
 		wantReason string
 	}{
-		{"partial-default", partial, nil, "", ""},
-		{"partial-strict", partial, strict, EnvQualityStrict, "semantic-coverage-partial"},
-		{"zero-default", none, nil, "semantic retrieval unavailable", semanticIndexEmptyReason},
-		{"zero-strict", none, strict, "semantic retrieval unavailable", semanticIndexEmptyReason},
+		{"partial-default", partial, nil, nil, "", ""},
+		{"partial-strict", partial, nil, strict, EnvQualityStrict, "semantic-coverage-partial"},
+		{"zero-default", nil, none, nil, "semantic retrieval unavailable", semanticIndexEmptyReason},
+		{"zero-strict", nil, none, strict, "semantic retrieval unavailable", semanticIndexEmptyReason},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			server := newEmbedServer(t, 8)
+			batch := 16
+			if tc.fail != nil {
+				server.setFailWhen(tc.fail)
+				batch = 1
+			}
 			server.zeroWhen = tc.zero
-			opts := embedOptions(server.ts.URL, 8, 16, "routes-model")
+			opts := embedOptions(server.ts.URL, 8, batch, "routes-model")
 			if tc.mutate != nil {
 				tc.mutate(&opts)
 			}

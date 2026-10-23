@@ -192,14 +192,17 @@ func TestQueryEmbeddingFailureReturnsError(t *testing.T) {
 func TestCoveragePartialBanneredHybrid(t *testing.T) {
 	const dim = 8
 	server := newEmbedServer(t, dim)
-	// util.py 内容永远返回零向量（K35 拒绝）→ 覆盖缺口但 circuit 健康。
-	server.zeroWhen = func(text string) bool { return strings.Contains(text, "parse_config") }
-	e := newTestEngineWith(t, embedOptions(server.ts.URL, dim, 16, "fake-model"))
+	// util.py 内容（parse_config）的嵌入请求失败，批大小 1 → 只有它缺向量。
+	server.setFailWhen(func(texts []string) bool { return len(texts) == 1 && strings.Contains(texts[0], "parse_config") })
+	e := newTestEngineWith(t, embedOptions(server.ts.URL, dim, 1, "fake-model"))
 	root := newFixtureWorkspace(t)
 
 	result, err := e.Search(context.Background(), searchRequest(root, "HandleLogin"))
 	if err != nil {
 		t.Fatalf("search: %v", err)
+	}
+	if !containsString(result.UncoveredFiles, "util.py") || !strings.Contains(result.Text, "[COVERAGE] semantic search does not cover") {
+		t.Fatalf("应列出缺向量的文件: uncovered=%v", result.UncoveredFiles)
 	}
 	if result.RetrievalMode != "hybrid" {
 		t.Fatalf("向量部分可用时应仍走 hybrid: %+v", result)
@@ -211,6 +214,45 @@ func TestCoveragePartialBanneredHybrid(t *testing.T) {
 	if !strings.Contains(result.Text, "[DEGRADED]") || !strings.Contains(result.Text, "semantic_coverage=") {
 		t.Fatalf("横幅应携带覆盖率: %q", strings.SplitN(result.Text, "\n", 2)[0])
 	}
+}
+
+// TestRejectedChunksExcludedFromCoverage：provider 对 util.py 的片段返回零向量
+// （永久拒绝）。这些片段不计入覆盖率分母：同步与状态显示 100%、没有覆盖
+// 缺口原因；查询走 hybrid，provider_rejected_files 与正文开头列出 util.py。
+func TestRejectedChunksExcludedFromCoverage(t *testing.T) {
+	const dim = 8
+	server := newEmbedServer(t, dim)
+	server.zeroWhen = func(text string) bool { return strings.Contains(text, "parse_config") }
+	e := newTestEngineWith(t, embedOptions(server.ts.URL, dim, 16, "fake-model"))
+	root := newFixtureWorkspace(t)
+	synced, err := e.Sync(context.Background(), syncRequest(root))
+	if err != nil || synced.SemanticCoverage != "100%" || synced.DegradedReason != "" {
+		t.Fatalf("被拒绝的片段不应算作覆盖缺口: %+v err=%v", synced, err)
+	}
+	status, err := e.WorkspaceStatus(context.Background(), engineRef(root))
+	if err != nil || status.Semantic == nil || status.Semantic.RejectedChunks == 0 || status.Semantic.Coverage != "100%" {
+		t.Fatalf("状态应显示被拒绝数且覆盖率 100%%: %+v err=%v", status.Semantic, err)
+	}
+	result, err := e.Search(context.Background(), searchRequest(root, "HandleLogin"))
+	if err != nil || result.RetrievalMode != "hybrid" || result.DegradedReason != "" {
+		t.Fatalf("查询应正常走 hybrid: %+v err=%v", result, err)
+	}
+	if len(result.ProviderRejectedFiles) != 1 || result.ProviderRejectedFiles[0] != "util.py" || len(result.UncoveredFiles) != 0 {
+		t.Fatalf("应只列出含被拒绝片段的 util.py: rejected=%v uncovered=%v", result.ProviderRejectedFiles, result.UncoveredFiles)
+	}
+	if !strings.HasPrefix(result.Text, "[COVERAGE] the embedding provider rejected some chunks in these 1 files") {
+		t.Fatalf("正文开头应写明被拒绝的文件: %q", strings.SplitN(result.Text, "\n", 2)[0])
+	}
+}
+
+// containsString 报告 list 是否含 want。
+func containsString(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
 
 // rerankServer 构造可编程 fake rerank provider（voyage 形状）。

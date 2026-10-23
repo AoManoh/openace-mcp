@@ -250,6 +250,9 @@ func (s *wsStatus) ready(manifest *index.Manifest, revisions int) {
 	s.fileCount = manifest.Counts.Files
 	s.chunkCount = manifest.Counts.Chunks
 	s.coveredChunks = manifest.VectorCount
+	// 被拒绝数取自所服务 revision 的 manifest：delta 构建只处理变更文件，
+	// 上一次构建的计数（setSemanticOutcome）不代表整个工作区。
+	s.rejectedChunks = manifest.RejectedCount
 	s.revisionCount = revisions
 	s.capabilities = manifest.ChunkerCapabilities
 	s.lastError = ""
@@ -419,10 +422,14 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 			if journal != nil {
 				semantic.JournalEntries = len(journal.Snapshot())
 			}
-			if semantic.TotalChunks == 0 {
+			// 覆盖率的分母扣除被 provider 永久拒绝的 chunk，与检索、同步结果
+			// 的 semantic_coverage 口径一致。
+			if embeddable := semantic.TotalChunks - semantic.RejectedChunks; semantic.TotalChunks == 0 {
 				semantic.Coverage = "100%"
+			} else if embeddable <= 0 {
+				semantic.Coverage = "0%"
 			} else {
-				semantic.Coverage = fmt.Sprintf("%d%%", semantic.CoveredChunks*100/semantic.TotalChunks)
+				semantic.Coverage = fmt.Sprintf("%d%%", semantic.CoveredChunks*100/embeddable)
 			}
 		}
 		circuit := e.embedClient.CircuitSnapshot()

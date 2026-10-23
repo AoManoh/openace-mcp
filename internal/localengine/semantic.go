@@ -50,8 +50,20 @@ type semanticOutcome struct {
 	// 已在持久化拒绝集内。零向量归一化时除零，NaN 会让相似度排序失真，
 	// 这类 chunk 记为未覆盖。
 	rejected int
+	// rejectedKeys 是 rejected 计数对应的键集合，构建按文件统计
+	// FileEntry.RejectedChunks 时使用。
+	rejectedKeys map[string]bool
 	// lastError 是最后一次失败的脱敏错误文本，进入 workspace_status。
 	lastError string
+}
+
+// markRejected 记下一个被拒绝的键并计数。
+func (s *semanticOutcome) markRejected(key string) {
+	if s.rejectedKeys == nil {
+		s.rejectedKeys = make(map[string]bool)
+	}
+	s.rejectedKeys[key] = true
+	s.rejected++
 }
 
 // improved 报告本次构建是否比 active revision 多覆盖了 chunk。内容未变的
@@ -317,7 +329,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 			continue
 		}
 		if journal.Rejected(key) {
-			out.rejected++
+			out.markRejected(key)
 			continue
 		}
 		missingHashes = append(missingHashes, key)
@@ -359,7 +371,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 			}
 			if paid.rejected[key] {
 				inherited = append(inherited, key)
-				out.rejected++
+				out.markRejected(key)
 				continue
 			}
 			keptHashes = append(keptHashes, key)
@@ -457,13 +469,11 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		}
 		batchGood := make(map[string][]float32, len(vectors))
 		var batchRejected []string
-		rejectedCount := 0
 		for i, vec := range vectors {
 			if err := vector.Normalize(vec); err != nil {
 				// provider 返回零向量或含 NaN：归一化会除零，NaN 会让
 				// 排序失真，该内容记为未覆盖并计数；同时写入持久化拒
 				// 绝集，重启后也不再为它付费。
-				rejectedCount++
 				batchRejected = append(batchRejected, missingHashes[span.start+i])
 				continue
 			}
@@ -480,7 +490,9 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 			return
 		}
 		embedMu.Lock()
-		out.rejected += rejectedCount
+		for _, key := range batchRejected {
+			out.markRejected(key)
+		}
 		for hash, vec := range batchGood {
 			reuse[hash] = vec
 			out.newlyEmbedded++

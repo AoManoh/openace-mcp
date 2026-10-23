@@ -74,6 +74,13 @@ type Result struct {
 	DegradedReason string `json:"degraded_reason,omitempty"`
 	// SemanticCoverage 是语义索引覆盖率（如 "87%"；语义路未配置时为空）。
 	SemanticCoverage string `json:"semantic_coverage,omitempty"`
+	// UncoveredFiles 是所服务 revision 里还有 chunk 没有向量（也没有被
+	// provider 拒绝）的文件，按路径排序，最多 50 个（超过时检索报错）。语义
+	// 检索没有覆盖它们，只能经融合中的词法部分命中；覆盖完整时为空。
+	UncoveredFiles []string `json:"uncovered_files,omitempty"`
+	// ProviderRejectedFiles 是含被 provider 永久拒绝 chunk 的文件，按路径
+	// 排序，最多列 50 个。这些 chunk 不计入覆盖率分母，只能经词法部分命中。
+	ProviderRejectedFiles []string `json:"provider_rejected_files,omitempty"`
 
 	// —— 方案④ quality-strict 可机读质量字段（2026-08-02;omitempty,
 	// legacy 与纯词法路径不填充,wire 不变）——

@@ -666,6 +666,12 @@ func retrievalStructured(result engine.Result) map[string]any {
 	if result.RerankSent > 0 {
 		fields["rerank_sent"] = result.RerankSent
 	}
+	if len(result.UncoveredFiles) > 0 {
+		fields["uncovered_files"] = result.UncoveredFiles
+	}
+	if len(result.ProviderRejectedFiles) > 0 {
+		fields["provider_rejected_files"] = result.ProviderRejectedFiles
+	}
 	if result.QueryPlan != "" {
 		fields["query_plan"] = result.QueryPlan
 	}

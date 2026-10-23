@@ -62,8 +62,9 @@ func TestStatusSemanticCoverageAndCircuit(t *testing.T) {
 	if semantic.CoveredChunks != semantic.TotalChunks-1 || semantic.RejectedChunks != 1 {
 		t.Fatalf("覆盖/拒绝计数不符（K31/K35）: %+v", semantic)
 	}
-	if semantic.Coverage == "" || semantic.Coverage == "100%" {
-		t.Fatalf("覆盖率应部分: %q", semantic.Coverage)
+	// 被拒绝的片段不计入覆盖率分母：其余片段全部有向量即为 100%。
+	if semantic.Coverage != "100%" {
+		t.Fatalf("被拒绝的片段不计入分母，覆盖率应为 100%%: %q", semantic.Coverage)
 	}
 	if semantic.ProviderState != "healthy" {
 		t.Fatalf("零向量拒绝不是 circuit 失败: %q", semantic.ProviderState)

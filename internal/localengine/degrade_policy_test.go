@@ -33,24 +33,33 @@ func queryEmbedCalls(s *embedServer, fromCall int) int {
 	return n
 }
 
-// partialCoverageServer 让 util.py 的片段得到零向量而被永久拒绝，覆盖率 80%。
+// partialCoverageServer 让 util.py 的片段（parse_config）嵌入请求暂时失败，
+// 构建发布部分覆盖的 revision；调用方用批大小 1，只有这些片段缺向量。被
+// provider 永久拒绝（零向量）的片段不计入覆盖率分母，不能用来制造缺口。
 func partialCoverageServer(t *testing.T) *embedServer {
 	s := newEmbedServer(t, 8)
-	s.zeroWhen = func(text string) bool { return strings.Contains(text, "util.py") }
+	s.setFailWhen(func(texts []string) bool {
+		for _, text := range texts {
+			if strings.Contains(text, "parse_config") {
+				return true
+			}
+		}
+		return false
+	})
 	return s
 }
 
-// TestPartialCoverageAnsweredWithReason：部分 chunk 被 provider 永久拒绝、覆盖
-// 率 80% 时，Sync、SyncBackground 与查询都照常返回并写明
-// semantic-coverage-partial；查询走 hybrid，状态为 ready。
+// TestPartialCoverageAnsweredWithReason：部分 chunk 嵌入失败、覆盖不完整时，
+// Sync、SyncBackground 与查询都照常返回并写明 semantic-coverage-partial；查询
+// 走 hybrid，正文开头与 uncovered_files 列出缺向量的文件，状态为 ready。
 func TestPartialCoverageAnsweredWithReason(t *testing.T) {
 	s := partialCoverageServer(t)
-	e := newTestEngineWith(t, embedOptions(s.ts.URL, 8, 16, "policy-model"))
+	e := newTestEngineWith(t, embedOptions(s.ts.URL, 8, 1, "policy-model"))
 	root := newFixtureWorkspace(t)
 	ctx := context.Background()
 
 	res, err := e.Sync(ctx, syncRequest(root))
-	if err != nil || res.SemanticCoverage != "80%" || !strings.Contains(res.DegradedReason, "semantic-coverage-partial") {
+	if err != nil || res.SemanticCoverage == "" || res.SemanticCoverage == "100%" || !strings.Contains(res.DegradedReason, "semantic-coverage-partial") {
 		t.Fatalf("覆盖不足的 Sync 应照常返回并写明原因: res=%+v err=%v", res, err)
 	}
 	if _, bgErr := e.SyncBackground(ctx, syncRequest(root)); bgErr != nil {
@@ -63,6 +72,9 @@ func TestPartialCoverageAnsweredWithReason(t *testing.T) {
 	got, err := e.Search(ctx, searchRequest(root, policyQuery))
 	if err != nil || got.RetrievalMode != "hybrid" || !strings.Contains(got.DegradedReason, "semantic-coverage-partial") {
 		t.Fatalf("覆盖不足的查询应走 hybrid 并写明原因: %+v err=%v", got, err)
+	}
+	if !containsString(got.UncoveredFiles, "util.py") || !strings.Contains(got.Text, "[COVERAGE] semantic search does not cover") {
+		t.Fatalf("应列出缺向量的文件: uncovered=%v text=%q", got.UncoveredFiles, got.Text)
 	}
 }
 
@@ -85,7 +97,7 @@ func TestLexicalOnlyEngineAnswersNormally(t *testing.T) {
 // 拒绝，Sync 也报错。
 func TestStrictRejectsPartialCoverageEarly(t *testing.T) {
 	s := partialCoverageServer(t)
-	opts := embedOptions(s.ts.URL, 8, 16, "policy-model")
+	opts := embedOptions(s.ts.URL, 8, 1, "policy-model")
 	opts.QualityStrict = true
 	e := newTestEngineWith(t, opts)
 	root := newFixtureWorkspace(t)

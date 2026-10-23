@@ -14,13 +14,12 @@ import (
 // 同步结果状态：revision、文件数、覆盖率、检索能力模式与原因都从同一个
 // 明确的 manifest 得出；Deleted 是同步前后文件集合中被移除的路径数。
 
-// TestRepeatedSyncKeepsRevisionCoverage：util.py 的片段被 provider 返回零向量
-// 而永久拒绝，覆盖率不足 100%。同一 revision 连续两次 Sync 都返回相同的
-// 覆盖率、原因与模式。
+// TestRepeatedSyncKeepsRevisionCoverage：util.py 的片段嵌入请求失败，覆盖率
+// 不足 100%。同一 revision 连续两次 Sync 都返回相同的覆盖率、原因与模式。
 func TestRepeatedSyncKeepsRevisionCoverage(t *testing.T) {
 	s := newEmbedServer(t, 8)
-	s.zeroWhen = func(text string) bool { return strings.Contains(text, "util.py") }
-	e := newTestEngineWith(t, embedOptions(s.ts.URL, 8, 16, "result-model"))
+	s.setFailWhen(func(texts []string) bool { return len(texts) == 1 && strings.Contains(texts[0], "parse_config") })
+	e := newTestEngineWith(t, embedOptions(s.ts.URL, 8, 1, "result-model"))
 	root := newFixtureWorkspace(t)
 	first, err := e.Sync(context.Background(), syncRequest(root))
 	if err != nil {

@@ -382,6 +382,11 @@ type retrieval struct {
 	// OPENACE_QUALITY_STRICT 判定的输入，不进入 Result。
 	rerankSent    int
 	rerankApplied bool
+	// uncovered、rejectedFiles 与 rejectedTotal 来自 coverageListing：缺向量
+	// 的文件与含被 provider 拒绝 chunk 的文件，写进正文开头与结构化字段。
+	uncovered     []string
+	rejectedFiles []string
+	rejectedTotal int
 	// queryPlan 记录本次查询的规划：词法路改用结构 token 查询时为该查询
 	// 串（零命中回退时追加 " fallback=original"），另追加 path_prefix=… 与
 	// artifact_kind=… 标签；全部未触发时为空。
@@ -424,7 +429,7 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	if renderErr != nil {
 		return engine.Result{}, renderErr
 	}
-	text := rendered.text
+	text := coverageNote(out.uncovered, out.rejectedFiles, out.rejectedTotal) + rendered.text
 	if out.timings != nil {
 		out.timings.RenderMs = time.Since(renderStart).Milliseconds()
 		out.timings.TotalMs = time.Since(out.started).Milliseconds()
@@ -454,6 +459,8 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	result.DegradedReason = degradedReason
 	result.SemanticCoverage = out.coverage
 	result.RerankSent = out.rerankSent
+	result.UncoveredFiles = out.uncovered
+	result.ProviderRejectedFiles = out.rejectedFiles
 	if e.semanticEnabled() {
 		result.EmbeddingProfile = fmt.Sprintf("%s/%s/%d",
 			e.embedCfg.ProviderType, e.embedCfg.Model, e.embedCfg.Dimension)
@@ -700,6 +707,18 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		return retrieval{}, err
 	}
 	gaps = append(gaps, revisionGaps...)
+	// 部分覆盖或有被拒绝内容时列出相关文件，调用方据此自己查这些文件；
+	// 缺向量的文件多到列不下时按语义路不可用报错。覆盖完整时不遍历文件表。
+	var uncovered, rejectedFiles []string
+	rejectedTotal := 0
+	if e.semanticEnabled() && (handle.manifest.RejectedCount > 0 || !handle.manifest.SemanticComplete()) {
+		var listGap *qualityGap
+		uncovered, rejectedFiles, rejectedTotal, listGap = coverageListing(handle.manifest)
+		if listGap != nil {
+			e.releaseHandle(handle)
+			return retrieval{}, e.policyError(e.withBuildProgress([]qualityGap{*listGap}, workspaceKey))
+		}
+	}
 
 	lexStart := time.Now()
 	lexHits, planLabel, err := e.lexicalRoute(ctx, handle, query, pathPrefix)
@@ -787,9 +806,12 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		handle: handle, ordered: ordered, mode: mode,
 		reasons: gapReasonList(gaps), coverage: coverage, syncResult: syncResult,
 		rerankSent: rerankSent, rerankApplied: rerankApplied,
-		queryPlan: planLabel,
-		timings:   timings,
-		started:   started,
+		queryPlan:     planLabel,
+		timings:       timings,
+		started:       started,
+		uncovered:     uncovered,
+		rejectedFiles: rejectedFiles,
+		rejectedTotal: rejectedTotal,
 	}
 	return out, nil
 }
@@ -1374,7 +1396,13 @@ func coveragePercent(manifest *index.Manifest) string {
 	if manifest.Counts.Chunks == 0 {
 		return "100%"
 	}
-	return fmt.Sprintf("%d%%", manifest.VectorCount*100/manifest.Counts.Chunks)
+	// 分母扣除被 provider 永久拒绝的 chunk；全部被拒绝时没有可做语义检索的
+	// 内容，记 0%。
+	embeddable := manifest.EmbeddableChunks()
+	if embeddable <= 0 {
+		return "0%"
+	}
+	return fmt.Sprintf("%d%%", manifest.VectorCount*100/embeddable)
 }
 
 // degradedBanner 构造正文首行的降级横幅：

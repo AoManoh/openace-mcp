@@ -3,6 +3,7 @@ package localengine
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,6 +30,14 @@ const (
 // 先发布的词法中间版本，或嵌入全部失败后发布的零覆盖 revision）。
 const semanticIndexEmptyReason = "semantic-index-empty"
 
+// coverageInsufficientReason 表示缺向量的文件超过 uncoveredFilesLimit 个：
+// 清单不再适合放进响应，调用方无从知道哪些文件没有经过语义检索。
+const coverageInsufficientReason = "semantic-coverage-insufficient"
+
+// uncoveredFilesLimit 是检索结果里能列出的未覆盖文件数上限。它按响应的
+// 可读长度取值，不是质量阈值。
+const uncoveredFilesLimit = 50
+
 // gapSwitch 返回一条原因归哪一类：
 //   - semantic-unavailable：语义路跑不了，包括向量文件不可用
 //     （vector-data-unavailable）、查询嵌入失败（query-embedding-failed(类别)）
@@ -46,7 +55,7 @@ const semanticIndexEmptyReason = "semantic-index-empty"
 //     （semantic-migration-blocked）。
 func gapSwitch(reason string) string {
 	switch {
-	case reason == "vector-data-unavailable", reason == semanticIndexEmptyReason, strings.HasPrefix(reason, "query-embedding-failed"):
+	case reason == "vector-data-unavailable", reason == semanticIndexEmptyReason, reason == coverageInsufficientReason, strings.HasPrefix(reason, "query-embedding-failed"):
 		return gapSemanticUnavailable
 	case strings.HasPrefix(reason, "rerank-skipped"), reason == "rerank-partial-response":
 		return gapRerank
@@ -124,7 +133,7 @@ func (e *Engine) manifestGaps(m *index.Manifest) []qualityGap {
 	case !m.SemanticComplete():
 		gaps = append(gaps, qualityGap{
 			reason: "semantic-coverage-partial",
-			detail: fmt.Errorf("semantic_coverage=%s (%d of %d live chunks have vectors)", coveragePercent(m), m.VectorCount, m.Counts.Chunks),
+			detail: fmt.Errorf("semantic_coverage=%s (%d of %d embeddable chunks have vectors; %d chunks rejected by the provider are excluded)", coveragePercent(m), m.VectorCount, m.EmbeddableChunks(), m.RejectedCount),
 		})
 	}
 	if m.SemanticMigrationBlock != "" {
@@ -139,7 +148,7 @@ func (e *Engine) manifestGaps(m *index.Manifest) []qualityGap {
 // “已嵌入 0、待嵌入 0”会让人误以为没有内容等待嵌入。
 func (e *Engine) withBuildProgress(gaps []qualityGap, workspaceKey string) []qualityGap {
 	for i, gap := range gaps {
-		if gap.reason != semanticIndexEmptyReason {
+		if gap.reason != semanticIndexEmptyReason && gap.reason != coverageInsufficientReason {
 			continue
 		}
 		e.mu.Lock()
@@ -155,6 +164,57 @@ func (e *Engine) withBuildProgress(gaps []qualityGap, workspaceKey string) []qua
 		gaps[i].detail = fmt.Errorf("%v; %s", gap.detail, extra)
 	}
 	return gaps
+}
+
+// coverageListing 列出所服务 revision 中语义覆盖有缺口的文件：uncovered 是
+// 还有 chunk 没有向量、也没有被 provider 拒绝的文件；rejected 是含被拒绝
+// chunk 的文件，最多列 uncoveredFilesLimit 个，rejectedTotal 是总数。两份
+// 清单按路径排序。未覆盖文件超过 uncoveredFilesLimit 个时返回
+// semantic-coverage-insufficient 缺口，调用方按语义路不可用处理。只在
+// manifest 显示覆盖不完整或有被拒绝内容时调用，覆盖完整的常态没有开销。
+func coverageListing(m *index.Manifest) (uncovered, rejected []string, rejectedTotal int, gap *qualityGap) {
+	for path, entry := range m.Files {
+		if entry.RejectedChunks > 0 {
+			rejected = append(rejected, path)
+		}
+		if entry.CoveredChunks+entry.RejectedChunks < entry.ChunkCount {
+			uncovered = append(uncovered, path)
+		}
+	}
+	sort.Strings(uncovered)
+	sort.Strings(rejected)
+	rejectedTotal = len(rejected)
+	if len(rejected) > uncoveredFilesLimit {
+		rejected = rejected[:uncoveredFilesLimit]
+	}
+	if len(uncovered) > uncoveredFilesLimit {
+		gap = &qualityGap{
+			reason: coverageInsufficientReason,
+			detail: fmt.Errorf("%d files still have chunks without vectors (semantic_coverage=%s), more than the %d that can be listed; semantic search would miss them", len(uncovered), coveragePercent(m), uncoveredFilesLimit),
+		}
+		return nil, rejected, rejectedTotal, gap
+	}
+	return uncovered, rejected, rejectedTotal, nil
+}
+
+// coverageNote 在正文开头写出语义检索没有覆盖的文件，调用方据此自己查这些
+// 文件，不把没检索到当成不存在。
+func coverageNote(uncovered, rejected []string, rejectedTotal int) string {
+	var b strings.Builder
+	if len(uncovered) > 0 {
+		fmt.Fprintf(&b, "[COVERAGE] semantic search does not cover these %d files yet (chunks without vectors); only lexical matching can find them: %s\n", len(uncovered), strings.Join(uncovered, ", "))
+	}
+	if len(rejected) > 0 {
+		more := ""
+		if rejectedTotal > len(rejected) {
+			more = fmt.Sprintf(" (+%d more)", rejectedTotal-len(rejected))
+		}
+		fmt.Fprintf(&b, "[COVERAGE] the embedding provider rejected some chunks in these %d files; those chunks are found only by lexical matching: %s%s\n", rejectedTotal, strings.Join(rejected, ", "), more)
+	}
+	if b.Len() > 0 {
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 // circuitLabel 把熔断器快照写成一句说明：状态、下次允许请求的时刻、连续

@@ -161,8 +161,8 @@ func TestBM25MigrationReusesInterruptedTFIDFJournal(t *testing.T) {
 	}
 	t.Logf("legacy_paid_texts=%d legacy_journal_vectors=%d legacy_rejected=%d migration_texts=%d cross_profile_reused=%d",
 		len(paidBefore), len(journalVectors), len(journalRejected), len(migrationTexts), migrated.CrossProfileReused)
-	if !strings.Contains(migrated.DegradedReason, "semantic-coverage-partial") || strings.Contains(migrated.DegradedReason, "semantic-migration-blocked") {
-		t.Fatalf("README 沿用拒绝后覆盖不完整，但不属于迁移阻止: %+v", migrated)
+	if migrated.SemanticCoverage != "100%" || strings.Contains(migrated.DegradedReason, "semantic-coverage-partial") || strings.Contains(migrated.DegradedReason, "semantic-migration-blocked") {
+		t.Fatalf("README 沿用的拒绝不计入覆盖率分母，覆盖完整，也不属于迁移阻止: %+v", migrated)
 	}
 	manifest, store := loadActiveManifest(t, current, root)
 	assertManifestServesBM25(t, store, manifest, "session login configuration")
