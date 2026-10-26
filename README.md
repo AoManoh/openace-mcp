@@ -238,6 +238,8 @@ embedding 地址、模型、维度和内置嵌入模板都没变时,新子树只
 
 `auto` 复用 daemon 有两道门:build 一致,provider 配置指纹一致。build 过期的旧 daemon 不挡路——Unix 上新 wrapper 连接时自动接管替换,实测 0.1 秒。配置指纹不一致则明确报错,绝不静默复用。每个 daemon 响应都带 `served_by`,多 IDE/WSL 混用时一眼看出在跟谁说话。
 
+`auto` 模式下 daemon 被停掉后,任一会话的下一次调用都会把它重新拉起。需要暂时停用(例如停住计费的后台嵌入)时,用 `openace-mcp daemon stop [--reason 原因]`:先写停用标记,再停掉 daemon;标记存在期间各会话不再自动拉起,检索直接返回写明停用时间、原因与解除命令的错误。`openace-mcp daemon resume` 删除标记,下一次调用照常拉起。`daemon_status` 的 `launched_by` 显示 daemon 是由哪个 wrapper 进程(进程号、工作目录、时间)拉起的。
+
 ## 索引范围与安全边界
 
 默认尊重 `.gitignore` / `.ignore`,并跳过 `.env*`、credentials、私钥、证书、keystore 等敏感文件(hard denylist,不可绕过)。

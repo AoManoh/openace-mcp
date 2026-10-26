@@ -19,6 +19,9 @@ type Status struct {
 	// 报告的用量合计（全部工作区）。各工作区的分项在 workspace_status 的
 	// semantic.usage。
 	ProviderUsage *engine.ProviderUsage `json:"provider_usage,omitempty"`
+	// LaunchedBy 是拉起本 daemon 的 wrapper 进程（见 EnvLaunchedBy）；手动
+	// 启动时为空。
+	LaunchedBy *LaunchInfo `json:"launched_by,omitempty"`
 }
 
 func capabilities(engineID string) map[string]bool {
@@ -43,8 +46,9 @@ func (s *Server) engineID() string {
 
 func (s *Server) statusSnapshot(ctx context.Context) Status {
 	status := Status{
-		Status:   "ok",
-		ServedBy: s.servedBy(),
+		Status:     "ok",
+		ServedBy:   s.servedBy(),
+		LaunchedBy: s.launchedBy,
 	}
 	if inspector, ok := s.workspaceInspector(); ok {
 		workspaces, err := inspector.ListWorkspaceStatuses(ctx)

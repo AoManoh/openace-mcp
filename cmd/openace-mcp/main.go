@@ -22,6 +22,9 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "daemon":
+			if len(os.Args) > 2 {
+				os.Exit(runDaemonControl(os.Args[2:]))
+			}
 			runDaemon()
 			return
 		case "version", "-version", "--version", "-v":
@@ -162,6 +165,9 @@ func runDaemon() {
 	server := daemon.NewServer(service)
 
 	fmt.Fprintf(os.Stderr, "openace-daemon: listening on %s\n", addr)
+	if launcher := strings.TrimSpace(os.Getenv(daemon.EnvLaunchedBy)); launcher != "" {
+		fmt.Fprintf(os.Stderr, "openace-daemon: launched by %s\n", launcher)
+	}
 	if err := server.ListenAndServe(ctx, addr); err != nil && err != context.Canceled {
 		fmt.Fprintf(os.Stderr, "openace-daemon: %v\n", err)
 		os.Exit(1)

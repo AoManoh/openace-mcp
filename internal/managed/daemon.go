@@ -72,6 +72,10 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 	if err := reusable(ctx, managedClient, requestedEngine, expectedProfile); err == nil {
 		attachRecoverHook(managedClient, managedAddr, requestedEngine, expectedProfile)
 		return managedClient, nil
+	} else if heldErr := refuseIfHeld(managedAddr, err); heldErr != nil {
+		// 停用标记存在：不接管、不拉起（见 hold.go）。放在接管之前，否则会先
+		// 停掉一个正在运行的旧 daemon 再拒绝拉起新的。
+		return nil, heldErr
 	} else if healthy(ctx, managedClient) {
 		// T5(外部灰度 08-14 形态):wrapper 升级后旧 daemon 占位,此前
 		// 只能报错等人工清场。build 级不匹配且 wrapper 不旧于 daemon
@@ -81,7 +85,7 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 			return nil, err
 		}
 	}
-	logPath, err := startDaemon(managedAddr)
+	logPath, err := startDaemonProcess(managedAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -116,8 +120,10 @@ func attachRecoverHook(client *daemon.Client, managedAddr string, requestedEngin
 		defer releaseLock()
 		if err := reusable(ctx, client, requestedEngine, expectedProfile); err == nil {
 			return nil
+		} else if heldErr := refuseIfHeld(managedAddr, err); heldErr != nil {
+			return heldErr
 		}
-		logPath, err := startDaemon(managedAddr)
+		logPath, err := startDaemonProcess(managedAddr)
 		if err != nil {
 			return err
 		}
@@ -345,13 +351,17 @@ func waitReady(ctx context.Context, client *daemon.Client, timeout time.Duration
 	}
 }
 
+// startDaemonProcess 可注入：单测不拉起真实进程（测试二进制带 daemon 参数
+// 会重新执行全部测试）。
+var startDaemonProcess = startDaemon
+
 func startDaemon(addr string) (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return "", fmt.Errorf("resolve current executable: %w", err)
 	}
 	cmd := exec.Command(exe, "daemon")
-	cmd.Env = upsertEnv(os.Environ(), "OPENACE_DAEMON_LISTEN_ADDR", listenAddr(addr))
+	cmd.Env = daemonEnv(addr)
 	cmd.Stdin = nil
 	cmd.Stdout = io.Discard
 	// M6(诊断报告 2026-08-03,已批准):脱离 wrapper 进程组——daemon 是
@@ -371,6 +381,14 @@ func startDaemon(addr string) (string, error) {
 	// bind 失败)时不留僵尸;wrapper 先退则由 init 接管,两态皆无残留。
 	go func() { _ = cmd.Wait() }()
 	return logPath, nil
+}
+
+// daemonEnv 是被拉起 daemon 的环境：wrapper 自身环境加监听地址与拉起者信息
+// （daemon.EnvLaunchedBy，进 daemon_status 的 launched_by 与启动日志）。
+func daemonEnv(addr string) []string {
+	cwd, _ := os.Getwd()
+	env := upsertEnv(os.Environ(), "OPENACE_DAEMON_LISTEN_ADDR", listenAddr(addr))
+	return upsertEnv(env, daemon.EnvLaunchedBy, daemon.EncodeLaunchInfo(daemon.LaunchInfo{PID: os.Getpid(), Cwd: cwd, At: time.Now().UTC()}))
 }
 
 func daemonLogFile() (*os.File, string) {

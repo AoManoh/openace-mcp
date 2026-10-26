@@ -45,6 +45,7 @@ type Server struct {
 	authErr      error
 	reconcileErr error
 	startedAt    time.Time
+	launchedBy   *LaunchInfo
 	statusMu     sync.Mutex
 	listenAddr   string
 	// logf 是诊断日志出口(灰度反馈 2026-08-07:检索阻塞时 daemon 日志
@@ -91,11 +92,12 @@ func NewServer(service engine.Service) *Server {
 	// ListenAndServe 前置校验拒绝启动)。
 	token, tokenErr := resolveAuthToken()
 	server := &Server{
-		service:   service,
-		authToken: token,
-		authErr:   tokenErr,
-		startedAt: time.Now().UTC(),
-		logf:      log.New(os.Stderr, "openace-daemon: ", log.LstdFlags|log.LUTC|log.Lmsgprefix).Printf,
+		service:    service,
+		authToken:  token,
+		authErr:    tokenErr,
+		startedAt:  time.Now().UTC(),
+		launchedBy: launchInfoFromEnv(),
+		logf:       log.New(os.Stderr, "openace-daemon: ", log.LstdFlags|log.LUTC|log.Lmsgprefix).Printf,
 	}
 	server.tasks = NewTaskStore(server.runTask, 0)
 	server.reconciler, server.reconcileErr = newWorkspaceReconciler(service)
