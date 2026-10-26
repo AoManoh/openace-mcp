@@ -94,7 +94,8 @@ type Result struct {
 	// EmbeddingProfile 是语义路身份短指纹（provider/model/dimension）。
 	EmbeddingProfile string `json:"embedding_profile,omitempty"`
 	// BuildMode 是本次 sync 的构建形态与成因(灰度反馈四 §6.1:重建
-	// 原因不可见时调用方只能从进度条反猜):"delta" 或
+	// 原因不可见时调用方只能从进度条反猜):"delta"、"delta:merge-small-segments"
+	// (段数达到阈值时只把小段与本次变更合并成一个新段,大段不重写)或
 	// "full:<first-build|lexical-selfheal|vector-repair|schema-upgrade|
 	// compaction-segments|compaction-garbage|semantic-fill>";no-op 不
 	// 发布时为空。加性 omitempty。

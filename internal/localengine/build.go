@@ -38,14 +38,112 @@ type chunkRecord struct {
 }
 
 // compaction（把全部 segment 合并为一个、物理丢弃死 chunk 的全量构建）的
-// 触发阈值：segment 数或死 chunk 占比任一达到阈值，下一次有内容变更的
-// 构建走全量路径。已有向量按键复用，合并本身不调用 provider；构建中
-// 新增或仍缺向量的内容继续按正常嵌入流程处理。
-// 阈值是固定常数，不提供环境变量。
+// 触发阈值：死 chunk 占比达到 compactGarbageRatio，下一次有内容变更的构建
+// 走全量路径；segment 数达到 compactSegmentThreshold 时先只合并小段（见
+// smallSegmentsToMerge），没有可行方案才走全量路径。已有向量按键复用，
+// 合并本身不调用 provider；构建中新增或仍缺向量的内容继续按正常嵌入流程
+// 处理。阈值是固定常数，不提供环境变量。
 const (
 	compactSegmentThreshold = 8
 	compactGarbageRatio     = 0.5
+	// smallSegmentDivisor 划分小段：chunk 数小于最大段 1/smallSegmentDivisor
+	// 的段算小段。段数达到 compactSegmentThreshold 时先只把小段与本次变更
+	// 合并成一个新段，大段原样保留（见 smallSegmentsToMerge）。
+	smallSegmentDivisor = 8
 )
+
+// errSmallMergeUnavailable 表示小段合并要搬运的 chunk 记录或向量与 manifest
+// 对不上（段文件读不出、记录数不符、已覆盖的向量读不回）。runBuild 收到后
+// 改走全量合并：全量路径按既有规则重新切分与修复，小段合并不猜测缺失的数据，
+// 也不为搬运的记录送审。
+var errSmallMergeUnavailable = errors.New("小段合并的输入与 manifest 不一致")
+
+// smallSegmentsToMerge 在段数达到 compactSegmentThreshold 时给出只合并小段的
+// 方案：chunk 数小于最大段 1/smallSegmentDivisor 的段算小段并入新段，其余段
+// 保留。返回 nil 表示没有可行方案（没有小段，或保留的段加新段仍达到阈值），
+// 调用方走全量合并。
+//
+// 不再满 8 段就全量合并的原因：全量合并重写全部段，而触发它的常常是 7 个
+// 只有几十个 chunk 的小段。2026-10-26 实测一个约 22.9 万 chunk 的工作区里，
+// 一个状态文件约每 2 分钟重写一次、每次只变 1 个 chunk，却每 8 次重写一遍
+// 1.6 GB 的基础段，daemon 6.6 天写盘 413 GB。按段大小分层、小段先
+// 合并是 Lucene TieredMergePolicy 与 RocksDB 分层合并的做法，写盘量与小段
+// 的总量成正比。大段里的死 chunk 仍由 compactGarbageRatio 触发全量合并回收。
+// 小工作区（最大段不到 smallSegmentDivisor 个 chunk 的若干倍）没有小段，
+// 照旧全量合并，代价本来就小。
+func smallSegmentsToMerge(manifest *index.Manifest) map[string]bool {
+	largest := 0
+	for _, segment := range manifest.Segments {
+		if segment.Counts.Chunks > largest {
+			largest = segment.Counts.Chunks
+		}
+	}
+	limit := largest / smallSegmentDivisor
+	small := make(map[string]bool)
+	kept := 0
+	for _, segment := range manifest.Segments {
+		if segment.Counts.Chunks < limit {
+			small[segment.ID] = true
+		} else {
+			kept++
+		}
+	}
+	if len(small) == 0 || kept+1 >= compactSegmentThreshold {
+		return nil
+	}
+	return small
+}
+
+// smallSegmentCarry 是小段合并要搬进新段的存活记录：当前版本位于被合并
+// 小段、本次又没有变更或删除的文件。
+type smallSegmentCarry struct {
+	records []chunkRecord
+	byFile  map[string][]chunkRecord
+}
+
+// loadSmallSegmentCarry 读取被合并小段里仍然存活的文件记录。FileEntry.SegmentID
+// 指向每个存活文件当前版本所在的段，只从这个段取记录，同一文件留在更早小段
+// 里的旧版本不搬运；本次变更的文件由 delta 记录取代，删除的文件进 tombstone，
+// 都不搬运。读出的记录数与 FileEntry.ChunkCount 不符时返回
+// errSmallMergeUnavailable。
+func loadSmallSegmentCarry(store *index.Store, previous *index.Manifest, mergeSmall map[string]bool, changed []workspace.ContextAsset, removed []string) (smallSegmentCarry, error) {
+	carry := smallSegmentCarry{byFile: make(map[string][]chunkRecord)}
+	skip := make(map[string]bool, len(changed)+len(removed))
+	for _, asset := range changed {
+		skip[asset.RelPath] = true
+	}
+	for _, path := range removed {
+		skip[path] = true
+	}
+	want := make(map[string]int)
+	for path, entry := range previous.Files {
+		if mergeSmall[entry.SegmentID] && !skip[path] {
+			want[path] = entry.ChunkCount
+		}
+	}
+	for _, segment := range previous.Segments {
+		if !mergeSmall[segment.ID] {
+			continue
+		}
+		records, err := readSegmentChunkRecords(store.SegmentPathFor(segment.ID))
+		if err != nil {
+			return smallSegmentCarry{}, fmt.Errorf("%w: 读取段 %s: %v", errSmallMergeUnavailable, segment.ID, err)
+		}
+		for _, record := range records {
+			if _, ok := want[record.RelPath]; !ok || previous.Files[record.RelPath].SegmentID != segment.ID {
+				continue
+			}
+			carry.byFile[record.RelPath] = append(carry.byFile[record.RelPath], record)
+			carry.records = append(carry.records, record)
+		}
+	}
+	for path, count := range want {
+		if len(carry.byFile[path]) != count {
+			return smallSegmentCarry{}, fmt.Errorf("%w: %s 读出 %d 条记录，manifest 记 %d 条", errSmallMergeUnavailable, path, len(carry.byFile[path]), count)
+		}
+	}
+	return carry, nil
+}
 
 // garbageRatio 计算 revision 中死 chunk 占全部 segment chunk 的比例。死 chunk
 // 指被同一文件的新版本覆盖的旧 chunk，以及所属文件已进 tombstone（记录
@@ -187,13 +285,22 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 		_, removed, _ := diffDeltaAssets(previous, assets)
 		garbage = projectedGarbageRatio(previous, removed)
 	}
+	// 段数达到阈值时先尝试只合并小段（smallSegmentsToMerge）；没有可行方案，
+	// 或合并输入与 manifest 对不上（errSmallMergeUnavailable），走全量合并。
+	var mergeSmall map[string]bool
+	if previous != nil && len(previous.Segments) >= compactSegmentThreshold {
+		mergeSmall = smallSegmentsToMerge(previous)
+	}
 	useDelta := previous != nil && contentChanged &&
 		previous.SchemaVersion == index.ManifestSchemaV2 &&
 		!needsLexicalRebuild && !repairRequested &&
-		len(previous.Segments) < compactSegmentThreshold &&
+		(len(previous.Segments) < compactSegmentThreshold || mergeSmall != nil) &&
 		garbage < compactGarbageRatio
 	if useDelta {
-		return e.buildDelta(ctx, store, status, root, workspaceKey, previous, assets)
+		deltaResult, deltaManifest, deltaErr := e.buildDelta(ctx, store, status, root, workspaceKey, previous, assets, mergeSmall)
+		if !errors.Is(deltaErr, errSmallMergeUnavailable) {
+			return deltaResult, deltaManifest, deltaErr
+		}
 	}
 	return e.buildFull(ctx, store, status, root, workspaceKey, previous, assets, contentChanged, needsLexicalRebuild,
 		fullBuildReason(previous, contentChanged, needsLexicalRebuild, repairRequested, garbage))
@@ -667,7 +774,12 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 //     检索。
 //   - manifest 沿用 previous 的 segment 列表，有记录时追加本次 delta 段；
 //     只有删除时 staging 为空，做 manifest-only 发布。
-func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, assets workspace.AssetSet) (engine.Result, *index.Manifest, error) {
+//   - mergeSmall 非空时（段数达到阈值，见 smallSegmentsToMerge），这些小段
+//     里仍存活的文件记录连同本次变更写进同一个新段，段列表去掉这些小段，
+//     其余段原样保留、不重写。搬运的记录只复用既有向量、不送审；记录或
+//     向量读不全时返回 errSmallMergeUnavailable，此时还没有发出任何送审
+//     请求，runBuild 改走全量合并。
+func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, assets workspace.AssetSet, mergeSmall map[string]bool) (engine.Result, *index.Manifest, error) {
 	status.setStage(engine.IndexStageChunking)
 	changed, removed, currentPaths := diffDeltaAssets(previous, assets)
 	delta, err := e.chunkChangedAssets(ctx, changed)
@@ -693,17 +805,56 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 		}
 	}
 
+	// 小段合并先读出要搬运的存活记录；读不全就交给全量合并，此时还没有
+	// 发出任何送审请求。
+	var carry smallSegmentCarry
+	if len(mergeSmall) > 0 {
+		carry, err = loadSmallSegmentCarry(store, previous, mergeSmall, changed, removed)
+		if err != nil {
+			return engine.Result{}, nil, err
+		}
+	}
+
 	// 语义路只嵌入 delta 记录，复用按 embedKey。既有向量按行选读：delta
-	// 实际复用的行数约等于变更 chunk 数，不为此整读全部 prior 段（needed
-	// 是变更记录的 embedKey 集）。
+	// 实际复用的行数约等于变更 chunk 数加搬运的 chunk 数，不为此整读全部
+	// prior 段（needed 是这两类记录的 embedKey 集）。
 	var prior priorVectors
 	defer func() { prior.release() }()
 	if e.semanticEnabled() {
-		needed := make(map[string]bool, len(records))
+		needed := make(map[string]bool, len(records)+len(carry.records))
 		for _, record := range records {
 			needed[embedKey(record)] = true
 		}
+		for _, record := range carry.records {
+			needed[embedKey(record)] = true
+		}
 		prior = e.loadPriorVectors(store, previous, needed)
+	}
+	// 搬运的记录只复用既有向量：每个文件读回的向量数不得少于它在 previous
+	// 里的 CoveredChunks，少了就改走全量合并，不为搬运送审，也不让合并后的
+	// 覆盖率比合并前低。
+	var carriedEntries []vector.Entry
+	var carriedVectors [][]float32
+	carriedCovered := make(map[string]int, len(carry.byFile))
+	if e.semanticEnabled() && len(carry.records) > 0 {
+		for _, record := range carry.records {
+			key := embedKey(record)
+			vec, ok := prior.activeByHash[key]
+			if !ok {
+				vec, ok = prior.olderByHash[key]
+			}
+			if !ok {
+				continue
+			}
+			carriedEntries = append(carriedEntries, vector.Entry{ID: record.ID, ContentHash: key})
+			carriedVectors = append(carriedVectors, vec)
+			carriedCovered[record.RelPath]++
+		}
+		for path := range carry.byFile {
+			if carriedCovered[path] < previous.Files[path].CoveredChunks {
+				return engine.Result{}, nil, fmt.Errorf("%w: %s 读回 %d 个向量，manifest 记 %d 个", errSmallMergeUnavailable, path, carriedCovered[path], previous.Files[path].CoveredChunks)
+			}
+		}
 	}
 	seman, err := e.embedRecords(ctx, store, workspaceKey, prior, records, status)
 	if err != nil {
@@ -712,6 +863,18 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 	coveredHash := make(map[string]bool, len(seman.entries))
 	for _, entry := range seman.entries {
 		coveredHash[entry.ContentHash] = true
+	}
+	if len(carriedEntries) > 0 {
+		seman.entries = append(seman.entries, carriedEntries...)
+		seman.vectors = append(seman.vectors, carriedVectors...)
+		seman.covered += len(carriedEntries)
+		seman.coveredByActive += len(carriedEntries)
+	}
+	segmentRecords := records
+	if len(carry.records) > 0 {
+		segmentRecords = make([]chunkRecord, 0, len(records)+len(carry.records))
+		segmentRecords = append(segmentRecords, records...)
+		segmentRecords = append(segmentRecords, carry.records...)
 	}
 
 	// 组装 manifest v2 的 Files、Tombstones 与 Segments。
@@ -730,9 +893,9 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 
 	var artifacts segmentArtifacts
 	var discard func()
-	hasSegment := len(records) > 0
+	hasSegment := len(segmentRecords) > 0
 	if hasSegment {
-		artifacts, discard, err = e.buildSegmentStaging(ctx, store, records, seman)
+		artifacts, discard, err = e.buildSegmentStaging(ctx, store, segmentRecords, seman)
 		if err != nil {
 			return engine.Result{}, nil, err
 		}
@@ -759,6 +922,15 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 		}
 		files[asset.RelPath] = entry
 	}
+	// 搬运的文件内容没变，只是换到新段；CoveredChunks 取实际搬过去的向量数。
+	for path := range carry.byFile {
+		entry := files[path]
+		entry.SegmentID = artifacts.buildID
+		if seman.enabled {
+			entry.CoveredChunks = carriedCovered[path]
+		}
+		files[path] = entry
+	}
 
 	tombstones := deltaTombstones(previous, currentPaths, removed, delta.skippedPaths)
 	counts, vectorCount := sumLiveCounts(files)
@@ -770,14 +942,22 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 	manifest.Files = files
 	manifest.Tombstones = tombstones
 	manifest.Counts = counts
-	manifest.Segments = append([]index.SegmentRef{}, previous.Segments...)
+	// 被合并的小段从列表中去掉，其余段保持原顺序；新段排在最后。查询按段序
+	// “后者覆盖前者”判定同一文件的存活版本，新段只含当前版本原本位于小段
+	// 或本次变更的文件，放在最后不会盖掉保留段里的存活版本。
+	manifest.Segments = make([]index.SegmentRef, 0, len(previous.Segments)+1)
+	for _, segment := range previous.Segments {
+		if !mergeSmall[segment.ID] {
+			manifest.Segments = append(manifest.Segments, segment)
+		}
+	}
 	if hasSegment {
 		manifest.Segments = append(manifest.Segments, index.SegmentRef{
 			ID:                   artifacts.buildID,
 			ChunksChecksum:       artifacts.chunksChecksum,
 			VectorsChecksum:      artifacts.vectorsChecksum,
 			VectorsIndexChecksum: artifacts.vectorsIndexChecksum,
-			Counts:               index.Counts{Files: len(delta.byFile), Chunks: len(records)},
+			Counts:               index.Counts{Files: len(delta.byFile) + len(carry.byFile), Chunks: len(segmentRecords)},
 			VectorCount:          len(seman.entries),
 		})
 	}
@@ -796,7 +976,11 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 	if hasSegment {
 		staging = artifacts.staging
 	}
-	return e.finishPublish(store, status, workspaceKey, manifest, staging, discard, seman, delta.skippedFiles, len(records), "delta", previous)
+	buildMode := "delta"
+	if len(mergeSmall) > 0 {
+		buildMode = "delta:merge-small-segments"
+	}
+	return e.finishPublish(store, status, workspaceKey, manifest, staging, discard, seman, delta.skippedFiles, len(segmentRecords), buildMode, previous)
 }
 
 // diffDeltaAssets 对比 previous manifest 与当前资产集，返回变更文件（新增
