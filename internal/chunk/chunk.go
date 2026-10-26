@@ -91,9 +91,12 @@ type Profile struct {
 // ContentHash 复用零重嵌(K61)。
 // Version 9（2026-10-26）：行窗口 fallback 的边界改由行内容决定（fallback.go
 // splitLines）。v8 的窗口起点只由行号决定，大文件中间插入一行会让其后全部
-// chunk 内容改变、整段重新送审；v9 插入或删除只改变附近的 chunk。不超过一个
-// 窗口与 MaxChunkBytes 的文件、含超长行的文件与全部 AST 语言的产出不变，
-// 向量按 ContentHash 复用（K61）；多 chunk 的行窗口文件升版本时重嵌一次。
+// chunk 内容改变、整段重新送审；v9 插入或删除只改变附近的 chunk。Markdown 与
+// reStructuredText 里超过 maxLineBytes 的行只在该行内部按字节窗口细分，其余
+// 行照常按内容边界切分；其他语言含这种行的文件仍整文件按字节窗口切分。不超过
+// 一个窗口与 MaxChunkBytes 的文件、非文档语言含超长行的文件与全部 AST 语言的
+// 产出不变，向量按 ContentHash 复用（K61）；多 chunk 的行窗口文件升版本时
+// 重嵌一次。
 func DefaultProfile() Profile {
 	return Profile{
 		ID:             "default",

@@ -5,9 +5,22 @@ import (
 	"unicode/utf8"
 )
 
-// maxLineBytes 是单行长度阈值；超过即视为 minified/生成物，
-// 按字节窗口降级切分，避免行窗口失效（暗坑 K7）。
+// maxLineBytes 是单行长度阈值；代码与数据文件里超过它的行视为 minified/
+// 生成物，整文件按字节窗口降级切分，避免行窗口失效（暗坑 K7）。Markdown 与
+// reStructuredText 例外，见 proseLanguages。
 const maxLineBytes = 4096
+
+// proseLanguages 是段落常写成一整行的文档语言。中文段落不换行很常见，一段
+// 超过 maxLineBytes 并不说明文件是生成物：2026-10-26 实测一份 205 KB 的项目
+// 状态文档有 3 行超过 4,096 字节，只占全文 14%。这类文件只把超长行本身按
+// 字节窗口切开，其余行照常按内容边界切分。其他语言里的超长行在同一次统计中
+// 都是生成物（运行记录 jsonl、minified js/css、证据 json、日志），这类文件
+// 基本整体重写或只在末尾追加，整文件字节窗口在这两种写法下改动也只影响末尾
+// 或本来就全部改变，维持 v8 的切法，已有向量继续复用。
+var proseLanguages = map[string]bool{
+	"markdown":         true,
+	"restructuredtext": true,
+}
 
 // paragraphCutDivisor 控制段落边界成为切点的比例：空行之后下一段首行的
 // hash 能被它整除时在该空行后切开，约每 paragraphCutDivisor 个段落一个切点。
@@ -36,15 +49,27 @@ type lineSpan struct {
 //
 // 整个文件不超过一个窗口且不超过 MaxChunkBytes 时，产出与 v8 完全相同的
 // 单个 chunk：内容与行号不变，升版本后这类文件的向量按内容键直接复用。
-// 含超长行（minified/生成物）的文件仍按字节窗口切分，与 v8 相同。
+//
+// 含超过 maxLineBytes 的行时分两种情况。代码与数据文件视为 minified/生成物，
+// 整文件按字节窗口切分，与 v8 相同。Markdown 与 reStructuredText 照常按内容
+// 边界切分：超过 MaxChunkBytes 的行会单独成为一个核心段（核心段字节上限在它
+// 前后强制切开），再由 splitOversized 在该行内部按字节窗口细分，窗口不跨行；
+// 前后的核心段不向它借重叠行。v9 首版对这两种情况都整文件按字节窗口切分，
+// 文档任何位置的增删都会让其后全部窗口错位，2026-10-26 实测在上述项目状态
+// 文档开头插入一段，101 个 chunk 全部要重新嵌入。
 func (p Profile) splitLines(file File, language string) []Chunk {
 	content := normalizeNewlines(file.Content)
 	if strings.TrimSpace(content) == "" {
 		return nil
 	}
-	if hasOversizedLine(content) {
+	if !proseLanguages[language] && hasOversizedLine(content) {
 		return p.splitBytes(file.RelPath, language, content)
 	}
+	return p.splitStable(file.RelPath, language, content)
+}
+
+// splitStable 是 splitLines 按内容边界切分的部分；content 已统一换行且非空白。
+func (p Profile) splitStable(relPath string, language string, content string) []Chunk {
 	window := p.WindowLines
 	if isDocLanguage(language) {
 		window = p.DocWindowLines
@@ -58,7 +83,7 @@ func (p Profile) splitLines(file File, language string) []Chunk {
 	}
 	lines := strings.Split(content, "\n")
 	if len(lines) <= window && len(content) <= p.MaxChunkBytes {
-		return []Chunk{p.build(file.RelPath, language, CapabilityFallback, 1, len(lines), content, "")}
+		return []Chunk{p.build(relPath, language, CapabilityFallback, 1, len(lines), content, "")}
 	}
 	// 多 chunk 文件末尾的换行不算一行：Split 在末尾换行后多出一个空串，
 	// 计入的话最后一个 chunk 的 EndLine 会指向不存在的行。多 chunk 文件升版本
@@ -77,7 +102,7 @@ func (p Profile) splitLines(file File, language string) []Chunk {
 		if strings.TrimSpace(text) == "" {
 			continue
 		}
-		chunks = append(chunks, p.splitOversized(file.RelPath, language, CapabilityFallback, start+1, core.end, text, "")...)
+		chunks = append(chunks, p.splitOversized(relPath, language, CapabilityFallback, start+1, core.end, text, "")...)
 	}
 	return chunks
 }
