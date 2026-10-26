@@ -15,6 +15,10 @@ type Status struct {
 	runtimeinfo.ServedBy
 	ActiveWorkspaceCount int    `json:"active_workspace_count"`
 	WorkspaceStatusError string `json:"workspace_status_error,omitempty"`
+	// ProviderUsage 是本 daemon 启动以来向模型服务商成功送审、服务商在响应里
+	// 报告的用量合计（全部工作区）。各工作区的分项在 workspace_status 的
+	// semantic.usage。
+	ProviderUsage *engine.ProviderUsage `json:"provider_usage,omitempty"`
 }
 
 func capabilities(engineID string) map[string]bool {
@@ -49,6 +53,10 @@ func (s *Server) statusSnapshot(ctx context.Context) Status {
 		} else {
 			status.WorkspaceStatusError = err.Error()
 		}
+	}
+	if reporter, ok := s.service.(engine.UsageReporter); ok {
+		usage := reporter.ProviderUsage()
+		status.ProviderUsage = &usage
 	}
 	return status
 }

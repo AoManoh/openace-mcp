@@ -152,6 +152,8 @@ var (
 	_ engine.RepoMapper         = (*deferredEngine)(nil)
 	_ engine.Identifier         = (*deferredEngine)(nil)
 	_ engine.ProfileIdentifier  = (*deferredEngine)(nil)
+	_ engine.UsageReporter      = (*deferredEngine)(nil)
+	_ engine.UsageReporter      = (*Engine)(nil)
 )
 
 // probeUntilResolved 反复探测直到成功或服务关闭。关闭时取消 ctx，在途的探测
@@ -388,4 +390,13 @@ func (d *deferredEngine) EngineID() string {
 // EngineProfileFingerprint 实现 engine.ProfileIdentifier。
 func (d *deferredEngine) EngineProfileFingerprint() string {
 	return d.fingerprint
+}
+
+// ProviderUsage 实现 engine.UsageReporter。维度尚未探测成功时还没有发出过
+// 嵌入或精排请求（探测请求由临时客户端发出、不计入），返回零用量。
+func (d *deferredEngine) ProviderUsage() engine.ProviderUsage {
+	if e := d.ready.Load(); e != nil {
+		return e.ProviderUsage()
+	}
+	return engine.ProviderUsage{}
 }

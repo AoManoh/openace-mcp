@@ -273,6 +273,12 @@ type SemanticStatus struct {
 	SharedReused       int    `json:"shared_reused,omitempty"`
 	SharedVectorsBytes int64  `json:"shared_vectors_bytes,omitempty"`
 	SharedVectorsError string `json:"shared_vectors_error,omitempty"`
+	// Usage 是本进程启动以来该工作区成功送审、服务商在响应里报告的用量：
+	// 构建期文档嵌入，以及检索期查询嵌入与精排。进程重启后归零，计费以
+	// 服务商账单为准。LastEmbedTokens 是最近一次发出文档嵌入请求的构建
+	// 报告的 tokens。
+	Usage           *UsageCounts `json:"usage,omitempty"`
+	LastEmbedTokens int64        `json:"last_embed_tokens,omitempty"`
 
 	// Rerank* 描述精排 provider（未配置时 RerankDisabledReason 解释原因）。
 	RerankProvider       string `json:"rerank_provider,omitempty"`
@@ -365,4 +371,31 @@ type WorkspaceStatus struct {
 	// C.1:文件选择遵循 ignore 链但排除面完全黑盒,使用方为定位
 	// docs/ 缺失做了一整轮对照实验)。根文件归 "."。加性 omitempty。
 	TopLevelFileCounts map[string]int `json:"top_level_file_counts,omitempty"`
+}
+
+// UsageCounts 是成功送审后服务商在响应里报告的用量：文档嵌入、查询嵌入与
+// 精排的 tokens 与请求数分列，服务商按这个数计费。成功响应里没有用量字段
+// （部分自部署服务）时只计入 UnreportedRequests，不估算。
+type UsageCounts struct {
+	DocumentTokens     int64 `json:"document_tokens,omitempty"`
+	DocumentRequests   int64 `json:"document_requests,omitempty"`
+	QueryTokens        int64 `json:"query_tokens,omitempty"`
+	QueryRequests      int64 `json:"query_requests,omitempty"`
+	RerankTokens       int64 `json:"rerank_tokens,omitempty"`
+	RerankRequests     int64 `json:"rerank_requests,omitempty"`
+	UnreportedRequests int64 `json:"unreported_requests,omitempty"`
+}
+
+// IsZero 报告是否没有任何送审记录。
+func (u UsageCounts) IsZero() bool {
+	return u == UsageCounts{}
+}
+
+// ProviderUsage 是本进程启动以来向模型服务商成功送审的用量累计（全部工作区
+// 合计），进入 daemon_status 的 provider_usage。
+type ProviderUsage struct {
+	Since          time.Time `json:"since"`
+	EmbeddingModel string    `json:"embedding_model,omitempty"`
+	RerankModel    string    `json:"rerank_model,omitempty"`
+	UsageCounts
 }

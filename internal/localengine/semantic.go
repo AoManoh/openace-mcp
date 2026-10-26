@@ -278,6 +278,11 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	if !out.enabled || len(records) == 0 {
 		return out, nil
 	}
+	// 本次构建的送审用量单独计量后记入该工作区状态：共享客户端被几个工作区
+	// 同时使用时，按 ctx 携带的计量器归属，不会混记。
+	meter := &reliability.UsageMeter{}
+	ctx = reliability.WithUsageMeter(ctx, meter)
+	defer func() { status.addUsage(meter.Snapshot(), true) }()
 	journal, err := e.journalFor(workspaceKey, store)
 	if err != nil {
 		return out, fmt.Errorf("打开 embedding journal: %w", err)

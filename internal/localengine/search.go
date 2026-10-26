@@ -696,6 +696,10 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	if err != nil {
 		return retrieval{}, err
 	}
+	// 本次检索的查询嵌入与精排用量记入该工作区状态（状态里的 usage）。
+	queryMeter := &reliability.UsageMeter{}
+	ctx = reliability.WithUsageMeter(ctx, queryMeter)
+	defer func() { e.noteQueryUsage(workspaceKey, queryMeter.Snapshot()) }()
 	// 所服务 revision 的 manifest 已能说明的缺口（没有向量、语义覆盖不足、
 	// 迁移暂停原因，见 manifestGaps）在词法召回与查询嵌入之前按政策判定：
 	// 没有向量或 strict 时拒绝，不发出任何模型请求，没有向量时错误带构建

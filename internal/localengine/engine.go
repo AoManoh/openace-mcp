@@ -109,6 +109,9 @@ type Engine struct {
 	// 在程序内开启，生产没有对应环境变量，默认 false。
 	fragmentGate bool
 
+	// createdAt 是引擎创建时刻，ProviderUsage 的累计从这里开始。
+	createdAt time.Time
+
 	mu       sync.Mutex
 	inflight map[string]*buildCall
 	statuses map[string]*wsStatus
@@ -170,6 +173,7 @@ var (
 //   - 配置了 rerank：创建客户端。
 func New(opts Options) (*Engine, error) {
 	e := &Engine{
+		createdAt:       time.Now().UTC(),
 		profile:         chunk.DefaultProfile(),
 		rerankDegrade:   normalizeDegrade(opts.RerankDegrade),
 		lexWeights:      lexical.DefaultWeights(),

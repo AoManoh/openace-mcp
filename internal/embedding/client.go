@@ -40,6 +40,9 @@ type Client struct {
 	governor     *reliability.Governor
 	limiter      *reliability.RateLimiter
 	retry        reliability.RetryPolicy
+	// usage 累计本客户端全部成功响应里服务商报告的用量（进程内各工作区
+	// 共享）；按工作区的用量经 ctx 携带的计量器另记（reliability.WithUsageMeter）。
+	usage reliability.UsageMeter
 }
 
 // NewClient 创建客户端；未启用的配置直接报错（调用方应先判 Enabled）。
@@ -81,6 +84,11 @@ func (c *Client) GovernorSnapshot() reliability.GovernorSnapshot {
 // QueryCircuitSnapshot 返回查询嵌入独立的熔断状态。
 func (c *Client) QueryCircuitSnapshot() reliability.CircuitSnapshot {
 	return c.circuitQuery.Snapshot()
+}
+
+// UsageSnapshot 返回客户端创建以来成功响应里服务商报告的用量累计。
+func (c *Client) UsageSnapshot() reliability.UsageCounts {
+	return c.usage.Snapshot()
 }
 
 // laneCircuit 按输入类型选择各自的熔断器，防止索引失败暂停查询请求。
@@ -363,6 +371,11 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 			Embedding []float32 `json:"embedding"`
 			Index     int       `json:"index"`
 		} `json:"data"`
+		// Usage 是服务商报告的本次计费用量（Voyage 与 OpenAI 兼容形状都在
+		// usage.total_tokens）；缺省时为 nil。
+		Usage *struct {
+			TotalTokens int64 `json:"total_tokens"`
+		} `json:"usage"`
 	}
 	// 成功路径读尽剩余字节让连接归还池(L7,诊断 2026-08-03):json.Decoder
 	// 停在 JSON 值末尾,不读尽 body 时 HTTP/1.1 连接无法复用,每批重建
@@ -387,6 +400,18 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 		}
 		return nil, &reliability.CallError{Class: reliability.ClassPermanent, Message: reliability.SanitizeMessage("malformed embeddings response: " + err.Error())}
 	}
+	// 用量在结构校验之前记账：服务商返回 200 即已计费，之后因数量或维度不符
+	// 整批拒绝的响应同样花了钱，不记会让状态里的用量低于账单。
+	kind := reliability.UsageDocument
+	if inputType == InputQuery {
+		kind = reliability.UsageQuery
+	}
+	var usedTokens int64
+	if decoded.Usage != nil {
+		usedTokens = decoded.Usage.TotalTokens
+	}
+	c.usage.Record(kind, usedTokens, decoded.Usage != nil)
+	reliability.RecordUsage(ctx, kind, usedTokens, decoded.Usage != nil)
 	// 结构校验（暗坑 K22）：数量精确、index 唯一且在界、维度与配置一致。
 	if len(decoded.Data) != len(texts) {
 		return nil, &reliability.CallError{

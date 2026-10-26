@@ -81,6 +81,11 @@ type wsStatus struct {
 	// 读写共享库的错误。
 	sharedReused int
 	sharedError  string
+	// usage 是本进程启动以来该工作区成功送审、服务商报告的用量累计（构建期
+	// 文档嵌入与检索期查询嵌入、精排）；lastEmbedTokens 是最近一次发出文档
+	// 嵌入请求的构建报告的 tokens。
+	usage           reliability.UsageCounts
+	lastEmbedTokens int64
 }
 
 // setSharedVectors 记录最近一次构建使用共享向量库的结果。
@@ -90,6 +95,57 @@ func (s *wsStatus) setSharedVectors(reused int, errText string) {
 	s.sharedError = errText
 	s.updatedAt = time.Now().UTC()
 	s.mu.Unlock()
+}
+
+// addUsage 累加一次构建或检索的送审用量；build 为 true 且本次发出过文档
+// 嵌入请求时，同时更新 lastEmbedTokens。
+func (s *wsStatus) addUsage(counts reliability.UsageCounts, build bool) {
+	if s == nil || counts == (reliability.UsageCounts{}) {
+		return
+	}
+	s.mu.Lock()
+	s.usage = s.usage.Plus(counts)
+	if build && counts.DocumentRequests > 0 {
+		s.lastEmbedTokens = counts.DocumentTokens
+	}
+	s.mu.Unlock()
+}
+
+// noteQueryUsage 把一次检索的查询嵌入与精排用量记入工作区状态；工作区还没有
+// 状态跟踪器时不记录（与 noteSkippedRevisions 一致）。
+func (e *Engine) noteQueryUsage(workspaceKey string, counts reliability.UsageCounts) {
+	e.mu.Lock()
+	status, ok := e.statuses[workspaceKey]
+	e.mu.Unlock()
+	if ok {
+		status.addUsage(counts, false)
+	}
+}
+
+// ProviderUsage 返回本进程启动以来全部工作区成功送审、服务商报告的用量合计。
+func (e *Engine) ProviderUsage() engine.ProviderUsage {
+	var counts reliability.UsageCounts
+	out := engine.ProviderUsage{Since: e.createdAt}
+	if e.embedClient != nil {
+		counts = counts.Plus(e.embedClient.UsageSnapshot())
+		out.EmbeddingModel = e.embedCfg.Model
+	}
+	if e.rerankClient != nil {
+		counts = counts.Plus(e.rerankClient.UsageSnapshot())
+		out.RerankModel = e.rerankClient.Config().Model
+	}
+	out.UsageCounts = usageStatus(counts)
+	return out
+}
+
+// usageStatus 把内部计数转成状态输出的结构。
+func usageStatus(counts reliability.UsageCounts) engine.UsageCounts {
+	return engine.UsageCounts{
+		DocumentTokens: counts.DocumentTokens, DocumentRequests: counts.DocumentRequests,
+		QueryTokens: counts.QueryTokens, QueryRequests: counts.QueryRequests,
+		RerankTokens: counts.RerankTokens, RerankRequests: counts.RerankRequests,
+		UnreportedRequests: counts.UnreportedRequests,
+	}
 }
 
 // setEmbedRequestStats 记录一次嵌入阶段的请求计数：before、after 是该阶段
@@ -449,6 +505,11 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 			semantic.LastEmbedRateWaitSeconds = int(tracker.embedRateWait.Round(time.Second) / time.Second)
 			semantic.SharedReused = tracker.sharedReused
 			semantic.SharedVectorsError = tracker.sharedError
+			if tracker.usage != (reliability.UsageCounts{}) {
+				usage := usageStatus(tracker.usage)
+				semantic.Usage = &usage
+			}
+			semantic.LastEmbedTokens = tracker.lastEmbedTokens
 			tracker.mu.Unlock()
 			// journal 条数从已打开的 journal 实时读取；journal 尚未打开时不
 			// 显示。

@@ -140,3 +140,9 @@ type BackgroundSyncer interface {
 type Lifecycle interface {
 	Close(context.Context) error
 }
+
+// UsageReporter 是可选能力：实现方报告本进程启动以来向模型服务商成功送审的
+// 用量（daemon_status 的 provider_usage）。
+type UsageReporter interface {
+	ProviderUsage() ProviderUsage
+}

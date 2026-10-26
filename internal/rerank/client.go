@@ -38,6 +38,28 @@ type Client struct {
 	httpClient *http.Client
 	circuit    *reliability.Circuit
 	retry      reliability.RetryPolicy
+	// usage 累计成功响应里服务商报告的精排用量（进程内各工作区共享）；
+	// 按工作区的用量经 ctx 携带的计量器另记。
+	usage reliability.UsageMeter
+}
+
+// UsageSnapshot 返回客户端创建以来成功响应里服务商报告的精排用量累计。
+func (c *Client) UsageSnapshot() reliability.UsageCounts {
+	return c.usage.Snapshot()
+}
+
+// reportedUsage 读取响应里的 usage.total_tokens（voyage 形状）；TEI 形状的
+// 响应是数组、没有用量字段，返回 reported=false。
+func reportedUsage(raw []byte) (tokens int64, reported bool) {
+	var decoded struct {
+		Usage *struct {
+			TotalTokens int64 `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil || decoded.Usage == nil {
+		return 0, false
+	}
+	return decoded.Usage.TotalTokens, true
 }
 
 // NewClient 创建客户端；未启用的配置直接报错。
@@ -164,6 +186,10 @@ func (c *Client) doRequest(ctx context.Context, query string, docs []Document) (
 	if err != nil {
 		return nil, &reliability.CallError{Class: reliability.ClassTransient, Message: reliability.SanitizeMessage("read response: " + err.Error())}
 	}
+	// 用量在结构校验之前记账：服务商返回 200 即已计费。
+	tokens, reported := reportedUsage(raw)
+	c.usage.Record(reliability.UsageRerank, tokens, reported)
+	reliability.RecordUsage(ctx, reliability.UsageRerank, tokens, reported)
 	scored, err := parseResponse(c.cfg.ProviderType, raw)
 	if err != nil {
 		return nil, err
