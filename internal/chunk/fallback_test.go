@@ -32,8 +32,23 @@ func TestFallbackLineNumbersMatchContent(t *testing.T) {
 			t.Fatalf("语言识别错误: %s", chunk.Language)
 		}
 	}
-	if chunks[1].StartLine != chunks[0].StartLine+profile.WindowLines-profile.OverlapLines {
-		t.Fatalf("窗口步进错误: %d -> %d", chunks[0].StartLine, chunks[1].StartLine)
+	// v9 边界由内容决定：每个 chunk 不超过一个窗口，首个从第 1 行开始、
+	// 最后一个到文件末行（末尾换行后的空串不算一行），相邻 chunk 的起止行
+	// 单调前进。
+	realLines := len(lines)
+	if lines[realLines-1] == "" {
+		realLines--
+	}
+	if chunks[0].StartLine != 1 || chunks[len(chunks)-1].EndLine != realLines {
+		t.Fatalf("chunk 应覆盖整个文件: 首 %d 末 %d / %d", chunks[0].StartLine, chunks[len(chunks)-1].EndLine, realLines)
+	}
+	for i, chunk := range chunks {
+		if chunk.EndLine-chunk.StartLine+1 > profile.WindowLines {
+			t.Fatalf("chunk [%d-%d] 超过窗口 %d 行", chunk.StartLine, chunk.EndLine, profile.WindowLines)
+		}
+		if i > 0 && (chunk.StartLine <= chunks[i-1].StartLine || chunk.EndLine <= chunks[i-1].EndLine) {
+			t.Fatalf("chunk 未单调前进: [%d-%d] 之后 [%d-%d]", chunks[i-1].StartLine, chunks[i-1].EndLine, chunk.StartLine, chunk.EndLine)
+		}
 	}
 }
 

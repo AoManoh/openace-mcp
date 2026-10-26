@@ -30,7 +30,7 @@ func TestPlanEmbedJobsCountsSiblingProfileVectorsAsReusable(t *testing.T) {
 		t.Fatal(err)
 	}
 	e7.profile.Version = "7"
-	e7.storeProfile = strings.Replace(e7.storeProfile, "default-v8", "default-v7", 1)
+	e7.storeProfile = strings.Replace(e7.storeProfile, currentProfilePrefix(), "default-v7", 1)
 	first, err := e7.Sync(context.Background(), syncRequest(root))
 	if err != nil || first.SemanticCoverage != "100%" {
 		t.Fatalf("v7 首建失败: %+v err=%v", first, err)
@@ -58,7 +58,7 @@ func TestPlanEmbedJobsCountsSiblingProfileVectorsAsReusable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(plan.StoreProfile, "default-v8") {
+	if !strings.Contains(plan.StoreProfile, currentProfilePrefix()) {
 		t.Fatalf("计划应落在新 profile 子树: %+v", plan)
 	}
 	if server.callCount() != callsAfterV7 {
@@ -124,7 +124,7 @@ func TestPlanEmbedJobsSkipsSiblingWhenCurrentRevisionComplete(t *testing.T) {
 		t.Fatal(err)
 	}
 	e7.profile.Version = "7"
-	e7.storeProfile = strings.Replace(e7.storeProfile, "default-v8", "default-v7", 1)
+	e7.storeProfile = strings.Replace(e7.storeProfile, currentProfilePrefix(), "default-v7", 1)
 	if res, err := e7.Sync(context.Background(), syncRequest(root)); err != nil || res.SemanticCoverage != "100%" {
 		t.Fatalf("v7 构建失败: %+v err=%v", res, err)
 	}
