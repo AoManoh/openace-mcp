@@ -481,6 +481,9 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 		semantic.Provider = e.embedCfg.ProviderType
 		semantic.Model = e.embedCfg.Model
 		semantic.Dimension = e.embedCfg.Dimension
+		// gapFillPause 是“内容变化时暂停全量补缺”的说明，在 provider 最后
+		// 错误的回填之后追加，不挡住熔断器的错误文本。
+		var gapFillPause string
 		if tracker != nil {
 			tracker.mu.Lock()
 			semantic.CoveredChunks = tracker.coveredChunks
@@ -515,6 +518,7 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 			// 显示。
 			e.mu.Lock()
 			journal := e.journals[tracker.workspaceKey]
+			gapFillPause = e.gapFillPause[tracker.workspaceKey]
 			e.mu.Unlock()
 			if journal != nil {
 				semantic.JournalEntries = len(journal.Snapshot())
@@ -537,6 +541,15 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 		}
 		if semantic.LastError == "" && circuit.LastError != "" {
 			semantic.LastError = circuit.LastError
+		}
+		// 暂停在解除前一直给出：之后一次成功的 delta 会清空 embedError，
+		// 与迁移暂停原因同样单独追加。
+		if gapFillPause != "" && !strings.Contains(semantic.LastError, gapFillPause) {
+			if semantic.LastError == "" {
+				semantic.LastError = gapFillPause
+			} else {
+				semantic.LastError += "；" + gapFillPause
+			}
 		}
 		// 查询路径的熔断器状态与吞吐治理器（按 provider 反馈调节请求速率
 		// 与并发窗口的组件）的窗口、速率、暂停截止时刻都进状态：否则构建

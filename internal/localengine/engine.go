@@ -125,6 +125,11 @@ type Engine struct {
 	// repair 记录查询期发现向量文件损坏或缺失的工作区（键为 workspaceKey），
 	// 下次同步强制全量重建向量；构建开始时取走标记。
 	repair map[string]bool
+	// gapFillPause 记录处于“内容变化时暂停全量补缺”的工作区（键为
+	// workspaceKey，值为写进 workspace_status 的说明），由 noteGapFillOutcome
+	// 登记与清除，gapFillEligible 据此让内容变化的同步保持 delta。只存在
+	// 内存里，daemon 重启后重新尝试补缺口。
+	gapFillPause map[string]string
 	// journals 是每个工作区的 embedding journal（已付费但尚未进入 revision
 	// 的向量暂存文件）与持久化拒绝集：构建被取消或进程被杀时已付费批次
 	// 不丢；provider 返回零向量或 NaN 的内容记入拒绝集，跨重启不再重复
@@ -183,6 +188,7 @@ func New(opts Options) (*Engine, error) {
 		handles:         make(map[string]*revisionHandle),
 		vectorSegments:  make(map[string]*sharedVectorIndex),
 		repair:          make(map[string]bool),
+		gapFillPause:    make(map[string]string),
 		journals:        make(map[string]*index.Journal),
 		statCaches:      make(map[string]*workspace.StatCache),
 		lastSyncOK:      make(map[string]time.Time),

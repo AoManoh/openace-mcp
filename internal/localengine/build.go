@@ -207,8 +207,10 @@ func projectedGarbageRatio(previous *index.Manifest, removed []string) float64 {
 //     不发布；provider 熔断器（连续失败后暂停向它发请求）在退避期也直接
 //     返回，覆盖缺口留在状态里。
 //   - 选路：delta 只用于 manifest v2 前身之上的内容变更，且没有词法或向量
-//     修复请求、segment 数与预估垃圾比都低于 compaction 阈值；其余全走
-//     全量路径，成因经 fullBuildReason 写进 Result.BuildMode。
+//     修复请求、segment 数与预估垃圾比都低于 compaction 阈值、前一 revision
+//     没有这次能补的语义缺口（见 gapFillEligible）；其余全走全量路径，成因经
+//     fullBuildReason 写进 Result.BuildMode。全量构建结束后按缺口是否减少
+//     更新“内容变化时暂停全量补缺”（见 noteGapFillOutcome）。
 func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, workspaceKey string) (result engine.Result, manifest *index.Manifest, err error) {
 	store, err := e.storeFor(workspaceKey)
 	if err != nil {
@@ -291,19 +293,84 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	if previous != nil && len(previous.Segments) >= compactSegmentThreshold {
 		mergeSmall = smallSegmentsToMerge(previous)
 	}
+	// 前一 revision 有语义缺口、这次内容又有变化时，缺口能补就走全量路径，
+	// 在同一次构建里处理变更并补齐缺口。delta 只为变更文件嵌入：首建发布的
+	// 词法中间 revision 在嵌入中途被打断后，只要每次同步都有文件在变，缺口就
+	// 一直留着，期间缺向量的文件超过 uncoveredFilesLimit 个，检索直接报错。
+	gapFill := contentChanged && e.gapFillEligible(workspaceKey, previous)
 	useDelta := previous != nil && contentChanged &&
 		previous.SchemaVersion == index.ManifestSchemaV2 &&
 		!needsLexicalRebuild && !repairRequested &&
 		(len(previous.Segments) < compactSegmentThreshold || mergeSmall != nil) &&
-		garbage < compactGarbageRatio
+		garbage < compactGarbageRatio && !gapFill
 	if useDelta {
 		deltaResult, deltaManifest, deltaErr := e.buildDelta(ctx, store, status, root, workspaceKey, previous, assets, mergeSmall)
 		if !errors.Is(deltaErr, errSmallMergeUnavailable) {
+			// delta 只在把覆盖补完整时解除暂停（例如删掉了一直被拒的文件），
+			// 否则状态会在覆盖 100% 时仍显示暂停。delta 让缺口变小但没补完
+			// 时不解除：缺口里持续失败的内容还在，解除只会再引发一次整份重写。
+			if deltaErr == nil && deltaManifest != nil && deltaManifest.SemanticComplete() {
+				e.noteGapFillOutcome(workspaceKey, nil, deltaManifest, false)
+			}
 			return deltaResult, deltaManifest, deltaErr
 		}
 	}
-	return e.buildFull(ctx, store, status, root, workspaceKey, previous, assets, contentChanged, needsLexicalRebuild,
-		fullBuildReason(previous, contentChanged, needsLexicalRebuild, repairRequested, garbage))
+	result, manifest, err = e.buildFull(ctx, store, status, root, workspaceKey, previous, assets, contentChanged, needsLexicalRebuild,
+		fullBuildReason(previous, contentChanged, needsLexicalRebuild, repairRequested, garbage, gapFill))
+	if err == nil {
+		e.noteGapFillOutcome(workspaceKey, previous, manifest, gapFill)
+	}
+	return result, manifest, err
+}
+
+// gapFillEligible 报告前一 revision 的语义缺口这次能不能补：配置了
+// embedding、前一 revision 覆盖不完整、没有迁移暂停原因、索引请求的熔断器
+// 不在退避期，并且该工作区没有处于“内容变化时暂停全量补缺”。迁移暂停期间
+// 按设计不为缺口送审；退避期内送审一定被拒。这两种情况下走全量只会白白
+// 重写整个索引，保持 delta。
+func (e *Engine) gapFillEligible(workspaceKey string, previous *index.Manifest) bool {
+	if previous == nil || !e.semanticEnabled() || previous.SemanticComplete() || previous.SemanticMigrationBlock != "" {
+		return false
+	}
+	if e.embedClient.CircuitSnapshot().State == "backoff" {
+		return false
+	}
+	e.mu.Lock()
+	_, paused := e.gapFillPause[workspaceKey]
+	e.mu.Unlock()
+	return !paused
+}
+
+// uncoveredChunks 是 revision 里还没有向量、也没有被 provider 拒绝的 chunk 数。
+func uncoveredChunks(m *index.Manifest) int {
+	if gap := m.EmbeddableChunks() - m.VectorCount; gap > 0 {
+		return gap
+	}
+	return 0
+}
+
+// noteGapFillOutcome 在构建成功后更新“内容变化时暂停全量补缺”。全量构建
+// 每次都调用；delta 只在把覆盖补完整时调用，previous 传 nil，只按是否完整判断。
+//   - 返回的 revision 覆盖完整，或缺口数比构建开始时少：清除暂停。
+//   - 这次是为补缺口才走的全量（gapFill），缺口却没有减少：登记暂停。provider
+//     对缺口里的内容持续失败时，熔断器每次只退避 30 秒到 5 分钟；不登记的话，
+//     文件频繁变化的工作区每次退避结束都会整份重写索引。说明写明对应 revision、
+//     剩余缺口与解除条件，经 workspace_status 的 semantic.last_error 给出。
+//   - 其余情况不改动。暂停只存在内存里，daemon 重启后重新尝试。
+func (e *Engine) noteGapFillOutcome(workspaceKey string, previous *index.Manifest, published *index.Manifest, gapFill bool) {
+	if published == nil || !e.semanticEnabled() {
+		return
+	}
+	progressed := published.SemanticComplete() || (previous != nil && uncoveredChunks(published) < uncoveredChunks(previous))
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	switch {
+	case progressed:
+		delete(e.gapFillPause, workspaceKey)
+	case gapFill:
+		e.gapFillPause[workspaceKey] = fmt.Sprintf("内容变化时的全量补缺已暂停：%s 为补语义缺口重建了索引，缺口没有减少（该 revision 仍有 %d 个 chunk 没有向量）；之后内容变化的同步只处理变化的文件，内容没变的同步仍会尝试补齐，缺口减少或 daemon 重启后恢复",
+			published.Revision, uncoveredChunks(published))
+	}
 }
 
 // publishLexicalInterim 在首次构建的嵌入开始前发布一个只有词法索引的中间
@@ -358,8 +425,9 @@ func (e *Engine) publishLexicalInterim(ctx context.Context, store *index.Store, 
 // 方。没有成因时，delta 报表里的异常数字会被解读成升级触发了全量重嵌，
 // 调用方只能从进度条反猜。判定顺序与 runBuild 的 useDelta 条件一致；
 // garbage 是 runBuild 已算出的结果预估垃圾比，纯删除越阈同样标为
-// compaction-garbage。
-func fullBuildReason(previous *index.Manifest, contentChanged bool, needsLexicalRebuild bool, repairRequested bool, garbage float64) string {
+// compaction-garbage。gapFill 为真表示内容有变化、但为补前一 revision 的
+// 语义缺口走了全量，与内容没变的补齐同样标为 semantic-fill。
+func fullBuildReason(previous *index.Manifest, contentChanged bool, needsLexicalRebuild bool, repairRequested bool, garbage float64, gapFill bool) string {
 	switch {
 	case previous == nil:
 		return "full:first-build"
@@ -373,7 +441,7 @@ func fullBuildReason(previous *index.Manifest, contentChanged bool, needsLexical
 		return "full:compaction-segments"
 	case contentChanged && garbage >= compactGarbageRatio:
 		return "full:compaction-garbage"
-	case !contentChanged:
+	case !contentChanged, gapFill:
 		return "full:semantic-fill"
 	}
 	return "full"
@@ -592,9 +660,10 @@ func coveredPerFile(fileRecords []chunkRecord, coveredHash map[string]bool) int 
 	return covered
 }
 
-// buildFull 是全量构建：首建、词法或向量损坏修复、语义补齐与 compaction
-// 都走这里，产出单 segment 的 revision。未变文件的 chunk 记录与向量全部
-// 本地复用，provider 只为真正缺向量的内容调用。
+// buildFull 是全量构建：首建、词法或向量损坏修复、语义补齐（内容没变，或
+// 内容有变化但前一 revision 有这次能补的缺口）与 compaction 都走这里，产出
+// 单 segment 的 revision。未变文件的 chunk 记录与向量全部本地复用，provider
+// 只为真正缺向量的内容调用。
 //   - 切分：与 previous 内容身份一致的文件直接复用其 chunk 记录，其余重新
 //     切分。内容检查拒绝或切出 0 chunk 的文件计入 skippedFiles 且不进
 //     manifest。
@@ -681,7 +750,8 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 	// 查询按既有降级语义标记），嵌入结束后按实际向量覆盖发布，缺口显式报告。
 	// 词法 revision 成为其 previous，GC 链不变。中间发布失败不影响主构建；
 	// 显式 Sync 仍阻塞到最终发布；嵌入中途崩溃时词法 revision 继续可
-	// 服务，下次同步按语义补齐路径完成。
+	// 服务，下次同步无论内容是否变化都按语义补齐路径完成（runBuild 的
+	// gapFill；熔断器退避与“内容变化时暂停全量补缺”期间除外）。
 	if previous == nil && e.semanticEnabled() && len(records) > 0 && e.lexicalFirst {
 		if lexManifest := e.publishLexicalInterim(ctx, store, status, root, workspaceKey, records, files, capabilities, totalBytes); lexManifest != nil {
 			previous = lexManifest

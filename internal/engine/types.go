@@ -98,7 +98,9 @@ type Result struct {
 	// (段数达到阈值时只把小段与本次变更合并成一个新段,大段不重写)或
 	// "full:<first-build|lexical-selfheal|vector-repair|schema-upgrade|
 	// compaction-segments|compaction-garbage|semantic-fill>";no-op 不
-	// 发布时为空。加性 omitempty。
+	// 发布时为空。semantic-fill 表示为补齐前一 revision 的语义缺口走全量:
+	// 内容没变时,或内容有变化而缺口这次能补时(provider 不在退避期、没有
+	// 迁移暂停原因、该工作区没有处于内容变化时暂停全量补缺)。加性 omitempty。
 	BuildMode string `json:"build_mode,omitempty"`
 	// CrossProfileReused 是本次构建从同 workspace 兼容旧 profile 子树
 	// 自动复用的唯一向量键数。升级成本透明;0 省略。

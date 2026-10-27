@@ -158,3 +158,81 @@ func TestColdBuildLexicalFirstCrashRecovery(t *testing.T) {
 		t.Fatalf("恢复路径应为 semantic-fill: %q", res.BuildMode)
 	}
 }
+
+// TestColdBuildLexicalFirstRecoveryWithContentChange：词法中间 revision 发布、
+// 两批向量已写入 journal 后构建被取消，下一次同步前工作区有一个文件变了。
+// 这次同步应在同一次构建里补齐全部缺口（full:semantic-fill、单段、覆盖
+// 100%），取消前已写入 journal 的内容不再送审。只按“内容是否变化”选路时，
+// 这次同步走 delta，只为变化的文件嵌入；中间 revision 留下的缺口要等某次
+// 内容没变的同步才补上，期间缺向量的文件过多，检索直接报错。
+func TestColdBuildLexicalFirstRecoveryWithContentChange(t *testing.T) {
+	const dim = 8
+	server := newEmbedServer(t, dim)
+	// proceed 每收到一个值放行一个请求，关闭后全部放行。
+	proceed := make(chan struct{}, 64)
+	inner := server.ts.Config.Handler
+	server.ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-proceed
+		inner.ServeHTTP(w, r)
+	})
+	e := newTestEngineWith(t, embedOptions(server.ts.URL, dim, 1, "fake-model"))
+	root := newFixtureWorkspace(t)
+	var b strings.Builder
+	b.WriteString("package app\n")
+	for i := 0; i < 26; i++ {
+		b.WriteString("\n// Widget 声明。\nfunc Widget")
+		b.WriteByte(byte('A' + i))
+		b.WriteString("() {}\n")
+	}
+	writeFixture(t, root, "widgets.go", b.String())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.Sync(ctx, syncRequest(root))
+		done <- err
+	}()
+	proceed <- struct{}{}
+	proceed <- struct{}{}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		status, err := e.WorkspaceStatus(context.Background(), engineRef(root))
+		if err == nil && status.IndexRevision != "" && status.Semantic != nil && status.Semantic.JournalEntries >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("词法中间 revision 未发布，或两批向量未写入 journal")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	journaled := server.textsSince(0)
+	if len(journaled) != 2 {
+		t.Fatalf("取消前应恰好完成 2 个请求: %d", len(journaled))
+	}
+	cancel()
+	close(proceed)
+	<-done
+	interim, _ := loadActiveManifest(t, e, root)
+	if interim.VectorCount != 0 || interim.Counts.Chunks == 0 {
+		t.Fatalf("取消后 active 应是没有向量的词法中间 revision: vectors=%d chunks=%d", interim.VectorCount, interim.Counts.Chunks)
+	}
+
+	callsBefore := server.callCount()
+	writeFixture(t, root, "README.md", fixtureReadme+"\nLogin settings are documented here.\n")
+	res, err := e.Sync(context.Background(), syncRequest(root))
+	if err != nil {
+		t.Fatalf("恢复同步失败: %v", err)
+	}
+	manifest, _ := loadActiveManifest(t, e, root)
+	if res.BuildMode != "full:semantic-fill" || res.SemanticCoverage != "100%" || len(manifest.Segments) != 1 || !manifest.SemanticComplete() {
+		t.Fatalf("内容有变化的恢复同步应在这次构建里补齐缺口: build=%s coverage=%s segments=%d vectors=%d/%d",
+			res.BuildMode, res.SemanticCoverage, len(manifest.Segments), manifest.VectorCount, manifest.Counts.Chunks)
+	}
+	for _, text := range server.textsSince(callsBefore) {
+		for _, paid := range journaled {
+			if text == paid {
+				t.Fatalf("取消前已写入 journal 的内容不得再次送审: %q", text[:min(60, len(text))])
+			}
+		}
+	}
+}
