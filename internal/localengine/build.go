@@ -194,6 +194,21 @@ func projectedGarbageRatio(previous *index.Manifest, removed []string) float64 {
 	return float64(dead) / float64(total)
 }
 
+// drainParserPoolsHook 在切分结束后清空解析器内存池时调用，参数是调用时的构建
+// 阶段。只供测试核对清空发生在嵌入之前，生产路径为 nil。
+var drainParserPoolsHook func(stage engine.IndexStage)
+
+// drainParserPoolsAfterChunking 在切分结束、进入嵌入与写分段之前清空 tree-sitter
+// 的 arena 池。runBuild 末尾的 defer 只在整次构建返回时清空，切分在构建前段就
+// 结束了，嵌入与写分段期间池里的 arena 一直和全部向量同时占内存（mailyn-cli
+// 一半副本 135 MiB）。并发构建时库只清掉池里空闲的 arena，正在使用的不受影响。
+func drainParserPoolsAfterChunking(status *wsStatus) {
+	if hook := drainParserPoolsHook; hook != nil {
+		hook(status.currentStage())
+	}
+	chunk.DrainParserPools()
+}
+
 // runBuild 执行一次索引构建，在两条路径间选择：delta（只为变更文件产出
 // 新 segment，成本与变更量成正比）与 full（首建、损坏修复、语义补齐与
 // compaction 的全量构建）。未发布的数据写入 staging 临时目录，失败或取消
@@ -743,6 +758,7 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 		recordsByFile[asset.RelPath] = fileRecords
 		records = append(records, fileRecords...)
 	}
+	drainParserPoolsAfterChunking(status)
 
 	// 首建的词法中间发布。启用语义的仓库若等嵌入结束才发布，在此之前
 	// 不可检索，大仓 30 分钟不可用。只在首建（previous==nil）触发：嵌入
@@ -853,6 +869,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 	status.setStage(engine.IndexStageChunking)
 	changed, removed, currentPaths := diffDeltaAssets(previous, assets)
 	delta, err := e.chunkChangedAssets(ctx, changed)
+	drainParserPoolsAfterChunking(status)
 	if err != nil {
 		return engine.Result{}, nil, err
 	}

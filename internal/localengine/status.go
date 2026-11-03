@@ -352,6 +352,13 @@ func (s *wsStatus) setStage(stage engine.IndexStage) {
 	s.updatedAt = time.Now().UTC()
 }
 
+// currentStage 返回当前构建阶段。
+func (s *wsStatus) currentStage() engine.IndexStage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stage
+}
+
 func (s *wsStatus) ready(manifest *index.Manifest, revisions int) {
 	now := time.Now().UTC()
 	s.mu.Lock()
