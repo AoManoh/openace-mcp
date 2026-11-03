@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/AoManoh/openace-mcp/internal/reliability"
 )
@@ -92,38 +93,72 @@ func (c *Client) CircuitSnapshot() reliability.CircuitSnapshot {
 // circuit 退避期返回 ClassBackoff；任何失败下调用方候选集不受影响
 // （P3-T04 业务验收：rerank 失败绝不丢候选）。
 func (c *Client) Rerank(ctx context.Context, query string, docs []Document) (hits []Hit, sent int, err error) {
+	hits, sent, _, err = c.RerankWithStats(ctx, query, docs)
+	return hits, sent, err
+}
+
+// CallStats 记录一次精排调用里各次尝试的情况，供检索诊断区分“服务商单次
+// 响应慢”与“客户端在重试”：Attempts 是实际发出的请求次数；RetryWait 是两次
+// 尝试之间等待的总时长（调用总耗时减去各次尝试耗时）；AttemptDurations 是
+// 每次尝试从发出到收到响应或失败的耗时。没有发出请求时全为零值。
+type CallStats struct {
+	Attempts         int
+	RetryWait        time.Duration
+	AttemptDurations []time.Duration
+}
+
+// LongestAttempt 返回耗时最长的一次尝试。
+func (s CallStats) LongestAttempt() time.Duration {
+	var longest time.Duration
+	for _, d := range s.AttemptDurations {
+		longest = max(longest, d)
+	}
+	return longest
+}
+
+// RerankWithStats 与 Rerank 相同，另外返回各次尝试的统计；失败时同样返回
+// 已发生的尝试。重试次数、单次超时与熔断规则不变。
+func (c *Client) RerankWithStats(ctx context.Context, query string, docs []Document) (hits []Hit, sent int, stats CallStats, err error) {
 	if len(docs) == 0 {
-		return nil, 0, nil
+		return nil, 0, stats, nil
 	}
 	sent = c.tokenCappedCount(query, docs)
 	if sent == 0 {
 		// 预算不足以送审任何文档：如实返回空重排（调用方保持 RRF 序）。
-		return nil, 0, nil
+		return nil, 0, stats, nil
 	}
 	if err := c.circuit.Gate(); err != nil {
-		return nil, 0, err
+		return nil, 0, stats, err
 	}
 	var out []Hit
+	callStart := time.Now()
+	var attemptsTotal time.Duration
 	retryErr := c.retry.Do(ctx, func(ctx context.Context) error {
+		attemptStart := time.Now()
 		got, err := c.doRequest(ctx, query, docs[:sent])
+		elapsed := time.Since(attemptStart)
+		stats.Attempts++
+		stats.AttemptDurations = append(stats.AttemptDurations, elapsed)
+		attemptsTotal += elapsed
 		if err != nil {
 			return err
 		}
 		out = got
 		return nil
 	})
+	stats.RetryWait = max(time.Since(callStart)-attemptsTotal, 0)
 	if retryErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			// 取消优先：不计为 provider 失败（暗坑 K26）。
-			return nil, 0, ctxErr
+			return nil, 0, stats, ctxErr
 		}
 		if callErr := asCallError(retryErr); callErr != nil {
 			c.circuit.RecordFailure(callErr)
 		}
-		return nil, 0, retryErr
+		return nil, 0, stats, retryErr
 	}
 	c.circuit.RecordSuccess()
-	return out, sent, nil
+	return out, sent, stats, nil
 }
 
 // tokenCappedCount 按保守估算（字节/4）决定送审文档数。

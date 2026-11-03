@@ -166,6 +166,12 @@ type RetrievalTimings struct {
 	RerankMs     int64 `json:"rerank_ms,omitempty"`
 	RenderMs     int64 `json:"render_ms"`
 	TotalMs      int64 `json:"total_ms"`
+	// RerankAttempts 是本次精排实际发出的请求次数（含重试）；
+	// RerankRetryWaitMs 是两次尝试之间等待的总时长；RerankAttemptMs 是最长
+	// 一次尝试的耗时。三者用来区分精排慢是服务商单次响应慢还是客户端在重试。
+	RerankAttempts    int   `json:"rerank_attempts,omitempty"`
+	RerankRetryWaitMs int64 `json:"rerank_retry_wait_ms,omitempty"`
+	RerankAttemptMs   int64 `json:"rerank_attempt_ms,omitempty"`
 }
 
 // Summary 输出一行人类可读的结果摘要，供 MCP 工具文本渲染使用。
@@ -286,6 +292,11 @@ type SemanticStatus struct {
 	RerankProvider       string `json:"rerank_provider,omitempty"`
 	RerankState          string `json:"rerank_state,omitempty"`
 	RerankDisabledReason string `json:"rerank_disabled_reason,omitempty"`
+	// RerankCalls、RerankRetries、RerankSlowestAttemptMs 是本进程启动以来该
+	// 工作区检索发出的精排调用次数、其中的重试次数与最长单次尝试耗时。
+	RerankCalls            int64 `json:"rerank_calls,omitempty"`
+	RerankRetries          int64 `json:"rerank_retries,omitempty"`
+	RerankSlowestAttemptMs int64 `json:"rerank_slowest_attempt_ms,omitempty"`
 }
 
 // MultiRetrievalStatus 汇总一次跨工作区检索的每仓结果。

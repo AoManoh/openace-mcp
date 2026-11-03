@@ -707,8 +707,15 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	rerankSent := 0
 	if e.rerankClient != nil && len(ordered) > 0 {
 		rerankStart := time.Now()
-		reordered, applied, sent, rerankGaps, rerankErr := e.rerankOrder(ctx, handle, query, ordered)
+		var rerankStats rerank.CallStats
+		reordered, applied, sent, rerankGaps, rerankErr := e.rerankOrder(ctx, handle, query, ordered, &rerankStats)
 		timings.RerankMs = time.Since(rerankStart).Milliseconds()
+		// 尝试次数与重试等待在精排成功、失败时都记录：慢请求与失败请求
+		// 正是需要归因的那部分。
+		timings.RerankAttempts = rerankStats.Attempts
+		timings.RerankRetryWaitMs = rerankStats.RetryWait.Milliseconds()
+		timings.RerankAttemptMs = rerankStats.LongestAttempt().Milliseconds()
+		e.noteRerankStats(handle.workspaceKey, rerankStats)
 		if rerankErr != nil {
 			e.releaseHandle(handle)
 			return retrieval{}, rerankErr
@@ -1114,7 +1121,7 @@ func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *re
 //   - 已送审但 provider 未返回的候选按原序补回并记 rerank-partial-response
 //     （见 rerankAssembleOrder）。
 //   - 生效时每条候选带上 reranked/rerankScore/source。
-func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query string, ordered []rankedHit) ([]rankedHit, bool, int, []qualityGap, error) {
+func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query string, ordered []rankedHit, stats *rerank.CallStats) ([]rankedHit, bool, int, []qualityGap, error) {
 	head := rerankHeadLimit
 	if head > len(ordered) {
 		head = len(ordered)
@@ -1134,7 +1141,8 @@ func (e *Engine) rerankOrder(ctx context.Context, handle *revisionHandle, query 
 		docs = append(docs, rerank.Document{ID: hit.id, Text: rerankDocText(record)})
 		included = append(included, hit)
 	}
-	hits, sent, err := e.rerankClient.Rerank(ctx, query, docs)
+	hits, sent, callStats, err := e.rerankClient.RerankWithStats(ctx, query, docs)
+	*stats = callStats
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, false, 0, nil, ctx.Err()

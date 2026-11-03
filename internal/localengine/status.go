@@ -13,6 +13,7 @@ import (
 	"github.com/AoManoh/openace-mcp/internal/index"
 	"github.com/AoManoh/openace-mcp/internal/pathutil"
 	"github.com/AoManoh/openace-mcp/internal/reliability"
+	"github.com/AoManoh/openace-mcp/internal/rerank"
 )
 
 // wsStatus 跟踪单个工作区的构建与索引状态，是 workspace_status 的数据源。
@@ -24,6 +25,12 @@ type wsStatus struct {
 
 	root         pathutil.WorkspaceRoot
 	workspaceKey string
+
+	// rerankCalls、rerankRetries、rerankSlowestAttempt 是本进程内该工作区检索
+	// 发出的精排调用次数、其中的重试次数与最长单次尝试耗时，见 noteRerank。
+	rerankCalls          int64
+	rerankRetries        int64
+	rerankSlowestAttempt time.Duration
 
 	inFlight      bool
 	stage         engine.IndexStage
@@ -95,6 +102,27 @@ func (s *wsStatus) setSharedVectors(reused int, errText string) {
 	s.sharedError = errText
 	s.updatedAt = time.Now().UTC()
 	s.mu.Unlock()
+}
+
+// noteRerank 累计一次精排调用的尝试情况；没有发出请求（如 token 预算连第一条
+// 都装不下、熔断器退避）时不计。
+func (s *wsStatus) noteRerank(stats rerank.CallStats) {
+	if s == nil || stats.Attempts == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rerankCalls++
+	s.rerankRetries += int64(stats.Attempts - 1)
+	s.rerankSlowestAttempt = max(s.rerankSlowestAttempt, stats.LongestAttempt())
+}
+
+// noteRerankStats 把一次精排调用的尝试情况记进该工作区的状态跟踪器。
+func (e *Engine) noteRerankStats(workspaceKey string, stats rerank.CallStats) {
+	e.mu.Lock()
+	tracker := e.statuses[workspaceKey]
+	e.mu.Unlock()
+	tracker.noteRerank(stats)
 }
 
 // addUsage 累加一次构建或检索的送审用量；build 为 true 且本次发出过文档
@@ -575,6 +603,13 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 	if e.rerankCfg.Enabled {
 		semantic.RerankProvider = e.rerankCfg.Identity()
 		semantic.RerankState = e.rerankClient.CircuitSnapshot().State
+		if tracker != nil {
+			tracker.mu.Lock()
+			semantic.RerankCalls = tracker.rerankCalls
+			semantic.RerankRetries = tracker.rerankRetries
+			semantic.RerankSlowestAttemptMs = tracker.rerankSlowestAttempt.Milliseconds()
+			tracker.mu.Unlock()
+		}
 	} else if rerankConfigured {
 		semantic.RerankDisabledReason = e.rerankCfg.DisabledReason
 	}

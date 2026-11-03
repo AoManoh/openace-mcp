@@ -587,6 +587,12 @@ func retrievalDiagnosticsText(result engine.Result) string {
 		t := result.Timings
 		parts = append(parts, fmt.Sprintf("timings_ms[total=%d sync=%d lexical=%d embed=%d vector=%d fuse=%d rerank=%d render=%d]",
 			t.TotalMs, t.SyncMs, t.LexicalMs, t.QueryEmbedMs, t.VectorMs, t.FuseMs, t.RerankMs, t.RenderMs))
+		// 精排的尝试次数、重试等待与最长单次耗时：精排慢时据此区分服务商单次
+		// 响应慢与客户端在重试。没有发出精排请求时不写。
+		if t.RerankAttempts > 0 {
+			parts = append(parts, fmt.Sprintf("rerank_attempts=%d rerank_retry_wait_ms=%d rerank_attempt_ms=%d",
+				t.RerankAttempts, t.RerankRetryWaitMs, t.RerankAttemptMs))
+		}
 	}
 	if summary := hitsSummaryText(result.Hits); summary != "" {
 		parts = append(parts, summary)
