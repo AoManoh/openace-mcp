@@ -226,21 +226,8 @@ func (c *Client) BulkFetchResults(ctx context.Context, status BulkJobStatus, exp
 			// 行形状为实跑驱动器核实的 voyage 口径:状态码在 response 层,
 			// 数据在 response.body 层;单输入行使 data 恰 1 条,天然规避
 			// "data[].index 是服务端全局偏移"的历史陷阱(2026-08-05 实测)。
-			var row struct {
-				CustomID string `json:"custom_id"`
-				Response struct {
-					StatusCode int `json:"status_code"`
-					Body       struct {
-						Data []struct {
-							Embedding []float32 `json:"embedding"`
-						} `json:"data"`
-						Usage struct {
-							TotalTokens int `json:"total_tokens"`
-						} `json:"usage"`
-					} `json:"body"`
-				} `json:"response"`
-			}
-			if err := json.Unmarshal(line, &row); err != nil {
+			row, err := decodeBulkResultRow(line, c.cfg.Dimension)
+			if err != nil {
 				return fmt.Errorf("bulk fetch: 结果行解析失败: %w", err)
 			}
 			if !expectSet[row.CustomID] {
@@ -264,7 +251,7 @@ func (c *Client) BulkFetchResults(ctx context.Context, status BulkJobStatus, exp
 				result.RejectReason[row.CustomID] = fmt.Sprintf("bad shape: data=%d dim=%d want=%d", len(data), dim, c.cfg.Dimension)
 				continue
 			}
-			result.Vectors[row.CustomID] = data[0].Embedding
+			result.Vectors[row.CustomID] = exactVector(data[0].Embedding)
 			result.UsageTokens += row.Response.Body.Usage.TotalTokens
 		}
 		return scanner.Err()
@@ -346,4 +333,36 @@ func (c *Client) bulkDownload(ctx context.Context, fileID string) (io.ReadCloser
 		return nil, reliability.ClassifyHTTPResponse(resp)
 	}
 	return resp.Body, nil
+}
+
+// bulkResultRow 是批作业结果文件的一行。行形状为实跑驱动器核实的 voyage 口径:
+// 状态码在 response 层,数据在 response.body 层;单输入行使 data 恰 1 条,天然
+// 规避"data[].index 是服务端全局偏移"的历史陷阱(2026-08-05 实测)。
+type bulkResultRow struct {
+	CustomID string `json:"custom_id"`
+	Response struct {
+		StatusCode int `json:"status_code"`
+		Body       struct {
+			Data  []bulkResultItem `json:"data"`
+			Usage struct {
+				TotalTokens int `json:"total_tokens"`
+			} `json:"usage"`
+		} `json:"body"`
+	} `json:"response"`
+}
+
+type bulkResultItem struct {
+	Embedding []float32 `json:"embedding"`
+}
+
+// decodeBulkResultRow 解析结果文件的一行。维度已知时先为唯一一条向量预分配
+// 容量，encoding/json 把元素追加进已有容量、不再逐个扩容（不预分配时 1024 维
+// 向量的容量停在 1344）。行里的条数或维度不符时照常解析，由调用方按形状拒绝。
+func decodeBulkResultRow(line []byte, dim int) (bulkResultRow, error) {
+	var row bulkResultRow
+	if dim > 0 {
+		row.Response.Body.Data = []bulkResultItem{{Embedding: make([]float32, 0, dim)}}
+	}
+	err := json.Unmarshal(line, &row)
+	return row, err
 }

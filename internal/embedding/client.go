@@ -366,16 +366,27 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 		return nil, reliability.ClassifyHTTPResponse(resp)
 	}
 
+	type embeddingItem struct {
+		Embedding []float32 `json:"embedding"`
+		Index     int       `json:"index"`
+	}
 	var decoded struct {
-		Data []struct {
-			Embedding []float32 `json:"embedding"`
-			Index     int       `json:"index"`
-		} `json:"data"`
+		Data []embeddingItem `json:"data"`
 		// Usage 是服务商报告的本次计费用量（Voyage 与 OpenAI 兼容形状都在
 		// usage.total_tokens）；缺省时为 nil。
 		Usage *struct {
 			TotalTokens int64 `json:"total_tokens"`
 		} `json:"usage"`
+	}
+	// 维度已知时按请求条数预分配每条向量的容量。encoding/json 解码数组时
+	// 把元素追加进已有容量，不再逐个扩容：不预分配时 1024 维向量的容量停在
+	// 1344，构建期间全部新向量多占约三成内存。条数或维度与预期不同时 json
+	// 照常扩容，下面的结构校验照旧拒绝。
+	if c.cfg.Dimension > 0 {
+		decoded.Data = make([]embeddingItem, len(texts))
+		for i := range decoded.Data {
+			decoded.Data[i].Embedding = make([]float32, 0, c.cfg.Dimension)
+		}
 	}
 	// 成功路径读尽剩余字节让连接归还池(L7,诊断 2026-08-03):json.Decoder
 	// 停在 JSON 值末尾,不读尽 body 时 HTTP/1.1 连接无法复用,每批重建
@@ -435,7 +446,7 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 					len(item.Embedding), c.cfg.Dimension, EnvDimension),
 			}
 		}
-		out[item.Index] = item.Embedding
+		out[item.Index] = exactVector(item.Embedding)
 	}
 	// 查询向量数值校验：查询向量要归一化后与索引做相似度，范数为零或含
 	// 非有限分量时无法检索。在这里判为无效响应，调用链在计入成功之前就
@@ -487,4 +498,16 @@ func asCallError(err error) *reliability.CallError {
 		return callErr
 	}
 	return nil
+}
+
+// exactVector 返回容量等于长度的向量：容量已经相等时原样返回，否则复制到
+// 恰好长度的新切片。构建期间新向量要一直留到写分段，多余的容量按向量条数
+// 累积成可观的内存。
+func exactVector(v []float32) []float32 {
+	if cap(v) == len(v) {
+		return v
+	}
+	out := make([]float32, len(v))
+	copy(out, v)
+	return out
 }
