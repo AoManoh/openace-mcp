@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,7 +33,22 @@ const LexicalDirName = "lexical.bleve"
 // daemon 内同一 Store 的 Publish 由上层 singleflight 串行化。
 type Store struct {
 	root string
+	// verifiedMu 保护 verified。verified 记录本进程内已通过校验的分段：键为
+	// 分段 ID，值为当时的期望校验和与 chunks.jsonl 的文件身份，见
+	// verifySegmentChunks。零值可用；引擎按工作区缓存 Store，记录随之保留。
+	verifiedMu sync.Mutex
+	verified   map[string]verifiedSegment
 }
+
+// verifiedSegment 是一个分段的 chunks.jsonl 通过校验时的期望校验和与文件身份。
+type verifiedSegment struct {
+	checksum string
+	identity fileIdentity
+}
+
+// checksumFileForVerify 是 VerifyManifest 计算分段校验和所用的函数。包级变量
+// 只供测试统计计算次数，生产路径始终是 ChecksumFile。
+var checksumFileForVerify = ChecksumFile
 
 // NewStore 定位（必要时创建）索引根目录：
 // <cacheDir>/<namespace>/engines/local-hybrid/<workspaceKey>/<profileKey>/
@@ -186,18 +202,59 @@ func (s *Store) VerifyManifest(manifest *Manifest) error {
 	}
 	for _, segment := range segments {
 		dir := s.SegmentPathFor(segment.ID)
-		sum, err := ChecksumFile(filepath.Join(dir, ChunksFileName))
-		if err != nil {
-			return fmt.Errorf("读取 segment %s chunks 数据: %w", segment.ID, err)
-		}
-		if sum != segment.ChunksChecksum {
-			return fmt.Errorf("segment %s chunks checksum 不匹配: manifest=%s 实际=%s", segment.ID, segment.ChunksChecksum, sum)
+		if err := s.verifySegmentChunks(segment, filepath.Join(dir, ChunksFileName)); err != nil {
+			return err
 		}
 		if info, err := os.Stat(filepath.Join(dir, LexicalDirName)); err != nil || !info.IsDir() {
 			return fmt.Errorf("segment %s lexical 索引目录缺失: %v", segment.ID, err)
 		}
 	}
 	return nil
+}
+
+// verifySegmentChunks 校验一个分段的 chunks.jsonl。分段发布后不再改写，本进程
+// 内该文件的大小、修改时间与 inode（取不到 inode 的平台只比前两项）都没变、
+// 期望校验和也相同时，沿用上次的结果，不再重读整个文件：一个 6 段、共 390 MB
+// 的工作区，改动前每次检索要完整重算三次（约 1 秒）。文件被改写时
+// 身份随之改变，照常重算并报出损坏；校验失败时删除记录，下一次重新计算。
+// 先取身份再算校验和：两步之间文件若被改写，记下的是改写前的身份，下一次
+// 比对必然不一致而重算，不会把新内容当成已校验。
+func (s *Store) verifySegmentChunks(segment SegmentRef, path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		s.forgetVerified(segment.ID)
+		return fmt.Errorf("读取 segment %s chunks 数据: %w", segment.ID, err)
+	}
+	identity := identityOf(info)
+	s.verifiedMu.Lock()
+	cached, ok := s.verified[segment.ID]
+	s.verifiedMu.Unlock()
+	if ok && cached.checksum == segment.ChunksChecksum && cached.identity == identity {
+		return nil
+	}
+	sum, err := checksumFileForVerify(path)
+	if err != nil {
+		s.forgetVerified(segment.ID)
+		return fmt.Errorf("读取 segment %s chunks 数据: %w", segment.ID, err)
+	}
+	if sum != segment.ChunksChecksum {
+		s.forgetVerified(segment.ID)
+		return fmt.Errorf("segment %s chunks checksum 不匹配: manifest=%s 实际=%s", segment.ID, segment.ChunksChecksum, sum)
+	}
+	s.verifiedMu.Lock()
+	if s.verified == nil {
+		s.verified = make(map[string]verifiedSegment)
+	}
+	s.verified[segment.ID] = verifiedSegment{checksum: sum, identity: identity}
+	s.verifiedMu.Unlock()
+	return nil
+}
+
+// forgetVerified 删除一个分段的校验记录：校验失败或分段目录被删除时调用。
+func (s *Store) forgetVerified(segmentID string) {
+	s.verifiedMu.Lock()
+	delete(s.verified, segmentID)
+	s.verifiedMu.Unlock()
 }
 
 // ListRevisions 返回全部持久化 manifest 的 revision 标识（无序）。
@@ -249,6 +306,7 @@ func (s *Store) RemoveRevision(revision string) error {
 		if err := removeAllWithRetry(s.SegmentPathFor(segment.ID)); err != nil {
 			return err
 		}
+		s.forgetVerified(segment.ID)
 	}
 	return nil
 }
@@ -329,6 +387,7 @@ func (s *Store) CleanupOrphanSegments() error {
 		if err := removeAllWithRetry(filepath.Join(s.root, segmentsDir, entry.Name())); err != nil {
 			return err
 		}
+		s.forgetVerified(entry.Name())
 	}
 	return nil
 }
