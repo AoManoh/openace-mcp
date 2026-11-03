@@ -93,12 +93,19 @@ const embedTemplateVersion = "a2p-v1"
 //   - 模板文案已冻结：任何改动必须同时升级 embedTemplateVersion，否则新旧
 //     文本的向量会在同一子树内混用。
 func embedDocText(record chunkRecord) string {
+	if hook := embedDocTextHook; hook != nil {
+		hook()
+	}
 	head := "This chunk is from " + record.RelPath + ", " + record.Language
 	if record.Symbol != "" {
 		head += ", defining " + record.Symbol
 	}
 	return head + ".\n" + record.Content
 }
+
+// embedDocTextHook 在每次生成送审文本时调用，只供测试统计文本的生成时机，
+// 生产路径为 nil。
+var embedDocTextHook func()
 
 // embedKey 是向量复用与 journal 的键：sha256(模板版本, 相对路径, 符号,
 // 语言, 内容 hash)。嵌入输入含路径与符号头，键必须覆盖同样的字段：若只
@@ -321,11 +328,14 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	// 切出相同的批次。已在持久化拒绝集（provider 曾对该内容返回零向量或
 	// NaN）里的键不再送 provider：拒绝集跨重启保留，否则 watcher 每个周期
 	// 都会为同一段病理内容重复付费。
+	// missingIdx[i] 是 missingHashes[i] 首次出现的记录下标。送审文本在投放
+	// 那一批时才由 embedDocText 生成，不在这里为全部缺口一次生成：一次生成
+	// 的文本要在整个嵌入阶段留在内存里（mailyn-cli 一半副本首建时 191 MiB）。
 	var missingHashes []string
-	var missingTexts []string
+	var missingIdx []int
 	reusedRows := 0
 	seen := make(map[string]bool, len(records))
-	for _, record := range records {
+	for i, record := range records {
 		key := embedKey(record)
 		if seen[key] {
 			continue
@@ -343,7 +353,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 			continue
 		}
 		missingHashes = append(missingHashes, key)
-		missingTexts = append(missingTexts, embedDocText(record))
+		missingIdx = append(missingIdx, i)
 	}
 	if len(missingHashes) > 0 {
 		processed, err := e.recoverBulkState(ctx, journal, status, reuse, &out)
@@ -351,14 +361,15 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 			return out, err
 		}
 		if len(processed) > 0 {
-			var keptHashes, keptTexts []string
+			var keptHashes []string
+			var keptIdx []int
 			for i, key := range missingHashes {
 				if !processed[key] {
 					keptHashes = append(keptHashes, key)
-					keptTexts = append(keptTexts, missingTexts[i])
+					keptIdx = append(keptIdx, missingIdx[i])
 				}
 			}
-			missingHashes, missingTexts = keptHashes, keptTexts
+			missingHashes, missingIdx = keptHashes, keptIdx
 		}
 	}
 
@@ -367,7 +378,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	// 之前：迁移受阻时不送审，共享库里已有的向量仍能补上缺口。
 	if len(missingHashes) > 0 {
 		before := len(missingHashes)
-		missingHashes, missingTexts = e.reuseSharedVectors(missingHashes, missingTexts, reuse, &out)
+		missingHashes, missingIdx = e.reuseSharedVectors(missingHashes, missingIdx, reuse, &out)
 		reusedRows += before - len(missingHashes)
 	}
 
@@ -380,7 +391,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		paid := e.siblingPaidStateFor(store, missingHashes)
 		var inherited []string
 		keptHashes := make([]string, 0, len(missingHashes))
-		keptTexts := make([]string, 0, len(missingTexts))
+		keptIdx := make([]int, 0, len(missingIdx))
 		for i, key := range missingHashes {
 			if vec, ok := paid.vectors[key]; ok {
 				reuse[key] = vec
@@ -394,9 +405,9 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 				continue
 			}
 			keptHashes = append(keptHashes, key)
-			keptTexts = append(keptTexts, missingTexts[i])
+			keptIdx = append(keptIdx, missingIdx[i])
 		}
-		missingHashes, missingTexts = keptHashes, keptTexts
+		missingHashes, missingIdx = keptHashes, keptIdx
 		if err := journal.MarkRejected(inherited); err != nil {
 			return out, fmt.Errorf("journal 拒绝集落盘: %w", err)
 		}
@@ -421,7 +432,8 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	// semantic_bulk.go）。回收的向量写入同一 journal 与 reuse，之后与同步
 	// 路径共用 assembleSemanticOutcome，产物等价。
 	if len(missingHashes) > 0 && e.bulkEligible(len(missingHashes)) {
-		if err := e.bulkEmbedMissing(ctx, journal, status, missingHashes, missingTexts, reuse, &out); err != nil {
+		textAt := func(i int) string { return embedDocText(records[missingIdx[i]]) }
+		if err := e.bulkEmbedMissing(ctx, journal, status, missingHashes, textAt, reuse, &out); err != nil {
 			return out, err
 		}
 		return e.assembleSemanticOutcome(records, reuse, activeUsable, out), nil
@@ -539,16 +551,26 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	resourceTick := time.NewTicker(100 * time.Millisecond)
 	defer resourceTick.Stop()
 	cancelled := workCtx.Done()
+	// pendingTexts 是下一批（batches[next]）已生成的送审文本：准入未通过时留着，
+	// 下一轮直接用，不为同一批重复生成。
+	var pendingTexts []string
 	for next < len(batches) || running > 0 {
 		changed := e.embedClient.IndexWindowChanges()
 		// 当前窗口之外只实体化一个待准入批。重试睡眠不计入正在执行的
 		// 批次数，但仍通过客户端的逻辑批次内存检查控制新建 goroutine。
 		for workCtx.Err() == nil && next < len(batches) && running-waitingCount <= e.embedClient.GovernorSnapshot().Window {
 			id, span := next, batches[next]
-			batch, ok := e.embedClient.TryIndexBatch(missingTexts[span.start:span.end])
+			if pendingTexts == nil {
+				pendingTexts = make([]string, span.end-span.start)
+				for i := range pendingTexts {
+					pendingTexts[i] = embedDocText(records[missingIdx[span.start+i]])
+				}
+			}
+			batch, ok := e.embedClient.TryIndexBatch(pendingTexts)
 			if !ok {
 				break
 			}
+			pendingTexts = nil
 			next++
 			running++
 			wg.Add(1)

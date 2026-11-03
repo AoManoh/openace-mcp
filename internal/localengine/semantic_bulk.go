@@ -121,7 +121,7 @@ func (e *Engine) bulkEligible(missing int) bool {
 //     一次。
 //   - 全部作业处理完后删除状态文件。
 func (e *Engine) bulkEmbedMissing(ctx context.Context, journal *index.Journal, status *wsStatus,
-	missingHashes []string, missingTexts []string, reuse map[string][]float32, out *semanticOutcome) error {
+	missingHashes []string, textAt func(int) string, reuse map[string][]float32, out *semanticOutcome) error {
 	statePath := bulkStatePath(journal)
 	state, err := loadBulkState(statePath)
 	if err != nil {
@@ -140,12 +140,14 @@ func (e *Engine) bulkEmbedMissing(ctx context.Context, journal *index.Journal, s
 			submitted[key] = true
 		}
 	}
+	// pendingPos[j] 是 pendingKeys[j] 在 missingHashes 中的位置；送审文本按提交
+	// 段经 textAt 生成，不为全部缺口一次生成。
 	var pendingKeys []string
-	var pendingTexts []string
+	var pendingPos []int
 	for i, key := range missingHashes {
 		if !submitted[key] {
 			pendingKeys = append(pendingKeys, key)
-			pendingTexts = append(pendingTexts, missingTexts[i])
+			pendingPos = append(pendingPos, i)
 		}
 	}
 
@@ -157,7 +159,11 @@ func (e *Engine) bulkEmbedMissing(ctx context.Context, journal *index.Journal, s
 		if end > len(pendingKeys) {
 			end = len(pendingKeys)
 		}
-		segKeys, segTexts := pendingKeys[start:end], pendingTexts[start:end]
+		segKeys := pendingKeys[start:end]
+		segTexts := make([]string, end-start)
+		for j := range segTexts {
+			segTexts[j] = textAt(pendingPos[start+j])
+		}
 		state.PendingIntent = &bulkIntent{KeysSHA256: bulkKeysDigest(segKeys), Count: len(segKeys), CreatedAt: time.Now().UTC()}
 		if err := saveBulkState(statePath, state); err != nil {
 			return fmt.Errorf("提交意向落盘失败(尚未发生任何服务端调用,可直接重跑): %w", err)
