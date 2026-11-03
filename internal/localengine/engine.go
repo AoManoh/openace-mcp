@@ -122,6 +122,10 @@ type Engine struct {
 	// 持有它的句柄数引用计数，归零即释放。
 	vectorMu       sync.Mutex
 	vectorSegments map[string]*sharedVectorIndex
+	// segmentMetaMu 保护 segmentMetaCache：各分段 chunks.jsonl 解码出的按文件
+	// 分组的元数据，键为分段目录加 chunks 校验和，见 segment_meta_cache.go。
+	segmentMetaMu    sync.Mutex
+	segmentMetaCache map[string]*segmentMetaEntry
 	// repair 记录查询期发现向量文件损坏或缺失的工作区（键为 workspaceKey），
 	// 下次同步强制全量重建向量；构建开始时取走标记。
 	repair map[string]bool
@@ -970,6 +974,10 @@ func (e *Engine) Close(ctx context.Context) error {
 			delete(e.handles, revision)
 		}
 	}
+	// 分段元数据缓存只服务后续打开的句柄，引擎关闭后不会再有新句柄，随之释放。
+	e.segmentMetaMu.Lock()
+	e.segmentMetaCache = nil
+	e.segmentMetaMu.Unlock()
 	journals := make([]*index.Journal, 0, len(e.journals))
 	for key, journal := range e.journals {
 		journals = append(journals, journal)

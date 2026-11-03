@@ -1,8 +1,6 @@
 package localengine
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -292,62 +290,17 @@ func (h *revisionHandle) releaseVectorIndexes() {
 // 存活判定分两步：同一相对路径出现在多个 segment 时，后面（更新）的
 // segment 整体覆盖前面的记录（newest-wins）；路径不在 manifest.Files 里
 // （文件已删除或改名）的记录全部丢弃。
+// 不经分段缓存，每次都逐个分段完整解码；打开句柄走 Engine.liveChunkMetas。
 func loadLiveChunkMetas(manifest *index.Manifest, segmentDirs []string) (map[string]chunkMeta, error) {
-	type located struct {
-		id   string
-		meta chunkMeta
-	}
-	byFile := make(map[string][]located, len(manifest.Files))
-	for segIdx, dir := range segmentDirs {
-		file, err := os.Open(filepath.Join(dir, index.ChunksFileName))
+	perSegment := make([]map[string][]locatedMeta, len(segmentDirs))
+	for i, dir := range segmentDirs {
+		byFile, err := decodeSegmentMetas(dir)
 		if err != nil {
-			return nil, fmt.Errorf("读取 segment chunk 数据: %w", err)
+			return nil, err
 		}
-		reader := bufio.NewReaderSize(file, 1<<20)
-		var offset int64
-		segByFile := make(map[string][]located)
-		for {
-			line, err := reader.ReadBytes('\n')
-			lineLen := len(line)
-			trimmed := bytes.TrimRight(line, "\n")
-			if len(trimmed) > 0 {
-				var record chunkRecord
-				if unmarshalErr := json.Unmarshal(trimmed, &record); unmarshalErr != nil {
-					file.Close()
-					return nil, fmt.Errorf("chunk 数据损坏: %w", unmarshalErr)
-				}
-				segByFile[record.RelPath] = append(segByFile[record.RelPath], located{
-					id: record.ID,
-					meta: chunkMeta{
-						RelPath: record.RelPath, Language: record.Language,
-						StartLine: record.StartLine, EndLine: record.EndLine,
-						Symbol: record.Symbol, ContentHash: record.ContentHash,
-						segIdx: segIdx, offset: offset, length: len(trimmed),
-					},
-				})
-			}
-			offset += int64(lineLen)
-			if err != nil {
-				break
-			}
-		}
-		file.Close()
-		// manifest.Segments 按构建先后排列，后面的 segment 含同一文件的更新
-		// 版本，整组覆盖前面的记录。
-		for path, group := range segByFile {
-			byFile[path] = group
-		}
+		perSegment[i] = byFile
 	}
-	metas := make(map[string]chunkMeta)
-	for path, group := range byFile {
-		if _, live := manifest.Files[path]; !live {
-			continue
-		}
-		for _, item := range group {
-			metas[item.id] = item.meta
-		}
-	}
-	return metas, nil
+	return assembleLiveMetas(manifest, perSegment), nil
 }
 
 // rankedHit 是进入渲染的最终排序候选。score 只用于渲染时同文件块合并后
@@ -1522,7 +1475,7 @@ func (e *Engine) openOrReuseHandle(store *index.Store, workspaceKey string, mani
 	if err != nil {
 		return nil, fmt.Errorf("打开词法索引（revision %s）: %w", manifest.Revision, err)
 	}
-	chunks, err := loadLiveChunkMetas(manifest, segmentDirs)
+	chunks, err := e.liveChunkMetas(manifest, segmentDirs)
 	if err != nil {
 		lex.Close()
 		return nil, err
