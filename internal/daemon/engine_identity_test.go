@@ -57,3 +57,33 @@ func TestServedByAdvertisesEngineProfile(t *testing.T) {
 
 	// 无自述能力（legacy ACE / 旧实现）不广播该字段。
 }
+
+// componentSyncer 模拟同时自述配置指纹组成项的服务。
+type componentSyncer struct {
+	profiledSyncer
+	components map[string]string
+}
+
+func (s componentSyncer) EngineProfileComponents() map[string]string { return s.components }
+
+// TestDaemonStatusProfileComponents：daemon 状态带配置指纹的组成项，wrapper 在
+// 指纹不一致时据此逐项列出不同的设置；服务不自述组成项时不输出该字段。
+func TestDaemonStatusProfileComponents(t *testing.T) {
+	useTempTaskStore(t)
+	profiled := profiledSyncer{
+		identifiableSyncer: identifiableSyncer{id: engine.EngineLocalHybrid},
+		profile:            "abc123def456",
+	}
+	server := NewServer(componentSyncer{profiledSyncer: profiled, components: map[string]string{"rerank": "standard/rerank-3"}})
+	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })
+	status := server.statusSnapshot(context.Background())
+	if status.EngineProfileComponents["rerank"] != "standard/rerank-3" || status.EngineProfile != "abc123def456" {
+		t.Fatalf("daemon 状态应带配置指纹与组成项: %+v", status)
+	}
+
+	plain := NewServer(profiled)
+	t.Cleanup(func() { _ = plain.Shutdown(context.Background()) })
+	if components := plain.statusSnapshot(context.Background()).EngineProfileComponents; components != nil {
+		t.Fatalf("不自述组成项的服务不应输出该字段: %v", components)
+	}
+}

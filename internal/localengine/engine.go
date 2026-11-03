@@ -70,6 +70,9 @@ type Engine struct {
 	// 给 wrapper：wrapper 只复用指纹一致的 daemon，用户改了 provider 或降级
 	// 配置后不会静默连上仍按旧配置运行的 daemon。
 	fingerprint string
+	// fingerprintComponents 是指纹各组成项的说明（见
+	// Options.FingerprintComponents），只读，由 EngineProfileComponents 复制返回。
+	fingerprintComponents map[string]string
 
 	embedCfg      embedding.Config
 	embedClient   *embedding.Client
@@ -265,6 +268,7 @@ func New(opts Options) (*Engine, error) {
 		e.rerankClient = client
 	}
 	e.fingerprint = engineFingerprint(opts)
+	e.fingerprintComponents = engineFingerprintComponents(opts)
 	return e, nil
 }
 
@@ -274,6 +278,22 @@ func New(opts Options) (*Engine, error) {
 func engineFingerprint(opts Options) string {
 	opts.Embedding.TemplateVersion = embedTemplateVersion
 	return opts.Fingerprint()
+}
+
+// engineFingerprintComponents 返回与 engineFingerprint 同一口径（模板版本取
+// embedTemplateVersion）的指纹组成项说明。
+func engineFingerprintComponents(opts Options) map[string]string {
+	opts.Embedding.TemplateVersion = embedTemplateVersion
+	return opts.FingerprintComponents()
+}
+
+// copyComponents 返回组成项说明的副本，调用方修改返回值不影响引擎内的记录。
+func copyComponents(components map[string]string) map[string]string {
+	out := make(map[string]string, len(components))
+	for name, value := range components {
+		out[name] = value
+	}
+	return out
 }
 
 // dimensionCacheDir 返回维度探测缓存所在的 cache 根目录；取不到时返回空，
@@ -296,6 +316,12 @@ func embeddingSubtreeSuffix(cfg embedding.Config) string {
 // daemon 复用判定。
 func (e *Engine) EngineProfileFingerprint() string {
 	return e.fingerprint
+}
+
+// EngineProfileComponents 实现 engine.ProfileComponentReporter，返回指纹各组成
+// 项说明的副本。
+func (e *Engine) EngineProfileComponents() map[string]string {
+	return copyComponents(e.fingerprintComponents)
 }
 
 // semanticEnabled 报告是否配置了 embedding provider，即语义路是否可用。

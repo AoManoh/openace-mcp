@@ -306,7 +306,7 @@ func TestRecoverHookProbesWhenStartupLockContended(t *testing.T) {
 	defer release()
 
 	client := daemon.NewClient(addr)
-	attachRecoverHook(client, addr, "local-hybrid", "")
+	attachRecoverHook(client, addr, "local-hybrid", profileExpectation{})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	err = client.Health(ctx)

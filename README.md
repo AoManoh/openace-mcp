@@ -314,7 +314,9 @@ wrapper 与 daemon 的一致性分两层,行为刻意不同:
 - **索引速度慢**：先用 `workspace_status` 或 `task_status` 确认当前阶段、进度和 provider 状态。嵌入并发按成功吞吐与过载自动调整；窗口长时间未被用满且未测得吞吐增益时，保留已有判断，等待输入恢复后再比较。检查显式 `OPENACE_EMBEDDING_RPM_BUDGET`、`OPENACE_EMBEDDING_TPM_BUDGET` 和状态中的资源等待原因。`OPENACE_EMBEDDING_MAX_CONCURRENCY` 已退役，启用语义 provider 时设置它会报错，应移除此变量。
 - **客户端找不到命令**:`command` 写绝对路径(`~/go/bin/openace-mcp` 等);IDE 启动子进程不经过 shell,环境变量占位符不展开。
 - **升级不生效**:Unix 上重跑 `go install` 就完事,旧 daemon 会被自动接管,开着的会话下次调用自动跟上;`daemon_status` 能核对两边的 build。Windows 仍需手动:停旧 daemon,重启 MCP 会话。
-- **改了 provider env 没反应**:确认重启了 MCP 会话;`daemon_status` 可查当前 daemon 的 build 与配置指纹。
+- **改了 provider env 没反应**:确认重启了 MCP 会话;`daemon_status` 可查当前 daemon 的 build、配置指纹与指纹组成项(`engine_profile_components`)。
+- **报 `engine profile ... != ...`**:本会话的配置与正在运行的共享 daemon 不一致,报错会逐项列出不同的设置与两边的取值。共享 daemon 服务所有连到同一地址的会话:把本会话的 `OPENACE_*` 配置改成与它一致,或用 `OPENACE_DAEMON_ADDR` 给本会话另起一个地址;只有所有会话都要换成新配置时才停共享 daemon。
+- **报 `did not respond within`**:daemon 在超时内没有响应,通常是正在构建大仓索引或正在重启。先用 `daemon_status` / `workspace_status` 查看,再重试;不要为此停掉共享 daemon,其他会话也在用它。
 - **WSL/Windows 混用**:WSL 里复用 Windows daemon 时传 `D:\project` 或 `/mnt/d/project` 均可(自动规范化);非 WSL 的 POSIX 路径会被拒绝,避免产生无效 workspace 身份。
 - **`provider_profile_id` 报错**:该参数属已退役 legacy 引擎,删除即可。
 

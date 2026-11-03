@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -25,14 +26,14 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	expectedProfile := ""
+	expectedProfile := profileExpectation{}
 	if requestedEngine == engine.EngineLocalHybrid {
 		// 期望配置指纹来自本进程 env（K29）：解析失败即配置错误，fail-fast。
 		opts, err := localengine.OptionsFromEnv()
 		if err != nil {
 			return nil, err
 		}
-		expectedProfile = opts.Fingerprint()
+		expectedProfile = profileExpectation{fingerprint: opts.Fingerprint(), components: opts.FingerprintComponents()}
 	}
 	addr := daemonAddrFromEnv()
 	managedAddr := managedDaemonAddr(addr)
@@ -107,10 +108,10 @@ func Connect(ctx context.Context) (*daemon.Client, error) {
 // 探测→拉起→就绪→身份复验)重拉,随后由 client 对原请求重试一次。
 // 仅 managed 自有地址接线——手工 daemon(manual-daemon 模式)生命周期
 // 归用户,不代拉。
-func attachRecoverHook(client *daemon.Client, managedAddr string, requestedEngine string, expectedProfile string) {
+func attachRecoverHook(client *daemon.Client, managedAddr string, requestedEngine string, expectedProfile profileExpectation) {
 	// Connect 时兼容性已复验;把期望身份绑定到 Client,后续每个带
 	// served_by 的响应零额外请求复验,防会话中途 daemon 换血。
-	client.SetExpectedIdentity(buildinfo.Current(), requestedEngine, expectedProfile)
+	client.SetExpectedIdentity(buildinfo.Current(), requestedEngine, expectedProfile.fingerprint)
 	client.SetRecoverHook(func(ctx context.Context) error {
 		releaseLock, err := acquireStartupLock(ctx, managedAddr, startupTimeout())
 		if err != nil {
@@ -137,7 +138,7 @@ func attachRecoverHook(client *daemon.Client, managedAddr string, requestedEngin
 	})
 }
 
-func reusable(ctx context.Context, client *daemon.Client, requestedEngine string, expectedProfile string) error {
+func reusable(ctx context.Context, client *daemon.Client, requestedEngine string, expectedProfile profileExpectation) error {
 	statusCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 	status, err := client.DaemonStatus(statusCtx)
@@ -156,7 +157,7 @@ func reusable(ctx context.Context, client *daemon.Client, requestedEngine string
 	if err := compatibleEngine(requestedEngine, status.Engine); err != nil {
 		return fmt.Errorf("openACE daemon at %s is not compatible with this MCP wrapper: %w", client.Endpoint(), err)
 	}
-	if err := compatibleEngineProfile(requestedEngine, expectedProfile, status.EngineProfile); err != nil {
+	if err := compatibleEngineProfile(requestedEngine, expectedProfile, status.EngineProfile, status.EngineProfileComponents); err != nil {
 		return fmt.Errorf("openACE daemon at %s is not compatible with this MCP wrapper: %w", client.Endpoint(), err)
 	}
 	return nil
@@ -175,21 +176,74 @@ func compatibleEngine(requested string, daemonEngine string) error {
 	return nil
 }
 
+// profileExpectation 是 wrapper 按本进程 env 算出的配置指纹与各组成项说明。
+// 组成项只用于指纹不一致时逐项说明，判定只看指纹。
+type profileExpectation struct {
+	fingerprint string
+	components  map[string]string
+}
+
 // compatibleEngineProfile 校验 local-hybrid 的 provider 配置指纹一致
 // （Stage 3 暗坑 K29）：用户改 provider env 后不得静默复用旧配置 daemon。
 // 旧 daemon（Stage 2，无 engine_profile 广播）按纯词法档对待——与
 // semantic/rerank 全关的期望兼容，与任何 provider 配置不兼容（D11）。
-func compatibleEngineProfile(requestedEngine string, expected string, daemonProfile string) error {
+//
+// 不一致时报错逐项列出不同的组成项与两边的取值。处置写成“让本会话配置与
+// 运行中的 daemon 一致，或用 OPENACE_DAEMON_ADDR 另起一个 daemon”：共享
+// daemon 服务所有连到同一地址的会话，改动前的“restart the daemon”会让一个
+// 会话的配置差异中断其他会话，而且重启后的 daemon 仍按拉起它的那份配置运行。
+func compatibleEngineProfile(requestedEngine string, expected profileExpectation, daemonProfile string, daemonComponents map[string]string) error {
 	if requestedEngine != engine.EngineLocalHybrid {
 		return nil
 	}
 	if daemonProfile == "" {
 		daemonProfile = localengine.Options{}.Fingerprint()
+		daemonComponents = localengine.Options{}.FingerprintComponents()
 	}
-	if expected != daemonProfile {
-		return fmt.Errorf("wrapper engine profile %s != daemon engine profile %s (provider/degrade env changed); restart the daemon to apply the new configuration", expected, daemonProfile)
+	if expected.fingerprint == daemonProfile {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("wrapper engine profile %s != daemon engine profile %s; differing settings: %s. The daemon at this address serves every session that connects to it: make this session's openACE MCP configuration (OPENACE_* environment variables) match the running daemon, or point this session at its own daemon with OPENACE_DAEMON_ADDR (for example 127.0.0.1:8766). Stop the shared daemon only if every session should switch to this session's configuration",
+		expected.fingerprint, daemonProfile, describeProfileDifferences(expected.components, daemonComponents))
+}
+
+// describeProfileDifferences 按 localengine.FingerprintComponentNames 的顺序列出
+// 两边取值不同的组成项；daemon 多出或缺少的组成项名排在后面。daemon 没有
+// 提供组成项（旧版本）时如实说明无法逐项比较。
+func describeProfileDifferences(wrapper map[string]string, daemonSide map[string]string) string {
+	if len(daemonSide) == 0 {
+		return "unknown, the daemon does not report its profile components (older build), so the settings cannot be compared one by one"
+	}
+	names := localengine.FingerprintComponentNames()
+	known := make(map[string]bool, len(names))
+	for _, name := range names {
+		known[name] = true
+	}
+	var extra []string
+	for name := range daemonSide {
+		if !known[name] {
+			extra = append(extra, name)
+		}
+	}
+	sort.Strings(extra)
+	var diffs []string
+	for _, name := range append(names, extra...) {
+		if wrapper[name] == daemonSide[name] {
+			continue
+		}
+		diffs = append(diffs, fmt.Sprintf("%s (this session: %s; daemon: %s)", name, orMissing(wrapper[name]), orMissing(daemonSide[name])))
+	}
+	if len(diffs) == 0 {
+		return "none found in the reported components, the daemon computes its fingerprint differently (different openACE build)"
+	}
+	return strings.Join(diffs, ", ")
+}
+
+func orMissing(value string) string {
+	if value == "" {
+		return "not reported"
+	}
+	return value
 }
 
 // errDaemonBuildMismatch 标记 wrapper/daemon 构建不一致(T5 接管判据:

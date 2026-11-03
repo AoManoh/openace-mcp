@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -201,46 +202,110 @@ func normalizeDegrade(mode DegradeMode) DegradeMode {
 // 其他指纹项相同才会得到相同指纹。OpenAI-compatible 服务允许不带 key，
 // 是否启用语义路径由 Enabled 决定。
 func (o Options) Fingerprint() string {
-	embedComponent := "off"
+	// 词法评分模型决定词法路的分数与排序，不由 env 配置，但必须进指纹：
+	// 未设置评分模型、实际按 TF-IDF 评分的旧 daemon 与 BM25 的 wrapper 即使
+	// env 完全相同也不能互相复用。加入该项时前缀从 v3 升到 v4，纯词法零值
+	// 配置的指纹同样随之改变。检索降级开关退役后前缀升到 v5：旧 daemon 在
+	// 语义路失败时返回纯词法结果，新 wrapper 不能复用它。前缀在组成项变化
+	// 时升版，旧版 daemon 与新版 wrapper 不会算出相同指纹。
+	inputs := []string{"engine-profile-v5"}
+	for _, part := range o.fingerprintParts() {
+		inputs = append(inputs, part.input)
+	}
+	sum := sha256.Sum256([]byte(strings.Join(inputs, "\x00")))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// fingerprintPart 是引擎配置指纹的一个组成项：input 原样进入指纹哈希；label
+// 是写进 daemon 状态与报错的说明，含 input 或能唯一对应 input 的短哈希，
+// 两组配置某一项的 label 相同当且仅当该项的 input 相同。
+type fingerprintPart struct {
+	name  string
+	input string
+	label string
+}
+
+// fingerprintComponentNames 是指纹组成项的名称与顺序；顺序就是哈希输入的顺序，
+// 改动会改变全部指纹值。
+var fingerprintComponentNames = []string{"lexical", "embedding", "rerank", "rerank_degrade", "quality_strict", "bulk"}
+
+// FingerprintComponentNames 返回指纹组成项的名称，顺序固定，供报错按同一顺序
+// 列出不一致的项。
+func FingerprintComponentNames() []string {
+	return append([]string(nil), fingerprintComponentNames...)
+}
+
+// FingerprintComponents 返回指纹各组成项的说明（名称见
+// FingerprintComponentNames）。daemon 把它放进状态，wrapper 在指纹不一致时逐项
+// 比较，告诉用户具体哪项设置不同；不含 key，URL 只保留协议、主机与路径。
+func (o Options) FingerprintComponents() map[string]string {
+	components := make(map[string]string, len(fingerprintComponentNames))
+	for _, part := range o.fingerprintParts() {
+		components[part.name] = part.label
+	}
+	return components
+}
+
+// fingerprintParts 按 fingerprintComponentNames 的顺序给出各组成项。
+func (o Options) fingerprintParts() []fingerprintPart {
+	lexicalPart := "lexical-" + lexical.ScoringModel
+	embed := fingerprintPart{name: "embedding", input: "off", label: "off"}
 	if o.Embedding.Enabled {
 		// 用只凭 env 可算的配置身份（维度未显式配置时记 auto），不用含探测维度的
-		// ProfileHash：wrapper 不做探测，两边才能算出同一指纹。
-		embedComponent = o.Embedding.ConfigIdentity()
+		// ProfileHash：wrapper 不做探测，两边才能算出同一指纹。ConfigIdentity 是
+		// 哈希，label 另写出 adapter、模型、维度与地址，并带上这个哈希。
+		embed.input = o.Embedding.ConfigIdentity()
+		dimension := "auto"
+		if !o.Embedding.DimensionAuto {
+			dimension = fmt.Sprintf("%d", o.Embedding.Dimension)
+		}
+		embed.label = fmt.Sprintf("%s/%s dim=%s endpoint=%s id=%s",
+			o.Embedding.ProviderType, o.Embedding.Model, dimension, displayEndpoint(o.Embedding.BaseURL), embed.input)
 	}
-	rerankComponent := "off"
+	rr := fingerprintPart{name: "rerank", input: "off", label: "off"}
 	if o.Rerank.Enabled {
-		rerankComponent = o.Rerank.Identity()
+		rr.input = o.Rerank.Identity()
+		rr.label = rr.input
+		if o.Rerank.Model == "" {
+			// 没有模型 id 时 Identity 带原始地址，label 改用去掉用户信息与查询
+			// 参数的地址，并附 input 的短哈希保持一一对应。
+			sum := sha256.Sum256([]byte(rr.input))
+			rr.label = fmt.Sprintf("%s@%s id=%s", o.Rerank.ProviderType, displayEndpoint(o.Rerank.BaseURL), hex.EncodeToString(sum[:])[:8])
+		}
 	}
 	// QualityStrict 改变检索语义（缺口报错还是降级放行），与降级开关同类，
 	// 必须进指纹：否则一个 strict=on 与一个 strict=off 的 wrapper 会复用
 	// 同一个 daemon，实际语义由先启动的那个决定。
-	strictComponent := "strict-off"
+	strict := "strict-off"
 	if o.QualityStrict {
-		strictComponent = "strict-on"
+		strict = "strict-on"
 	}
 	// 批量嵌入模式是构建行为模式（构建由 daemon 执行），wrapper 与 daemon
 	// 必须一致：不进指纹就会按先启动者的模式执行，与降级、严格档开关的
 	// 处理不一致。它不改变向量身份（同模型同维度，批接口与实时接口产出
 	// 的向量在三个抽样点上的余弦相似度均为 1.000000），所以不进 ProfileHash，索引子树
-	// 不变。前缀 "engine-profile-v4" 在指纹组成项变化时升版，旧版 daemon
-	// 与新版 wrapper 不会算出相同指纹。
-	bulkComponent := "bulk-off"
+	// 不变。
+	bulk := "bulk-off"
 	if o.Embedding.BatchAPIMode != "" {
-		bulkComponent = "bulk-" + o.Embedding.BatchAPIMode
+		bulk = "bulk-" + o.Embedding.BatchAPIMode
 	}
-	// 词法评分模型决定词法路的分数与排序，不由 env 配置，但必须进指纹：
-	// 未设置评分模型、实际按 TF-IDF 评分的旧 daemon 与 BM25 的 wrapper 即使
-	// env 完全相同也不能互相复用。加入该项时前缀从 v3 升到 v4，纯词法零值
-	// 配置的指纹同样随之改变。检索降级开关退役后前缀升到 v5：旧 daemon 在
-	// 语义路失败时返回纯词法结果，新 wrapper 不能复用它。
-	sum := sha256.Sum256([]byte(strings.Join([]string{
-		"engine-profile-v5",
-		"lexical-" + lexical.ScoringModel,
-		embedComponent,
-		rerankComponent,
-		string(normalizeDegrade(o.RerankDegrade)),
-		strictComponent,
-		bulkComponent,
-	}, "\x00")))
-	return hex.EncodeToString(sum[:])[:12]
+	degrade := string(normalizeDegrade(o.RerankDegrade))
+	return []fingerprintPart{
+		{name: "lexical", input: lexicalPart, label: lexicalPart},
+		embed,
+		rr,
+		{name: "rerank_degrade", input: degrade, label: degrade},
+		{name: "quality_strict", input: strict, label: strict},
+		{name: "bulk", input: bulk, label: bulk},
+	}
+}
+
+// displayEndpoint 返回给人看的服务地址：只保留协议、主机与路径，去掉 URL 里的
+// 用户信息、查询参数与片段，这些位置可能带凭据。解析失败时返回 "invalid-url"。
+func displayEndpoint(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "invalid-url"
+	}
+	return parsed.Scheme + "://" + parsed.Host + parsed.Path
 }

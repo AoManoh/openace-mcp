@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -285,7 +286,10 @@ func (c *Client) validateServedBy(served *runtimeinfo.ServedBy) error {
 	if mismatch == "" {
 		return nil
 	}
-	return fmt.Errorf("%s: %s; restart the MCP session or restore the expected daemon", engine.DaemonIdentityChangedMarker, mismatch)
+	// 共享 daemon 被别的会话或运维操作换成了不同版本或配置时走到这里。处置
+	// 是重启本会话，让 wrapper 按本会话配置重新连接；从本会话停掉共享
+	// daemon 会中断其他正在使用它的会话。
+	return fmt.Errorf("%s: %s; the daemon at %s was replaced by a different build or configuration while this session was running; restart this MCP session so its wrapper reconnects with matching settings, and do not stop the shared daemon from this session", engine.DaemonIdentityChangedMarker, mismatch, c.Endpoint())
 }
 
 func (c *Client) validateDecodedIdentity(out any) error {
@@ -372,9 +376,10 @@ func (c *Client) do(req *http.Request, path string, out any) error {
 			req.Header.Set(callerTimeoutHeader, strconv.FormatInt(remaining, 10))
 		}
 	}
+	start := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return c.annotateTimeout(err, start)
 	}
 	defer resp.Body.Close()
 
@@ -382,7 +387,7 @@ func (c *Client) do(req *http.Request, path string, out any) error {
 	// decode 报裸 unexpected end of JSON input,无端点、无恢复提示)。
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes+1))
 	if err != nil {
-		return err
+		return c.annotateTimeout(err, start)
 	}
 	truncated := len(data) > maxResponseBodyBytes
 	if truncated {
@@ -410,6 +415,19 @@ func (c *Client) do(req *http.Request, path string, out any) error {
 		return err
 	}
 	return nil
+}
+
+// annotateTimeout 给请求超时的错误补上 daemon 地址、已等待的时长与处置。
+// 改动前调用方只看到 "i/o timeout" 或 "context deadline exceeded"，分不清是
+// daemon 正忙于构建、正在重启还是已经卡住，常见的反应是去停共享 daemon，
+// 而这会中断其他正在使用它的会话。原错误用 %w 保留，errors.Is 仍能识别
+// 超时与连接被拒。不是超时的错误原样返回。
+func (c *Client) annotateTimeout(err error, start time.Time) error {
+	var netErr net.Error
+	if !errors.Is(err, context.DeadlineExceeded) && !(errors.As(err, &netErr) && netErr.Timeout()) {
+		return err
+	}
+	return fmt.Errorf("openACE daemon at %s did not respond within %s (%w); check daemon_status to see whether it is building an index or restarting, then retry; do not stop the shared daemon from this session", c.Endpoint(), time.Since(start).Round(100*time.Millisecond), err)
 }
 
 func baseURL(addr string) string {

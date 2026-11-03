@@ -22,6 +22,10 @@ type Status struct {
 	// LaunchedBy 是拉起本 daemon 的 wrapper 进程（见 EnvLaunchedBy）；手动
 	// 启动时为空。
 	LaunchedBy *LaunchInfo `json:"launched_by,omitempty"`
+	// EngineProfileComponents 是配置指纹各组成项的说明（不含凭据）。只放在
+	// daemon 状态里、不随每个响应的 served_by 携带；wrapper 在指纹不一致时
+	// 读取它，逐项说明哪项设置与本会话不同。
+	EngineProfileComponents map[string]string `json:"engine_profile_components,omitempty"`
 }
 
 func capabilities(engineID string) map[string]bool {
@@ -61,6 +65,9 @@ func (s *Server) statusSnapshot(ctx context.Context) Status {
 	if reporter, ok := s.service.(engine.UsageReporter); ok {
 		usage := reporter.ProviderUsage()
 		status.ProviderUsage = &usage
+	}
+	if reporter, ok := s.service.(engine.ProfileComponentReporter); ok {
+		status.EngineProfileComponents = reporter.EngineProfileComponents()
 	}
 	return status
 }

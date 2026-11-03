@@ -47,6 +47,12 @@ type ProfileIdentifier interface {
 	EngineProfileFingerprint() string
 }
 
+// ProfileComponentReporter 是可选能力：实现方给出配置指纹各组成项的说明（不含
+// 凭据），daemon 放进状态，wrapper 在指纹不一致时据此逐项说明哪项设置不同。
+type ProfileComponentReporter interface {
+	EngineProfileComponents() map[string]string
+}
+
 // WorkspaceRef 标识一次请求指向的工作区与引擎/档案身份。
 // DirectoryPath 允许是调用方提供的原始路径；canonical 化由实现负责。
 type WorkspaceRef struct {

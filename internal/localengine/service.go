@@ -392,6 +392,12 @@ func (d *deferredEngine) EngineProfileFingerprint() string {
 	return d.fingerprint
 }
 
+// EngineProfileComponents 实现 engine.ProfileComponentReporter，口径与
+// EngineProfileFingerprint 相同，维度探测成功前后不变。
+func (d *deferredEngine) EngineProfileComponents() map[string]string {
+	return engineFingerprintComponents(d.opts)
+}
+
 // ProviderUsage 实现 engine.UsageReporter。维度尚未探测成功时还没有发出过
 // 嵌入或精排请求（探测请求由临时客户端发出、不计入），返回零用量。
 func (d *deferredEngine) ProviderUsage() engine.ProviderUsage {
