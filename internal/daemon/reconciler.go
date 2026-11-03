@@ -361,10 +361,17 @@ func (r *workspaceReconciler) workspaceInFlight(ctx context.Context, root string
 	if r.inspector == nil {
 		return false
 	}
-	status, err := r.inspector.WorkspaceStatus(ctx, engine.WorkspaceRef{
+	ref := engine.WorkspaceRef{
 		DirectoryPath:     root,
 		ProviderProfileID: strings.TrimSpace(providerProfileID),
-	})
+	}
+	// 优先只读状态跟踪器：WorkspaceStatus 还要统计顶层目录文件数，每个周期
+	// 为每个被监视的工作区做一遍没有必要。
+	if prober, ok := r.inspector.(engine.WorkspaceInFlightProber); ok {
+		inFlight, err := prober.WorkspaceInFlight(ctx, ref)
+		return err == nil && inFlight
+	}
+	status, err := r.inspector.WorkspaceStatus(ctx, ref)
 	return err == nil && status.InFlight
 }
 

@@ -678,16 +678,24 @@ func (e *Engine) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (
 
 // attachTopLevelCounts 按 active manifest 统计每个顶层目录下被索引的文件
 // 数，根目录下的文件归 "."。计数帮助核对实际索引范围；预期目录缺失时，
-// 还需区分忽略规则与尚未同步等原因，不能仅据该计数裁定原因。打不开
-// 句柄时跳过，状态查询不因这项附加信息失败。
+// 还需区分忽略规则与尚未同步等原因，不能仅据该计数裁定原因。manifest
+// 读不出时跳过，状态查询不因这项附加信息失败。
+//
+// 只读 manifest（分段校验结果有缓存时不重算校验和），不打开检索句柄。改动前
+// 这里打开完整检索句柄，会解码全部 chunk 元数据并常驻到下一次发布；后台监视
+// 每 30 秒经 WorkspaceStatus 走到这里，被监视但没人检索的工作区也因此常驻一份
+// 句柄，首建期间还为中间 revision 多占内存（第 8 步堆剖析）。
 func (e *Engine) attachTopLevelCounts(status *engine.WorkspaceStatus, workspaceKey string) {
-	handle, err := e.acquireHandle(workspaceKey)
+	store, err := e.storeFor(workspaceKey)
 	if err != nil {
 		return
 	}
-	defer e.releaseHandle(handle)
+	manifest, _, err := store.ResolveUsable()
+	if err != nil {
+		return
+	}
 	counts := make(map[string]int, 16)
-	for path := range handle.manifest.Files {
+	for path := range manifest.Files {
 		top := "."
 		if i := strings.IndexByte(path, '/'); i > 0 {
 			top = path[:i]
@@ -697,6 +705,31 @@ func (e *Engine) attachTopLevelCounts(status *engine.WorkspaceStatus, workspaceK
 	if len(counts) > 0 {
 		status.TopLevelFileCounts = counts
 	}
+}
+
+// WorkspaceInFlight 实现 engine.WorkspaceInFlightProber：只读内存里的状态跟踪器，
+// 不读 manifest、不打开检索句柄。后台监视每个周期用它判断工作区是否正在
+// 构建；本进程内还没有跟踪器（没有构建过）时返回 false。
+func (e *Engine) WorkspaceInFlight(ctx context.Context, ref engine.WorkspaceRef) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := rejectProfileID(ref); err != nil {
+		return false, err
+	}
+	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
+	if err != nil {
+		return false, err
+	}
+	e.mu.Lock()
+	tracker := e.statuses[workspaceKey]
+	e.mu.Unlock()
+	if tracker == nil {
+		return false, nil
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	return tracker.inFlight, nil
 }
 
 // ListWorkspaceStatuses 实现 engine.WorkspaceInspector：返回本进程内有状态

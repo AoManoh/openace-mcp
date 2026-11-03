@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -542,5 +543,45 @@ func (s *fakeWatchSyncer) signalDir(dir string) {
 	select {
 	case s.dirSyncCh <- dir:
 	default:
+	}
+}
+
+// probeWatchSyncer 在 fakeWatchSyncer 之外实现 engine.WorkspaceInFlightProber。
+type probeWatchSyncer struct {
+	*fakeWatchSyncer
+	probes atomic.Int32
+}
+
+func (s *probeWatchSyncer) WorkspaceInFlight(context.Context, engine.WorkspaceRef) (bool, error) {
+	s.probes.Add(1)
+	return false, nil
+}
+
+// TestReconcilerUsesInFlightProbe：服务实现了 WorkspaceInFlight 时，后台监视用它
+// 判断是否正在构建，不再为此调用 WorkspaceStatus（后者统计顶层目录文件数，
+// 改动前会打开完整检索句柄）。
+func TestReconcilerUsesInFlightProbe(t *testing.T) {
+	t.Setenv("OPENACE_WATCH_MODE", "seen")
+	t.Setenv("OPENACE_WATCH_INTERVAL", "50ms")
+	t.Setenv("OPENACE_WATCH_DEBOUNCE", "1ms")
+	t.Setenv("OPENACE_WATCH_TIMEOUT", "1s")
+
+	syncer := &probeWatchSyncer{fakeWatchSyncer: newFakeWatchSyncer()}
+	syncer.setChanged(true)
+	reconciler, err := newWorkspaceReconciler(syncer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdownReconciler(t, reconciler)
+	reconciler.Observe("/tmp/project")
+	syncer.waitForBackgroundSync(t)
+	if syncer.probes.Load() == 0 {
+		t.Fatal("reconciler should ask WorkspaceInFlight before syncing")
+	}
+	syncer.mu.Lock()
+	checks := syncer.statusChecks
+	syncer.mu.Unlock()
+	if checks != 0 {
+		t.Fatalf("reconciler should not call WorkspaceStatus when WorkspaceInFlight is available, got %d calls", checks)
 	}
 }

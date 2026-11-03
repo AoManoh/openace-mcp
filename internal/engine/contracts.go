@@ -131,6 +131,13 @@ type WorkspaceInspector interface {
 	ListWorkspaceStatuses(context.Context) ([]WorkspaceStatus, error)
 }
 
+// WorkspaceInFlightProber 是可选能力：只读内存里的状态回答工作区是否正在构建，
+// 不读 manifest、不打开检索句柄。后台监视每个周期都要问一次，实现了它时不再
+// 为此调用 WorkspaceStatus。
+type WorkspaceInFlightProber interface {
+	WorkspaceInFlight(context.Context, WorkspaceRef) (bool, error)
+}
+
 // ChangeDetector 判断工作区自上次索引后是否发生变化。
 type ChangeDetector interface {
 	WorkspaceChanged(context.Context, WorkspaceRef) (bool, error)

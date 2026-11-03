@@ -392,6 +392,15 @@ func (d *deferredEngine) EngineProfileFingerprint() string {
 	return d.fingerprint
 }
 
+// WorkspaceInFlight 实现 engine.WorkspaceInFlightProber：维度探测成功前没有任何
+// 构建，返回 false；之后转给真正的 Engine。
+func (d *deferredEngine) WorkspaceInFlight(ctx context.Context, ref engine.WorkspaceRef) (bool, error) {
+	if e := d.ready.Load(); e != nil {
+		return e.WorkspaceInFlight(ctx, ref)
+	}
+	return false, ctx.Err()
+}
+
 // EngineProfileComponents 实现 engine.ProfileComponentReporter，口径与
 // EngineProfileFingerprint 相同，维度探测成功前后不变。
 func (d *deferredEngine) EngineProfileComponents() map[string]string {
