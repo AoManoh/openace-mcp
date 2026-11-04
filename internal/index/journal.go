@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -30,15 +31,39 @@ import (
 //
 // 尾部半写记录在打开时截断（暗坑 K40）。文件只存 hash 与向量，
 // 不存 chunk 明文（暗坑 K54）。
+//
+// 内存里只有键到记录起始偏移的表，向量只在文件里，用 ReadInto 按键读回。
+// 全部向量新取的全量构建若把新向量留在堆上，构建期间会一直占着（mailyn-cli
+// 一半副本约 700 MiB）；写分段时按偏移逐行读回，堆上只剩偏移表。
 type Journal struct {
 	mu        sync.Mutex
 	dir       string
 	dimension int
-	file      *os.File
-	entries   map[string][]float32
-	rejected  map[string]bool
-	bytes     int64
+	// file 是追加写句柄，reader 是按偏移读回的只读句柄。发布后清理改写文件时两者
+	// 都先关闭（Windows 上不能改名覆盖仍打开的文件），改名后重新打开。
+	file   *os.File
+	reader *os.File
+	// offsets 是键到记录起始偏移的表；bytes 是文件当前长度，也就是下一条记录的偏移。
+	offsets  map[string]int64
+	rejected map[string]bool
+	bytes    int64
+	// scratch 是读回单条记录的复用缓冲，持锁使用。
+	scratch []byte
+	// stale 表示偏移表删掉了文件里仍在的记录（读回时校验失败），下一次发布后清理
+	// 即使没有已发布的键也要改写文件，把坏记录去掉；否则进程崩溃后重新打开时会在
+	// 这条坏记录处截断，丢掉它后面的已付费记录。
+	stale bool
+	// broken 非空时拒绝追加：一批写入失败后没能把文件截回写入前的长度，文件末尾
+	// 可能有半条记录，之后追加的记录偏移不可信。重新打开 journal 时按坏尾截断恢复。
+	broken error
 }
+
+// journalWrite 把一批编码好的记录写进追加句柄。测试替换它来模拟只写了一部分就
+// 失败的情形。
+var journalWrite = func(f *os.File, b []byte) (int, error) { return f.Write(b) }
+
+// journalRename 是发布后清理用的改名，测试替换它来模拟改名失败。
+var journalRename = renameWithRetry
 
 const (
 	journalDirName   = "journal"
@@ -53,7 +78,7 @@ func (s *Store) JournalDir() string {
 	return JournalDirOf(s.root)
 }
 
-// OpenJournal 打开（必要时创建）store 的 journal，载入既有条目与拒绝集。
+// OpenJournal 打开（必要时创建）store 的 journal，载入既有条目的偏移与拒绝集。
 // 维度不符的历史条目整体丢弃（profile 子树隔离下不应出现，防御路径）。
 func OpenJournal(store *Store, dimension int) (*Journal, error) {
 	if dimension <= 0 {
@@ -63,18 +88,16 @@ func OpenJournal(store *Store, dimension int) (*Journal, error) {
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
 		return nil, err
 	}
-	j := &Journal{dir: dir, dimension: dimension, entries: map[string][]float32{}, rejected: map[string]bool{}}
-	if err := j.loadVectors(); err != nil {
+	j := &Journal{dir: dir, dimension: dimension, offsets: map[string]int64{}, rejected: map[string]bool{}}
+	if err := j.loadOffsets(); err != nil {
 		return nil, err
 	}
 	if err := j.loadRejected(); err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(j.vectorsPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, filePerm)
-	if err != nil {
+	if err := j.openHandles(); err != nil {
 		return nil, err
 	}
-	j.file = file
 	return j, nil
 }
 
@@ -85,10 +108,48 @@ func (j *Journal) Dir() string { return j.dir }
 func (j *Journal) vectorsPath() string  { return filepath.Join(j.dir, journalFileName) }
 func (j *Journal) rejectedPath() string { return filepath.Join(j.dir, rejectedFileName) }
 
-// loadVectors 顺序读取记录，坏尾截断（K40）。已付费条目无论规模全部
-// 保留（2026-08-26 裁决）——历史上这里有超上限压实（含 M8 修过的字节环
-// 缺陷），因其本质是静默丢弃已付费向量而整体移除。
-func (j *Journal) loadVectors() error {
+// recordLen 是键长为 hashLen 的一条记录在文件里的总字节数：长度字段、键长、键、
+// 维度、向量与 CRC。
+func (j *Journal) recordLen(hashLen int) int {
+	return 4 + 2 + hashLen + 4 + 4*j.dimension + 4
+}
+
+// openHandles 打开追加写句柄与读句柄（调用方持锁或尚未发布 j）。
+func (j *Journal) openHandles() error {
+	file, err := os.OpenFile(j.vectorsPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, filePerm)
+	if err != nil {
+		return err
+	}
+	reader, err := os.Open(j.vectorsPath())
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
+	j.file, j.reader = file, reader
+	return nil
+}
+
+// closeHandles 关闭两个句柄（调用方持锁）。
+func (j *Journal) closeHandles() error {
+	var err error
+	if j.file != nil {
+		err = j.file.Close()
+		j.file = nil
+	}
+	if j.reader != nil {
+		if cerr := j.reader.Close(); err == nil {
+			err = cerr
+		}
+		j.reader = nil
+	}
+	return err
+}
+
+// loadOffsets 顺序读取记录并校验 CRC 与维度，只记下每个键的起始偏移，坏尾截断
+// （K40）。已付费条目无论规模全部保留（2026-08-26 裁决）——历史上这里有超上限
+// 压实（含 M8 修过的字节环缺陷），因其本质是静默丢弃已付费向量而整体移除。同一
+// 个键出现多次时以最后一条为准，与此前把向量逐条写进表的结果一致。
+func (j *Journal) loadOffsets() error {
 	file, err := os.Open(j.vectorsPath())
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -99,12 +160,15 @@ func (j *Journal) loadVectors() error {
 	defer file.Close()
 	reader := bufio.NewReaderSize(file, 1<<20)
 	var goodOffset int64
+	var buf []byte
 	for {
-		hash, vector, recordLen, err := readJournalRecord(reader, j.dimension)
+		var hash string
+		var recordLen int64
+		hash, _, recordLen, buf, err = readJournalPayload(reader, j.dimension, buf)
 		if err != nil {
 			break
 		}
-		j.entries[hash] = vector
+		j.offsets[hash] = goodOffset
 		goodOffset += recordLen
 	}
 	info, err := os.Stat(j.vectorsPath())
@@ -121,47 +185,139 @@ func (j *Journal) loadVectors() error {
 	return nil
 }
 
-// readJournalRecord 读取单条记录；任何不一致返回错误（调用方截断）。
-func readJournalRecord(reader *bufio.Reader, wantDim int) (string, []float32, int64, error) {
+// readJournalPayload 顺序读出一条完整记录并校验长度、CRC、键长与维度；任何不
+// 一致返回错误（打开时由调用方截断，只读快照按 ErrJournalCorrupt 报告）。buf 是
+// 可复用的缓冲，容量不够时重新分配并经返回值交回；vecBytes 指向 buf 里的向量
+// 部分，下一次调用前有效。
+func readJournalPayload(reader *bufio.Reader, wantDim int, buf []byte) (hash string, vecBytes []byte, recordLen int64, out []byte, err error) {
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(reader, lenBuf[:]); err != nil {
-		return "", nil, 0, err
+		return "", nil, 0, buf, err
 	}
-	payloadLen := binary.LittleEndian.Uint32(lenBuf[:])
+	payloadLen := int(binary.LittleEndian.Uint32(lenBuf[:]))
 	if payloadLen == 0 || payloadLen > 1<<20 {
-		return "", nil, 0, errors.New("记录长度非法")
+		return "", nil, 0, buf, errors.New("记录长度非法")
 	}
-	payload := make([]byte, payloadLen)
-	if _, err := io.ReadFull(reader, payload); err != nil {
-		return "", nil, 0, err
+	if cap(buf) < payloadLen+4 {
+		buf = make([]byte, payloadLen+4)
 	}
-	var crcBuf [4]byte
-	if _, err := io.ReadFull(reader, crcBuf[:]); err != nil {
-		return "", nil, 0, err
+	data := buf[:payloadLen+4]
+	if _, err := io.ReadFull(reader, data); err != nil {
+		return "", nil, 0, buf, err
 	}
-	if crc32.ChecksumIEEE(payload) != binary.LittleEndian.Uint32(crcBuf[:]) {
-		return "", nil, 0, errors.New("crc 不匹配")
+	payload := data[:payloadLen]
+	if crc32.ChecksumIEEE(payload) != binary.LittleEndian.Uint32(data[payloadLen:]) {
+		return "", nil, 0, buf, errors.New("crc 不匹配")
 	}
 	if len(payload) < 2 {
-		return "", nil, 0, errors.New("payload 过短")
+		return "", nil, 0, buf, errors.New("payload 过短")
 	}
 	hashLen := int(binary.LittleEndian.Uint16(payload[:2]))
 	rest := payload[2:]
 	if len(rest) < hashLen+4 {
-		return "", nil, 0, errors.New("hash 越界")
+		return "", nil, 0, buf, errors.New("hash 越界")
 	}
-	hash := string(rest[:hashLen])
+	hash = string(rest[:hashLen])
 	rest = rest[hashLen:]
 	dim := int(binary.LittleEndian.Uint32(rest[:4]))
 	rest = rest[4:]
 	if dim != wantDim || len(rest) != dim*4 {
-		return "", nil, 0, errors.New("维度不符")
+		return "", nil, 0, buf, errors.New("维度不符")
 	}
-	vector := make([]float32, dim)
-	for i := range vector {
-		vector[i] = math.Float32frombits(binary.LittleEndian.Uint32(rest[i*4:]))
+	return hash, rest, int64(4 + payloadLen + 4), buf, nil
+}
+
+// decodeJournalVector 把小端 float32 字节解码进 dst（长度为维度）。
+func decodeJournalVector(vecBytes []byte, dst []float32) {
+	for i := range dst {
+		dst[i] = math.Float32frombits(binary.LittleEndian.Uint32(vecBytes[i*4:]))
 	}
-	return hash, vector, int64(4 + payloadLen + 4), nil
+}
+
+// checkJournalRecord 校验按偏移读回的一条完整记录（含长度字段与 CRC）是否就是
+// key 的记录，通过时返回空串，否则返回问题描述。
+func checkJournalRecord(record []byte, key string, dim int) string {
+	payloadLen := int(binary.LittleEndian.Uint32(record[:4]))
+	if payloadLen != len(record)-8 {
+		return "长度字段不符"
+	}
+	payload := record[4 : 4+payloadLen]
+	if crc32.ChecksumIEEE(payload) != binary.LittleEndian.Uint32(record[4+payloadLen:]) {
+		return "CRC 不符"
+	}
+	if hashLen := int(binary.LittleEndian.Uint16(payload[:2])); hashLen != len(key) || string(payload[2:2+hashLen]) != key {
+		return "键不符"
+	}
+	rest := payload[2+len(key):]
+	if int(binary.LittleEndian.Uint32(rest[:4])) != dim {
+		return "维度不符"
+	}
+	return ""
+}
+
+// readRecordLocked 按偏移读回 key 的整条记录并校验，返回指向 j.scratch 的切片，
+// 下一次读回前有效（调用方持锁）。记录不完整或校验失败时返回包装
+// ErrJournalCorrupt 的错误；读文件本身失败时原样包装返回。
+func (j *Journal) readRecordLocked(key string, offset int64) ([]byte, error) {
+	if j.reader == nil {
+		return nil, fmt.Errorf("journal %s 的读句柄没有打开（已关闭，或发布后清理失败后没能重新打开）", j.vectorsPath())
+	}
+	size := j.recordLen(len(key))
+	if cap(j.scratch) < size {
+		j.scratch = make([]byte, size)
+	}
+	record := j.scratch[:size]
+	if _, err := j.reader.ReadAt(record, offset); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, fmt.Errorf("%w: %s 偏移 %d 处键 %s 的记录不完整", ErrJournalCorrupt, j.vectorsPath(), offset, key)
+		}
+		return nil, fmt.Errorf("读取 %s（偏移 %d，键 %s）: %w", j.vectorsPath(), offset, key, err)
+	}
+	if problem := checkJournalRecord(record, key, j.dimension); problem != "" {
+		return nil, fmt.Errorf("%w: %s 偏移 %d 处键 %s 的记录%s", ErrJournalCorrupt, j.vectorsPath(), offset, key, problem)
+	}
+	return record, nil
+}
+
+// Has 报告 journal 里有没有 key 的已付费向量。
+func (j *Journal) Has(key string) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	_, ok := j.offsets[key]
+	return ok
+}
+
+// Len 返回 journal 里的条目数。
+func (j *Journal) Len() int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return len(j.offsets)
+}
+
+// ReadInto 把 key 的向量从文件读进 dst（长度必须等于维度）。记录不完整或校验
+// 失败时返回包装 ErrJournalCorrupt 的错误，错误里写明文件、偏移与键，并把该键移
+// 出偏移表：这条向量已经读不出来，留在表里每次构建都会在同一处失败；移出后下一
+// 次构建会为它重新送审，原因由这个错误交给调用方报告。
+func (j *Journal) ReadInto(key string, dst []float32) error {
+	if len(dst) != j.dimension {
+		return fmt.Errorf("journal 读回缓冲维度 %d 与配置 %d 不符", len(dst), j.dimension)
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	offset, ok := j.offsets[key]
+	if !ok {
+		return fmt.Errorf("journal %s 没有键 %s", j.vectorsPath(), key)
+	}
+	record, err := j.readRecordLocked(key, offset)
+	if err != nil {
+		if errors.Is(err, ErrJournalCorrupt) {
+			delete(j.offsets, key)
+			j.stale = true
+		}
+		return err
+	}
+	decodeJournalVector(record[4+2+len(key)+4:], dst)
+	return nil
 }
 
 func encodeJournalRecord(hash string, vector []float32) []byte {
@@ -186,78 +342,129 @@ func encodeJournalRecord(hash string, vector []float32) []byte {
 }
 
 // Append 落盘一批已付费向量（批成功即调用，D4）；每批一次 fsync。
+//   - 写入失败（例如磁盘满）时可能只写了一部分：把文件截回写入前的长度再返回
+//     错误，本批不计入。不截回的话半条记录留在文件中间，之后追加的记录在下次
+//     打开时会随它一起被截掉（K40 遇到坏记录即截断其后内容），同进程里按偏移
+//     读回也会错位。截回也失败时停止追加（broken），已有条目照常可读。
+//   - 写入成功即记入偏移表，之后 fsync 失败只返回错误：数据已在文件里，同一进
+//     程之后的构建直接复用，不为它再付费；本次构建由调用方按落盘失败处理。
 func (j *Journal) Append(vectors map[string][]float32) error {
 	if len(vectors) == 0 {
 		return nil
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.broken != nil {
+		return fmt.Errorf("journal %s 已停止追加: %w", j.vectorsPath(), j.broken)
+	}
+	if j.file == nil {
+		return fmt.Errorf("journal %s 的追加句柄没有打开（已关闭，或发布后清理失败后没能重新打开）", j.vectorsPath())
+	}
+	type placed struct {
+		hash   string
+		offset int64
+	}
 	var buf []byte
+	var added []placed
 	for hash, vector := range vectors {
 		if len(vector) != j.dimension {
 			return fmt.Errorf("journal 维度不符: %d vs %d", len(vector), j.dimension)
 		}
-		if _, exists := j.entries[hash]; exists {
+		if _, exists := j.offsets[hash]; exists {
 			continue
 		}
+		added = append(added, placed{hash: hash, offset: j.bytes + int64(len(buf))})
 		buf = append(buf, encodeJournalRecord(hash, vector)...)
 	}
 	if len(buf) == 0 {
 		return nil
 	}
-	if _, err := j.file.Write(buf); err != nil {
-		return err
-	}
-	if err := j.file.Sync(); err != nil {
-		return err
-	}
-	for hash, vector := range vectors {
-		if _, exists := j.entries[hash]; !exists {
-			j.entries[hash] = vector
+	if _, err := journalWrite(j.file, buf); err != nil {
+		if terr := j.truncateLocked(j.bytes); terr != nil {
+			j.broken = fmt.Errorf("写入失败（%v）后截回 %d 字节也失败（%v），文件末尾可能有半条记录，重新打开 journal 时会截掉", err, j.bytes, terr)
+			return j.broken
 		}
+		return fmt.Errorf("journal %s 写入失败，已截回写入前的 %d 字节: %w", j.vectorsPath(), j.bytes, err)
+	}
+	for _, entry := range added {
+		j.offsets[entry.hash] = entry.offset
 	}
 	j.bytes += int64(len(buf))
+	if err := j.file.Sync(); err != nil {
+		return fmt.Errorf("journal %s fsync 失败（本批已写进文件并可复用）: %w", j.vectorsPath(), err)
+	}
 	return nil
 }
 
-// Snapshot 返回当前条目视图（复用源；调用方不得修改向量）。
+// truncateLocked 把文件截到 size 字节。追加句柄以 O_APPEND 打开，在 Windows 上
+// 这类句柄没有截断权限，先试句柄、不行再按路径截断。
+func (j *Journal) truncateLocked(size int64) error {
+	if err := j.file.Truncate(size); err == nil {
+		return nil
+	}
+	return os.Truncate(j.vectorsPath(), size)
+}
+
+// Snapshot 从文件读出全部条目（键到向量）。内存与条目数成正比，构建路径不调用
+// 它，只给测试与人工核对用；读回校验失败的条目不在结果里，并按 ReadInto 的规则
+// 移出偏移表。
 func (j *Journal) Snapshot() map[string][]float32 {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	out := make(map[string][]float32, len(j.entries))
-	for hash, vector := range j.entries {
-		out[hash] = vector
+	out := make(map[string][]float32, len(j.offsets))
+	for key, offset := range j.offsets {
+		record, err := j.readRecordLocked(key, offset)
+		if err != nil {
+			if errors.Is(err, ErrJournalCorrupt) {
+				delete(j.offsets, key)
+				j.stale = true
+			}
+			continue
+		}
+		vector := make([]float32, j.dimension)
+		decodeJournalVector(record[4+2+len(key)+4:], vector)
+		out[key] = vector
 	}
 	return out
 }
 
 // CompactAfterPublish 清除已随 revision 入盘的条目（K41：发布即 GC），
-// 并压实文件。
+// 并压实文件。读回时校验失败、已移出偏移表的记录也在这时从文件里去掉。
+// 返回包装 ErrJournalCorrupt 的错误时压实已经完成，只是复制时又发现了校验失败
+// 的记录，它们没有写进新文件，错误里有条数。
 func (j *Journal) CompactAfterPublish(published map[string]bool) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	changed := false
-	for hash := range j.entries {
+	changed := j.stale
+	for hash := range j.offsets {
 		if published[hash] {
-			delete(j.entries, hash)
+			delete(j.offsets, hash)
 			changed = true
 		}
 	}
 	if !changed {
 		return nil
 	}
+	// 移出偏移表的记录还在文件里，改写成功前一直按 stale 处理：这次改写失败时，
+	// 下一次清理即使没有新的已发布键也会重试。
+	j.stale = true
 	return j.rewriteLocked()
 }
 
-// rewriteLocked 以 temp+rename 原子重写 journal（调用方持锁）。逐条流式
-// 写入(1MiB 缓冲):历史实现先在内存拼出完整文件字节,400K×1024 维时
-// 单块缓冲可达 ~1.6GiB,低内存环境重写即 OOM 风险(2026-08-26 裁决修复)。
+// rewriteLocked 以 temp+rename 原子重写 journal（调用方持锁）：偏移表里的记录按
+// 偏移顺序逐条从原文件读出、校验后写进临时文件（1 MiB 缓冲，不在内存里拼整个
+// 文件），fsync 后改名覆盖原文件，再重新打开两个句柄并换上新偏移。
+//   - 复制完成前失败：删掉临时文件，原文件与句柄都不动。
+//   - 改名失败：原文件不动，句柄重新打开到原文件，偏移表仍与原文件一致。此前的
+//     实现改名失败后追加句柄保持关闭，之后每次追加都失败，直到进程重启。
+//   - 复制时校验失败的记录不写出，从偏移表移除并计数返回。
 func (j *Journal) rewriteLocked() error {
-	if j.file != nil {
-		_ = j.file.Close()
-		j.file = nil
-	}
 	path := j.vectorsPath()
+	keys := make([]string, 0, len(j.offsets))
+	for key := range j.offsets {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(a, b int) bool { return j.offsets[keys[a]] < j.offsets[keys[b]] })
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-journal-*")
 	if err != nil {
 		return err
@@ -268,13 +475,24 @@ func (j *Journal) rewriteLocked() error {
 		os.Remove(tmpName)
 	}
 	writer := bufio.NewWriterSize(tmp, 1<<20)
+	newOffsets := make(map[string]int64, len(keys))
 	var total int64
-	for hash, vector := range j.entries {
-		record := encodeJournalRecord(hash, vector)
+	damaged := 0
+	for _, key := range keys {
+		record, err := j.readRecordLocked(key, j.offsets[key])
+		if errors.Is(err, ErrJournalCorrupt) {
+			damaged++
+			continue
+		}
+		if err != nil {
+			cleanup()
+			return err
+		}
 		if _, err := writer.Write(record); err != nil {
 			cleanup()
 			return err
 		}
+		newOffsets[key] = total
 		total += int64(len(record))
 	}
 	if err := writer.Flush(); err != nil {
@@ -293,17 +511,26 @@ func (j *Journal) rewriteLocked() error {
 		os.Remove(tmpName)
 		return err
 	}
-	if err := renameWithRetry(tmpName, path); err != nil {
+	_ = j.closeHandles()
+	if err := journalRename(tmpName, path); err != nil {
 		os.Remove(tmpName)
-		return err
+		if reopenErr := j.openHandles(); reopenErr != nil {
+			j.broken = fmt.Errorf("发布后清理改名失败（%v）后重新打开 journal 也失败（%v）", err, reopenErr)
+			return j.broken
+		}
+		return fmt.Errorf("journal %s 发布后清理改名失败，原文件未改动: %w", path, err)
 	}
 	syncDirBestEffort(filepath.Dir(path))
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, filePerm)
-	if err != nil {
-		return err
-	}
-	j.file = file
+	j.offsets = newOffsets
 	j.bytes = total
+	j.stale = false
+	if err := j.openHandles(); err != nil {
+		j.broken = fmt.Errorf("发布后清理完成但重新打开 journal 失败（%v）", err)
+		return j.broken
+	}
+	if damaged > 0 {
+		return fmt.Errorf("%w: 发布后清理 %s 时有 %d 条记录校验失败，没有写进新文件，对应内容下次构建会重新送审", ErrJournalCorrupt, path, damaged)
+	}
 	return nil
 }
 
@@ -430,13 +657,17 @@ func readVectorsSnapshot(path string, dimension int) (map[string][]float32, erro
 	defer file.Close()
 	reader := bufio.NewReaderSize(file, 1<<20)
 	var offset int64
+	var buf []byte
 	for record := 1; ; record++ {
 		if _, err := reader.Peek(1); err == io.EOF {
 			return vectors, nil
 		} else if err != nil {
 			return nil, fmt.Errorf("读取 %s（偏移 %d）: %w", path, offset, err)
 		}
-		hash, vector, size, err := readJournalRecord(reader, dimension)
+		var hash string
+		var vecBytes []byte
+		var size int64
+		hash, vecBytes, size, buf, err = readJournalPayload(reader, dimension, buf)
 		if err != nil {
 			var pathErr *os.PathError
 			if errors.As(err, &pathErr) {
@@ -444,6 +675,8 @@ func readVectorsSnapshot(path string, dimension int) (map[string][]float32, erro
 			}
 			return nil, fmt.Errorf("%w: %s 第 %d 条记录（偏移 %d）: %v", ErrJournalCorrupt, path, record, offset, err)
 		}
+		vector := make([]float32, dimension)
+		decodeJournalVector(vecBytes, vector)
 		vectors[hash] = vector
 		offset += size
 	}
@@ -483,14 +716,9 @@ func readRejectedSnapshot(path string) (map[string]bool, error) {
 	return rejected, nil
 }
 
-// Close 关闭 journal 文件句柄。
+// Close 关闭 journal 的追加与读句柄。
 func (j *Journal) Close() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.file == nil {
-		return nil
-	}
-	err := j.file.Close()
-	j.file = nil
-	return err
+	return j.closeHandles()
 }
