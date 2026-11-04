@@ -195,7 +195,6 @@ func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *ind
 	if err != nil {
 		return fmt.Errorf("打开 embedding journal: %w", err)
 	}
-	journalKeys := journal.Snapshot()
 	seen := make(map[string]bool, len(records))
 	var pending []chunkRecord
 	for _, record := range records {
@@ -224,7 +223,7 @@ func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *ind
 			plan.CrossProfileReusable++
 			continue
 		}
-		if _, ok := journalKeys[key]; ok {
+		if journal.Has(key) {
 			plan.Reusable++
 			continue
 		}
@@ -243,11 +242,15 @@ func (e *Engine) tallyEmbedPlan(ctx context.Context, plan *EmbedPlan, store *ind
 		for _, record := range pending {
 			keys = append(keys, embedKey(record))
 		}
-		paid := e.siblingPaidStateFor(store, keys)
+		// 离线计划只读：不传接收函数，旧子树 journal 里的向量不转存，只计数。
+		paid, err := e.siblingPaidStateFor(store, keys, nil)
+		if err != nil {
+			return err
+		}
 		kept := pending[:0]
 		for _, record := range pending {
 			key := embedKey(record)
-			if _, ok := paid.vectors[key]; ok {
+			if paid.reused[key] {
 				plan.Reusable++
 				plan.CrossProfileReusable++
 				continue
@@ -358,7 +361,6 @@ func (e *Engine) ImportEmbeddings(ctx context.Context, ref engine.WorkspaceRef, 
 	}
 
 	report := ImportReport{}
-	existing := journal.Snapshot()
 	const flushEvery = 512
 	batch := make(map[string][]float32, flushEvery)
 	flush := func() error {
@@ -369,7 +371,6 @@ func (e *Engine) ImportEmbeddings(ctx context.Context, ref engine.WorkspaceRef, 
 			return fmt.Errorf("journal 落盘: %w", err)
 		}
 		for key := range batch {
-			existing[key] = nil
 			delete(batch, key)
 		}
 		return nil
@@ -389,7 +390,7 @@ func (e *Engine) ImportEmbeddings(ctx context.Context, ref engine.WorkspaceRef, 
 			report.UnknownKey++
 			continue
 		}
-		if _, dup := existing[key]; dup {
+		if journal.Has(key) {
 			report.Existing++
 			continue
 		}

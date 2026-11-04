@@ -107,8 +107,8 @@ func (e *Engine) bulkEligible(missing int) bool {
 }
 
 // bulkEmbedMissing 执行批作业路径的全流程：读取状态文件、跳过已提交的键、
-// 提交剩余输入、轮询到终态、回收结果写入 journal 与 reuse。正常返回时全部
-// 可回收向量都已进入 journal 与 reuse，调用方接着做与同步路径相同的组装；
+// 提交剩余输入、轮询到终态、回收结果写入 journal。正常返回时全部可回收向量
+// 都已进入 journal，调用方接着做与同步路径相同的组装；
 // 任何作业到达非 completed 终态时返回带作业 id 与处置步骤的错误。
 // 分支：
 //   - 状态文件属于另一 embedding 身份：报错并要求清理后重跑。
@@ -121,7 +121,7 @@ func (e *Engine) bulkEligible(missing int) bool {
 //     一次。
 //   - 全部作业处理完后删除状态文件。
 func (e *Engine) bulkEmbedMissing(ctx context.Context, journal *index.Journal, status *wsStatus,
-	missingHashes []string, textAt func(int) string, reuse map[string][]float32, out *semanticOutcome) error {
+	missingHashes []string, textAt func(int) string, out *semanticOutcome) error {
 	statePath := bulkStatePath(journal)
 	state, err := loadBulkState(statePath)
 	if err != nil {
@@ -179,7 +179,7 @@ func (e *Engine) bulkEmbedMissing(ctx context.Context, journal *index.Journal, s
 		}
 	}
 
-	return e.collectBulkJobs(ctx, journal, status, statePath, &state, reuse, out, len(missingHashes))
+	return e.collectBulkJobs(ctx, journal, status, statePath, &state, out, len(missingHashes))
 }
 
 func (e *Engine) checkBulkState(statePath string, state bulkState) error {
@@ -210,7 +210,7 @@ func (e *Engine) checkBulkState(statePath string, state bulkState) error {
 	return nil
 }
 
-func (e *Engine) recoverBulkState(ctx context.Context, journal *index.Journal, status *wsStatus, reuse map[string][]float32, out *semanticOutcome) (map[string]bool, error) {
+func (e *Engine) recoverBulkState(ctx context.Context, journal *index.Journal, status *wsStatus, out *semanticOutcome) (map[string]bool, error) {
 	statePath := bulkStatePath(journal)
 	if _, err := os.Stat(statePath); errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -233,10 +233,10 @@ func (e *Engine) recoverBulkState(ctx context.Context, journal *index.Journal, s
 	if len(state.Jobs) == 0 {
 		return processed, nil
 	}
-	return processed, e.collectBulkJobs(ctx, journal, status, statePath, &state, reuse, out, total)
+	return processed, e.collectBulkJobs(ctx, journal, status, statePath, &state, out, total)
 }
 
-func (e *Engine) collectBulkJobs(ctx context.Context, journal *index.Journal, status *wsStatus, statePath string, state *bulkState, reuse map[string][]float32, out *semanticOutcome, total int) error {
+func (e *Engine) collectBulkJobs(ctx context.Context, journal *index.Journal, status *wsStatus, statePath string, state *bulkState, out *semanticOutcome, total int) error {
 	// 3) 轮询与回收：逐作业等到终态。completed 的作业全量回收进 journal；
 	// 非 completed 终态先回收已产出的部分，再返回错误。
 	ingested := 0
@@ -261,13 +261,11 @@ func (e *Engine) collectBulkJobs(ctx context.Context, journal *index.Journal, st
 			return 0, fmt.Errorf("批作业 %s 拒绝集落盘失败: %w", jobID, err)
 		}
 		// 与同步路径相同，回收的向量也记进共享向量库；写入失败只影响复用。
+		// 写入后不再留在内存，组装与写分段按键从 journal 读回。
 		if err := e.appendSharedVectors(good); err != nil {
 			out.sharedError = sanitizeError(err)
 		}
-		for key, vec := range good {
-			reuse[key] = vec
-			out.newlyEmbedded++
-		}
+		out.newlyEmbedded += len(good)
 		out.rejected += len(normRejected)
 		if n := len(result.RejectedKeys); n > 0 {
 			out.lastError = sanitizeError(fmt.Errorf("bulk job %s: %d rows rejected (first: %s=%s)",

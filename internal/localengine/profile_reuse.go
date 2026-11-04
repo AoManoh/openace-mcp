@@ -106,11 +106,20 @@ func (e *Engine) mergeSiblingProfileVectors(current *index.Store, root pathutil.
 	}
 }
 
+// siblingAdoptBatch 是从兄弟子树 journal 转存已付费向量时每批交给接收函数的条数：
+// 一批一次 fsync，批越小落盘次数越多，批越大转存期间占用的内存越多。
+const siblingAdoptBatch = 256
+
+// siblingSecondPassHook 在对某个旧 journal 做第二遍转存之前调用，参数是该 journal
+// 目录。只供测试模拟两遍之间文件被别的进程改写，生产路径为 nil。
+var siblingSecondPassHook func(dir string)
+
 // siblingPaidState 是同一 embedding 身份的兄弟子树里与本次缺失键有关的已付费
 // 状态，由 siblingPaidStateFor 在任何文档嵌入请求之前只读收集。
 type siblingPaidState struct {
-	// vectors 是缺失键在兄弟子树 journal 里已付费、尚未发布的向量。
-	vectors map[string][]float32
+	// reused 是在兄弟子树 journal 里找到已付费、尚未发布向量的缺失键；传了接收
+	// 函数时这些向量已经交给它（构建传当前子树 journal 的追加）。
+	reused map[string]bool
 	// rejected 是兄弟子树拒绝集里的缺失键：provider 曾对这些内容返回零向量
 	// 或 NaN。
 	rejected map[string]bool
@@ -128,12 +137,21 @@ type siblingPaidState struct {
 // 完整之后再加回旧内容也受同样保护。旧子树的文件一律不改写、不截断、不
 // 消费；确实不存在（没有这样的子树或子树里没有 journal）视为没有旧状态，
 // 读不出或已损坏则阻止送审，不当作“没有旧状态”。
-func (e *Engine) siblingPaidStateFor(current *index.Store, missing []string) siblingPaidState {
-	state := siblingPaidState{vectors: map[string][]float32{}, rejected: map[string]bool{}}
+//
+// adopt 非 nil 时（构建），旧 journal 里缺口需要的已付费向量每 siblingAdoptBatch
+// 条交给它一次，构建传当前子树 journal 的追加：转存后这些向量与当前子树 journal
+// 的条目同样按键读回，不必把整个旧 journal 读进内存；adopt 为 nil 时（离线计划）
+// 只记录哪些键能复用，不写任何文件。每个旧 journal 读两遍：第一遍只校验并记下
+// 缺口里有哪些键，任何一处读不出或损坏都按原规则阻止送审、不复用其中任何一条
+// （损坏处之后可能还有缺口需要的已付费记录）；第一遍完整读完才做第二遍转存。
+// 两遍之间文件被别的进程改写、第二遍没读到第一遍有的键时同样阻止送审。返回的
+// 错误只来自 adopt，旧子树读不出、损坏或被改写按 blockReason 报告。
+func (e *Engine) siblingPaidStateFor(current *index.Store, missing []string, adopt func(map[string][]float32) error) (siblingPaidState, error) {
+	state := siblingPaidState{reused: map[string]bool{}, rejected: map[string]bool{}}
 	dirs, err := e.sameEmbeddingSiblingJournalDirs(current)
 	if err != nil {
 		state.blockReason = fmt.Sprintf("语义迁移已暂停：无法检查同一 embedding 身份的旧索引子树（%v），其中可能有已付费、尚未发布的向量或未回收的 Batch 作业，本次不为缺口送审；词法检索与已复用的向量照常可用。排除这个错误后重新 sync", err)
-		return state
+		return state, nil
 	}
 	want := make(map[string]bool, len(missing))
 	for _, key := range missing {
@@ -141,17 +159,39 @@ func (e *Engine) siblingPaidStateFor(current *index.Store, missing []string) sib
 	}
 	heldBy := map[string]string{}
 	for _, dir := range dirs {
-		vectors, rejected, err := index.ReadJournalSnapshot(dir, e.embedCfg.Dimension)
+		need := map[string]bool{}
+		rejected, err := index.ScanJournalSnapshot(dir, e.embedCfg.Dimension, want, func(key string, _ []float32) error {
+			if !state.reused[key] {
+				need[key] = true
+			}
+			return nil
+		})
 		if err != nil {
 			state.blockReason = siblingJournalBlockReason(dir, err)
-			return state
+			return state, nil
+		}
+		if adopt == nil {
+			for key := range need {
+				state.reused[key] = true
+			}
+		} else if len(need) > 0 {
+			if hook := siblingSecondPassHook; hook != nil {
+				hook(dir)
+			}
+			adopted, blockReason, err := adoptSiblingJournal(dir, e.embedCfg.Dimension, need, adopt, state.reused)
+			if err != nil {
+				return state, err
+			}
+			if blockReason != "" {
+				state.blockReason = blockReason
+				return state, nil
+			}
+			if adopted != len(need) {
+				state.blockReason = fmt.Sprintf("语义迁移已暂停：旧索引子树的 embedding journal %s 在读取期间被改写（第一遍读到缺口需要的 %d 条，第二遍只读到 %d 条），无法确认其余已付费向量的去向，本次不为缺口送审；词法检索与已复用的向量照常可用。重新 sync 会再检查一次", dir, len(need), adopted)
+				return state, nil
+			}
 		}
 		for key := range want {
-			if vec, ok := vectors[key]; ok {
-				if _, seen := state.vectors[key]; !seen {
-					state.vectors[key] = vec
-				}
-			}
 			if rejected[key] {
 				state.rejected[key] = true
 			}
@@ -160,14 +200,14 @@ func (e *Engine) siblingPaidStateFor(current *index.Store, missing []string) sib
 		bulk, err := loadBulkState(path)
 		if err != nil {
 			state.blockReason = fmt.Sprintf("语义迁移已暂停：旧索引子树的批作业状态 %s 读不出来（%v），无法确认其中的作业是否已经计费，本次不为缺口送审；词法检索与已复用的向量照常可用。核对或修复该文件后重新 sync", path, err)
-			return state
+			return state, nil
 		}
 		if bulk.ProfileHash != "" && bulk.ProfileHash != e.embedCfg.ProfileHash() {
 			continue
 		}
 		if intent := bulk.PendingIntent; intent != nil {
 			state.blockReason = fmt.Sprintf("语义迁移已暂停：旧索引子树的批作业状态 %s 有一条未收尾的提交意向（%d 条输入，keys_sha256=%s，记录于 %s），无法确定服务端是否已为它建了作业、作业覆盖哪些内容，本次不为任何缺口送审；词法检索与已复用的向量照常可用。恢复：用升级前的 openACE 版本对该工作区执行一次 sync，按它给出的核对步骤处理这条意向；或到 provider 控制台核对后人工修正该文件，再重新 sync", path, intent.Count, intent.KeysSHA256, intent.CreatedAt.Format(time.RFC3339))
-			return state
+			return state, nil
 		}
 		for _, job := range bulk.Jobs {
 			// 作业的输入键清单是判断它覆盖哪些已付费输入的唯一依据。清单缺失、
@@ -175,7 +215,7 @@ func (e *Engine) siblingPaidStateFor(current *index.Store, missing []string) sib
 			// 这个作业可能覆盖任何缺口。
 			if problem := unusableJobKeys(job.Keys); problem != "" {
 				state.blockReason = fmt.Sprintf("语义迁移已暂停：旧索引子树的批作业状态 %s 登记的作业 %q 没有可用的输入键清单（%s），无法确定它覆盖哪些已付费输入，本次不为任何缺口送审；词法检索与已复用的向量照常可用。恢复：到 provider 控制台核对该作业，把完整的 keys（每项是 64 位小写十六进制的 embedKey）补回该文件，再用升级前的 openACE 版本对该工作区执行一次 sync 回收结果；或确认该作业已失效、不再需要后人工移走该状态文件再 sync（缺口会重新送审计费）", path, job.ID, problem)
-				return state
+				return state, nil
 			}
 			for _, key := range job.Keys {
 				if want[key] {
@@ -188,7 +228,7 @@ func (e *Engine) siblingPaidStateFor(current *index.Store, missing []string) sib
 	var paths []string
 	seenPath := map[string]bool{}
 	for key, path := range heldBy {
-		if _, reused := state.vectors[key]; reused || state.rejected[key] {
+		if state.reused[key] || state.rejected[key] {
 			continue
 		}
 		held++
@@ -201,7 +241,52 @@ func (e *Engine) siblingPaidStateFor(current *index.Store, missing []string) sib
 		sort.Strings(paths)
 		state.blockReason = fmt.Sprintf("语义迁移已暂停：本次待送审的内容里有 %d 条登记在旧索引子树尚未回收结果的 Batch 作业中（状态文件 %s）。这些输入可能已在服务端计费，新索引子树不再送审，本次不为任何缺口送审，以免同一内容付两次费；词法检索与已复用的向量照常可用，未覆盖的 chunk 计入语义覆盖率。恢复：用升级前的 openACE 版本对该工作区执行一次 sync，由它回收作业结果并发布，之后本版本直接复用这些向量；或到 provider 控制台确认这些作业已失效或不再需要，人工移走该状态文件后重新 sync（此时缺口会重新送审计费）", held, strings.Join(paths, "、"))
 	}
-	return state
+	return state, nil
+}
+
+// adoptSiblingJournal 是 siblingPaidStateFor 的第二遍：把旧 journal 里 need 中的
+// 键每 siblingAdoptBatch 条交给 adopt 转存，转存成功后记进 reused，返回转存条数。
+// 第二遍读不出或损坏（两遍之间文件被改写）时返回阻止原因；此前已转存的记录都
+// 通过了校验，留在当前子树 journal 里照常复用。返回的错误只来自 adopt。
+func adoptSiblingJournal(dir string, dimension int, need map[string]bool, adopt func(map[string][]float32) error, reused map[string]bool) (int, string, error) {
+	batch := map[string][]float32{}
+	adopted := 0
+	var adoptErr error
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := adopt(batch); err != nil {
+			adoptErr = err
+			return err
+		}
+		for key := range batch {
+			reused[key] = true
+		}
+		adopted += len(batch)
+		batch = map[string][]float32{}
+		return nil
+	}
+	_, err := index.ScanJournalSnapshot(dir, dimension, need, func(key string, vec []float32) error {
+		if reused[key] {
+			return nil
+		}
+		batch[key] = append([]float32(nil), vec...)
+		if len(batch) >= siblingAdoptBatch {
+			return flush()
+		}
+		return nil
+	})
+	if adoptErr == nil {
+		_ = flush()
+	}
+	if adoptErr != nil {
+		return adopted, "", adoptErr
+	}
+	if err != nil {
+		return adopted, siblingJournalBlockReason(dir, err), nil
+	}
+	return adopted, "", nil
 }
 
 // unusableJobKeys 检查旧 Batch 作业登记的输入键清单能否确定作业覆盖的输入：

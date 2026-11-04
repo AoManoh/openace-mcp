@@ -37,15 +37,17 @@ func (e *Engine) sharedVectors() (*index.SharedVectors, error) {
 	return shared, nil
 }
 
-// reuseSharedVectors 在共享向量库里查找缺口键，命中的向量写入 reuse 并计入
+// reuseSharedVectors 在共享向量库里查找缺口键，命中记录的位置写入 reuse 并计入
 // out.sharedReused，返回仍需送审的键与对应的记录下标（idx 与 hashes 逐项对应）。
+// 查找时整条读出校验，但只保留位置，写分段时再按位置读回：另一个 worktree 首建
+// 时几乎每个 chunk 都会命中，把命中的向量留在堆上会占用数百 MiB 到 GiB。
 // 共享库读不出时全部缺口照常送审，原因写进 out.sharedError：共享库只用来省
 // 费用与时间，不影响结果是否正确。
-func (e *Engine) reuseSharedVectors(hashes []string, idx []int, reuse map[string][]float32, out *semanticOutcome) ([]string, []int) {
+func (e *Engine) reuseSharedVectors(hashes []string, idx []int, reuse map[string]vecRef, out *semanticOutcome) ([]string, []int) {
 	shared, err := e.sharedVectors()
-	var hits map[string][]float32
+	var hits map[string]index.SharedRef
 	if err == nil {
-		hits, err = shared.Lookup(hashes)
+		hits, err = shared.LookupRefs(hashes)
 	}
 	if err != nil {
 		out.sharedError = sanitizeError(fmt.Errorf("读取共享向量库失败，缺口照常送审: %w", err))
@@ -57,8 +59,8 @@ func (e *Engine) reuseSharedVectors(hashes []string, idx []int, reuse map[string
 	keptHashes := make([]string, 0, len(hashes)-len(hits))
 	keptIdx := make([]int, 0, len(hashes)-len(hits))
 	for i, key := range hashes {
-		if vec, ok := hits[key]; ok {
-			reuse[key] = vec
+		if ref, ok := hits[key]; ok {
+			reuse[key] = vecRef{shared: &ref}
 			out.sharedReused++
 			continue
 		}

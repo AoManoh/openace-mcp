@@ -500,6 +500,10 @@ type segmentArtifacts struct {
 	vectorsIndexChecksum string
 }
 
+// segmentWriteHook 在写最终分段的向量文件之前调用（只在有向量行时），返回错误
+// 即按写分段失败处理。只供测试在这个时刻中断构建或检查组装结果，生产路径为 nil。
+var segmentWriteHook func(ctx context.Context, seman semanticOutcome) error
+
 // buildSegmentStaging 在 staging 目录内产出一个 segment：chunks.jsonl、
 // Bleve 索引，配置了 embedding 时再写向量文件。任一步失败或 ctx 取消都
 // 丢弃 staging；成功时返回 discard 供调用方在发布失败时清理。
@@ -529,10 +533,16 @@ func (e *Engine) buildSegmentStaging(ctx context.Context, store *index.Store, re
 	}
 	artifacts := segmentArtifacts{buildID: buildID, staging: staging}
 	// 配置了 embedding 时向量文件一定写入，空集也合法：空仓库或零覆盖的
-	// revision 同样可以发布。
+	// revision 同样可以发布。向量按 seman.refs 逐行从 prior 段、journal 或共享
+	// 向量库取得（writeSegmentVectors）。
 	if seman.enabled {
-		artifacts.vectorsChecksum, artifacts.vectorsIndexChecksum, err =
-			vector.Write(staging, e.embedCfg.Dimension, seman.entries, seman.vectors)
+		if hook := segmentWriteHook; hook != nil && len(seman.entries) > 0 {
+			if err := hook(ctx, seman); err != nil {
+				discard()
+				return segmentArtifacts{}, nil, err
+			}
+		}
+		artifacts.vectorsChecksum, artifacts.vectorsIndexChecksum, err = e.writeSegmentVectors(ctx, staging, seman)
 		if err != nil {
 			discard()
 			return segmentArtifacts{}, nil, fmt.Errorf("写入向量数据: %w", err)
@@ -625,14 +635,22 @@ func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKe
 	e.retireHandles(workspaceKey, manifest.Revision, manifest.PreviousRevision)
 	e.gcRevisions(store, status, workspaceKey, manifest.Revision, manifest.PreviousRevision)
 	// 已随 revision 入盘的向量从 journal 清除；失败不影响发布，条目留到
-	// 下次发布再清。
+	// 下次发布再清。清理按偏移把剩余记录复制到新文件，复制时可能发现校验失败
+	// 的记录、改名也可能失败，错误写进 semantic.last_error，不静默忽略。
 	if seman.enabled && len(seman.entries) > 0 {
 		if journal, journalErr := e.journalFor(workspaceKey, store); journalErr == nil {
 			published := make(map[string]bool, len(seman.entries))
 			for _, entry := range seman.entries {
 				published[entry.ContentHash] = true
 			}
-			_ = journal.CompactAfterPublish(published)
+			if err := journal.CompactAfterPublish(published); err != nil {
+				note := sanitizeError(fmt.Errorf("发布后清理 embedding journal: %w", err))
+				if seman.lastError == "" {
+					seman.lastError = note
+				} else {
+					seman.lastError += "；" + note
+				}
+			}
 		}
 	}
 	status.setSkippedFiles(skippedFiles)
@@ -921,7 +939,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 	// 里的 CoveredChunks，少了就改走全量合并，不为搬运送审，也不让合并后的
 	// 覆盖率比合并前低。
 	var carriedEntries []vector.Entry
-	var carriedVectors [][]float32
+	var carriedRefs []vecRef
 	carriedCovered := make(map[string]int, len(carry.byFile))
 	if e.semanticEnabled() && len(carry.records) > 0 {
 		for _, record := range carry.records {
@@ -934,7 +952,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 				continue
 			}
 			carriedEntries = append(carriedEntries, vector.Entry{ID: record.ID, ContentHash: key})
-			carriedVectors = append(carriedVectors, vec)
+			carriedRefs = append(carriedRefs, vecRef{mem: vec})
 			carriedCovered[record.RelPath]++
 		}
 		for path := range carry.byFile {
@@ -953,7 +971,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 	}
 	if len(carriedEntries) > 0 {
 		seman.entries = append(seman.entries, carriedEntries...)
-		seman.vectors = append(seman.vectors, carriedVectors...)
+		seman.refs = append(seman.refs, carriedRefs...)
 		seman.covered += len(carriedEntries)
 		seman.coveredByActive += len(carriedEntries)
 	}

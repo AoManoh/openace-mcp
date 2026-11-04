@@ -556,7 +556,7 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 			gapFillPause = e.gapFillPause[tracker.workspaceKey]
 			e.mu.Unlock()
 			if journal != nil {
-				semantic.JournalEntries = len(journal.Snapshot())
+				semantic.JournalEntries = journal.Len()
 			}
 			// 覆盖率的分母扣除被 provider 永久拒绝的 chunk，与检索、同步结果
 			// 的 semantic_coverage 口径一致。

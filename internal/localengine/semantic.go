@@ -23,10 +23,14 @@ type semanticOutcome struct {
 	// enabled 表示本引擎配置了 embedding provider。为 false 时其余字段全为
 	// 零值，调用方不读取它们；纯词法配置下的构建产物与没有语义路时一致。
 	enabled bool
-	// entries 与 vectors 逐行对应，只包含拿到向量的 chunk，顺序与传入的
-	// records 相同；没有向量的 chunk 不出现。
+	// entries 与 refs 逐行对应，只包含拿到向量的 chunk，顺序与传入的
+	// records 相同；没有向量的 chunk 不出现。refs 只记每一行向量在哪里，写分段
+	// 时由 writeSegmentVectors 逐行取得，本次新取与 journal、共享库里的向量不
+	// 常驻内存。
 	entries []vector.Entry
-	vectors [][]float32
+	refs    []vecRef
+	// journal 是 refs 里 journal 行读回所用的本工作区 journal。
+	journal *index.Journal
 	// covered 是本次处理的 records 中拿到向量的 chunk 数，等于 len(entries)，
 	// 复用来的向量与新嵌入的向量同样计入。全量构建时它就是新 revision 的
 	// VectorCount；delta 构建只处理变更文件的 chunk，VectorCount 由各文件的
@@ -60,6 +64,17 @@ type semanticOutcome struct {
 	rejectedKeys map[string]bool
 	// lastError 是最后一次失败的脱敏错误文本，进入 workspace_status。
 	lastError string
+}
+
+// vecRef 是写分段时一行向量的来源。
+//   - mem 非 nil：向量本身，来自 active、previous 或旧 profile 子树的 revision
+//     （整段 mmap 时指向映射页，按行选读时是堆上拷贝）。
+//   - shared 非 nil：向量在共享向量库的段文件里，按位置读回。
+//   - 两者都为 nil：向量在本工作区 journal 里，按 embedKey 读回。本次新取、上次
+//     构建中断前已付费、从旧子树 journal 转存来的向量都是这一类。
+type vecRef struct {
+	mem    []float32
+	shared *index.SharedRef
 }
 
 // markRejected 记下一个被拒绝的键并计数。
@@ -268,14 +283,16 @@ func (e *Engine) loadPriorRowsSelective(prior *priorVectors, store *index.Store,
 //   - 先按 embedKey 复用既有向量，来源按优先级依次为 active revision、
 //     previous revision、兼容的旧 profile 子树、journal（上次构建中断前已
 //     付费落盘的批次），取第一个命中。复用是逐位拷贝，同一 chunk 跨
-//     revision 的向量完全一致。
+//     revision 的向量完全一致。journal 里的向量不读进内存，只按键判断有没有，
+//     写分段时再读回。
 //   - 当前子树拒绝集里的键不送 provider。仍有缺口时先经 siblingPaidStateFor
-//     只读检查同一 embedding 身份旧子树的已付费状态：其 journal 里的向量
-//     直接复用，其拒绝集里的键不送审并记进当前子树的拒绝集；旧状态无法
-//     确认或尚未回收时，所有缺口都不送 provider，按未覆盖发布并在
-//     lastError 与 migrationBlock 说明原因。
+//     只读检查同一 embedding 身份旧子树的已付费状态：其 journal 里缺口需要的
+//     向量逐批转存进当前子树的 journal 后复用，其拒绝集里的键不送审并记进当前
+//     子树的拒绝集；旧状态无法确认或尚未回收时，所有缺口都不送 provider，按
+//     未覆盖发布并在 lastError 与 migrationBlock 说明原因。
 //   - 再对仍缺失的唯一键调用 provider。每批成功立刻写入 journal，之后即使
-//     构建被取消或进程被杀，这批付费向量下次构建仍可复用。
+//     构建被取消或进程被杀，这批付费向量下次构建仍可复用；写入后不再留在内存，
+//     组装结果只记它在 journal 里。
 //   - provider 失败只记录不中断：词法索引的新鲜度优先于语义覆盖，本次拿到
 //     的向量照常入盘，缺口如实进入覆盖率。只有 ctx 取消与本地落盘失败才
 //     返回错误。
@@ -297,30 +314,25 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	status.setStage(engine.IndexStageEmbedding)
 
 	// 1) 复用表按优先级填充：active revision、previous revision、兼容的旧
-	// profile 子树、journal，已有的键不被低优先级来源覆盖。旧 profile 子树
-	// 的向量只在 embedding 身份与模板版本完全一致时才会被
-	// mergeSiblingProfileVectors 注入到 prior。
-	reuse := make(map[string][]float32, len(prior.activeByHash))
+	// profile 子树，已有的键不被低优先级来源覆盖；journal 优先级最低，不进复用
+	// 表，按键用 journal.Has 判断。旧 profile 子树的向量只在 embedding 身份与
+	// 模板版本完全一致时才会被 mergeSiblingProfileVectors 注入到 prior。
+	reuse := make(map[string]vecRef, len(prior.activeByHash))
 	activeUsable := make(map[string]bool, len(prior.activeByHash))
 	crossUsable := make(map[string]bool, len(prior.crossProfileByHash))
 	for hash, vec := range prior.activeByHash {
-		reuse[hash] = vec
+		reuse[hash] = vecRef{mem: vec}
 		activeUsable[hash] = true
 	}
 	for hash, vec := range prior.olderByHash {
 		if _, ok := reuse[hash]; !ok {
-			reuse[hash] = vec
+			reuse[hash] = vecRef{mem: vec}
 		}
 	}
 	for hash, vec := range prior.crossProfileByHash {
 		if _, ok := reuse[hash]; !ok {
-			reuse[hash] = vec
+			reuse[hash] = vecRef{mem: vec}
 			crossUsable[hash] = true
-		}
-	}
-	for hash, vec := range journal.Snapshot() {
-		if _, ok := reuse[hash]; !ok {
-			reuse[hash] = vec
 		}
 	}
 
@@ -348,6 +360,10 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 			}
 			continue
 		}
+		if journal.Has(key) {
+			reusedRows++
+			continue
+		}
 		if journal.Rejected(key) {
 			out.markRejected(key)
 			continue
@@ -356,7 +372,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		missingIdx = append(missingIdx, i)
 	}
 	if len(missingHashes) > 0 {
-		processed, err := e.recoverBulkState(ctx, journal, status, reuse, &out)
+		processed, err := e.recoverBulkState(ctx, journal, status, &out)
 		if err != nil {
 			return out, err
 		}
@@ -383,18 +399,20 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	}
 
 	// 送审前只读检查同一 embedding 身份旧子树里与这些缺口有关的已付费状态
-	// （换子树后它们仍留在旧子树）：journal 里已付费的向量直接复用；旧拒绝
-	// 集里的键不送审，并写进当前子树的拒绝集；旧状态无法确认或尚未回收时，
-	// 不向 provider 发任何文档嵌入请求，复用到的向量照常组装发布，缺口按
-	// 未覆盖如实上报，原因与恢复步骤写进 lastError。
+	// （换子树后它们仍留在旧子树）：旧 journal 里已付费的向量逐批转存进当前
+	// 子树的 journal 后复用；旧拒绝集里的键不送审，并写进当前子树的拒绝集；旧
+	// 状态无法确认或尚未回收时，不向 provider 发任何文档嵌入请求，复用到的向量
+	// 照常组装发布，缺口按未覆盖如实上报，原因与恢复步骤写进 lastError。
 	if len(missingHashes) > 0 {
-		paid := e.siblingPaidStateFor(store, missingHashes)
+		paid, err := e.siblingPaidStateFor(store, missingHashes, journal.Append)
+		if err != nil {
+			return out, fmt.Errorf("旧子树 journal 的已付费向量转存进当前 journal: %w", err)
+		}
 		var inherited []string
 		keptHashes := make([]string, 0, len(missingHashes))
 		keptIdx := make([]int, 0, len(missingIdx))
 		for i, key := range missingHashes {
-			if vec, ok := paid.vectors[key]; ok {
-				reuse[key] = vec
+			if paid.reused[key] {
 				reusedRows++
 				out.crossProfileReused++
 				continue
@@ -415,7 +433,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 			out.lastError = paid.blockReason
 			out.migrationBlock = paid.blockReason
 			status.setEmbedProgress(len(missingHashes), 0)
-			return e.assembleSemanticOutcome(records, reuse, activeUsable, out), nil
+			return e.assembleSemanticOutcome(records, reuse, journal, activeUsable, out), nil
 		}
 	}
 
@@ -429,14 +447,14 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	status.setEmbedProgress(len(missingHashes), 0)
 	// 用户开启了批接口且缺失数达到阈值时，改走 provider 的批作业路径（费用
 	// 低 33%，服务端排队窗口最长 12 小时；崩溃安全与失败处理见
-	// semantic_bulk.go）。回收的向量写入同一 journal 与 reuse，之后与同步
-	// 路径共用 assembleSemanticOutcome，产物等价。
+	// semantic_bulk.go）。回收的向量写入同一 journal，之后与同步路径共用
+	// assembleSemanticOutcome，产物等价。
 	if len(missingHashes) > 0 && e.bulkEligible(len(missingHashes)) {
 		textAt := func(i int) string { return embedDocText(records[missingIdx[i]]) }
-		if err := e.bulkEmbedMissing(ctx, journal, status, missingHashes, textAt, reuse, &out); err != nil {
+		if err := e.bulkEmbedMissing(ctx, journal, status, missingHashes, textAt, &out); err != nil {
 			return out, err
 		}
-		return e.assembleSemanticOutcome(records, reuse, activeUsable, out), nil
+		return e.assembleSemanticOutcome(records, reuse, journal, activeUsable, out), nil
 	}
 	batchSize := e.embedCfg.BatchSize
 	if batchSize < 1 {
@@ -514,7 +532,8 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 			batchGood[missingHashes[span.start+i]] = vec
 		}
 		// 每批成功立刻写入 journal：之后即使构建被取消或进程被杀，
-		// 这批已付费的向量下次构建仍能复用。
+		// 这批已付费的向量下次构建仍能复用。写入后本批向量不再留在内存，
+		// 组装与写分段按键从 journal 读回。
 		if err := journal.Append(batchGood); err != nil {
 			recordFatal(fmt.Errorf("journal 落盘: %w", err))
 			return
@@ -533,10 +552,7 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		for _, key := range batchRejected {
 			out.markRejected(key)
 		}
-		for hash, vec := range batchGood {
-			reuse[hash] = vec
-			out.newlyEmbedded++
-		}
+		out.newlyEmbedded += len(batchGood)
 		embedded += span.end - span.start
 		status.setEmbedProgress(len(missingHashes)-embedded, embedded)
 		embedMu.Unlock()
@@ -620,27 +636,85 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		return out, err
 	}
 
-	return e.assembleSemanticOutcome(records, reuse, activeUsable, out), nil
+	return e.assembleSemanticOutcome(records, reuse, journal, activeUsable, out), nil
 }
 
-// assembleSemanticOutcome 把 reuse 中的向量按 records 顺序组装成
-// entries/vectors，并统计 covered 与 coveredByActive；同步与批作业两条
-// 路径共用。embedKey 相同的多条记录共享同一个向量值。vector.Entry 的
-// ContentHash 字段存放的是 embedKey：字段名沿用旧版，索引子树按模板
-// 版本隔离，同一子树内该字段的含义恒定。
-func (e *Engine) assembleSemanticOutcome(records []chunkRecord, reuse map[string][]float32, activeUsable map[string]bool, out semanticOutcome) semanticOutcome {
+// assembleSemanticOutcome 按 records 顺序组装 entries/refs，并统计 covered 与
+// coveredByActive；同步与批作业两条路径共用。键先查复用表（prior 的行与共享
+// 库位置），没有再查 journal，与 embedRecords 的复用优先级一致；embedKey 相同
+// 的多条记录引用同一个来源。vector.Entry 的 ContentHash 字段存放的是
+// embedKey：字段名沿用旧版，索引子树按模板版本隔离，同一子树内该字段的含义
+// 恒定。
+func (e *Engine) assembleSemanticOutcome(records []chunkRecord, reuse map[string]vecRef, journal *index.Journal, activeUsable map[string]bool, out semanticOutcome) semanticOutcome {
+	out.journal = journal
 	for _, record := range records {
 		key := embedKey(record)
-		vec, ok := reuse[key]
+		ref, ok := reuse[key]
 		if !ok {
-			continue
+			if journal == nil || !journal.Has(key) {
+				continue
+			}
+			ref = vecRef{}
 		}
 		out.entries = append(out.entries, vector.Entry{ID: record.ID, ContentHash: key})
-		out.vectors = append(out.vectors, vec)
+		out.refs = append(out.refs, ref)
 		out.covered++
 		if activeUsable[key] {
 			out.coveredByActive++
 		}
 	}
 	return out
+}
+
+// writeSegmentVectors 按 seman.refs 逐行取得向量写进 staging 目录：内存里的行
+// 直接复制，journal 行按键读回，共享库行按位置读回，每 4,096 行检查一次 ctx。
+// 任何一行读不出都返回错误，调用方丢弃 staging、不发布。
+func (e *Engine) writeSegmentVectors(ctx context.Context, staging string, seman semanticOutcome) (string, string, error) {
+	if len(seman.refs) != len(seman.entries) {
+		return "", "", fmt.Errorf("向量来源 %d 行与条目 %d 行不一致", len(seman.refs), len(seman.entries))
+	}
+	var shared *index.SharedReader
+	defer func() {
+		if shared != nil {
+			_ = shared.Close()
+		}
+	}()
+	return vector.WriteRows(staging, e.embedCfg.Dimension, seman.entries, func(i int, dst []float32) error {
+		if i%4096 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		ref, key := seman.refs[i], seman.entries[i].ContentHash
+		switch {
+		case ref.mem != nil:
+			if len(ref.mem) != len(dst) {
+				return fmt.Errorf("第 %d 行维度 %d 与配置 %d 不符", i, len(ref.mem), len(dst))
+			}
+			copy(dst, ref.mem)
+			return nil
+		case ref.shared != nil:
+			if shared == nil {
+				store, err := e.sharedVectors()
+				if err != nil {
+					return fmt.Errorf("打开共享向量库读回第 %d 行: %w", i, err)
+				}
+				shared = store.OpenReader()
+			}
+			if err := shared.ReadInto(key, *ref.shared, dst); err != nil {
+				return fmt.Errorf("共享向量库在写分段时读不出，本次不发布，重新 sync 会重新查找、查不到的缺口照常送审: %w", err)
+			}
+			return nil
+		case seman.journal == nil:
+			return fmt.Errorf("第 %d 行（键 %s）的向量在 journal 里，但没有可用的 journal", i, key)
+		default:
+			if err := seman.journal.ReadInto(key, dst); err != nil {
+				if errors.Is(err, index.ErrJournalCorrupt) {
+					return fmt.Errorf("embedding journal 在写分段时读回校验失败，本次不发布；该键已移出 journal，下一次构建只为它重新送审: %w", err)
+				}
+				return fmt.Errorf("embedding journal 在写分段时读不出，本次不发布: %w", err)
+			}
+			return nil
+		}
+	})
 }
