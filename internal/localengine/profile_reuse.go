@@ -331,6 +331,12 @@ func siblingJournalBlockReason(dir string, err error) string {
 	return fmt.Sprintf("语义迁移已暂停：读取旧索引子树的 embedding journal %s 失败（%v），无法确认其中是否有已付费、尚未发布的向量，本次不为缺口送审；词法检索与已复用的向量照常可用。排除这个读取错误（例如文件权限、磁盘或挂载问题）后重新 sync", dir, err)
 }
 
+// journalReadBlockReason 是读不出本子树 journal（读文件本身报错）时写进 last_error
+// 的原因与恢复步骤。
+func journalReadBlockReason(dir string, err error) string {
+	return fmt.Sprintf("语义补齐已暂停：本子树的 embedding journal %s 读不出（%v），无法确认其中有哪些已付费、尚未发布的向量，本次不为缺口送审；词法检索与已复用的向量照常可用。排除这个读取错误（例如磁盘、权限或挂载问题）后重新 sync 即可补齐；确认不再需要这些已付费向量时，可以人工把该 journal 目录移走再 sync（缺口会重新送审计费）", dir, err)
+}
+
 // sameEmbeddingSiblingJournalDirs 返回同一工作区目录下、子树名以当前
 // embeddingSubtreeSuffix 结尾的其他索引子树里存在的 journal 目录，即 embedding
 // 身份相同而 chunk profile 或词法评分模型不同的子树。按目录名判断身份，不

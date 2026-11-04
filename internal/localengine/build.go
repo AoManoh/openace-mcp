@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"context"
@@ -638,18 +639,30 @@ func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKe
 	// 下次发布再清。清理按偏移把剩余记录复制到新文件，复制时可能发现校验失败
 	// 的记录、改名也可能失败，错误写进 semantic.last_error，不静默忽略。
 	if seman.enabled && len(seman.entries) > 0 {
-		if journal, journalErr := e.journalFor(workspaceKey, store); journalErr == nil {
+		journal, journalErr := e.journalFor(workspaceKey, store)
+		var cleanupErr error
+		switch {
+		case journalErr != nil:
+			// 打开失败也要报告（改动前直接跳过）。嵌入阶段已因 journal 读不出暂停补齐
+			// 时，lastError 里已有同一个 journal 的说明，不再重复。
+			if !strings.Contains(seman.lastError, store.JournalDir()) {
+				cleanupErr = fmt.Errorf("发布后清理 embedding journal：打开失败，已发布向量对应的记录这次没有清除: %w", journalErr)
+			}
+		default:
 			published := make(map[string]bool, len(seman.entries))
 			for _, entry := range seman.entries {
 				published[entry.ContentHash] = true
 			}
 			if err := journal.CompactAfterPublish(published); err != nil {
-				note := sanitizeError(fmt.Errorf("发布后清理 embedding journal: %w", err))
-				if seman.lastError == "" {
-					seman.lastError = note
-				} else {
-					seman.lastError += "；" + note
-				}
+				cleanupErr = fmt.Errorf("发布后清理 embedding journal: %w", err)
+			}
+		}
+		if cleanupErr != nil {
+			note := sanitizeError(cleanupErr)
+			if seman.lastError == "" {
+				seman.lastError = note
+			} else {
+				seman.lastError += "；" + note
 			}
 		}
 	}

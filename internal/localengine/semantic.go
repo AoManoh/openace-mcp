@@ -307,9 +307,19 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 	meter := &reliability.UsageMeter{}
 	ctx = reliability.WithUsageMeter(ctx, meter)
 	defer func() { status.addUsage(meter.Snapshot(), true) }()
+	// 读文件本身报错（磁盘、权限或挂载问题）时 journal 为 nil：无法确认其中有哪些
+	// 已付费、尚未发布的向量，缺口一律不送审，免得为它们重复付费；已有来源的向量与
+	// 词法照常发布，原因写进 lastError。改动前整次构建失败、不发布，新改动的内容连
+	// 词法都搜不到。原因只留在进程内，不写进 manifest 的迁移暂停原因：写进去会让
+	// gapFillEligible 不再触发补缺，journal 恢复可读后内容没变的同步也补不上。
 	journal, err := e.journalFor(workspaceKey, store)
+	journalUnreadable := ""
 	if err != nil {
-		return out, fmt.Errorf("打开 embedding journal: %w", err)
+		if !errors.Is(err, index.ErrJournalRead) {
+			return out, fmt.Errorf("打开 embedding journal: %w", err)
+		}
+		journal = nil
+		journalUnreadable = journalReadBlockReason(store.JournalDir(), err)
 	}
 	status.setStage(engine.IndexStageEmbedding)
 
@@ -360,18 +370,19 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 			}
 			continue
 		}
-		if journal.Has(key) {
+		if journal != nil && journal.Has(key) {
 			reusedRows++
 			continue
 		}
-		if journal.Rejected(key) {
+		if journal != nil && journal.Rejected(key) {
 			out.markRejected(key)
 			continue
 		}
 		missingHashes = append(missingHashes, key)
 		missingIdx = append(missingIdx, i)
 	}
-	if len(missingHashes) > 0 {
+	// 批作业回收要把结果写进 journal，journal 读不出时跳过。
+	if len(missingHashes) > 0 && journal != nil {
 		processed, err := e.recoverBulkState(ctx, journal, status, &out)
 		if err != nil {
 			return out, err
@@ -396,6 +407,14 @@ func (e *Engine) embedRecords(ctx context.Context, store *index.Store, workspace
 		before := len(missingHashes)
 		missingHashes, missingIdx = e.reuseSharedVectors(missingHashes, missingIdx, reuse, &out)
 		reusedRows += before - len(missingHashes)
+	}
+
+	// journal 读不出：其余缺口全部不送审（也不转存旧子树 journal，转存要写进本子树
+	// journal）。缺口恰好为零时同样报告，journal 里可能仍有尚未回收的已付费向量。
+	if journal == nil {
+		out.lastError = journalUnreadable
+		status.setEmbedProgress(len(missingHashes), 0)
+		return e.assembleSemanticOutcome(records, reuse, nil, activeUsable, out), nil
 	}
 
 	// 送审前只读检查同一 embedding 身份旧子树里与这些缺口有关的已付费状态
