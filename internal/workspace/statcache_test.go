@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -67,21 +68,50 @@ func TestStatCacheDetectsChanges(t *testing.T) {
 func TestStatCacheRacyWindowAlwaysRehashes(t *testing.T) {
 	cache := NewStatCache()
 	now := time.Now()
-	cache.store("a.go", 10, now, "blob-1", now)
-	if _, ok := cache.lookup("a.go", 10, now, now); ok {
+	at := func(mtime time.Time) statKey { return statKey{size: 10, mtimeNs: mtime.UnixNano()} }
+	cache.store("a.go", at(now), "blob-1", now)
+	if _, ok := cache.lookup("a.go", at(now), now); ok {
 		t.Fatal("racy 窗口内不得命中")
 	}
-	if _, ok := cache.lookup("a.go", 10, now, now.Add(time.Hour)); ok {
+	if _, ok := cache.lookup("a.go", at(now), now.Add(time.Hour)); ok {
 		t.Fatal("哈希时仍在窗口内的结果不得在窗口过去后命中")
 	}
 	past := now.Add(-time.Hour)
-	cache.store("b.go", 10, past, "blob-2", now)
-	if hit, ok := cache.lookup("b.go", 10, past, now); !ok || hit != "blob-2" {
+	cache.store("b.go", at(past), "blob-2", now)
+	if hit, ok := cache.lookup("b.go", at(past), now); !ok || hit != "blob-2" {
 		t.Fatalf("窗口外应命中: %v %q", ok, hit)
 	}
-	cache.store("b.go", 10, now, "blob-3", now)
-	if _, ok := cache.lookup("b.go", 10, past, now.Add(time.Hour)); ok {
+	cache.store("b.go", at(now), "blob-3", now)
+	if _, ok := cache.lookup("b.go", at(past), now.Add(time.Hour)); ok {
 		t.Fatal("同一路径窗口内重新哈希后,旧记录应删除")
+	}
+	// 修改时间早已离开窗口、ctime 还在窗口内(刚做过保留修改时间的改写):同样不命中、不存入。
+	recentCtime := statKey{size: 10, mtimeNs: past.UnixNano(), ctimeNs: now.UnixNano()}
+	cache.store("c.go", recentCtime, "blob-4", now)
+	if _, ok := cache.lookup("c.go", recentCtime, now.Add(time.Hour)); ok {
+		t.Fatal("ctime 在窗口内时哈希的结果不得在窗口过去后命中")
+	}
+}
+
+// TestStatCacheComparesCtimeInodeDevice 修改时间与大小相同、ctime、inode 或设备号
+// 任一不同都不命中;全部相同才命中。
+func TestStatCacheComparesCtimeInodeDevice(t *testing.T) {
+	cache := NewStatCache()
+	now := time.Now()
+	past := now.Add(-time.Hour)
+	base := statKey{size: 10, mtimeNs: past.UnixNano(), ctimeNs: past.UnixNano(), ino: 7, dev: 3}
+	cache.store("a.go", base, "blob-1", now)
+	if hit, ok := cache.lookup("a.go", base, now); !ok || hit != "blob-1" {
+		t.Fatalf("各字段一致应命中: %v %q", ok, hit)
+	}
+	for name, changed := range map[string]statKey{
+		"ctime": {size: 10, mtimeNs: past.UnixNano(), ctimeNs: past.Add(time.Minute).UnixNano(), ino: 7, dev: 3},
+		"inode": {size: 10, mtimeNs: past.UnixNano(), ctimeNs: past.UnixNano(), ino: 8, dev: 3},
+		"dev":   {size: 10, mtimeNs: past.UnixNano(), ctimeNs: past.UnixNano(), ino: 7, dev: 4},
+	} {
+		if _, ok := cache.lookup("a.go", changed, now); ok {
+			t.Fatalf("%s 变化时不得命中", name)
+		}
 	}
 }
 
@@ -126,13 +156,79 @@ func TestScanRehashesFileHashedInsideRacyWindow(t *testing.T) {
 	}
 }
 
+// sameLengthRewriteKeepsStat 把 path 改写为 content(长度不变)后把修改时间拨回 mtime,
+// 模拟 tar -x、rsync -a、cp -p 这类保留修改时间的改写:大小与修改时间都和改写前相同,
+// 只有 ctime(以及 rename 时的 inode)会变。
+func sameLengthRewriteKeepsStat(t *testing.T, path string, content []byte, mtime time.Time, viaRename bool) {
+	t.Helper()
+	target := path
+	if viaRename {
+		target = path + ".tmp"
+	}
+	if err := os.WriteFile(target, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(target, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	if viaRename {
+		if err := os.Rename(target, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// statRewriteScenario 先扫描一次让 v1 进缓存,再做保留修改时间的等长改写,等 ctime 离开
+// racy 窗口后再扫描,第二次必须读到 v2。只在 Linux 与 macOS 上比较 ctime 与 inode。
+func statRewriteScenario(t *testing.T, viaRename bool) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("ctime 与 inode 只在 Linux 与 macOS 上参与比较")
+	}
+	t.Parallel()
+	root := t.TempDir()
+	path := filepath.Join(root, "a.go")
+	v1 := []byte("package a // v1\n")
+	v2 := []byte("package a // v2\n")
+	mtime := time.Now().Add(-time.Hour)
+	if err := os.WriteFile(path, v1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	cache := NewStatCache()
+	first, err := scanWithCache(context.Background(), root, cache)
+	if err != nil || len(first) != 1 || first[0].BlobName != blobName("a.go", v1) {
+		t.Fatalf("第一次扫描应读到 v1: %v %+v", err, first)
+	}
+	sameLengthRewriteKeepsStat(t, path, v2, mtime, viaRename)
+	time.Sleep(racyWindow + 300*time.Millisecond)
+	second, err := scanWithCache(context.Background(), root, cache)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("second scan: %v %d", err, len(second))
+	}
+	if second[0].BlobName != blobName("a.go", v2) {
+		t.Fatal("保留修改时间的等长改写没有检出:stat 缓存按大小与修改时间命中了改写前的哈希")
+	}
+}
+
+// TestStatCacheCtime 原地改写内容并把修改时间拨回原值:大小与修改时间不变,ctime 变了。
+func TestStatCacheCtime(t *testing.T) {
+	statRewriteScenario(t, false)
+}
+
+// TestStatCacheInode 新文件写好后 rename 覆盖原文件:大小与修改时间不变,inode 变了。
+func TestStatCacheInode(t *testing.T) {
+	statRewriteScenario(t, true)
+}
+
 // TestStatCachePrunesMissing 本轮未见路径被清理,防删除后同名复活误命中。
 func TestStatCachePrunesMissing(t *testing.T) {
 	cache := NewStatCache()
-	past := time.Now().Add(-time.Hour)
-	cache.store("gone.go", 10, past, "blob-old", time.Now())
+	past := statKey{size: 10, mtimeNs: time.Now().Add(-time.Hour).UnixNano()}
+	cache.store("gone.go", past, "blob-old", time.Now())
 	cache.prune(map[string]bool{})
-	if _, ok := cache.lookup("gone.go", 10, past, time.Now()); ok {
+	if _, ok := cache.lookup("gone.go", past, time.Now()); ok {
 		t.Fatal("被清理路径不得命中")
 	}
 }

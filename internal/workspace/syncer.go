@@ -152,7 +152,8 @@ func scanWithProgress(ctx context.Context, root string, cache *StatCache, progre
 		}
 		if cache != nil {
 			if info, infoErr := d.Info(); infoErr == nil {
-				if hit, ok := cache.lookup(rel, info.Size(), info.ModTime(), scanStart); ok {
+				key := statKeyOf(info)
+				if hit, ok := cache.lookup(rel, key, scanStart); ok {
 					seen[rel] = true
 					files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: hit})
 					report()
@@ -163,7 +164,7 @@ func scanWithProgress(ctx context.Context, root string, cache *StatCache, progre
 					return err
 				}
 				name := blobName(rel, content)
-				cache.store(rel, info.Size(), info.ModTime(), name, scanStart)
+				cache.store(rel, key, name, scanStart)
 				seen[rel] = true
 				files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: name})
 				report()
