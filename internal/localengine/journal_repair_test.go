@@ -30,6 +30,9 @@ func TestJournalMidFileDamageAfterRestartReembedsOnlyDamagedKey(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			const dim = 8
 			ctx := context.Background()
+			// 两个引擎实例共用同一个隔离的 cache 目录；不设置时会写进本机真实缓存。
+			t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+			t.Setenv("OPENACE_CACHE_NAMESPACE", "test")
 			server := newEmbedServer(t, dim)
 			opts := embedOptions(server.ts.URL, dim, 4, fmt.Sprintf("k40-repair-%d", i))
 			root := refsWorkspace(t, 20)
