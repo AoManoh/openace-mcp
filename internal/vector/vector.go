@@ -93,13 +93,27 @@ func Write(dir string, dimension int, entries []Entry, vectors [][]float32) (dat
 	if len(entries) != len(vectors) {
 		return "", "", fmt.Errorf("entries/vectors 数量不一致: %d vs %d", len(entries), len(vectors))
 	}
+	return WriteRows(dir, dimension, entries, func(i int, dst []float32) error {
+		if len(vectors[i]) != dimension {
+			return fmt.Errorf("第 %d 行维度 %d 与配置 %d 不符", i, len(vectors[i]), dimension)
+		}
+		copy(dst, vectors[i])
+		return nil
+	})
+}
+
+// WriteRows 与 Write 产出逐字节相同的两个文件，第 i 行向量由 rowAt(i, dst) 写进
+// dst（长度为 dimension，每行复用同一块缓冲）。构建用它从 journal、共享向量库或
+// 旧分段逐行读出向量写盘，不必先把全部向量放进内存。rowAt 返回的错误原样返回；
+// 读出的行照样做有限值与单位长度校验。
+func WriteRows(dir string, dimension int, entries []Entry, rowAt func(i int, dst []float32) error) (dataChecksum string, indexChecksum string, err error) {
 	if dimension <= 0 {
 		return "", "", errors.New("dimension 必须为正")
 	}
 	// 流式写 vectors.dat:旧实现先构造 count×dim×4 的完整 byte[]，
 	// 与调用方已持有的 float32 vectors 同时常驻；k8s 345K×1024 时
 	// 平白增加约1.4GiB峰值。按行复用小缓冲并同步计算 checksum。
-	dataChecksum, err = writeVectorData(filepath.Join(dir, DataFileName), dimension, vectors)
+	dataChecksum, err = writeVectorData(filepath.Join(dir, DataFileName), dimension, len(entries), rowAt)
 	if err != nil {
 		return "", "", err
 	}
@@ -114,7 +128,7 @@ func Write(dir string, dimension int, entries []Entry, vectors [][]float32) (dat
 	return dataChecksum, checksumBytes(idxBytes), nil
 }
 
-func writeVectorData(path string, dimension int, vectors [][]float32) (checksum string, err error) {
+func writeVectorData(path string, dimension int, count int, rowAt func(i int, dst []float32) error) (checksum string, err error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return "", err
@@ -128,9 +142,10 @@ func writeVectorData(path string, dimension int, vectors [][]float32) (checksum 
 	hash := sha256.New()
 	writer := bufio.NewWriterSize(io.MultiWriter(f, hash), 4<<20)
 	row := make([]byte, dimension*4)
-	for i, v := range vectors {
-		if len(v) != dimension {
-			return "", fmt.Errorf("第 %d 行维度 %d 与配置 %d 不符", i, len(v), dimension)
+	v := make([]float32, dimension)
+	for i := 0; i < count; i++ {
+		if err := rowAt(i, v); err != nil {
+			return "", err
 		}
 		var sum float64
 		for j, x := range v {
