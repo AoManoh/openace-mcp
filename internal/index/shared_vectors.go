@@ -81,25 +81,61 @@ func OpenSharedVectors(dir string, dimension int) (*SharedVectors, error) {
 // Dir 返回共享向量库目录。
 func (s *SharedVectors) Dir() string { return s.dir }
 
+// SharedRef 是共享向量库里一条记录的位置。段文件只追加、不改写，位置在段文件
+// 被用户删除之前一直有效。
+type SharedRef struct {
+	File   string
+	Offset int64
+	Length int
+}
+
 // Lookup 返回 keys 中在共享库里有合法记录的向量。读出的记录再校验一次 CRC、
 // 维度、有限值与单位长度（构建只写入归一化后的向量）；不合格的记录跳过并
 // 计数，对应内容照常送审。
 func (s *SharedVectors) Lookup(keys []string) (map[string][]float32, error) {
+	out := make(map[string][]float32)
+	err := s.lookup(keys, func(key string, _ sharedLocation, vec []float32) {
+		out[key] = append([]float32(nil), vec...)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// LookupRefs 与 Lookup 的查找与校验相同，但只返回记录的位置，不保留向量值：
+// 构建在写分段时再用 OpenReader 按位置读回。一次首建命中几十万条时，把命中的
+// 向量全部留在堆上会占用数百 MiB 到 GiB。
+func (s *SharedVectors) LookupRefs(keys []string) (map[string]SharedRef, error) {
+	out := make(map[string]SharedRef)
+	err := s.lookup(keys, func(key string, loc sharedLocation, _ []float32) {
+		out[key] = SharedRef{File: loc.file, Offset: loc.offset, Length: loc.length}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// lookup 对 keys 中在索引里的每个键读出整条记录并校验，合格的交给 hit（vec 是
+// 复用缓冲，hit 返回后失效），不合格的跳过、计数并移出索引。
+func (s *SharedVectors) lookup(keys []string, hit func(key string, loc sharedLocation, vec []float32)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.resetIfRemovedLocked(); err != nil {
-		return nil, err
+		return err
 	}
 	if err := s.refreshLocked(); err != nil {
-		return nil, err
+		return err
 	}
-	out := make(map[string][]float32)
 	files := map[string]*os.File{}
 	defer func() {
 		for _, file := range files {
 			_ = file.Close()
 		}
 	}()
+	var record []byte
+	vec := make([]float32, s.dimension)
 	for _, key := range keys {
 		loc, ok := s.index[key]
 		if !ok {
@@ -114,23 +150,82 @@ func (s *SharedVectors) Lookup(keys []string) (map[string][]float32, error) {
 				continue
 			}
 			if err != nil {
-				return nil, err
+				return err
 			}
 			files[loc.file], file = opened, opened
 		}
-		record := make([]byte, loc.length)
-		if _, err := file.ReadAt(record, loc.offset); err != nil {
-			return nil, err
+		if cap(record) < loc.length {
+			record = make([]byte, loc.length)
 		}
-		gotKey, vec, ok := decodeSharedRecord(record, s.dimension)
+		record = record[:loc.length]
+		if _, err := file.ReadAt(record, loc.offset); err != nil {
+			return err
+		}
+		gotKey, ok := decodeSharedRecordInto(record, s.dimension, vec)
 		if !ok || gotKey != key || !unitVector(vec) {
 			s.skipped++
 			delete(s.index, key)
 			continue
 		}
-		out[key] = vec
+		hit(key, loc, vec)
 	}
-	return out, nil
+	return nil
+}
+
+// SharedReader 按 LookupRefs 给出的位置读回共享库记录，缓存打开的段文件句柄。
+// 不能并发使用，用完调用 Close。
+type SharedReader struct {
+	dir       string
+	dimension int
+	files     map[string]*os.File
+	record    []byte
+}
+
+// OpenReader 返回一个按位置读回记录的读取器。
+func (s *SharedVectors) OpenReader() *SharedReader {
+	return &SharedReader{dir: s.dir, dimension: s.dimension, files: map[string]*os.File{}}
+}
+
+// ReadInto 按 ref 读回 key 的记录并再校验一次（CRC、键、维度、有限值与单位长度），
+// 向量写进 dst（长度必须等于维度）。段文件已被删除、读不出或校验失败时返回带
+// 文件、偏移与键的错误。
+func (r *SharedReader) ReadInto(key string, ref SharedRef, dst []float32) error {
+	if len(dst) != r.dimension {
+		return fmt.Errorf("共享向量读回缓冲维度 %d 与配置 %d 不符", len(dst), r.dimension)
+	}
+	path := filepath.Join(r.dir, ref.File)
+	file, ok := r.files[ref.File]
+	if !ok {
+		opened, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("打开共享向量库段文件 %s（键 %s）: %w", path, key, err)
+		}
+		r.files[ref.File], file = opened, opened
+	}
+	if cap(r.record) < ref.Length {
+		r.record = make([]byte, ref.Length)
+	}
+	record := r.record[:ref.Length]
+	if _, err := file.ReadAt(record, ref.Offset); err != nil {
+		return fmt.Errorf("读取共享向量库段文件 %s（偏移 %d，键 %s）: %w", path, ref.Offset, key, err)
+	}
+	gotKey, ok := decodeSharedRecordInto(record, r.dimension, dst)
+	if !ok || gotKey != key || !unitVector(dst) {
+		return fmt.Errorf("共享向量库段文件 %s 偏移 %d 处键 %s 的记录校验失败", path, ref.Offset, key)
+	}
+	return nil
+}
+
+// Close 关闭读取器打开的段文件句柄。
+func (r *SharedReader) Close() error {
+	var err error
+	for name, file := range r.files {
+		if cerr := file.Close(); err == nil {
+			err = cerr
+		}
+		delete(r.files, name)
+	}
+	return err
 }
 
 // Append 把一批已付费、已归一化的向量追加到本进程的段文件，写入后 fsync；
@@ -344,6 +439,8 @@ func (s *SharedVectors) scanSegmentLocked(name string, from int64) (int64, error
 	}
 	reader := bufio.NewReaderSize(file, 1<<20)
 	offset := from
+	var record []byte
+	vec := make([]float32, s.dimension)
 	for {
 		var lenBuf [4]byte
 		if _, err := io.ReadFull(reader, lenBuf[:]); err != nil {
@@ -353,12 +450,16 @@ func (s *SharedVectors) scanSegmentLocked(name string, from int64) (int64, error
 		if payloadLen == 0 || payloadLen > 1<<20 {
 			return offset, nil
 		}
-		record := make([]byte, 4+int(payloadLen)+4)
+		if size := 4 + int(payloadLen) + 4; cap(record) < size {
+			record = make([]byte, size)
+		} else {
+			record = record[:size]
+		}
 		copy(record, lenBuf[:])
 		if _, err := io.ReadFull(reader, record[4:]); err != nil {
 			return offset, nil
 		}
-		key, _, ok := decodeSharedRecord(record, s.dimension)
+		key, ok := decodeSharedRecordInto(record, s.dimension, vec)
 		if !ok {
 			s.skipped++
 		} else if _, exists := s.index[key]; !exists {
@@ -368,36 +469,36 @@ func (s *SharedVectors) scanSegmentLocked(name string, from int64) (int64, error
 	}
 }
 
-// decodeSharedRecord 解码一条完整记录（含长度前缀与 CRC），校验 CRC 与维度。
-func decodeSharedRecord(record []byte, dimension int) (string, []float32, bool) {
+// decodeSharedRecordInto 解码一条完整记录（含长度前缀与 CRC），校验 CRC 与维度，
+// 向量写进 dst（长度为 dimension）；不合格时返回 false，dst 内容无意义。
+func decodeSharedRecordInto(record []byte, dimension int, dst []float32) (string, bool) {
 	if len(record) < 4+2+4+4 {
-		return "", nil, false
+		return "", false
 	}
 	payloadLen := int(binary.LittleEndian.Uint32(record[:4]))
 	if len(record) != 4+payloadLen+4 {
-		return "", nil, false
+		return "", false
 	}
 	payload := record[4 : 4+payloadLen]
 	if crc32.ChecksumIEEE(payload) != binary.LittleEndian.Uint32(record[4+payloadLen:]) {
-		return "", nil, false
+		return "", false
 	}
 	hashLen := int(binary.LittleEndian.Uint16(payload[:2]))
 	rest := payload[2:]
 	if len(rest) < hashLen+4 {
-		return "", nil, false
+		return "", false
 	}
 	key := string(rest[:hashLen])
 	rest = rest[hashLen:]
 	dim := int(binary.LittleEndian.Uint32(rest[:4]))
 	rest = rest[4:]
-	if dim != dimension || len(rest) != dim*4 {
-		return "", nil, false
+	if dim != dimension || len(rest) != dim*4 || len(dst) != dim {
+		return "", false
 	}
-	vec := make([]float32, dim)
-	for i := range vec {
-		vec[i] = math.Float32frombits(binary.LittleEndian.Uint32(rest[i*4:]))
+	for i := range dst {
+		dst[i] = math.Float32frombits(binary.LittleEndian.Uint32(rest[i*4:]))
 	}
-	return key, vec, true
+	return key, true
 }
 
 // unitVector 报告向量的分量是否全为有限值且长度约为 1。

@@ -119,6 +119,56 @@ func TestSharedVectorsSkipCorruptRecordAndPartialTail(t *testing.T) {
 	}
 }
 
+// TestSharedVectorsLookupRefsReadBack：LookupRefs 校验后只返回位置，按位置读回的
+// 位值与写入相同；校验不过的记录不返回；位置与键对不上、或段文件在查找之后被
+// 删除时 ReadInto 报错。
+func TestSharedVectorsLookupRefsReadBack(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "shared")
+	writer, err := OpenSharedVectors(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]float32{"a": unit(4, 1), "b": unit(4, 2)}
+	if err := writer.Append(want); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Append(map[string][]float32{"long": {1, 1, 1, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := writer.LookupRefs([]string{"a", "b", "long", "missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 2 || writer.Skipped() != 1 {
+		t.Fatalf("应只返回 a、b 的位置并跳过非单位长度的记录: refs=%v skipped=%d", refs, writer.Skipped())
+	}
+	reader := writer.OpenReader()
+	dst := make([]float32, 4)
+	for key, vec := range want {
+		if err := reader.ReadInto(key, refs[key], dst); err != nil {
+			t.Fatalf("读回 %s: %v", key, err)
+		}
+		for i := range vec {
+			if math.Float32bits(dst[i]) != math.Float32bits(vec[i]) {
+				t.Fatalf("%s 第 %d 维读回 %v，写入 %v", key, i, dst[i], vec[i])
+			}
+		}
+	}
+	if err := reader.ReadInto("b", refs["a"], dst); err == nil {
+		t.Fatal("位置与键对不上应报错")
+	}
+	_ = reader.Close()
+	_ = writer.Close()
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	gone := writer.OpenReader()
+	defer gone.Close()
+	if err := gone.ReadInto("a", refs["a"], dst); err == nil || !strings.Contains(err.Error(), refs["a"].File) {
+		t.Fatalf("段文件被删除后读回应报错并写明文件: %v", err)
+	}
+}
+
 // TestSharedVectorsRejectInvalidVectors：读出的向量含非有限值或不是单位长度
 // 时不复用（构建只写入归一化后的向量）。
 func TestSharedVectorsRejectInvalidVectors(t *testing.T) {
