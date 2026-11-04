@@ -91,6 +91,42 @@ func TestReadJournalSnapshotCleanFilesUntouched(t *testing.T) {
 	}
 }
 
+// TestScanJournalSnapshotFiltersWanted：只把 want 里的键交给回调，拒绝集照常返回，
+// 文件不变；want 为 nil 时交出全部键；回调返回的错误原样返回。
+func TestScanJournalSnapshotFiltersWanted(t *testing.T) {
+	store := newV2TestStore(t)
+	all := writeSnapshotJournal(t, store)
+	before := readTree(t, store.Root())
+	got := map[string][]float32{}
+	rejected, err := ScanJournalSnapshot(store.JournalDir(), 4, map[string]bool{"paid-b": true, "absent": true}, func(key string, vec []float32) error {
+		got[key] = append([]float32(nil), vec...)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, map[string][]float32{"paid-b": all["paid-b"]}) {
+		t.Fatalf("只应交出 want 里存在的键: %v", got)
+	}
+	if !reflect.DeepEqual(rejected, map[string]bool{"zero-a": true, "zero-b": true}) {
+		t.Fatalf("拒绝集: %v", rejected)
+	}
+	if after := readTree(t, store.Root()); !reflect.DeepEqual(before, after) {
+		t.Fatal("流式读取不得改动子树文件")
+	}
+	everything := map[string][]float32{}
+	if _, err := ScanJournalSnapshot(store.JournalDir(), 4, nil, func(key string, vec []float32) error {
+		everything[key] = append([]float32(nil), vec...)
+		return nil
+	}); err != nil || !reflect.DeepEqual(everything, all) {
+		t.Fatalf("want 为 nil 时应交出全部键: %v err=%v", everything, err)
+	}
+	stop := errors.New("接收方停止")
+	if _, err := ScanJournalSnapshot(store.JournalDir(), 4, nil, func(string, []float32) error { return stop }); !errors.Is(err, stop) {
+		t.Fatalf("回调的错误应原样返回: %v", err)
+	}
+}
+
 // TestReadJournalSnapshotRejectsDamagedFiles：只有记录边界处的干净结尾算读完。
 // CRC 翻转、半写记录、维度不符、拒绝集末行不完整都以 ErrJournalCorrupt 报错，
 // 不返回部分结果，错误里带文件路径；文件保持原样，坏尾不被截断。

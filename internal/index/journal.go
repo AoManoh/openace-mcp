@@ -630,39 +630,52 @@ var ErrJournalCorrupt = errors.New("journal 记录不完整或校验失败")
 // ErrJournalCorrupt）。出错时不返回部分结果。dir 或其中的文件不存在时返回
 // 空结果。拒绝集与 loadRejected 一样只保留最近的 rejectedMaxEntries 条。
 func ReadJournalSnapshot(dir string, dimension int) (map[string][]float32, map[string]bool, error) {
-	if dimension <= 0 {
-		return nil, nil, errors.New("journal 需要正维度")
-	}
-	vectors, err := readVectorsSnapshot(filepath.Join(dir, journalFileName), dimension)
-	if err != nil {
-		return nil, nil, err
-	}
-	rejected, err := readRejectedSnapshot(filepath.Join(dir, rejectedFileName))
+	vectors := map[string][]float32{}
+	rejected, err := ScanJournalSnapshot(dir, dimension, nil, func(key string, vec []float32) error {
+		vectors[key] = append([]float32(nil), vec...)
+		return nil
+	})
 	if err != nil {
 		return nil, nil, err
 	}
 	return vectors, rejected, nil
 }
 
-// readVectorsSnapshot 逐条读取向量文件，见 ReadJournalSnapshot 的错误约定。
-func readVectorsSnapshot(path string, dimension int) (map[string][]float32, error) {
-	vectors := map[string][]float32{}
+// ScanJournalSnapshot 与 ReadJournalSnapshot 的只读方式与错误约定相同，但不把向量
+// 收进返回值：按文件顺序每读到一条键在 want 里的记录（want 为 nil 时是每一条）
+// 就调用 fn(key, vec)，vec 是复用缓冲，fn 返回后失效；读完向量文件再读拒绝集并
+// 返回。换用新索引子树时，引擎用它把旧子树 journal 里需要的已付费向量逐批转存进
+// 新子树的 journal，不必把整个旧 journal 读进内存。fn 返回错误时停止并原样返回；
+// 出错时 fn 可能已经收到错误位置之前的记录，调用方不能把收到的部分当作完整状态。
+func ScanJournalSnapshot(dir string, dimension int, want map[string]bool, fn func(key string, vec []float32) error) (map[string]bool, error) {
+	if dimension <= 0 {
+		return nil, errors.New("journal 需要正维度")
+	}
+	if err := scanVectorsSnapshot(filepath.Join(dir, journalFileName), dimension, want, fn); err != nil {
+		return nil, err
+	}
+	return readRejectedSnapshot(filepath.Join(dir, rejectedFileName))
+}
+
+// scanVectorsSnapshot 逐条读取向量文件，见 ScanJournalSnapshot 的约定。
+func scanVectorsSnapshot(path string, dimension int, want map[string]bool, fn func(key string, vec []float32) error) error {
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return vectors, nil
+			return nil
 		}
-		return nil, fmt.Errorf("打开 %s: %w", path, err)
+		return fmt.Errorf("打开 %s: %w", path, err)
 	}
 	defer file.Close()
 	reader := bufio.NewReaderSize(file, 1<<20)
 	var offset int64
 	var buf []byte
+	vector := make([]float32, dimension)
 	for record := 1; ; record++ {
 		if _, err := reader.Peek(1); err == io.EOF {
-			return vectors, nil
+			return nil
 		} else if err != nil {
-			return nil, fmt.Errorf("读取 %s（偏移 %d）: %w", path, offset, err)
+			return fmt.Errorf("读取 %s（偏移 %d）: %w", path, offset, err)
 		}
 		var hash string
 		var vecBytes []byte
@@ -671,13 +684,16 @@ func readVectorsSnapshot(path string, dimension int) (map[string][]float32, erro
 		if err != nil {
 			var pathErr *os.PathError
 			if errors.As(err, &pathErr) {
-				return nil, fmt.Errorf("读取 %s（第 %d 条记录，偏移 %d）: %w", path, record, offset, err)
+				return fmt.Errorf("读取 %s（第 %d 条记录，偏移 %d）: %w", path, record, offset, err)
 			}
-			return nil, fmt.Errorf("%w: %s 第 %d 条记录（偏移 %d）: %v", ErrJournalCorrupt, path, record, offset, err)
+			return fmt.Errorf("%w: %s 第 %d 条记录（偏移 %d）: %v", ErrJournalCorrupt, path, record, offset, err)
 		}
-		vector := make([]float32, dimension)
-		decodeJournalVector(vecBytes, vector)
-		vectors[hash] = vector
+		if want == nil || want[hash] {
+			decodeJournalVector(vecBytes, vector)
+			if err := fn(hash, vector); err != nil {
+				return err
+			}
+		}
 		offset += size
 	}
 }
