@@ -29,7 +29,8 @@ import (
 //	uint32 payloadLen | payload | uint32 crc32(payload)
 //	payload = uint16 hashLen | hash | uint32 dim | dim × float32
 //
-// 尾部半写记录在打开时截断（暗坑 K40）。文件只存 hash 与向量，
+// 打开时跳过文件中间读不通过的数据，只截掉末尾不完整的记录（暗坑 K40，
+// 2026-11-04 改规则，见 loadOffsets）。文件只存 hash 与向量，
 // 不存 chunk 明文（暗坑 K54）。
 //
 // 内存里只有键到记录起始偏移的表，向量只在文件里，用 ReadInto 按键读回。
@@ -49,14 +50,95 @@ type Journal struct {
 	bytes    int64
 	// scratch 是读回单条记录的复用缓冲，持锁使用。
 	scratch []byte
-	// stale 表示偏移表删掉了文件里仍在的记录（读回时校验失败），下一次发布后清理
-	// 即使没有已发布的键也要改写文件，把坏记录去掉；否则进程崩溃后重新打开时会在
-	// 这条坏记录处截断，丢掉它后面的已付费记录。
+	// stale 表示偏移表删掉了文件里仍在的记录（读回时校验失败，或打开时跳过了坏
+	// 数据但没能改写），下一次发布后清理即使没有已发布的键也要改写文件，把坏数据
+	// 去掉；否则坏数据一直留在文件里，回退到 8f838a4 及更早的版本时会在那里截断，
+	// 丢掉其后的已付费记录。
 	stale bool
 	// broken 非空时拒绝追加：一批写入失败后没能把文件截回写入前的长度，文件末尾
 	// 可能有半条记录，之后追加的记录偏移不可信。重新打开 journal 时按坏尾截断恢复。
 	broken error
+	// repair 是本次打开时对文件做的修复，只供状态上报。
+	repair JournalRepair
 }
+
+// JournalRepair 记录本进程打开 journal 时对文件做过的修复，供 workspace_status 与
+// 日志报告；进程重启后不保留。
+type JournalRepair struct {
+	// SkippedRegions、SkippedBytes 是跳过的读不通过的数据段数与字节数（不含截掉的
+	// 尾部）；EstimatedRecords 按坏区之后那条记录的长度估算跳过的条数，向上取整。
+	SkippedRegions   int
+	SkippedBytes     int64
+	EstimatedRecords int
+	// TruncatedTailBytes 是截掉的末尾不完整数据的字节数。
+	TruncatedTailBytes int64
+	// Rewritten 表示跳过坏数据后文件已改写为只含有效记录；RewriteError 是改写失败
+	// 或改写时又发现校验失败记录的说明。
+	Rewritten    bool
+	RewriteError string
+	// RemovedTempFiles 是删除的改写中途残留的临时文件数；TempCleanupError 是删除失败
+	// 的原因。
+	RemovedTempFiles int
+	TempCleanupError string
+}
+
+// Summary 用一句话说明修复内容，没有修复时返回空串。
+func (r JournalRepair) Summary() string {
+	var parts []string
+	if r.SkippedRegions > 0 {
+		part := fmt.Sprintf("跳过 %d 处读不通过的数据共 %d 字节（约 %d 条记录，对应内容在下一次构建重新送审，共享向量库里有同键记录的直接复用）",
+			r.SkippedRegions, r.SkippedBytes, r.EstimatedRecords)
+		switch {
+		case r.Rewritten && r.RewriteError == "":
+			part += "，文件已改写为只含有效记录"
+		case r.Rewritten:
+			part += "，文件已改写（" + r.RewriteError + "）"
+		default:
+			part += "；改写失败（" + r.RewriteError + "），坏数据仍在文件里，下一次发布后清理时重试，在此之前回退到 8f838a4 及更早的版本会在坏处截断"
+		}
+		parts = append(parts, part)
+	}
+	if r.TruncatedTailBytes > 0 {
+		parts = append(parts, fmt.Sprintf("截掉末尾不完整的 %d 字节", r.TruncatedTailBytes))
+	}
+	if r.RemovedTempFiles > 0 {
+		parts = append(parts, fmt.Sprintf("删除改写中途残留的临时文件 %d 个", r.RemovedTempFiles))
+	}
+	if r.TempCleanupError != "" {
+		parts = append(parts, "删除残留临时文件失败（"+r.TempCleanupError+"）")
+	}
+	return strings.Join(parts, "；")
+}
+
+// Repair 返回本次打开 journal 时对文件做的修复。
+func (j *Journal) Repair() JournalRepair {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.repair
+}
+
+// ErrJournalRead 表示打开 journal 时读文件本身失败（例如磁盘 I/O 错误），不是记录
+// 内容读不通过。这时不截断、不改写：文件里可能还有完整的已付费记录，只是这一次
+// 读不出来。
+var ErrJournalRead = errors.New("journal 文件读取失败")
+
+// recordFormatError 是 readJournalPayload 判定的记录内容问题（长度字段、CRC、键长、
+// 维度），用来与底层读错误区分。
+type recordFormatError string
+
+func (e recordFormatError) Error() string { return string(e) }
+
+// isRecordContentError 报告 err 是否是记录内容读不通过：格式问题，或记录写到一半
+// （读到文件末尾也不完整）。
+func isRecordContentError(err error) bool {
+	var format recordFormatError
+	return errors.As(err, &format) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// journalLoadReader 返回打开 journal 时顺序读取用的 reader；测试替换它来模拟读错误。
+var journalLoadReader = defaultJournalLoadReader
+
+func defaultJournalLoadReader(f *os.File) io.Reader { return f }
 
 // journalWrite 把一批编码好的记录写进追加句柄。测试替换它来模拟只写了一部分就
 // 失败的情形。
@@ -69,6 +151,11 @@ const (
 	journalDirName   = "journal"
 	journalFileName  = "vectors.journal"
 	rejectedFileName = "rejected.list"
+	// journalTempPrefix 是改写 journal 时临时文件的名字前缀。
+	journalTempPrefix = ".tmp-journal-"
+	// maxResyncKeyLen 是跳过坏数据后查找下一条记录时允许的最长键：生产的键是 64 位
+	// 十六进制，测试用短键；更长的位置不算记录起点。
+	maxResyncKeyLen = 256
 	// rejectedMaxEntries 限制拒绝集规模（病理内容计数级别）。
 	rejectedMaxEntries = 10_000
 )
@@ -89,6 +176,12 @@ func OpenJournal(store *Store, dimension int) (*Journal, error) {
 		return nil, err
 	}
 	j := &Journal{dir: dir, dimension: dimension, offsets: map[string]int64{}, rejected: map[string]bool{}}
+	// 删除失败不影响打开：残留文件只占磁盘，原因写进修复记录。
+	removed, err := removeJournalTempFiles(dir)
+	j.repair.RemovedTempFiles = removed
+	if err != nil {
+		j.repair.TempCleanupError = err.Error()
+	}
 	if err := j.loadOffsets(); err != nil {
 		return nil, err
 	}
@@ -98,7 +191,61 @@ func OpenJournal(store *Store, dimension int) (*Journal, error) {
 	if err := j.openHandles(); err != nil {
 		return nil, err
 	}
+	if j.repair.SkippedRegions > 0 {
+		if err := j.rewriteAfterSkip(); err != nil {
+			return nil, err
+		}
+	}
 	return j, nil
+}
+
+// removeJournalTempFiles 删除 journal 目录里改写中途留下的临时文件，返回删除的个数。
+// 只有持写锁的进程会改写 journal，打开时不会有正在写的临时文件；不删的话每次被
+// 终止的改写都留下一个与 journal 差不多大的文件。
+func removeJournalTempFiles(dir string) (int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	var firstErr error
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), journalTempPrefix) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		removed++
+	}
+	return removed, firstErr
+}
+
+// rewriteAfterSkip 在打开时跳过了文件中间的坏数据后立即改写文件，只留有效记录（调用
+// 方持锁或尚未发布 j）。坏数据留在文件里时，回退到 8f838a4 及更早的版本会在坏处截断、
+// 删掉其后的已付费记录。改写失败（例如磁盘空间不足）时文件不动、偏移表照常使用，
+// stale 让下一次发布后清理再试；只有改写后句柄重新打开失败、journal 无法继续使用时
+// 返回错误。
+func (j *Journal) rewriteAfterSkip() error {
+	j.stale = true
+	err := j.rewriteLocked()
+	switch {
+	case err == nil:
+		j.repair.Rewritten = true
+	case j.broken != nil:
+		_ = j.closeHandles()
+		return fmt.Errorf("journal %s 跳过坏数据后改写，之后无法继续使用: %w", j.vectorsPath(), err)
+	case errors.Is(err, ErrJournalCorrupt):
+		// 改写已完成，复制时又有记录校验失败，没有写进新文件。
+		j.repair.Rewritten = true
+		j.repair.RewriteError = err.Error()
+	default:
+		j.repair.RewriteError = err.Error()
+	}
+	return nil
 }
 
 // Dir 暴露 journal 所在目录:离线批车道(T8)的作业状态文件与 journal
@@ -145,50 +292,167 @@ func (j *Journal) closeHandles() error {
 	return err
 }
 
-// loadOffsets 顺序读取记录并校验 CRC 与维度，只记下每个键的起始偏移，坏尾截断
-// （K40）。已付费条目无论规模全部保留（2026-08-26 裁决）——历史上这里有超上限
-// 压实（含 M8 修过的字节环缺陷），因其本质是静默丢弃已付费向量而整体移除。同一
-// 个键出现多次时以最后一条为准，与此前把向量逐条写进表的结果一致。
+// loadOffsets 顺序读取记录并校验 CRC 与维度，只记下每个键的起始偏移。已付费条目
+// 无论规模全部保留（2026-08-26 裁决）——历史上这里有超上限压实（含 M8 修过的字节
+// 环缺陷），因其本质是静默丢弃已付费向量而整体移除。同一个键出现多次时以最后一条
+// 为准，与此前把向量逐条写进表的结果一致。
+//
+// 遇到记录内容读不通过（长度字段非法、记录不完整、CRC、键长或维度不符）时不信任
+// 该处的长度字段，用 findNextJournalRecord 从下一个字节起查找下一条完整通过校验的
+// 记录，跳过中间的坏数据继续读，段数与字节数记进修复记录；查到文件末尾也没有，
+// 说明是写到一半的尾部，截掉（K40）。改动前遇到第一处坏数据就截断，坏处之后完整的
+// 已付费记录一起丢失。读文件本身报错时返回包装 ErrJournalRead 的错误、不截断：文件
+// 里可能还有完整记录，只是这一次读不出来。
 func (j *Journal) loadOffsets() error {
-	file, err := os.Open(j.vectorsPath())
+	path := j.vectorsPath()
+	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return err
+		return fmt.Errorf("%w: 打开 %s: %w", ErrJournalRead, path, err)
 	}
 	defer file.Close()
-	reader := bufio.NewReaderSize(file, 1<<20)
-	var goodOffset int64
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("%w: 读取 %s 的文件信息: %w", ErrJournalRead, path, err)
+	}
+	size := info.Size()
+	reader := bufio.NewReaderSize(journalLoadReader(file), 1<<20)
+	// offset 是下一条待读记录的起点；end 是最后一条完整记录的末尾，截断与追加都从
+	// 这里开始。
+	var offset, end int64
 	var buf []byte
-	for {
-		var hash string
-		var recordLen int64
-		hash, _, recordLen, buf, err = readJournalPayload(reader, j.dimension, buf)
+	for offset < size {
+		hash, _, recordLen, next, err := readJournalPayload(reader, j.dimension, buf)
+		buf = next
+		if err == nil {
+			j.offsets[hash] = offset
+			offset += recordLen
+			end = offset
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			// 在记录边界提前读完：文件比打开时短，读取期间被别的写入者改过。持写锁时
+			// 不应发生；此时读到的内容不可信，不截断、不跳过。
+			return fmt.Errorf("%w: %s 在偏移 %d 处提前结束（打开时 %d 字节），文件在读取期间变短", ErrJournalRead, path, offset, size)
+		}
+		if !isRecordContentError(err) {
+			return fmt.Errorf("%w: 读取 %s（偏移 %d）: %w", ErrJournalRead, path, offset, err)
+		}
+		resume, keyLen, err := findNextJournalRecord(file, offset+1, size, j.dimension)
 		if err != nil {
+			return fmt.Errorf("%w: 在 %s 偏移 %d 之后查找下一条完整记录: %w", ErrJournalRead, path, offset, err)
+		}
+		if resume < 0 {
 			break
 		}
-		j.offsets[hash] = goodOffset
-		goodOffset += recordLen
+		gap := resume - offset
+		unit := int64(j.recordLen(keyLen))
+		j.repair.SkippedRegions++
+		j.repair.SkippedBytes += gap
+		j.repair.EstimatedRecords += int((gap + unit - 1) / unit)
+		if _, err := file.Seek(resume, io.SeekStart); err != nil {
+			return fmt.Errorf("%w: 定位 %s 偏移 %d: %w", ErrJournalRead, path, resume, err)
+		}
+		reader.Reset(journalLoadReader(file))
+		offset = resume
 	}
-	info, err := os.Stat(j.vectorsPath())
-	if err != nil {
-		return err
-	}
-	if info.Size() > goodOffset {
-		// 坏尾/维度不符残留：截断到最后一条完整记录。
-		if err := os.Truncate(j.vectorsPath(), goodOffset); err != nil {
+	if size > end {
+		// 末尾没有完整记录：截断到最后一条完整记录。截断前确认文件没有在读取期间
+		// 变短或被替换，否则读到的“不完整”不可信，截断会删掉别人写进去的内容。
+		now, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("%w: 截断前重新读取 %s 的文件信息: %w", ErrJournalRead, path, err)
+		}
+		if !os.SameFile(info, now) || now.Size() != size {
+			return fmt.Errorf("%w: %s 在读取期间被替换或变短（打开时 %d 字节，现在 %d 字节），不截断", ErrJournalRead, path, size, now.Size())
+		}
+		if err := os.Truncate(path, end); err != nil {
 			return err
 		}
+		j.repair.TruncatedTailBytes = size - end
 	}
-	j.bytes = goodOffset
+	j.bytes = end
 	return nil
 }
 
-// readJournalPayload 顺序读出一条完整记录并校验长度、CRC、键长与维度；任何不
-// 一致返回错误（打开时由调用方截断，只读快照按 ErrJournalCorrupt 报告）。buf 是
-// 可复用的缓冲，容量不够时重新分配并经返回值交回；vecBytes 指向 buf 里的向量
-// 部分，下一次调用前有效。
+// findNextJournalRecord 从 from 起逐字节查找下一条能完整通过校验的记录起点，返回起点
+// 与该记录的键长；查到 size 也没有时返回 -1。读不通过的记录的长度字段不可信：长度
+// 字段本身坏了，或者中间是半条记录时，按它跳会错位。一个位置要满足 validResyncRecord
+// 的全部条件才算记录起点，随机字节同时通过长度字段、维度字段与 CRC 的概率不超过
+// 2 的 -96 次方。每个位置先比长度字段，相符才算 CRC，查找对文件长度是线性的。
+func findNextJournalRecord(file *os.File, from, size int64, dim int) (int64, int, error) {
+	const window = 1 << 20
+	minPayload := 2 + 1 + 4 + 4*dim
+	maxPayload := 2 + maxResyncKeyLen + 4 + 4*dim
+	// 每块多读一条最长记录的长度，起点落在本块内的记录总能完整读到。
+	buf := make([]byte, window+4+maxPayload+4)
+	vec := make([]float32, dim)
+	for start := from; start < size; start += window {
+		n := int64(len(buf))
+		if rest := size - start; rest < n {
+			n = rest
+		}
+		chunk := buf[:n]
+		got, err := file.ReadAt(chunk, start)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return 0, 0, err
+		}
+		if int64(got) < n {
+			// 少读到的部分还是上一块的旧字节，拿来匹配会在错误的位置认出记录。
+			return 0, 0, fmt.Errorf("偏移 %d 起应有 %d 字节，只读到 %d 字节，文件在读取期间变短", start, n, got)
+		}
+		for i := int64(0); i < window && n-i >= int64(4+minPayload+4); i++ {
+			payloadLen := int(binary.LittleEndian.Uint32(chunk[i:]))
+			total := int64(4 + payloadLen + 4)
+			if payloadLen < minPayload || payloadLen > maxPayload || i+total > n {
+				continue
+			}
+			if key, ok := validResyncRecord(chunk[i:i+total], dim, vec); ok {
+				return start + i, len(key), nil
+			}
+		}
+	}
+	return -1, 0, nil
+}
+
+// validResyncRecord 判断 record（含长度字段与 CRC）能否当作查找到的记录起点：长度字段
+// 与键长、维度一致，键长 1–maxResyncKeyLen 且键全是可打印 ASCII，维度字段等于 dim，
+// CRC 相符，向量各分量是有限值且长度为 1（生产写进 journal 的向量都先归一化，写分段
+// 时 vector.WriteRows 也按单位长度校验）。顺序读取时不检查键的字符与向量长度；这里
+// 更严，因为候选位置来自逐字节查找。vec 是复用缓冲。
+func validResyncRecord(record []byte, dim int, vec []float32) (string, bool) {
+	payloadLen := int(binary.LittleEndian.Uint32(record[:4]))
+	payload := record[4 : 4+payloadLen]
+	hashLen := int(binary.LittleEndian.Uint16(payload[:2]))
+	if hashLen < 1 || hashLen > maxResyncKeyLen || payloadLen != 2+hashLen+4+4*dim {
+		return "", false
+	}
+	key := payload[2 : 2+hashLen]
+	for _, c := range key {
+		if c < 0x21 || c > 0x7e {
+			return "", false
+		}
+	}
+	if int(binary.LittleEndian.Uint32(payload[2+hashLen:])) != dim {
+		return "", false
+	}
+	if crc32.ChecksumIEEE(payload) != binary.LittleEndian.Uint32(record[4+payloadLen:]) {
+		return "", false
+	}
+	decodeJournalVector(payload[2+hashLen+4:], vec)
+	if !unitVector(vec) {
+		return "", false
+	}
+	return string(key), true
+}
+
+// readJournalPayload 顺序读出一条完整记录并校验长度、CRC、键长与维度。记录内容的
+// 问题以 recordFormatError 返回，记录写到一半时返回 io.ErrUnexpectedEOF（打开时由
+// 调用方查找下一条记录或截掉尾部，只读快照按 ErrJournalCorrupt 报告）；底层读错误
+// 原样返回。buf 是可复用的缓冲，容量不够时重新分配并经返回值交回；vecBytes 指向
+// buf 里的向量部分，下一次调用前有效。
 func readJournalPayload(reader *bufio.Reader, wantDim int, buf []byte) (hash string, vecBytes []byte, recordLen int64, out []byte, err error) {
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(reader, lenBuf[:]); err != nil {
@@ -196,33 +460,37 @@ func readJournalPayload(reader *bufio.Reader, wantDim int, buf []byte) (hash str
 	}
 	payloadLen := int(binary.LittleEndian.Uint32(lenBuf[:]))
 	if payloadLen == 0 || payloadLen > 1<<20 {
-		return "", nil, 0, buf, errors.New("记录长度非法")
+		return "", nil, 0, buf, recordFormatError("记录长度非法")
 	}
 	if cap(buf) < payloadLen+4 {
 		buf = make([]byte, payloadLen+4)
 	}
 	data := buf[:payloadLen+4]
 	if _, err := io.ReadFull(reader, data); err != nil {
+		if errors.Is(err, io.EOF) {
+			// 长度字段之后没有任何字节：记录写到一半，不是在记录边界干净结束。
+			err = io.ErrUnexpectedEOF
+		}
 		return "", nil, 0, buf, err
 	}
 	payload := data[:payloadLen]
 	if crc32.ChecksumIEEE(payload) != binary.LittleEndian.Uint32(data[payloadLen:]) {
-		return "", nil, 0, buf, errors.New("crc 不匹配")
+		return "", nil, 0, buf, recordFormatError("crc 不匹配")
 	}
 	if len(payload) < 2 {
-		return "", nil, 0, buf, errors.New("payload 过短")
+		return "", nil, 0, buf, recordFormatError("payload 过短")
 	}
 	hashLen := int(binary.LittleEndian.Uint16(payload[:2]))
 	rest := payload[2:]
 	if len(rest) < hashLen+4 {
-		return "", nil, 0, buf, errors.New("hash 越界")
+		return "", nil, 0, buf, recordFormatError("hash 越界")
 	}
 	hash = string(rest[:hashLen])
 	rest = rest[hashLen:]
 	dim := int(binary.LittleEndian.Uint32(rest[:4]))
 	rest = rest[4:]
 	if dim != wantDim || len(rest) != dim*4 {
-		return "", nil, 0, buf, errors.New("维度不符")
+		return "", nil, 0, buf, recordFormatError("维度不符")
 	}
 	return hash, rest, int64(4 + payloadLen + 4), buf, nil
 }
@@ -343,9 +611,9 @@ func encodeJournalRecord(hash string, vector []float32) []byte {
 
 // Append 落盘一批已付费向量（批成功即调用，D4）；每批一次 fsync。
 //   - 写入失败（例如磁盘满）时可能只写了一部分：把文件截回写入前的长度再返回
-//     错误，本批不计入。不截回的话半条记录留在文件中间，之后追加的记录在下次
-//     打开时会随它一起被截掉（K40 遇到坏记录即截断其后内容），同进程里按偏移
-//     读回也会错位。截回也失败时停止追加（broken），已有条目照常可读。
+//     错误，本批不计入。不截回的话半条记录留在文件中间：同进程里按偏移读回会
+//     错位；8f838a4 及更早的版本下次打开时会把之后追加的记录随它一起截掉（现在
+//     打开时跳过这半条）。截回也失败时停止追加（broken），已有条目照常可读。
 //   - 写入成功即记入偏移表，之后 fsync 失败只返回错误：数据已在文件里，同一进
 //     程之后的构建直接复用，不为它再付费；本次构建由调用方按落盘失败处理。
 func (j *Journal) Append(vectors map[string][]float32) error {
@@ -465,7 +733,7 @@ func (j *Journal) rewriteLocked() error {
 		keys = append(keys, key)
 	}
 	sort.Slice(keys, func(a, b int) bool { return j.offsets[keys[a]] < j.offsets[keys[b]] })
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-journal-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), journalTempPrefix+"*")
 	if err != nil {
 		return err
 	}
@@ -515,21 +783,21 @@ func (j *Journal) rewriteLocked() error {
 	if err := journalRename(tmpName, path); err != nil {
 		os.Remove(tmpName)
 		if reopenErr := j.openHandles(); reopenErr != nil {
-			j.broken = fmt.Errorf("发布后清理改名失败（%v）后重新打开 journal 也失败（%v）", err, reopenErr)
+			j.broken = fmt.Errorf("改写 journal 时改名失败（%v）后重新打开 journal 也失败（%v）", err, reopenErr)
 			return j.broken
 		}
-		return fmt.Errorf("journal %s 发布后清理改名失败，原文件未改动: %w", path, err)
+		return fmt.Errorf("journal %s 改写时改名失败，原文件未改动: %w", path, err)
 	}
 	syncDirBestEffort(filepath.Dir(path))
 	j.offsets = newOffsets
 	j.bytes = total
 	j.stale = false
 	if err := j.openHandles(); err != nil {
-		j.broken = fmt.Errorf("发布后清理完成但重新打开 journal 失败（%v）", err)
+		j.broken = fmt.Errorf("改写 journal 完成但重新打开失败（%v）", err)
 		return j.broken
 	}
 	if damaged > 0 {
-		return fmt.Errorf("%w: 发布后清理 %s 时有 %d 条记录校验失败，没有写进新文件，对应内容下次构建会重新送审", ErrJournalCorrupt, path, damaged)
+		return fmt.Errorf("%w: 改写 %s 时有 %d 条记录校验失败，没有写进新文件，对应内容下次构建会重新送审", ErrJournalCorrupt, path, damaged)
 	}
 	return nil
 }

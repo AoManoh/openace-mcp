@@ -326,7 +326,7 @@ func isEmbedKeyFormat(s string) bool {
 // 记录损坏与 I/O 失败的处理办法不同。
 func siblingJournalBlockReason(dir string, err error) string {
 	if errors.Is(err, index.ErrJournalCorrupt) {
-		return fmt.Sprintf("语义迁移已暂停：旧索引子树的 embedding journal %s 不能完整读出（%v），损坏处及之后的已付费向量无法确认，本次不为缺口送审；词法检索与已复用的向量照常可用。恢复：用升级前的 openACE 版本对该工作区执行一次 sync（它会截掉损坏的尾部、补齐并发布缺口），之后本版本复用其发布的向量；或确认不再需要这些已付费向量后，人工把该 journal 目录移出旧子树再 sync（缺口会重新送审计费）", dir, err)
+		return fmt.Sprintf("语义迁移已暂停：旧索引子树的 embedding journal %s 不能完整读出（%v），损坏处及之后的已付费向量无法确认，本次不为缺口送审；词法检索与已复用的向量照常可用。恢复：用升级前的 openACE 版本对该工作区执行一次 sync（它会跳过或截掉损坏处、补齐并发布缺口），之后本版本复用其发布的向量；或确认不再需要这些已付费向量后，人工把该 journal 目录移出旧子树再 sync（缺口会重新送审计费）", dir, err)
 	}
 	return fmt.Sprintf("语义迁移已暂停：读取旧索引子树的 embedding journal %s 失败（%v），无法确认其中是否有已付费、尚未发布的向量，本次不为缺口送审；词法检索与已复用的向量照常可用。排除这个读取错误（例如文件权限、磁盘或挂载问题）后重新 sync", dir, err)
 }

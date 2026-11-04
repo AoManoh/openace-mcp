@@ -54,6 +54,9 @@ func newService(opts Options, logf func(format string, args ...any), timing serv
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
+	if opts.Logf == nil {
+		opts.Logf = logf
+	}
 	if !opts.Embedding.Enabled || !opts.Embedding.DimensionAuto || opts.Embedding.Dimension > 0 {
 		return New(opts)
 	}

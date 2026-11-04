@@ -98,6 +98,10 @@ type Options struct {
 	// 评测程序在程序内覆盖，没有环境变量，默认 false。进入生产默认要等
 	// 真实碎片密集语料的验证与用户决定。
 	FragmentGate bool
+	// Logf 接收需要写进进程日志的事件（例如打开 embedding journal 时做过的修复），
+	// nil 时不写。NewService 用 daemon 与 MCP direct 模式的日志函数填入；不进配置
+	// 指纹。
+	Logf func(format string, args ...any)
 }
 
 // OptionsFromEnv 从环境变量解析引擎配置：embedding 与 rerank provider、精排

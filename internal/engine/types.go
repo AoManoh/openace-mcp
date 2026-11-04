@@ -234,6 +234,11 @@ type SemanticStatus struct {
 	PendingChunks  int `json:"pending_chunks,omitempty"`
 	EmbeddedChunks int `json:"embedded_chunks,omitempty"`
 	JournalEntries int `json:"journal_entries,omitempty"`
+	// JournalRepair 说明本进程打开该工作区 journal 时对文件做过的修复：跳过文件
+	// 中间读不通过的数据（对应内容重新送审）、截掉末尾不完整的记录、删除改写中途
+	// 残留的临时文件（暗坑 K40 改规则，加性 omitempty）。进程重启后不保留，日志里
+	// 有同样的一行。
+	JournalRepair string `json:"journal_repair,omitempty"`
 	// EmbedRatePerMin/EmbedETASeconds 是构建期嵌入速率与剩余时间估算
 	// (灰度反馈 2026-08-07:只见 pending 无 ETA;加性 omitempty,
 	// 构建结束归零)。估算按本次构建平均速率,provider 限速波动下仅供

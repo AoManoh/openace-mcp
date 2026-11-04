@@ -162,6 +162,8 @@ type Engine struct {
 	// 时关闭本进程的段文件。
 	sharedMu sync.Mutex
 	shared   *index.SharedVectors
+	// logf 写进程日志，来自 Options.Logf，未设置时丢弃。
+	logf func(format string, args ...any)
 }
 
 // 编译期断言：Engine 实现全部引擎契约接口。
@@ -201,6 +203,10 @@ func New(opts Options) (*Engine, error) {
 		lastSyncOK:      make(map[string]time.Time),
 		refreshFailures: make(map[string]string),
 		locks:           make(map[string]*index.ProcessLock),
+		logf:            opts.Logf,
+	}
+	if e.logf == nil {
+		e.logf = func(string, ...any) {}
 	}
 	if opts.LexicalWeights != nil {
 		e.lexWeights = *opts.LexicalWeights
@@ -388,12 +394,18 @@ func (e *Engine) journalFor(workspaceKey string, store *index.Store) (*index.Jou
 		return nil, err
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if existing, ok := e.journals[workspaceKey]; ok {
+		e.mu.Unlock()
 		_ = journal.Close()
 		return existing, nil
 	}
 	e.journals[workspaceKey] = journal
+	e.mu.Unlock()
+	// 打开时跳过的坏数据、截掉的尾部与删除的临时文件写进日志：workspace_status
+	// 里的同一说明在进程重启后就看不到了。
+	if summary := journal.Repair().Summary(); summary != "" {
+		e.logf("embedding journal %s: %s", store.JournalDir(), summary)
+	}
 	return journal, nil
 }
 

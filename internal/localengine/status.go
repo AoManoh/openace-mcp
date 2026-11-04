@@ -557,6 +557,7 @@ func (e *Engine) attachSemantic(status *engine.WorkspaceStatus, tracker *wsStatu
 			e.mu.Unlock()
 			if journal != nil {
 				semantic.JournalEntries = journal.Len()
+				semantic.JournalRepair = journal.Repair().Summary()
 			}
 			// 覆盖率的分母扣除被 provider 永久拒绝的 chunk，与检索、同步结果
 			// 的 semantic_coverage 口径一致。
