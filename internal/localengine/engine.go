@@ -145,6 +145,9 @@ type Engine struct {
 	// statCaches 是每个工作区一个的扫描 stat 缓存：大小与 mtime 都没变的
 	// 文件跳过重新哈希。构建持写锁串行执行，缓存自身仍加锁。
 	statCaches map[string]*workspace.StatCache
+	// statSnapshots 记录每个工作区 stat 快照的加载与保存情况（stat_snapshot.go），
+	// 与 statCaches 同时建立。
+	statSnapshots map[string]*statSnapshotState
 	// firstTouchKicks 记录正在后台做首触同步的工作区（首触：daemon 启动后
 	// 某工作区的第一次查询），每个工作区最多一个后台同步 goroutine。
 	firstTouchKicks sync.Map
@@ -200,6 +203,7 @@ func New(opts Options) (*Engine, error) {
 		gapFillPause:    make(map[string]string),
 		journals:        make(map[string]*index.Journal),
 		statCaches:      make(map[string]*workspace.StatCache),
+		statSnapshots:   make(map[string]*statSnapshotState),
 		lastSyncOK:      make(map[string]time.Time),
 		refreshFailures: make(map[string]string),
 		locks:           make(map[string]*index.ProcessLock),
@@ -335,16 +339,25 @@ func (e *Engine) semanticEnabled() bool {
 	return e.embedClient != nil
 }
 
-// statCacheFor 返回该工作区的扫描 stat 缓存，没有则创建。
-func (e *Engine) statCacheFor(workspaceKey string) *workspace.StatCache {
+// statCacheFor 返回该工作区的扫描 stat 缓存，没有则创建：有可用的 stat 快照时装入
+// 其中的条目（loadStatCache）。加载要读 manifest 与快照文件，不在 e.mu 下进行；并发
+// 创建时以先登记的为准。
+func (e *Engine) statCacheFor(workspaceKey string, root pathutil.WorkspaceRoot) *workspace.StatCache {
+	e.mu.Lock()
+	cache, ok := e.statCaches[workspaceKey]
+	e.mu.Unlock()
+	if ok {
+		return cache
+	}
+	loaded, state := e.loadStatCache(workspaceKey, root)
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	cache, ok := e.statCaches[workspaceKey]
-	if !ok {
-		cache = workspace.NewStatCache()
-		e.statCaches[workspaceKey] = cache
+	if existing, ok := e.statCaches[workspaceKey]; ok {
+		return existing
 	}
-	return cache
+	e.statCaches[workspaceKey] = loaded
+	e.statSnapshots[workspaceKey] = state
+	return loaded
 }
 
 // fusionParams 返回本实例的 RRF 融合参数。
@@ -611,7 +624,7 @@ var errFirstTouchRefresh = errors.New("first touch refresh in background")
 // 完成后清除登记；同步失败时下一次查询会再启动一次，与内联同步失败后的
 // 重试一致，失败原因经状态的 last_error 可见，不会一直静默用旧索引。
 func (e *Engine) firstTouchFastPath(ref engine.WorkspaceRef) (error, bool) {
-	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
+	root, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
 	if err != nil {
 		return nil, false
 	}
@@ -620,6 +633,11 @@ func (e *Engine) firstTouchFastPath(ref engine.WorkspaceRef) (error, bool) {
 	failure, failed := e.refreshFailures[workspaceKey]
 	e.mu.Unlock()
 	if synced || !e.hasServableRevision(ref) {
+		return nil, false
+	}
+	// stat 快照装入了条目时，扫描只重新哈希停机期间变化的文件，第一次检索走普通流程
+	// （扫描、按需 delta、有界等待），作答的就是当前内容，不必先用旧 revision 作答。
+	if e.statSnapshotWarm(workspaceKey, root) {
 		return nil, false
 	}
 	if _, running := e.firstTouchKicks.LoadOrStore(workspaceKey, struct{}{}); !running {
@@ -883,6 +901,7 @@ func (e *Engine) syncWorkspaceOutcome(ctx context.Context, ref engine.WorkspaceR
 				e.lastSyncOK[workspaceKey] = time.Now()
 				delete(e.refreshFailures, workspaceKey)
 				e.mu.Unlock()
+				e.maybeSaveStatSnapshot(workspaceKey, nil, false)
 			} else if !errors.Is(err, context.Canceled) {
 				e.mu.Lock()
 				e.refreshFailures[workspaceKey] = sanitizeError(err)
@@ -958,7 +977,7 @@ func (e *Engine) WorkspaceChanged(ctx context.Context, ref engine.WorkspaceRef) 
 		}
 		return false, err
 	}
-	assets, err := workspace.FileAssetSource{Cache: e.statCacheFor(workspaceKey)}.Load(ctx, root.CanonicalPath)
+	assets, err := workspace.FileAssetSource{Cache: e.statCacheFor(workspaceKey, root)}.Load(ctx, root.CanonicalPath)
 	if err != nil {
 		return false, err
 	}
@@ -1021,9 +1040,9 @@ func (e *Engine) Close(ctx context.Context) error {
 		journals = append(journals, journal)
 		delete(e.journals, key)
 	}
-	locks := make([]*index.ProcessLock, 0, len(e.locks))
+	locks := make(map[string]*index.ProcessLock, len(e.locks))
 	for key, lock := range e.locks {
-		locks = append(locks, lock)
+		locks[key] = lock
 		delete(e.locks, key)
 	}
 	e.mu.Unlock()
@@ -1045,6 +1064,11 @@ func (e *Engine) Close(ctx context.Context) error {
 		if err := journal.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
+	}
+	// 构建都已退出、写锁还在手里：保存条目有变化的 stat 快照，下次启动的第一次扫描
+	// 不必重新哈希全部文件。
+	for key, lock := range locks {
+		e.maybeSaveStatSnapshot(key, lock, true)
 	}
 	// 写锁最后释放，此后其他进程可以立即接管构建所有权。
 	for _, lock := range locks {

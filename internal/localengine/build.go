@@ -253,7 +253,7 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	// 扫描器，敏感文件不会绕过 AssetPolicy 进入索引。
 	status.setStage(engine.IndexStageScanning)
 	// 扫描期按进度回填文件数，大仓首扫时状态不再长期显示 files=0。
-	assets, scanStats, err := workspace.FileAssetSource{Cache: e.statCacheFor(workspaceKey), Progress: status.setScannedFiles}.LoadWithStats(ctx, root.CanonicalPath)
+	assets, scanStats, err := workspace.FileAssetSource{Cache: e.statCacheFor(workspaceKey, root), Progress: status.setScannedFiles}.LoadWithStats(ctx, root.CanonicalPath)
 	if err != nil {
 		return engine.Result{}, nil, fmt.Errorf("扫描工作区: %w", err)
 	}

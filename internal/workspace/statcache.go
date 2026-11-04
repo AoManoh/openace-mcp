@@ -29,6 +29,18 @@ import (
 type StatCache struct {
 	mu      sync.Mutex
 	entries map[string]statEntry
+	// gen 在条目新增、改变或删除时加一;保存 stat 快照的一方比较它决定是否需要重写。
+	gen uint64
+}
+
+// Generation 返回条目变化的计数,两次读数相同说明期间条目没有变化。
+func (c *StatCache) Generation() uint64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gen
 }
 
 type statEntry struct {
@@ -95,11 +107,19 @@ func (c *StatCache) store(rel string, key statKey, blobName string, now time.Tim
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	old, existed := c.entries[rel]
 	if now.Sub(key.changedAt()) < racyWindow {
-		delete(c.entries, rel)
+		if existed {
+			delete(c.entries, rel)
+			c.gen++
+		}
 		return
 	}
-	c.entries[rel] = statEntry{key: key, blobName: blobName}
+	entry := statEntry{key: key, blobName: blobName}
+	if !existed || old != entry {
+		c.entries[rel] = entry
+		c.gen++
+	}
 }
 
 // prune 丢弃本轮未见路径(删除/改名/变为不可索引的文件),防陈条目
@@ -112,6 +132,7 @@ func (c *StatCache) prune(seen map[string]bool) {
 	for rel := range c.entries {
 		if !seen[rel] {
 			delete(c.entries, rel)
+			c.gen++
 		}
 	}
 	c.mu.Unlock()

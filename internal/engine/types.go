@@ -389,6 +389,10 @@ type WorkspaceStatus struct {
 	// C.1:文件选择遵循 ignore 链但排除面完全黑盒,使用方为定位
 	// docs/ 缺失做了一整轮对照实验)。根文件归 "."。加性 omitempty。
 	TopLevelFileCounts map[string]int `json:"top_level_file_counts,omitempty"`
+	// StatSnapshot 说明本进程对该工作区 stat 快照(索引子树目录下的 stat-snapshot.json,
+	// 让重启后的第一次扫描跳过未变文件的重新哈希)的处理:已加载多少条、丢弃多少条、
+	// 整份作废的原因、文件不存在,以及最近一次保存。加性 omitempty。
+	StatSnapshot string `json:"stat_snapshot,omitempty"`
 }
 
 // UsageCounts 是成功送审后服务商在响应里报告的用量：文档嵌入、查询嵌入与

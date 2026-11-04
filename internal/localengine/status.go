@@ -647,6 +647,7 @@ func (e *Engine) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (
 		snapshot := status.snapshot()
 		e.attachSemantic(&snapshot, status)
 		e.attachTopLevelCounts(&snapshot, workspaceKey)
+		snapshot.StatSnapshot = e.statSnapshotSummary(workspaceKey)
 		return snapshot, nil
 	}
 	// 内存里没有跟踪器（daemon 刚启动）：从磁盘上的 manifest 恢复视图。
@@ -674,6 +675,7 @@ func (e *Engine) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (
 	snapshot := tracker.snapshot()
 	e.attachSemantic(&snapshot, tracker)
 	e.attachTopLevelCounts(&snapshot, workspaceKey)
+	snapshot.StatSnapshot = e.statSnapshotSummary(workspaceKey)
 	return snapshot, nil
 }
 

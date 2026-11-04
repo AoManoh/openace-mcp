@@ -123,7 +123,7 @@ func (e *Engine) PlanEmbedJobs(ctx context.Context, ref engine.WorkspaceRef, fn 
 // chunk 记录，其余文件重新切分；内容检查拒绝或切出 0 chunk 的文件跳过。
 // 不调用 provider。
 func (e *Engine) planLiveRecords(ctx context.Context, workspaceKey string, root pathutil.WorkspaceRoot, store *index.Store) (*index.Manifest, []chunkRecord, error) {
-	assets, _, err := workspace.FileAssetSource{Cache: e.statCacheFor(workspaceKey)}.LoadWithStats(ctx, root.CanonicalPath)
+	assets, _, err := workspace.FileAssetSource{Cache: e.statCacheFor(workspaceKey, root)}.LoadWithStats(ctx, root.CanonicalPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("扫描工作区: %w", err)
 	}
