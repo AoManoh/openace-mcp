@@ -100,9 +100,11 @@ type Config struct {
 	RPMBudget int
 	TPMBudget int
 
+	// Timeout 是建索引一侧（文档嵌入与 Batch API）的单次尝试超时。
 	Timeout time.Duration
-	// QueryTimeout 是查询期(InputQuery)单次尝试超时;0=回落 Timeout
-	// (RS3:未配置=现状行为)。
+	// QueryTimeout 是查询一侧（查询嵌入与维度探测）的单次尝试超时。
+	// ConfigFromEnv 总会填上（查询超时、显式的 OPENACE_PROVIDER_TIMEOUT 或
+	// 60 秒）；程序化构造时为 0 表示回落 Timeout。
 	QueryTimeout time.Duration
 	MaxRetries   int
 
@@ -199,11 +201,18 @@ func ConfigFromEnv() (Config, error) {
 	if cfg.TPMBudget, err = reliability.IntEnv(EnvTPMBudget, 0, 0); err != nil {
 		return Config{}, err
 	}
-	if cfg.Timeout, err = reliability.TimeoutFromEnv(); err != nil {
+	if cfg.Timeout, err = reliability.IndexTimeoutFromEnv(); err != nil {
 		return Config{}, err
 	}
 	if cfg.QueryTimeout, err = reliability.QueryTimeoutFromEnv(); err != nil {
 		return Config{}, err
+	}
+	// 查询一侧不沿用建索引的默认值：没有设查询超时时取显式的
+	// OPENACE_PROVIDER_TIMEOUT，否则 60 秒，交互最坏等待与改动前相同。
+	if cfg.QueryTimeout == 0 {
+		if cfg.QueryTimeout, err = reliability.TimeoutFromEnv(); err != nil {
+			return Config{}, err
+		}
 	}
 	if cfg.MaxRetries, err = reliability.MaxRetriesFromEnv(); err != nil {
 		return Config{}, err

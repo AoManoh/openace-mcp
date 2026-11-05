@@ -14,9 +14,52 @@ func clearEnv(t *testing.T) {
 		EnvAdapter, EnvBaseURL, EnvAPIKey, legacyEnvVoyageAPIKey, legacyEnvProvider, EnvModel,
 		EnvDimension, EnvBatchSize, EnvMaxConcurrency, EnvRPMBudget, EnvTPMBudget,
 		EnvThroughputGovernor, EnvBatchAPI, EnvBatchMinChunks,
-		"OPENACE_PROVIDER_TIMEOUT", "OPENACE_PROVIDER_MAX_RETRIES",
+		"OPENACE_PROVIDER_TIMEOUT", "OPENACE_PROVIDER_MAX_RETRIES", "OPENACE_QUERY_PROVIDER_TIMEOUT",
 	} {
 		t.Setenv(name, "")
+	}
+}
+
+// TestTimeoutSplitIndexAndQuery：文档嵌入（cfg.Timeout）与查询一侧
+// （cfg.QueryTimeout，查询嵌入与维度探测用）的单次尝试超时按下表取值。只有
+// 两个变量都没设置时文档嵌入改为 180 秒；查询一侧仍是设置的查询超时、显式的
+// OPENACE_PROVIDER_TIMEOUT 或 60 秒，不随建索引的默认值变长。
+func TestTimeoutSplitIndexAndQuery(t *testing.T) {
+	cases := []struct {
+		name, provider, query string
+		wantIndex, wantQuery  time.Duration
+	}{
+		{"都不设", "", "", 180 * time.Second, 60 * time.Second},
+		{"只设 OPENACE_PROVIDER_TIMEOUT", "90s", "", 90 * time.Second, 90 * time.Second},
+		{"只设 OPENACE_QUERY_PROVIDER_TIMEOUT", "", "15s", 180 * time.Second, 15 * time.Second},
+		{"两个都设", "120s", "20s", 120 * time.Second, 20 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv(EnvAPIKey, "k")
+			t.Setenv(EnvBaseURL, "https://api.voyageai.com/v1")
+			t.Setenv(EnvModel, "voyage-code-4")
+			t.Setenv("OPENACE_PROVIDER_TIMEOUT", tc.provider)
+			t.Setenv("OPENACE_QUERY_PROVIDER_TIMEOUT", tc.query)
+			cfg, err := ConfigFromEnv()
+			if err != nil {
+				t.Fatalf("ConfigFromEnv: %v", err)
+			}
+			if cfg.Timeout != tc.wantIndex || cfg.QueryTimeout != tc.wantQuery {
+				t.Fatalf("timeout=%v query_timeout=%v，期望 %v 与 %v", cfg.Timeout, cfg.QueryTimeout, tc.wantIndex, tc.wantQuery)
+			}
+			if got := probeTimeout(cfg); got != tc.wantQuery {
+				t.Fatalf("维度探测应按查询一侧的超时等待: %v，期望 %v", got, tc.wantQuery)
+			}
+		})
+	}
+	// 程序化构造的配置没有填 QueryTimeout 时回落 Timeout，两者都没有时 60 秒。
+	if got := probeTimeout(Config{Timeout: 5 * time.Second}); got != 5*time.Second {
+		t.Fatalf("没有查询超时时应回落 Timeout: %v", got)
+	}
+	if got := probeTimeout(Config{}); got != 60*time.Second {
+		t.Fatalf("都没有时应为 60s: %v", got)
 	}
 }
 
@@ -53,8 +96,8 @@ func TestDefaultsWithVoyageKey(t *testing.T) {
 	if cfg.BatchSize != 128 || cfg.InitialConcurrency != 16 || cfg.RPMBudget != 0 || cfg.TPMBudget != 0 {
 		t.Fatalf("默认运维参数不符: %+v", cfg)
 	}
-	if cfg.Timeout != 60*time.Second || cfg.MaxRetries != 5 {
-		t.Fatalf("默认超时/重试不符: timeout=%v retries=%d", cfg.Timeout, cfg.MaxRetries)
+	if cfg.Timeout != 180*time.Second || cfg.QueryTimeout != 60*time.Second || cfg.MaxRetries != 5 {
+		t.Fatalf("默认超时/重试不符: timeout=%v query_timeout=%v retries=%d", cfg.Timeout, cfg.QueryTimeout, cfg.MaxRetries)
 	}
 	if cfg.APIKey != "canary-key-123" {
 		t.Fatalf("VOYAGE_API_KEY 回退链失效")

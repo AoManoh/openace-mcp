@@ -21,7 +21,9 @@ import (
 
 const (
 	// EnvProviderTimeout 是单次 provider HTTP 请求的超时环境变量，
-	// embedding 与 rerank 共用。重试中的每次尝试各自计时。
+	// embedding 与 rerank 共用。重试中的每次尝试各自计时。未设置时两侧的
+	// 默认值不同：建索引一侧（文档嵌入与 Batch API）为 defaultIndexTimeout，
+	// 查询一侧（查询嵌入、维度探测与 rerank）为 defaultTimeout。
 	EnvProviderTimeout = "OPENACE_PROVIDER_TIMEOUT"
 	// EnvProviderMaxRetries 是一次调用内可重试类错误的最多重试次数。
 	// 值为 0 时只尝试一次。
@@ -33,13 +35,27 @@ const (
 	// 最坏等待不随构建期超时变长。
 	EnvQueryTimeout = "OPENACE_QUERY_PROVIDER_TIMEOUT"
 
-	defaultTimeout    = 60 * time.Second
-	defaultMaxRetries = 5
+	// defaultTimeout 是查询一侧在两个超时变量都没有设置时的单次尝试超时。
+	defaultTimeout = 60 * time.Second
+	// defaultIndexTimeout 是建索引一侧在 EnvProviderTimeout 没有设置时的单次
+	// 尝试超时。比查询一侧长的原因：大批文档请求在服务商那边可能要一分多钟
+	// （实测一批 128 条、19 万字节用了 78 秒）；到点放弃后 openACE 重发，而服务商
+	// 照常处理并计费被放弃的那次，同一批内容付两次费。查询一侧的请求小，等待
+	// 上限仍由 EnvQueryTimeout 与 defaultTimeout 决定，不随它变长。
+	defaultIndexTimeout = 180 * time.Second
+	defaultMaxRetries   = 5
 )
 
-// TimeoutFromEnv 读取 OPENACE_PROVIDER_TIMEOUT。未设置时返回 60s。
+// TimeoutFromEnv 读取 OPENACE_PROVIDER_TIMEOUT，未设置时返回 60s。查询一侧
+// （查询嵌入、维度探测与 rerank）在没有设置 EnvQueryTimeout 时用这个值。
 func TimeoutFromEnv() (time.Duration, error) {
 	return DurationEnv(EnvProviderTimeout, defaultTimeout)
+}
+
+// IndexTimeoutFromEnv 读取 OPENACE_PROVIDER_TIMEOUT，未设置时返回 180s，
+// 供建索引一侧（文档嵌入与 Batch API）使用。
+func IndexTimeoutFromEnv() (time.Duration, error) {
+	return DurationEnv(EnvProviderTimeout, defaultIndexTimeout)
 }
 
 // QueryTimeoutFromEnv 读取 OPENACE_QUERY_PROVIDER_TIMEOUT。未设置时返回

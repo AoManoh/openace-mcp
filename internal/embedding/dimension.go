@@ -68,6 +68,19 @@ func (w *CacheWriteWarning) Error() string {
 }
 func (w *CacheWriteWarning) Unwrap() error { return w.Err }
 
+// probeTimeout 是维度探测的总等待上限。探测是一次单文本的查询请求，按查询
+// 一侧的超时等待，不用建索引一侧更长的默认值：服务商不可用时引擎启动与后台
+// 重试不会因此多等。
+func probeTimeout(cfg Config) time.Duration {
+	if cfg.QueryTimeout > 0 {
+		return cfg.QueryTimeout
+	}
+	if cfg.Timeout > 0 {
+		return cfg.Timeout
+	}
+	return 60 * time.Second
+}
+
 // ProbeDimension 发送一次单文本嵌入请求并返回向量长度。用 Dimension=0 的临时配置构造
 // 客户端，此时客户端跳过维度校验（见 doRequest）。
 func ProbeDimension(ctx context.Context, cfg Config) (int, error) {
@@ -78,11 +91,7 @@ func ProbeDimension(ctx context.Context, cfg Config) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	timeout := cfg.Timeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout(cfg))
 	defer cancel()
 	vectors, err := client.EmbedBatch(probeCtx, []string{probeText}, InputQuery)
 	if err != nil {

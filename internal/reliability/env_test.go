@@ -25,6 +25,27 @@ func TestDurationEnvInvalid(t *testing.T) {
 	}
 }
 
+// TestIndexTimeoutFromEnv：建索引一侧（文档嵌入与 Batch API）没有设置
+// OPENACE_PROVIDER_TIMEOUT 时默认 180 秒，设置了就用设置值；查询一侧回落用的
+// TimeoutFromEnv 仍是 60 秒，不随建索引的默认值变长。
+func TestIndexTimeoutFromEnv(t *testing.T) {
+	t.Setenv(EnvProviderTimeout, "")
+	if value, err := IndexTimeoutFromEnv(); err != nil || value != 180*time.Second {
+		t.Fatalf("建索引一侧默认超时应为 180s: %v err=%v", value, err)
+	}
+	if value, err := TimeoutFromEnv(); err != nil || value != 60*time.Second {
+		t.Fatalf("查询一侧的回落值应仍为 60s: %v err=%v", value, err)
+	}
+	t.Setenv(EnvProviderTimeout, "90s")
+	if value, err := IndexTimeoutFromEnv(); err != nil || value != 90*time.Second {
+		t.Fatalf("显式设置应用于建索引一侧: %v err=%v", value, err)
+	}
+	t.Setenv(EnvProviderTimeout, "sixty")
+	if _, err := IndexTimeoutFromEnv(); err == nil || !strings.Contains(err.Error(), EnvProviderTimeout) {
+		t.Fatalf("非法时长应报错并指明变量: %v", err)
+	}
+}
+
 func TestIntEnvBounds(t *testing.T) {
 	t.Setenv(EnvProviderMaxRetries, "")
 	value, err := MaxRetriesFromEnv()

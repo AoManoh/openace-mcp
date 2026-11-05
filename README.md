@@ -284,7 +284,8 @@ embedding 地址、模型、维度和内置嵌入模板都没变时,新子树只
 | `OPENACE_WATCH_*` / `OPENACE_RECONCILE_CONCURRENCY` | daemon 对已服务过的工作区做变更监测:`OPENACE_WATCH_MODE` `seen`(默认)/`off`;间隔默认 30s、去抖 2s、单次同步超时 5m、探测出错后退避 5s–2m、最多 64 个工作区;并行 reconcile worker 默认 2 |
 | `OPENACE_TASK_QUEUE_SIZE` / `OPENACE_TASK_HISTORY_LIMIT` | 异步任务队列长度(默认 256,最大 4096)与保留的已完成任务数(默认 1024) |
 | `OPENACE_GRAY_FEEDBACK` | `1` = instructions 追加灰度反馈协议:调用 AI 在任务收尾交付答案时,一次性汇总本次全部 openACE 调用的诊断(事实/效果/体验/耗时/bug 复现),不在每次调用后打断任务。默认关闭 |
-| `OPENACE_PROVIDER_TIMEOUT` / `OPENACE_PROVIDER_MAX_RETRIES` | provider HTTP 超时(默认 `60s`)与单批重试上限(默认 `5`) |
+| `OPENACE_PROVIDER_TIMEOUT` / `OPENACE_PROVIDER_MAX_RETRIES` | 单次 provider HTTP 请求的超时与单批重试上限(默认 `5`)。超时未设置时,建索引一侧(文档嵌入与 Batch API)每次最多等 `180s`,查询嵌入、维度探测与精排等 `60s`:大批文档请求在服务商那边可能要一分多钟,到点放弃后 openACE 会重发,而服务商照常为被放弃的那次计费。设置后两侧都用设置值;查询一侧另设了 `OPENACE_QUERY_PROVIDER_TIMEOUT` 时用后者 |
+| `OPENACE_QUERY_PROVIDER_TIMEOUT` | 查询嵌入、维度探测与精排的单次超时(如 `15s`);未设置时用显式设置的 `OPENACE_PROVIDER_TIMEOUT`,两个都没设置时 `60s` |
 | `OPENACE_MODE` | `auto` / `direct` / `manual-daemon`(默认 `auto`) |
 | `OPENACE_CACHE_NAMESPACE` | cache 命名空间,隔离账号/tenant/测试批次 |
 | `OPENACE_DAEMON_ADDR` / `OPENACE_DAEMON_LISTEN_ADDR` | shim 连接地址 / daemon 监听地址(默认 `127.0.0.1:8765`) |
