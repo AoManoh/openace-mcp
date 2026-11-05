@@ -62,9 +62,16 @@ func newLockIdentity() string {
 
 // AcquireLock 获取 store 的写锁；被存活进程持有时返回 ErrLockHeld。
 func AcquireLock(store *Store) (*ProcessLock, error) {
-	path := store.LockPath()
+	return AcquireLockAt(store.LockPath(), "")
+}
+
+// AcquireLockAt 在 path 上获取跨进程独占锁，规则与 AcquireLock 相同。note 非空时
+// 写在身份行之后，作为第二行说明（换行折成空格），供状态显示持有者在做什么；
+// 互斥、复验、接管与释放都只比较身份行。
+func AcquireLockAt(path string, note string) (*ProcessLock, error) {
 	identity := newLockIdentity()
-	if err := tryCreateLock(path, identity); err != nil {
+	content := lockContent(identity, note)
+	if err := tryCreateLock(path, content); err != nil {
 		if !os.IsExist(err) {
 			return nil, err
 		}
@@ -72,7 +79,7 @@ func AcquireLock(store *Store) (*ProcessLock, error) {
 		if statErr != nil {
 			if os.IsNotExist(statErr) {
 				// 持有者恰好释放：重试一次创建。
-				if retryErr := tryCreateLock(path, identity); retryErr != nil {
+				if retryErr := tryCreateLock(path, content); retryErr != nil {
 					return nil, ErrLockHeld
 				}
 			} else {
@@ -80,7 +87,7 @@ func AcquireLock(store *Store) (*ProcessLock, error) {
 			}
 		} else {
 			holder, _ := os.ReadFile(path)
-			holderID := strings.TrimSpace(string(holder))
+			holderID := lockIdentityLine(holder)
 			timeStale := time.Since(info.ModTime()) > lockStaleAfter
 			// PID 存活探测（同主机 cache 语义）：持有进程已死则立即
 			// 接管，kill -9 后无需等满时间阈值（G4）；探测不确定时
@@ -88,7 +95,7 @@ func AcquireLock(store *Store) (*ProcessLock, error) {
 			if !timeStale && holderProcessAlive(holderID) {
 				return nil, fmt.Errorf("%w（%s）", ErrLockHeld, holderID)
 			}
-			if err := takeoverLock(path, identity); err != nil {
+			if err := takeoverLock(path, identity, content); err != nil {
 				return nil, err
 			}
 		}
@@ -103,12 +110,48 @@ func AcquireLock(store *Store) (*ProcessLock, error) {
 	return lock, nil
 }
 
-func tryCreateLock(path string, identity string) error {
+// lockContent 是锁文件内容：身份行，note 非空时再加一行说明。
+func lockContent(identity string, note string) string {
+	content := identity + "\n"
+	if note = strings.Join(strings.Fields(note), " "); note != "" {
+		content += note + "\n"
+	}
+	return content
+}
+
+// lockIdentityLine 取锁文件的第一行（持有者身份）。
+func lockIdentityLine(content []byte) string {
+	first, _, _ := strings.Cut(string(content), "\n")
+	return strings.TrimSpace(first)
+}
+
+// LockHolder 是从锁文件读出的持有者：身份行、其中的进程号与第二行说明。
+type LockHolder struct {
+	Identity string
+	PID      int
+	Note     string
+}
+
+// ReadLockHolder 读出 path 上锁文件的持有者；身份行里没有进程号时 PID 为 0。
+func ReadLockHolder(path string) (LockHolder, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return LockHolder{}, err
+	}
+	holder := LockHolder{Identity: lockIdentityLine(content)}
+	if _, rest, ok := strings.Cut(string(content), "\n"); ok {
+		holder.Note = strings.TrimSpace(rest)
+	}
+	_, _ = fmt.Sscanf(holder.Identity, "pid=%d", &holder.PID)
+	return holder, nil
+}
+
+func tryCreateLock(path string, content string) error {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, filePerm)
 	if err != nil {
 		return err
 	}
-	_, writeErr := file.WriteString(identity + "\n")
+	_, writeErr := file.WriteString(content)
 	syncErr := file.Sync()
 	closeErr := file.Close()
 	if writeErr != nil || syncErr != nil || closeErr != nil {
@@ -141,14 +184,14 @@ func holderProcessAlive(identity string) bool {
 }
 
 // takeoverLock 原子抢占 stale 锁：temp+rename 后回读裁决（K45/K46）。
-func takeoverLock(path string, identity string) error {
+func takeoverLock(path string, identity string, content string) error {
 	// 临时文件名必须对"每个接管者"唯一：identity 含随机分量，整体哈希
 	// 后取前缀。旧命名（identity 前 4 字节 + pid）在同进程并发接管时
 	// 全体撞名——竞争者互相覆盖临时文件再抢 rename，可能出现 0 胜者
 	// （ext4 上高概率复现，9p 因串行慢写从未暴露）。
 	digest := sha256.Sum256([]byte(identity))
 	tempFile := path + ".takeover-" + hex.EncodeToString(digest[:8])
-	if err := os.WriteFile(tempFile, []byte(identity+"\n"), filePerm); err != nil {
+	if err := os.WriteFile(tempFile, []byte(content), filePerm); err != nil {
 		return err
 	}
 	if err := os.Rename(tempFile, path); err != nil {
@@ -156,11 +199,11 @@ func takeoverLock(path string, identity string) error {
 		return err
 	}
 	// 回读裁决：并发接管时最后一次 rename 生效，未胜出者必须退出。
-	content, err := os.ReadFile(path)
+	current, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(string(content)) != identity {
+	if lockIdentityLine(current) != identity {
 		return ErrLockHeld
 	}
 	return nil
@@ -191,7 +234,7 @@ func (l *ProcessLock) Verify() error {
 		return ErrLockLost
 	}
 	content, err := os.ReadFile(l.path)
-	if err != nil || strings.TrimSpace(string(content)) != l.identity {
+	if err != nil || lockIdentityLine(content) != l.identity {
 		l.lost.Store(true)
 		return ErrLockLost
 	}
