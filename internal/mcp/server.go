@@ -678,6 +678,9 @@ func retrievalStructured(result engine.Result) map[string]any {
 	if len(result.ProviderRejectedFiles) > 0 {
 		fields["provider_rejected_files"] = result.ProviderRejectedFiles
 	}
+	if result.IndexFreshness != nil {
+		fields["index_freshness"] = result.IndexFreshness
+	}
 	if result.QueryPlan != "" {
 		fields["query_plan"] = result.QueryPlan
 	}
@@ -1004,6 +1007,7 @@ type multiRetrievalResult struct {
 	RetrievalMode    string
 	DegradedReason   string
 	SemanticCoverage string
+	IndexFreshness   *engine.IndexFreshness
 }
 
 func (s *Server) retrieve(ctx context.Context, dir string, providerProfileID string, query string, detail string, pathPrefix string, artifactKind string) (engine.Result, error) {
@@ -1104,6 +1108,7 @@ func (s *Server) retrieveMultiple(ctx context.Context, paths []string, providerP
 			results[i].RetrievalMode = result.RetrievalMode
 			results[i].DegradedReason = result.DegradedReason
 			results[i].SemanticCoverage = result.SemanticCoverage
+			results[i].IndexFreshness = result.IndexFreshness
 		}()
 	}
 	wg.Wait()
@@ -1131,6 +1136,7 @@ func summarizeMultiRetrievalResults(providerProfileID string, results []multiRet
 			item.RetrievalMode = result.RetrievalMode
 			item.DegradedReason = result.DegradedReason
 			item.SemanticCoverage = result.SemanticCoverage
+			item.IndexFreshness = result.IndexFreshness
 			if result.DegradedReason != "" {
 				status.DegradedCount++
 			}
@@ -1204,7 +1210,7 @@ func activeInstructions() string {
 	return serverInstructions
 }
 
-const retrievalDescription = "Search the local codebase index (hybrid lexical + semantic retrieval with reranking). Use this tool FIRST whenever you need to find code, configuration, tests, or documentation in the workspace before answering or editing. One focused intent per call; issue multiple calls for multi-part tasks. File selection honors .gitignore and .openaceignore: a directory that never appears in any result is usually excluded there (add a !pattern in .openaceignore to re-include gitignored paths)."
+const retrievalDescription = "Search the local codebase index (hybrid lexical + semantic retrieval with reranking). Use this tool FIRST whenever you need to find code, configuration, tests, or documentation in the workspace before answering or editing. One focused intent per call; issue multiple calls for multi-part tasks. File selection honors .gitignore and .openaceignore: a directory that never appears in any result is usually excluded there (add a !pattern in .openaceignore to re-include gitignored paths). When the [DEGRADED] banner says index-building, index-refreshing or stale-index, results come from an older index snapshot and the [INDEX] line below it gives that snapshot's publish time and the files changed on disk since then, as of the latest scan (pending=unknown until a scan finishes); Read those files directly for their current content."
 
 func repoMapTool() map[string]any {
 	return map[string]any{

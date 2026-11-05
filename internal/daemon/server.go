@@ -714,6 +714,7 @@ func aggregateMultiRetrieveResults(providerProfileID string, results []multiRetr
 		workspaceStatus.RetrievalMode = item.result.RetrievalMode
 		workspaceStatus.DegradedReason = item.result.DegradedReason
 		workspaceStatus.SemanticCoverage = item.result.SemanticCoverage
+		workspaceStatus.IndexFreshness = item.result.IndexFreshness
 		if item.result.DegradedReason != "" {
 			status.DegradedCount++
 		}

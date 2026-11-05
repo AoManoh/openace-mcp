@@ -81,6 +81,10 @@ type Result struct {
 	// ProviderRejectedFiles 是含被 provider 永久拒绝 chunk 的文件，按路径
 	// 排序，最多列 50 个。这些 chunk 不计入覆盖率分母，只能经词法部分命中。
 	ProviderRejectedFiles []string `json:"provider_rejected_files,omitempty"`
+	// IndexFreshness 是正文 [INDEX] 行的结构化形式：用旧 revision 降级作答
+	// （降级原因含 index-building、index-refreshing 或 stale-index）时说明所用
+	// 快照与磁盘的差距，其余情况省略。
+	IndexFreshness *IndexFreshness `json:"index_freshness,omitempty"`
 
 	// —— 方案④ quality-strict 可机读质量字段（2026-08-02;omitempty,
 	// legacy 与纯词法路径不填充,wire 不变）——
@@ -118,6 +122,32 @@ type Result struct {
 	Hits []Hit `json:"hits,omitempty"`
 	// Display 是展示统计(候选块/实展块/实展文件/是否截断)。
 	Display *DisplayStats `json:"display,omitempty"`
+}
+
+// IndexFreshness 说明一次降级作答所用的索引快照落后磁盘多少。清单来自最近一次
+// 完成的扫描：扫描时刻之后的改动不在其中。
+type IndexFreshness struct {
+	// SnapshotRevision 与 PublishedAt 是本次作答所用的 revision 及其发布时刻
+	// （manifest 没有记录发布时刻时省略）。
+	SnapshotRevision string     `json:"snapshot_revision"`
+	PublishedAt      *time.Time `json:"published_at,omitempty"`
+	// PendingKnown 为 true 时，ScannedAt 是清单所依据的扫描完成时刻，
+	// PendingCount 是那次扫描看到的、相对快照新增、修改或删除的文件总数，
+	// PendingFiles 按路径排序、最多 50 个。为 false 时还不知道哪些文件有改动：
+	// 扫描尚未完成（ScanStartedAt 是进行中扫描的开始时刻，还没开始时省略）、
+	// 扫描失败，或最近一次扫描比对的不是这个 revision。
+	PendingKnown  bool          `json:"pending_known"`
+	ScannedAt     *time.Time    `json:"scanned_at,omitempty"`
+	ScanStartedAt *time.Time    `json:"scan_started_at,omitempty"`
+	PendingCount  int           `json:"pending_count"`
+	PendingFiles  []PendingFile `json:"pending_files,omitempty"`
+}
+
+// PendingFile 是快照之后磁盘上有改动的一个文件；Change 为 added、modified 或
+// deleted。
+type PendingFile struct {
+	Path   string `json:"path"`
+	Change string `json:"change"`
 }
 
 // Hit 是单个检索命中的结构化引用(合并后块粒度,与正文 header 同源)。
@@ -338,9 +368,10 @@ type MultiWorkspaceStatus struct {
 	// Result 的降级字段剥离，multi_status 里降级仓与健康仓同形——
 	// "禁止静默降级"在 multi 工具面的缺口）。语义同 Result 的同名
 	// 字段；全部 omitempty，错误仓与纯词法零配置路径不出现，wire 加性。
-	RetrievalMode    string `json:"retrieval_mode,omitempty"`
-	DegradedReason   string `json:"degraded_reason,omitempty"`
-	SemanticCoverage string `json:"semantic_coverage,omitempty"`
+	RetrievalMode    string          `json:"retrieval_mode,omitempty"`
+	DegradedReason   string          `json:"degraded_reason,omitempty"`
+	SemanticCoverage string          `json:"semantic_coverage,omitempty"`
+	IndexFreshness   *IndexFreshness `json:"index_freshness,omitempty"`
 }
 
 // WorkspaceStatus 描述单个工作区的索引与运行状态。

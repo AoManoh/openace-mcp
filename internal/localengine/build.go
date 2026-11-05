@@ -252,6 +252,10 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	// 阶段 1：扫描。复用 workspace 包的文件选择与忽略规则，不另建第二套
 	// 扫描器，敏感文件不会绕过 AssetPolicy 进入索引。
 	status.setStage(engine.IndexStageScanning)
+	status.scanStarted()
+	if hook := scanStartedHook; hook != nil {
+		hook()
+	}
 	// 扫描期按进度回填文件数，大仓首扫时状态不再长期显示 files=0。
 	assets, scanStats, err := workspace.FileAssetSource{Cache: e.statCacheFor(workspaceKey, root), Progress: status.setScannedFiles}.LoadWithStats(ctx, root.CanonicalPath)
 	if err != nil {
@@ -267,6 +271,14 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 		return engine.Result{}, nil, resolveErr
 	}
 	contentChanged := previous == nil || assetsChanged(assets, previous)
+	// 相对可服务 revision 的改动文件：记进状态，用旧 revision 降级作答时写进 [INDEX]
+	// 行；removedPaths 同时用于下面的垃圾比预估。内容没变时清单为空，不再逐个比对。
+	var changedAssets []workspace.ContextAsset
+	var removedPaths []string
+	if previous != nil && contentChanged {
+		changedAssets, removedPaths, _ = diffDeltaAssets(previous, assets)
+	}
+	status.recordPending(previous, changedAssets, removedPaths)
 	repairRequested := e.consumeVectorRepair(workspaceKey)
 	// needsLexicalRebuild：内容未变，但词法索引打不开，或实际能打开的
 	// revision 落后于 manifest 认可的 revision（manifest 完好、Bleve 段
@@ -300,8 +312,7 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	// previous 会让它一直不触发（见 projectedGarbageRatio）。
 	garbage := 0.0
 	if previous != nil {
-		_, removed, _ := diffDeltaAssets(previous, assets)
-		garbage = projectedGarbageRatio(previous, removed)
+		garbage = projectedGarbageRatio(previous, removedPaths)
 	}
 	// 段数达到阈值时先尝试只合并小段（smallSegmentsToMerge）；没有可行方案，
 	// 或合并输入与 manifest 对不上（errSmallMergeUnavailable），走全量合并。

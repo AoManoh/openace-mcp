@@ -93,6 +93,10 @@ type wsStatus struct {
 	// 嵌入请求的构建报告的 tokens。
 	usage           reliability.UsageCounts
 	lastEmbedTokens int64
+	// pending 是最近一次完成的扫描相对可服务 revision 的改动文件，scanStartedAt 是
+	// 进行中扫描的开始时刻，两者用于降级作答时的 [INDEX] 行（见 index_freshness.go）。
+	pending       pendingScan
+	scanStartedAt *time.Time
 }
 
 // setSharedVectors 记录最近一次构建使用共享向量库的结果。
@@ -252,6 +256,7 @@ func (s *wsStatus) publishedInterim(manifest *index.Manifest, revisions int) {
 	s.revisionCount = revisions
 	s.capabilities = manifest.ChunkerCapabilities
 	s.migrationBlock = manifest.SemanticMigrationBlock
+	s.pendingPublishedLocked(manifest.Revision)
 	s.updatedAt = time.Now().UTC()
 }
 
@@ -379,6 +384,7 @@ func (s *wsStatus) ready(manifest *index.Manifest, revisions int) {
 	s.capabilities = manifest.ChunkerCapabilities
 	s.lastError = ""
 	s.migrationBlock = manifest.SemanticMigrationBlock
+	s.pendingPublishedLocked(manifest.Revision)
 	s.finishedAt = &now
 	s.updatedAt = now
 }
@@ -393,6 +399,7 @@ func (s *wsStatus) fail(err error) {
 	s.embedDone = 0
 	s.embedStartedAt = nil
 	s.lastError = sanitizeError(err)
+	s.pendingFailedLocked()
 	s.finishedAt = &now
 	s.updatedAt = now
 }

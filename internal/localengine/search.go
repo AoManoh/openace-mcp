@@ -340,6 +340,9 @@ type retrieval struct {
 	uncovered     []string
 	rejectedFiles []string
 	rejectedTotal int
+	// freshness 在用旧 revision 降级作答时非空，渲染为横幅下的 [INDEX] 行并进入
+	// Result.IndexFreshness（见 index_freshness.go）。
+	freshness *engine.IndexFreshness
 	// queryPlan 记录本次查询的规划：词法路改用结构 token 查询时为该查询
 	// 串（零命中回退时追加 " fallback=original"），另追加 path_prefix=… 与
 	// artifact_kind=… 标签；全部未触发时为空。
@@ -389,10 +392,11 @@ func (e *Engine) Search(ctx context.Context, req engine.SearchRequest) (engine.R
 	}
 	degradedReason := strings.Join(out.reasons, ",")
 	if degradedReason != "" {
-		text = degradedBanner(degradedReason, out.mode, out.coverage) + text
+		text = degradedBanner(degradedReason, out.mode, out.coverage, out.freshness) + text
 	}
 	result := servedResult(out.syncResult, handle.manifest)
 	result.Text = text
+	result.IndexFreshness = out.freshness
 	// 阶段耗时随每次检索结果返回，字段为 omitempty 的加性字段。
 	result.Timings = out.timings
 	// 结构化 hits 清单与展示统计：每个合并后的候选块一条，调用方可以按
@@ -649,6 +653,12 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 	if err != nil {
 		return retrieval{}, err
 	}
+	// 用旧 revision 作答（index-building、index-refreshing、stale-index）时附上所用
+	// 快照与磁盘的差距，其余情况索引就是最新的，不附。
+	var freshness *engine.IndexFreshness
+	if hasFreshnessGap(gaps) {
+		freshness = e.indexFreshness(workspaceKey, handle.manifest)
+	}
 	// 本次检索的查询嵌入与精排用量记入该工作区状态（状态里的 usage）。
 	queryMeter := &reliability.UsageMeter{}
 	ctx = reliability.WithUsageMeter(ctx, queryMeter)
@@ -776,6 +786,7 @@ func (e *Engine) retrieve(ctx context.Context, req engine.SearchRequest) (retrie
 		uncovered:     uncovered,
 		rejectedFiles: rejectedFiles,
 		rejectedTotal: rejectedTotal,
+		freshness:     freshness,
 	}
 	return out, nil
 }
@@ -1370,15 +1381,20 @@ func coveragePercent(manifest *index.Manifest) string {
 	return fmt.Sprintf("%d%%", manifest.VectorCount*100/embeddable)
 }
 
-// degradedBanner 构造正文首行的降级横幅：
+// degradedBanner 构造正文开头的降级横幅：首行
 // "[DEGRADED] <原因,逗号分隔>; mode=<检索模式>[; semantic_coverage=<覆盖率>]"，
-// 后跟空行。格式固定，调用方与测试依赖它。
-func degradedBanner(reason string, mode string, coverage string) string {
+// 格式固定，调用方与测试依赖它；freshness 非空时第二行是 [INDEX] 行（见 indexLine）；
+// 最后空一行。
+func degradedBanner(reason string, mode string, coverage string, freshness *engine.IndexFreshness) string {
 	banner := "[DEGRADED] " + reason + "; mode=" + mode
 	if coverage != "" {
 		banner += "; semantic_coverage=" + coverage
 	}
-	return banner + "\n\n"
+	banner += "\n"
+	if freshness != nil {
+		banner += indexLine(freshness) + "\n"
+	}
+	return banner + "\n"
 }
 
 // degradeDeniedError 构造 deny 模式下返回的错误：保留原始错误（其中已含
