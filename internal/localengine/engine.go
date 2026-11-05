@@ -266,6 +266,8 @@ func New(opts Options) (*Engine, error) {
 		if err != nil {
 			return nil, err
 		}
+		// 单次尝试超时被放弃的请求可能仍被计费，每次写一行 daemon 日志。
+		client.SetLogf(e.logf)
 		e.embedClient = client
 		// 索引子树按 embedding 身份隔离：ProfileHash 覆盖 provider、端点、
 		// 模型、维度、dtype 与模板版本，模板版本另以明文缀在后面便于辨认。
@@ -279,6 +281,7 @@ func New(opts Options) (*Engine, error) {
 		if err != nil {
 			return nil, err
 		}
+		client.SetLogf(e.logf)
 		e.rerankClient = client
 	}
 	e.fingerprint = engineFingerprint(opts)

@@ -209,8 +209,8 @@ embedding 地址、模型、维度和内置嵌入模板都没变时,新子树只
 | `sync_workspace` | 只同步,不检索 |
 | `start_codebase_retrieval` / `start_multi_codebase_retrieval` / `start_sync_workspace` | daemon 模式下提交异步任务,适合大仓库 |
 | `task_status` / `list_tasks` | 查询异步任务状态/找回最近任务 |
-| `workspace_status` | workspace revision、同步阶段、语义覆盖、provider 健康摘要、顶层目录文件计数(排除面可见) |
-| `daemon_status` | wrapper 与 daemon 的 build、pid、cache namespace、capability |
+| `workspace_status` | workspace revision、同步阶段、语义覆盖、provider 健康摘要、本进程启动以来该工作区的送审用量(`semantic.usage`,含被放弃的请求)、顶层目录文件计数(排除面可见) |
+| `daemon_status` | wrapper 与 daemon 的 build、pid、cache namespace、capability、本进程启动以来全部工作区的送审用量(`provider_usage`) |
 | `repo_map` | 只读的仓库地图(按目录/文件聚合的索引概览,带预算截断与 `focus` 子树参数);冷仓返回 index_not_ready,不触发索引 |
 | `cancel_task` | 取消一个排队或运行中的异步任务 |
 | `list_workspaces` | 列出 daemon 已知的工作区及其状态摘要 |
@@ -284,7 +284,7 @@ embedding 地址、模型、维度和内置嵌入模板都没变时,新子树只
 | `OPENACE_WATCH_*` / `OPENACE_RECONCILE_CONCURRENCY` | daemon 对已服务过的工作区做变更监测:`OPENACE_WATCH_MODE` `seen`(默认)/`off`;间隔默认 30s、去抖 2s、单次同步超时 5m、探测出错后退避 5s–2m、最多 64 个工作区;并行 reconcile worker 默认 2 |
 | `OPENACE_TASK_QUEUE_SIZE` / `OPENACE_TASK_HISTORY_LIMIT` | 异步任务队列长度(默认 256,最大 4096)与保留的已完成任务数(默认 1024) |
 | `OPENACE_GRAY_FEEDBACK` | `1` = instructions 追加灰度反馈协议:调用 AI 在任务收尾交付答案时,一次性汇总本次全部 openACE 调用的诊断(事实/效果/体验/耗时/bug 复现),不在每次调用后打断任务。默认关闭 |
-| `OPENACE_PROVIDER_TIMEOUT` / `OPENACE_PROVIDER_MAX_RETRIES` | 单次 provider HTTP 请求的超时与单批重试上限(默认 `5`)。超时未设置时,建索引一侧(文档嵌入与 Batch API)每次最多等 `180s`,查询嵌入、维度探测与精排等 `60s`:大批文档请求在服务商那边可能要一分多钟,到点放弃后 openACE 会重发,而服务商照常为被放弃的那次计费。设置后两侧都用设置值;查询一侧另设了 `OPENACE_QUERY_PROVIDER_TIMEOUT` 时用后者 |
+| `OPENACE_PROVIDER_TIMEOUT` / `OPENACE_PROVIDER_MAX_RETRIES` | 单次 provider HTTP 请求的超时与单批重试上限(默认 `5`)。超时未设置时,建索引一侧(文档嵌入与 Batch API)每次最多等 `180s`,查询嵌入、维度探测与精排等 `60s`:大批文档请求在服务商那边可能要一分多钟,到点放弃后 openACE 会重发,而服务商照常为被放弃的那次计费。设置后两侧都用设置值;查询一侧另设了 `OPENACE_QUERY_PROVIDER_TIMEOUT` 时用后者。被放弃的请求按文档嵌入、查询嵌入、精排分别记次数与请求体字节数(`document_abandoned_requests`、`document_abandoned_bytes` 等,为 0 时不出现),见 `workspace_status` 的 `semantic.usage` 与 `daemon_status` 的 `provider_usage`,daemon 日志每次记一行;服务商没有返回这些请求的用量,代码与文档内容实测约 3.2–3.3 字节一个 token,可据此粗估 |
 | `OPENACE_QUERY_PROVIDER_TIMEOUT` | 查询嵌入、维度探测与精排的单次超时(如 `15s`);未设置时用显式设置的 `OPENACE_PROVIDER_TIMEOUT`,两个都没设置时 `60s` |
 | `OPENACE_MODE` | `auto` / `direct` / `manual-daemon`(默认 `auto`) |
 | `OPENACE_CACHE_NAMESPACE` | cache 命名空间,隔离账号/tenant/测试批次 |

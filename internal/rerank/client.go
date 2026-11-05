@@ -42,6 +42,30 @@ type Client struct {
 	// usage 累计成功响应里服务商报告的精排用量（进程内各工作区共享）；
 	// 按工作区的用量经 ctx 携带的计量器另记。
 	usage reliability.UsageMeter
+	// logf 写被放弃请求的日志；nil 时不写。由 SetLogf 在发出请求前设置。
+	logf func(format string, args ...any)
+}
+
+// SetLogf 设置被放弃请求的日志输出（daemon 传入自己的日志函数）。只在客户端
+// 开始发请求之前调用。
+func (c *Client) SetLogf(logf func(format string, args ...any)) {
+	c.logf = logf
+}
+
+// transportFailure 归类一次没有拿到完整响应的传输失败。单次尝试超时、调用方
+// 仍在等待时，请求已经发出，服务商可能照常处理并计费，随后按重试规则重发：
+// 记为被放弃的精排请求（客户端累计与 ctx 计量器各记一次，字节数是发出的请求
+// 体长度）并写一行日志。调用方自己取消或截止时不记：不会重发。
+func (c *Client) transportFailure(ctx, attemptCtx context.Context, err error, sent int) error {
+	classified := reliability.ClassifyTransportError(ctx, attemptCtx, c.cfg.Timeout, err)
+	if reliability.IsAttemptTimeout(classified) {
+		c.usage.RecordAbandoned(reliability.UsageRerank, int64(sent))
+		reliability.RecordAbandoned(ctx, reliability.UsageRerank, int64(sent))
+		if c.logf != nil {
+			c.logf("rerank request abandoned after the %s per-attempt timeout: request_bytes=%d; the provider may still bill it", c.cfg.Timeout, sent)
+		}
+	}
+	return classified
 }
 
 // UsageSnapshot 返回客户端创建以来成功响应里服务商报告的精排用量累计。
@@ -210,7 +234,7 @@ func (c *Client) doRequest(ctx context.Context, query string, docs []Document) (
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, reliability.ClassifyTransportError(ctx, attemptCtx, c.cfg.Timeout, err)
+		return nil, c.transportFailure(ctx, attemptCtx, err, len(payload))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -219,6 +243,10 @@ func (c *Client) doRequest(ctx context.Context, query string, docs []Document) (
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
+		// 读响应体时单次尝试到了超时：服务商已经开始返回，这次同样可能计费。
+		if ctx.Err() == nil && attemptCtx.Err() != nil {
+			return nil, c.transportFailure(ctx, attemptCtx, err, len(payload))
+		}
 		return nil, &reliability.CallError{Class: reliability.ClassTransient, Message: reliability.SanitizeMessage("read response: " + err.Error())}
 	}
 	// 用量在结构校验之前记账：服务商返回 200 即已计费。

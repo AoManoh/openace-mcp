@@ -19,8 +19,10 @@ import (
 //     取消不是 provider 故障。如果算作一次失败，熔断器会把一个健康的
 //     provider 判成故障并暂停向它发请求，同一路径上的其他请求跟着被
 //     拒绝。
-//   - 单次尝试超时（attemptCtx 已结束）：归为 ClassTransient（可重试）。
-//     错误文本写明等待了多久，并提示端点慢时调大 EnvProviderTimeout。
+//   - 单次尝试超时（attemptCtx 已结束）：归为 ClassTransient（可重试），
+//     并置 AttemptTimedOut：请求已经发出，服务商可能照常处理并计费，客户端
+//     据此把这次记为被放弃的请求。错误文本写明等待了多久，并提示端点慢时
+//     调大 EnvProviderTimeout。
 //   - 证书验证失败（isCertificateError 识别的 x509 错误，或错误文本含
 //     "x509:"）：归为 ClassPermanent。错误文本提示检查端点 TLS 证书或
 //     本机信任库。原因：证书错误重试结果不变。此前归为 ClassTransient
@@ -38,8 +40,9 @@ func ClassifyTransportError(callerCtx context.Context, attemptCtx context.Contex
 	}
 	if attemptCtx.Err() != nil {
 		return &CallError{
-			Class:   ClassTransient,
-			Message: fmt.Sprintf("request timed out after %s (raise %s for slow endpoints)", timeout, EnvProviderTimeout),
+			Class:           ClassTransient,
+			Message:         fmt.Sprintf("request timed out after %s (raise %s for slow endpoints)", timeout, EnvProviderTimeout),
+			AttemptTimedOut: true,
 		}
 	}
 	message := SanitizeMessage(err.Error())

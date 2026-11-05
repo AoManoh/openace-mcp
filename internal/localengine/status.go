@@ -178,7 +178,10 @@ func usageStatus(counts reliability.UsageCounts) engine.UsageCounts {
 		DocumentTokens: counts.DocumentTokens, DocumentRequests: counts.DocumentRequests,
 		QueryTokens: counts.QueryTokens, QueryRequests: counts.QueryRequests,
 		RerankTokens: counts.RerankTokens, RerankRequests: counts.RerankRequests,
-		UnreportedRequests: counts.UnreportedRequests,
+		UnreportedRequests:        counts.UnreportedRequests,
+		DocumentAbandonedRequests: counts.DocumentAbandonedRequests, DocumentAbandonedBytes: counts.DocumentAbandonedBytes,
+		QueryAbandonedRequests: counts.QueryAbandonedRequests, QueryAbandonedBytes: counts.QueryAbandonedBytes,
+		RerankAbandonedRequests: counts.RerankAbandonedRequests, RerankAbandonedBytes: counts.RerankAbandonedBytes,
 	}
 }
 

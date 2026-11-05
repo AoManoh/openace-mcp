@@ -43,6 +43,14 @@ type Client struct {
 	// usage 累计本客户端全部成功响应里服务商报告的用量（进程内各工作区
 	// 共享）；按工作区的用量经 ctx 携带的计量器另记（reliability.WithUsageMeter）。
 	usage reliability.UsageMeter
+	// logf 写被放弃请求的日志；nil 时不写。由 SetLogf 在发出请求前设置。
+	logf func(format string, args ...any)
+}
+
+// SetLogf 设置被放弃请求的日志输出（daemon 传入自己的日志函数）。只在客户端
+// 开始发请求之前调用。
+func (c *Client) SetLogf(logf func(format string, args ...any)) {
+	c.logf = logf
 }
 
 // NewClient 创建客户端；未启用的配置直接报错（调用方应先判 Enabled）。
@@ -359,7 +367,7 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, reliability.ClassifyTransportError(ctx, attemptCtx, timeout, err)
+		return nil, c.transportFailure(ctx, attemptCtx, timeout, err, inputType, len(payload))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -396,7 +404,7 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 		// 响应体读取期间的取消/超时不是 malformed（F3）：误判为 permanent
 		// 会计入 circuit 并在大批量构建中把语义路整场熄火。
 		if ctx.Err() != nil || attemptCtx.Err() != nil {
-			return nil, reliability.ClassifyTransportError(ctx, attemptCtx, timeout, err)
+			return nil, c.transportFailure(ctx, attemptCtx, timeout, err, inputType, len(payload))
 		}
 		// 连接中断类解码错误同理（F6，sealed 实跑发现：redis 首建遭
 		// "unexpected EOF" 被判 permanent → circuit 退避 → 11% 覆盖入库;
@@ -413,10 +421,7 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 	}
 	// 用量在结构校验之前记账：服务商返回 200 即已计费，之后因数量或维度不符
 	// 整批拒绝的响应同样花了钱，不记会让状态里的用量低于账单。
-	kind := reliability.UsageDocument
-	if inputType == InputQuery {
-		kind = reliability.UsageQuery
-	}
+	kind := usageKind(inputType)
 	var usedTokens int64
 	if decoded.Usage != nil {
 		usedTokens = decoded.Usage.TotalTokens
@@ -464,6 +469,31 @@ func (c *Client) doRequest(ctx context.Context, texts []string, inputType InputT
 		}
 	}
 	return out, nil
+}
+
+// usageKind 把输入类型映射为用量分类。
+func usageKind(inputType InputType) reliability.UsageKind {
+	if inputType == InputQuery {
+		return reliability.UsageQuery
+	}
+	return reliability.UsageDocument
+}
+
+// transportFailure 归类一次没有拿到完整响应的传输失败。单次尝试超时、调用方
+// 仍在等待时，请求已经发出，服务商可能照常处理并计费，随后按重试规则重发同一
+// 批内容：记为被放弃的请求（客户端累计与 ctx 计量器各记一次，字节数是发出的
+// 请求体长度）并写一行日志。调用方自己取消或截止时不记：不会重发。
+func (c *Client) transportFailure(ctx, attemptCtx context.Context, timeout time.Duration, err error, inputType InputType, sent int) error {
+	classified := reliability.ClassifyTransportError(ctx, attemptCtx, timeout, err)
+	if reliability.IsAttemptTimeout(classified) {
+		kind := usageKind(inputType)
+		c.usage.RecordAbandoned(kind, int64(sent))
+		reliability.RecordAbandoned(ctx, kind, int64(sent))
+		if c.logf != nil {
+			c.logf("embedding %s request abandoned after the %s per-attempt timeout: request_bytes=%d; the provider may still bill it", kind, timeout, sent)
+		}
+	}
+	return classified
 }
 
 // queryVectorProblem 检查查询向量能否用于相似度检索：每个分量都是有限数，

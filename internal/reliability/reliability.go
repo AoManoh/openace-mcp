@@ -54,6 +54,16 @@ type CallError struct {
 	StatusCode int
 	RetryAfter time.Duration
 	Message    string
+	// AttemptTimedOut 为真表示单次尝试到了超时、调用方仍在等待（只由
+	// ClassifyTransportError 设置）。请求已经发出，服务商可能照常处理并计费，
+	// 而 openACE 会按重试规则重发同一批内容；客户端据此记录被放弃的请求。
+	AttemptTimedOut bool
+}
+
+// IsAttemptTimeout 报告 err 是否为单次尝试超时、调用方仍在等待的传输失败。
+func IsAttemptTimeout(err error) bool {
+	var callErr *CallError
+	return errors.As(err, &callErr) && callErr.AttemptTimedOut
 }
 
 // Error 返回 "provider <类别> (HTTP <状态码>): <消息>"。没有状态码的

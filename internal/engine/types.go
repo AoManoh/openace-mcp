@@ -453,6 +453,11 @@ type HeavyBuildStatus struct {
 // UsageCounts 是成功送审后服务商在响应里报告的用量：文档嵌入、查询嵌入与
 // 精排的 tokens 与请求数分列，服务商按这个数计费。成功响应里没有用量字段
 // （部分自部署服务）时只计入 UnreportedRequests，不估算。
+//
+// *_abandoned_requests 与 *_abandoned_bytes 是单次尝试到了超时、调用方仍在
+// 等待而被放弃的请求数与请求体字节数。这些请求已经发出，服务商可能照常处理
+// 并计费，openACE 随后重发同一批内容；服务商没有返回用量，只记字节数，不估
+// tokens。为 0 时不输出。
 type UsageCounts struct {
 	DocumentTokens     int64 `json:"document_tokens,omitempty"`
 	DocumentRequests   int64 `json:"document_requests,omitempty"`
@@ -461,6 +466,13 @@ type UsageCounts struct {
 	RerankTokens       int64 `json:"rerank_tokens,omitempty"`
 	RerankRequests     int64 `json:"rerank_requests,omitempty"`
 	UnreportedRequests int64 `json:"unreported_requests,omitempty"`
+
+	DocumentAbandonedRequests int64 `json:"document_abandoned_requests,omitempty"`
+	DocumentAbandonedBytes    int64 `json:"document_abandoned_bytes,omitempty"`
+	QueryAbandonedRequests    int64 `json:"query_abandoned_requests,omitempty"`
+	QueryAbandonedBytes       int64 `json:"query_abandoned_bytes,omitempty"`
+	RerankAbandonedRequests   int64 `json:"rerank_abandoned_requests,omitempty"`
+	RerankAbandonedBytes      int64 `json:"rerank_abandoned_bytes,omitempty"`
 }
 
 // IsZero 报告是否没有任何送审记录。
