@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -63,13 +64,15 @@ func (h *HeavyBuildSlots) slotPath(slot int) string {
 }
 
 // TryAcquire 依次尝试每个名额，拿到一个就返回释放函数；全部被存活进程持有时返回
-// ErrHeavySlotsBusy；名额目录不可用时返回该错误。
+// ErrHeavySlotsBusy；名额目录不可用时返回该错误。锁文件的说明行是 note 加
+// " acquired=<取得名额的时刻>"，等待者看到的是持有者占用了多久，不是它开始排队的时刻。
 func (h *HeavyBuildSlots) TryAcquire(note string) (func(), error) {
 	if err := ensurePrivateDir(h.dir); err != nil {
 		return nil, err
 	}
+	stamped := strings.TrimSpace(note + " acquired=" + time.Now().UTC().Format(time.RFC3339))
 	for slot := 0; slot < h.count; slot++ {
-		lock, err := AcquireLockAt(h.slotPath(slot), note)
+		lock, err := AcquireLockAt(h.slotPath(slot), stamped)
 		if err == nil {
 			return lock.Release, nil
 		}

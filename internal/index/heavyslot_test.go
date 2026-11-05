@@ -162,7 +162,7 @@ func TestHeavySlotCancel(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("取消后等待者没有在 5 秒内返回")
 	}
-	if holders := slots.Holders(); len(holders) != 1 || holders[0].Note != "workspace=/srv/a" {
+	if holders := slots.Holders(); len(holders) != 1 || !strings.HasPrefix(holders[0].Note, "workspace=/srv/a acquired=") {
 		t.Fatalf("取消的等待者不应占名额: %+v", holders)
 	}
 }
@@ -184,9 +184,12 @@ func TestHeavySlotHolders(t *testing.T) {
 		t.Fatalf("两个名额都被占时第三个应等待: %v", err)
 	}
 	holders := slots.Holders()
-	if len(holders) != 2 || holders[0].Slot != 0 || holders[0].PID != os.Getpid() || holders[0].Note != "workspace=/srv/a build=full" ||
-		holders[1].Slot != 1 || holders[1].Note != "workspace=/srv/b build=delta" {
-		t.Fatalf("Holders 应按名额序列出进程号与说明: %+v", holders)
+	if len(holders) != 2 || holders[0].Slot != 0 || holders[0].PID != os.Getpid() || !strings.HasPrefix(holders[0].Note, "workspace=/srv/a build=full acquired=") ||
+		holders[1].Slot != 1 || !strings.HasPrefix(holders[1].Note, "workspace=/srv/b build=delta acquired=") {
+		t.Fatalf("Holders 应按名额序列出进程号与说明（带取得名额的时刻）: %+v", holders)
+	}
+	if _, err := time.Parse(time.RFC3339, strings.TrimPrefix(holders[0].Note, "workspace=/srv/a build=full acquired=")); err != nil {
+		t.Fatalf("acquired= 应为 RFC 3339 时刻: %q %v", holders[0].Note, err)
 	}
 }
 

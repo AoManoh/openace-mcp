@@ -9,6 +9,8 @@ type ContextAsset struct {
 	AbsPath  string
 	RelPath  string
 	BlobName string
+	// Size 是扫描时的文件字节数，构建前估算峰值内存用（localengine 的重型构建判定）。
+	Size int64
 }
 
 type AssetSet []ContextAsset

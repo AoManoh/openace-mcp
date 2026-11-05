@@ -2,7 +2,9 @@ package localengine
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -197,5 +199,68 @@ func TestQueryBuildWaitDisabledKeepsBlocking(t *testing.T) {
 	}
 	if res.SemanticCoverage != "100%" {
 		t.Fatalf("默认路径应等到完整构建: %+v", res)
+	}
+}
+
+// TestQueryDoesNotWaitForHeavyBuild（第 4 步 T4.6）：有可服务 revision 时，排队中的重型构建不让
+// 检索等满查询等待上限：一个等待片内以旧索引作答，标 index-building 并带 [INDEX] 行。
+func TestQueryDoesNotWaitForHeavyBuild(t *testing.T) {
+	forceHeavyBuilds(t)
+	e := newTestEngineWith(t, Options{QueryBuildWait: 40 * time.Second})
+	e.buildWaitSlice = 200 * time.Millisecond
+	root := newFixtureWorkspace(t)
+	first, err := e.Sync(context.Background(), syncRequest(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := occupySlot(t, e, otherHolderNote)
+	writeFixture(t, root, "main.go", fixtureMainGo+"\n// HeavyEdit 改动。\nfunc HeavyEdit() {}\n")
+	start := time.Now()
+	res, err := e.Search(context.Background(), searchRequest(root, "HandleLogin"))
+	elapsed := time.Since(start)
+	if err != nil || res.DegradedReason != "index-building" {
+		t.Fatalf("重型构建排队时应以旧索引作答并标 index-building: reason=%q err=%v", res.DegradedReason, err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("不应为重型构建等满 40 秒，实际 %v", elapsed)
+	}
+	line := strings.SplitN(res.Text, "\n", 3)[1]
+	if !strings.HasPrefix(line, "[INDEX] snapshot="+first.IndexRevision+" ") || !strings.HasSuffix(line, " pending=1: main.go") {
+		t.Fatalf("应带 [INDEX] 行列出排队构建扫描到的改动: %q", line)
+	}
+	release()
+	waitBuildIdle(t, e, root)
+	clean, err := e.Search(context.Background(), searchRequest(root, "HeavyEdit"))
+	if err != nil || clean.DegradedReason != "" || !strings.Contains(clean.Text, "HeavyEdit") {
+		t.Fatalf("名额释放、构建完成后检索应包含改动且不降级: reason=%q err=%v", clean.DegradedReason, err)
+	}
+}
+
+// TestQueryNoSnapshotReportsQueue（第 4 步 T4.6）：没有可服务 revision 时保持有界等待，报错写明
+// 构建在排队以及名额持有者。
+func TestQueryNoSnapshotReportsQueue(t *testing.T) {
+	forceHeavyBuilds(t)
+	e := newTestEngineWith(t, Options{QueryBuildWait: time.Second})
+	e.buildWaitSlice = 200 * time.Millisecond
+	root := newFixtureWorkspace(t)
+	release := occupySlot(t, e, otherHolderNote)
+	start := time.Now()
+	_, err := e.Search(context.Background(), searchRequest(root, "HandleLogin"))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("没有可服务 revision、构建排队时应报错")
+	}
+	for _, want := range []string{EnvQueryBuildWait, "heavy_build=queued", fmt.Sprintf("pid=%d", os.Getpid()), "workspace=/srv/other"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("错误应写明 %q: %v", want, err)
+		}
+	}
+	if elapsed < 900*time.Millisecond || elapsed > 5*time.Second {
+		t.Fatalf("没有快照时应保持 1 秒的有界等待，实际 %v", elapsed)
+	}
+	release()
+	waitBuildIdle(t, e, root)
+	if _, err := e.Search(context.Background(), searchRequest(root, "HandleLogin")); err != nil {
+		t.Fatalf("名额释放后检索应成功: %v", err)
 	}
 }

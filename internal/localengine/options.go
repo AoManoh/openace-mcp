@@ -60,6 +60,10 @@ const (
 	// 向量数据默认以 mmap 驻留，内存紧张时由内核回收文件页，只会变慢，
 	// 结果不变，不需要用降低召回换内存。
 	EnvVectorMemoryBudget = "OPENACE_VECTOR_MEMORY_BUDGET"
+	// EnvHeavyBuildSlots 是同一用户在本机所有 openACE 进程之间共享的重型构建名额数
+	// （估算峰值内存不低于 1 GiB 的构建先取名额再切分，见 heavy_build.go），整数且
+	// 不小于 1，默认 1，非法值启动时报错。
+	EnvHeavyBuildSlots = "OPENACE_HEAVY_BUILD_SLOTS"
 )
 
 // defaultQueryBuildWait 是查询有界等待的默认上界。它必须小于最严格的主流
@@ -98,6 +102,9 @@ type Options struct {
 	// 评测程序在程序内覆盖，没有环境变量，默认 false。进入生产默认要等
 	// 真实碎片密集语料的验证与用户决定。
 	FragmentGate bool
+	// HeavyBuildSlots 是重型构建名额数，小于 1 按 1；不进配置指纹（只影响构建排队，
+	// 不影响索引内容与检索结果）。
+	HeavyBuildSlots int
 	// Logf 接收需要写进进程日志的事件（例如打开 embedding journal 时做过的修复），
 	// nil 时不写。NewService 用 daemon 与 MCP direct 模式的日志函数填入；不进配置
 	// 指纹。
@@ -153,6 +160,10 @@ func OptionsFromEnv() (Options, error) {
 	if raw := strings.TrimSpace(os.Getenv(EnvVectorMemoryBudget)); raw != "" && raw != "0" {
 		return Options{}, fmt.Errorf("%s is no longer supported (value %q): remove it; vectors are memory-mapped and the kernel reclaims their pages under memory pressure, so retrieval stays complete and only gets slower", EnvVectorMemoryBudget, raw)
 	}
+	heavySlots, err := reliability.IntEnv(EnvHeavyBuildSlots, 1, 1)
+	if err != nil {
+		return Options{}, err
+	}
 	// TemplateVersion 参与 ProfileHash，而 ProfileHash 又进入 Fingerprint：
 	// 这里与 New 都注入同一常量 embedTemplateVersion，wrapper 只走本函数
 	// 算指纹，daemon 还会走 New，两处必须一致才能复用判定。
@@ -164,6 +175,7 @@ func OptionsFromEnv() (Options, error) {
 		FreshnessWindow: freshness,
 		QualityStrict:   strict,
 		QueryBuildWait:  buildWait,
+		HeavyBuildSlots: heavySlots,
 	}, nil
 }
 

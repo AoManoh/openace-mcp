@@ -99,6 +99,9 @@ type Engine struct {
 	// 用旧索引降级应答。大仓重建的 ETA 是分钟级，等满整个预算再降级只是
 	// 增加延迟。测试可以调小。
 	buildWaitSlice time.Duration
+	// heavySlots 是同一用户跨进程共享的重型构建名额（OPENACE_HEAVY_BUILD_SLOTS，
+	// 见 heavy_build.go）；目录在 New 时按当时的系统临时目录定下。
+	heavySlots *index.HeavyBuildSlots
 	// freshnessWindow 大于 0 时，上次成功同步距今不足该时长的查询跳过
 	// 内联扫描，直接用现有 revision；该时长只限定跳过扫描的时间，构建失败
 	// 或尚未完成时返回的旧索引仍可能更早。
@@ -227,6 +230,7 @@ func New(opts Options) (*Engine, error) {
 	e.qualityStrict = opts.QualityStrict
 	e.queryBuildWait = opts.QueryBuildWait
 	e.buildWaitSlice = 5 * time.Second
+	e.heavySlots = index.NewHeavyBuildSlots(index.DefaultHeavyBuildDir(), opts.HeavyBuildSlots)
 	e.freshnessWindow = opts.FreshnessWindow
 	e.lexicalFirst = !opts.DisableLexicalFirst
 	e.fragmentGate = opts.FragmentGate
@@ -710,6 +714,12 @@ func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.Workspace
 	// 时与整段等待行为一致。
 	deadline := time.Now().Add(budget)
 	for {
+		// 进入等待前与每个等待片结束时核对：在建构建是重型构建（排队或进行中，见
+		// heavy_build.go）且有可服务 revision 时不再等，先用已有索引作答。大仓全量构建要
+		// 几分钟到几十分钟，普通 delta 的有界等待不受影响。
+		if reason := e.heavyBuildWaitReason(ref); reason != "" && e.hasServableRevision(ref) {
+			return engine.Result{}, e.queryBuildWaitError(ref, reason+"，先用已有索引作答，构建继续后台推进")
+		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return engine.Result{}, e.queryBuildWaitError(ref, fmt.Sprintf("等待 %s 后返回(%s=%s,调用方截止时间也限制等待),构建继续后台推进", budget.Round(time.Millisecond), EnvQueryBuildWait, e.queryBuildWait))
@@ -791,7 +801,6 @@ func (e *Engine) buildProgressLabel(workspaceKey string) string {
 		return "stage=unknown"
 	}
 	tracker.mu.Lock()
-	defer tracker.mu.Unlock()
 	label := fmt.Sprintf("stage=%s embedded=%d pending=%d", tracker.stage, tracker.embedDone, tracker.embedPending)
 	if rate, eta := tracker.embedRateETALocked(time.Now().UTC()); rate > 0 {
 		label += fmt.Sprintf(" rate=%d/min", rate)
@@ -799,7 +808,9 @@ func (e *Engine) buildProgressLabel(workspaceKey string) string {
 			label += fmt.Sprintf(" eta=%s", (time.Duration(eta) * time.Second).Round(time.Second))
 		}
 	}
-	return label
+	tracker.mu.Unlock()
+	// 重型构建的排队情况要读名额文件，放在释放跟踪器锁之后。
+	return label + e.heavyProgressLabel(workspaceKey)
 }
 
 func (e *Engine) syncWorkspace(ctx context.Context, ref engine.WorkspaceRef) (engine.Result, error) {

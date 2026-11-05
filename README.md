@@ -272,6 +272,7 @@ embedding 地址、模型、维度和内置嵌入模板都没变时,新子树只
 | `OPENACE_RETRIEVAL_DEGRADE` | 已移除。配置了 embedding 后,查询嵌入失败、索引没有向量、向量文件不可用时检索一律报错,不再有返回纯词法结果的档位。设置为任何值时启动报错,删除该行即可;需要覆盖不足、索引不新鲜也报错时用 `OPENACE_QUALITY_STRICT=on` |
 | `OPENACE_QUALITY_STRICT` | `on` = 质量严格档:语义链路任一缺口(覆盖 <100%、索引不是最新、语义迁移暂停、已配置的 rerank 未生效、rerank 未配置等)直接报错,同步与查询一致;显式 `OPENACE_RERANK_ADAPTER=off` 不算缺口;要求已配置 embedding。默认 `off`。结构化结果携带 `rerank_sent`/`embedding_profile` |
 | `OPENACE_QUERY_BUILD_WAIT` | 查询等待在建索引的上界,**默认 `40s`**(先于主流 MCP 客户端的请求超时,冷仓首建期间的同步检索返回带构建进度的可行动错误,而非裸超时):超时后用已有索引作答并标 `index-building`;没有索引,或已有索引还没有任何向量(首建中)时返回带进度的错误;显式 `0` = 等到构建完成。调用方带截止时间时(MCP 工具调用默认 110 秒,daemon 模式经请求头传给 daemon),等待最晚在截止前 2 秒结束并返回带进度的错误;查询不再等待时构建照常继续 |
+| `OPENACE_HEAVY_BUILD_SLOTS` | 同一用户在本机所有 openACE 进程之间共享的重型构建名额数,默认 `1`,整数且不小于 1,非法值启动报错。构建前按要切分的文件字节估算匿名内存峰值(每 800 字节约一个 chunk,每个 chunk 约 5.7 KiB),不低于 1 GiB 的是重型构建(约 34 万个 chunk 的仓库全部重新嵌入,按实测外推峰值约 1.8 GiB),先取名额再切分;名额被占时 `workspace_status` 的 `stage` 为 `queued`,`heavy_build` 写明估算峰值与名额持有者的进程号和工作区。已有索引的工作区,检索不为重型构建等待,先用已有索引作答并标 `index-building`;没有索引时按 `OPENACE_QUERY_BUILD_WAIT` 等待,超时报错里写明排队与持有者。名额文件在系统临时目录的 `openace-heavy-build-<uid>/` 下 |
 | `OPENACE_MCP_TOOLS` | MCP 工具面:未设 = 只暴露 `codebase_retrieval`;`all` = 完整能力面;或逗号清单指定 |
 | `OPENACE_RENDER_LINE_NUMBERS` | `1` = 检索结果围栏内逐行携带真实文件行号(`cat -n` 形状,Read-parity 试验面);默认关闭 |
 | `OPENACE_FULL_RESULTS` | `detail=full` 时带正文返回的候选块数(按排名取前 N 个,其余只给标题行),默认 `20`;`0`=全部只给标题行。这是使用者侧配置,不是 AI 的调用参数;改动后重启 MCP 会话生效,不需要重启 daemon |

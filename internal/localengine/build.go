@@ -330,6 +330,14 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 		!needsLexicalRebuild && !repairRequested &&
 		(len(previous.Segments) < compactSegmentThreshold || mergeSmall != nil) &&
 		garbage < compactGarbageRatio && !gapFill
+	// 重型构建排队（heavy_build.go）：选路之后、切分之前按估算峰值内存判定，重型构建先取
+	// 跨进程名额，名额被占时状态为 queued；构建结束（含失败与取消）时释放。
+	estimate := estimateBuild(useDelta, assets, changedAssets)
+	releaseSlot, err := e.waitHeavySlot(ctx, status, root, estimate)
+	if err != nil {
+		return engine.Result{}, nil, err
+	}
+	defer releaseSlot()
 	if useDelta {
 		deltaResult, deltaManifest, deltaErr := e.buildDelta(ctx, store, status, root, workspaceKey, previous, assets, mergeSmall)
 		if !errors.Is(deltaErr, errSmallMergeUnavailable) {
@@ -340,6 +348,15 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 				e.noteGapFillOutcome(workspaceKey, nil, deltaManifest, false)
 			}
 			return deltaResult, deltaManifest, deltaErr
+		}
+		// 小段合并的输入读不全时改走全量合并：按全量重新估算，增量不算重型而全量算的，
+		// 这时再取名额。
+		if full := estimateBuild(false, assets, nil); !estimate.heavy() && full.heavy() {
+			releaseFull, err := e.waitHeavySlot(ctx, status, root, full)
+			if err != nil {
+				return engine.Result{}, nil, err
+			}
+			defer releaseFull()
 		}
 	}
 	result, manifest, err = e.buildFull(ctx, store, status, root, workspaceKey, previous, assets, contentChanged, needsLexicalRebuild,

@@ -97,6 +97,8 @@ type wsStatus struct {
 	// 进行中扫描的开始时刻，两者用于降级作答时的 [INDEX] 行（见 index_freshness.go）。
 	pending       pendingScan
 	scanStartedAt *time.Time
+	// heavy 是在建重型构建的排队情况（见 heavy_build.go），构建结束时清空。
+	heavy heavyBuildState
 }
 
 // setSharedVectors 记录最近一次构建使用共享向量库的结果。
@@ -385,6 +387,7 @@ func (s *wsStatus) ready(manifest *index.Manifest, revisions int) {
 	s.lastError = ""
 	s.migrationBlock = manifest.SemanticMigrationBlock
 	s.pendingPublishedLocked(manifest.Revision)
+	s.heavy = heavyBuildState{}
 	s.finishedAt = &now
 	s.updatedAt = now
 }
@@ -400,6 +403,7 @@ func (s *wsStatus) fail(err error) {
 	s.embedStartedAt = nil
 	s.lastError = sanitizeError(err)
 	s.pendingFailedLocked()
+	s.heavy = heavyBuildState{}
 	s.finishedAt = &now
 	s.updatedAt = now
 }
@@ -655,6 +659,7 @@ func (e *Engine) WorkspaceStatus(ctx context.Context, ref engine.WorkspaceRef) (
 		e.attachSemantic(&snapshot, status)
 		e.attachTopLevelCounts(&snapshot, workspaceKey)
 		snapshot.StatSnapshot = e.statSnapshotSummary(workspaceKey)
+		e.attachHeavyBuild(&snapshot, workspaceKey)
 		return snapshot, nil
 	}
 	// 内存里没有跟踪器（daemon 刚启动）：从磁盘上的 manifest 恢复视图。
@@ -759,6 +764,7 @@ func (e *Engine) ListWorkspaceStatuses(ctx context.Context) ([]engine.WorkspaceS
 	for _, tracker := range trackers {
 		snapshot := tracker.snapshot()
 		e.attachSemantic(&snapshot, tracker)
+		e.attachHeavyBuild(&snapshot, tracker.workspaceKey)
 		statuses = append(statuses, snapshot)
 	}
 	sort.Slice(statuses, func(i, j int) bool { return statuses[i].DirectoryPath < statuses[j].DirectoryPath })

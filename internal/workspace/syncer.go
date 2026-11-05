@@ -35,6 +35,7 @@ type fileBlob struct {
 	AbsPath  string
 	RelPath  string
 	BlobName string
+	Size     int64
 }
 
 func scan(ctx context.Context, root string) ([]fileBlob, error) {
@@ -155,7 +156,7 @@ func scanWithProgress(ctx context.Context, root string, cache *StatCache, progre
 				key := statKeyOf(info)
 				if hit, ok := cache.lookup(rel, key, scanStart); ok {
 					seen[rel] = true
-					files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: hit})
+					files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: hit, Size: info.Size()})
 					report()
 					return nil
 				}
@@ -166,7 +167,7 @@ func scanWithProgress(ctx context.Context, root string, cache *StatCache, progre
 				name := blobName(rel, content)
 				cache.store(rel, key, name, scanStart)
 				seen[rel] = true
-				files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: name})
+				files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: name, Size: int64(len(content))})
 				report()
 				return nil
 			}
@@ -179,6 +180,7 @@ func scanWithProgress(ctx context.Context, root string, cache *StatCache, progre
 			AbsPath:  path,
 			RelPath:  rel,
 			BlobName: blobName(rel, content),
+			Size:     int64(len(content)),
 		})
 		report()
 		return nil

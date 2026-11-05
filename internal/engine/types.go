@@ -25,6 +25,8 @@ const (
 	IndexStageFailed        IndexStage = "failed"
 
 	// local-hybrid 引擎的构建阶段（发现阶段复用 IndexStageScanning）。
+	// IndexStageQueued 是重型构建扫描完成后等待跨进程名额（见 WorkspaceStatus.HeavyBuild）。
+	IndexStageQueued     IndexStage = "queued"
 	IndexStageChunking   IndexStage = "chunking"
 	IndexStageEmbedding  IndexStage = "embedding"
 	IndexStageIndexing   IndexStage = "indexing"
@@ -424,6 +426,28 @@ type WorkspaceStatus struct {
 	// 让重启后的第一次扫描跳过未变文件的重新哈希)的处理:已加载多少条、丢弃多少条、
 	// 整份作废的原因、文件不存在,以及最近一次保存。加性 omitempty。
 	StatSnapshot string `json:"stat_snapshot,omitempty"`
+	// HeavyBuild 在在建构建按估算峰值内存属于重型构建时出现：排队等名额（queued）
+	// 或已取得名额（running）。加性 omitempty。
+	HeavyBuild *HeavyBuildStatus `json:"heavy_build,omitempty"`
+}
+
+// HeavyBuildStatus 说明一次重型构建的排队情况。同一用户在本机的全部 openACE 进程共享
+// OPENACE_HEAVY_BUILD_SLOTS 个名额（默认 1），名额被占时重型构建在扫描之后、切分之前
+// 等待；有可服务 revision 的工作区，检索不为它等待，先用已有索引作答。
+type HeavyBuildStatus struct {
+	// State 为 queued（等名额）或 running（已取得名额，或名额不可用、没有排队）；
+	// Since 是进入该状态的时刻。
+	State string     `json:"state"`
+	Since *time.Time `json:"since,omitempty"`
+	// BuildMode 是 full 或 delta；EstimatedPeakMiB 是构建前按内容字节估算的匿名内存峰值。
+	BuildMode        string `json:"build_mode"`
+	EstimatedPeakMiB int64  `json:"estimated_peak_mib"`
+	// Slots 是名额数；Holders 是当前持有名额的进程号与它们写下的说明（工作区、构建
+	// 形态、估算峰值、开始时刻）。
+	Slots   int      `json:"slots"`
+	Holders []string `json:"holders,omitempty"`
+	// Error 是名额目录不可用时没有排队、直接构建的原因。
+	Error string `json:"error,omitempty"`
 }
 
 // UsageCounts 是成功送审后服务商在响应里报告的用量：文档嵌入、查询嵌入与
