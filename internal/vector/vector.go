@@ -389,12 +389,23 @@ func (ix *Index) Mapped() bool {
 // 时的范数合理性探针(写路径强制单位范数,norm² 偏离 1 即拒绝该行)。
 // 范数探针能拦截错位/截断/大面积损坏,不能拦截保范数的位翻转;需要
 // 全文件强校验的路径(查询索引/整段复用)继续走 Load。
+//
+// 驻留形态:可映射时(OPENACE_VECTOR_MMAP 没有关、小端主机)打开即把
+// vectors.dat 映射为只读文件后备页,只有访问到的页才读入,RowView 返回
+// 经同样检查的映射视图,不占 Go heap;ReadRow 仍是 pread 拷贝。delta
+// 构建复用的行数可达整段规模(大批文件改动时),逐行拷贝曾让一半规模
+// 副本的构建匿名内存达到首建的 2.9 倍。
 type RowReader struct {
 	dimension int
 	entries   []Entry
 	file      *os.File
 	closed    atomic.Bool
+	mapped    mmap.MMap // 非 nil = data 是映射页的别名视图
+	data      []float32
 }
+
+// rowReaderMaps 决定 OpenRowReader 是否映射数据文件;var 仅供测试关闭映射。
+var rowReaderMaps = func() bool { return loadUseMmap() && hostLittleEndian }
 
 // OpenRowReader 打开按行读取器;idx 校验语义与 Load 一致(checksum/
 // schema/维度/count/数据尺寸对齐)。
@@ -431,12 +442,63 @@ func OpenRowReader(dir string, wantDimension int, wantIndexChecksum string) (*Ro
 	if err != nil {
 		return nil, fmt.Errorf("读取 %s: %w", DataFileName, err)
 	}
-	return &RowReader{dimension: header.Dimension, entries: header.Entries, file: f}, nil
+	reader := &RowReader{dimension: header.Dimension, entries: header.Entries, file: f}
+	// 映射失败(部分网络盘/特殊挂载)不算错误:不映射,调用方用 ReadRow 拷贝,
+	// 两种读法的行值逐位相同。
+	if header.Count > 0 && rowReaderMaps() {
+		if mapped, mapErr := mmap.Map(f, mmap.RDONLY, 0); mapErr == nil {
+			reader.mapped = mapped
+			reader.data = unsafe.Slice((*float32)(unsafe.Pointer(&mapped[0])), header.Count*header.Dimension)
+		}
+	}
+	return reader, nil
 }
 
 // Entries 返回行映射(调用方不得修改)。
 func (r *RowReader) Entries() []Entry {
 	return r.entries
+}
+
+// Mapped 报告数据文件是否已映射,即 RowView 是否可用。
+func (r *RowReader) Mapped() bool {
+	return r.mapped != nil
+}
+
+// RowView 返回第 i 行向量的映射视图,检查与 ReadRow 相同(非有限分量、
+// 范数偏离)。视图指向映射页,Close 后失效,调用方必须在 Close 之前用完;
+// 需要在 Close 后继续持有时用 ReadRow。未映射时返回错误。
+func (r *RowReader) RowView(i int) ([]float32, error) {
+	if r.closed.Load() {
+		return nil, errors.New("row reader 已关闭")
+	}
+	if r.mapped == nil {
+		return nil, errors.New("数据文件没有映射")
+	}
+	if i < 0 || i >= len(r.entries) {
+		return nil, fmt.Errorf("行号 %d 越界(count=%d)", i, len(r.entries))
+	}
+	row := r.data[i*r.dimension : (i+1)*r.dimension]
+	if err := checkRow(row, i); err != nil {
+		return nil, err
+	}
+	return row, nil
+}
+
+// checkRow 是按行读取的完整性底线:分量必须有限,范数平方偏离 1 不超过
+// 0.01(写路径强制单位范数,读出偏离即错位或损坏)。
+func checkRow(row []float32, i int) error {
+	var sum float64
+	for _, value := range row {
+		f := float64(value)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return fmt.Errorf("第 %d 行含非有限分量(疑似损坏)", i)
+		}
+		sum += f * f
+	}
+	if math.Abs(sum-1) > 0.01 {
+		return fmt.Errorf("第 %d 行范数异常(norm²=%.4f,疑似错位/损坏)", i, sum)
+	}
+	return nil
 }
 
 // ReadRow 读取第 i 行向量(pread+小端解码+范数探针);返回的切片为
@@ -453,29 +515,30 @@ func (r *RowReader) ReadRow(i int) ([]float32, error) {
 		return nil, fmt.Errorf("读取第 %d 行: %w", i, err)
 	}
 	row := make([]float32, r.dimension)
-	var sum float64
 	for j := range row {
-		value := math.Float32frombits(binary.LittleEndian.Uint32(buf[j*4:]))
-		f := float64(value)
-		if math.IsNaN(f) || math.IsInf(f, 0) {
-			return nil, fmt.Errorf("第 %d 行含非有限分量(疑似损坏)", i)
-		}
-		sum += f * f
-		row[j] = value
+		row[j] = math.Float32frombits(binary.LittleEndian.Uint32(buf[j*4:]))
 	}
-	// 写路径强制单位范数(writeVectorData);读出偏离即结构性损坏。
-	if math.Abs(sum-1) > 0.01 {
-		return nil, fmt.Errorf("第 %d 行范数异常(norm²=%.4f,疑似错位/损坏)", i, sum)
+	if err := checkRow(row, i); err != nil {
+		return nil, err
 	}
 	return row, nil
 }
 
-// Close 关闭数据文件句柄(幂等)。
+// Close 解除映射并关闭数据文件句柄(幂等)。之后 RowView 给出的视图全部失效。
 func (r *RowReader) Close() error {
 	if !r.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	return r.file.Close()
+	var err error
+	if r.mapped != nil {
+		err = r.mapped.Unmap()
+		r.mapped = nil
+		r.data = nil
+	}
+	if closeErr := r.file.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 // Count 返回向量行数。

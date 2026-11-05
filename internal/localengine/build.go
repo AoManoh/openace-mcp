@@ -1006,6 +1006,15 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 	if err != nil {
 		return engine.Result{}, nil, err
 	}
+	// 旧段里读不出或检查不通过的行没有复用、已按缺口重新送审，写进
+	// semantic.last_error；改动前这类行被静默跳过。
+	if note := prior.rejectedRowsNote(); note != "" {
+		if seman.lastError == "" {
+			seman.lastError = note
+		} else {
+			seman.lastError += "；" + note
+		}
+	}
 	coveredHash := make(map[string]bool, len(seman.entries))
 	for _, entry := range seman.entries {
 		coveredHash[entry.ContentHash] = true

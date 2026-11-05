@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -154,10 +156,15 @@ type priorVectors struct {
 	activeLoadedRows       int
 	activeLoadedSegments   int
 	activeExpectedSegments int
+	// rejectedRows 是按行读取时读不出或检查不通过的行数，键为段 ID。这些行
+	// 不复用、之后按缺口重新取得向量；delta 构建把它写进 semantic.last_error，
+	// 不静默重新付费。
+	rejectedRows map[string]int
 	// indexes 持有底层数据：整段装载时是 *vector.Index，各 byHash 表的值
 	// 是其数据的子切片，可能指向 mmap 页；按行选读时是 *vector.RowReader，
-	// 表值是独立拷贝。构建方用完 prior 必须调用 release，否则映射与文件
-	// 句柄一直保留到进程退出。
+	// 数据文件已映射时表值是映射视图，否则是独立拷贝。构建方用完 prior
+	// 必须调用 release，否则映射与文件句柄一直保留到进程退出；release
+	// 之后表值里的映射视图全部失效。
 	indexes []io.Closer
 }
 
@@ -271,12 +278,53 @@ func (e *Engine) loadPriorRowsSelective(prior *priorVectors, store *index.Store,
 		if _, ok := prior.activeByHash[entry.ContentHash]; ok {
 			continue
 		}
-		row, err := reader.ReadRow(i)
+		// 数据文件已映射时取映射视图，不拷贝：大批文件改动的 delta 要复用的行数
+		// 接近整段，逐行拷贝曾让匿名内存达到首建的 2.9 倍。视图在 prior.release
+		// 关闭读取器时失效，与整段装载的映射同一时机（新段写完之后）。
+		var row []float32
+		if reader.Mapped() && priorRowViews {
+			row, err = reader.RowView(i)
+		} else {
+			if hook := priorRowCopyHook; hook != nil {
+				hook()
+			}
+			row, err = reader.ReadRow(i)
+		}
 		if err != nil {
+			if prior.rejectedRows == nil {
+				prior.rejectedRows = make(map[string]int)
+			}
+			prior.rejectedRows[segment.ID]++
 			continue
 		}
 		target[entry.ContentHash] = row
 	}
+}
+
+// priorRowViews 为 false 时按行读取一律拷贝；只供测试对照改动前的行为。
+var priorRowViews = true
+
+// priorRowCopyHook 在按行读取每拷贝一行时调用，只供测试统计拷贝行数，生产路径为 nil。
+var priorRowCopyHook func()
+
+// rejectedRowsNote 把按行读取时读不出或检查不通过的行写成一句状态说明；没有时返回空串。
+func (p priorVectors) rejectedRowsNote() string {
+	if len(p.rejectedRows) == 0 {
+		return ""
+	}
+	ids := make([]string, 0, len(p.rejectedRows))
+	total := 0
+	for id, count := range p.rejectedRows {
+		ids = append(ids, id)
+		total += count
+	}
+	sort.Strings(ids)
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, fmt.Sprintf("%s %d 行", id, p.rejectedRows[id]))
+	}
+	return fmt.Sprintf("复用旧向量时 %d 行读不出或检查不通过（疑似数据损坏；段 %s），这些行没有复用，按缺口重新取得向量",
+		total, strings.Join(parts, "、"))
 }
 
 // embedRecords 为 records（全量或 delta 构建产出的 chunk 记录）组装向量集。
