@@ -132,6 +132,37 @@ func TestStatSnapshotFirstQuery(t *testing.T) {
 		}
 	})
 
+	t.Run("platform without ctime and inode neither loads nor saves", func(t *testing.T) {
+		// Windows 原生的文件元数据没有 ctime 与 inode：快照跨重启加载后，保留修改时间的
+		// 等长改写会一直命中旧哈希，所以这类平台不用快照。
+		statSnapshotSupported = false
+		t.Cleanup(func() { statSnapshotSupported = workspace.StatSnapshotSupported })
+		before, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e5, err := New(opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := e5.Search(context.Background(), searchRequest(root, "parse_config"))
+		if err != nil || !strings.Contains(result.DegradedReason, "index-refreshing") {
+			t.Fatalf("不支持的平台不应加载快照,第一次检索保持首触快路径: %v %q", err, result.DegradedReason)
+		}
+		waitFirstTouchConverged(t, e5, root)
+		status, err := e5.WorkspaceStatus(context.Background(), ref)
+		if err != nil || !strings.Contains(status.StatSnapshot, "not used on this platform") {
+			t.Fatalf("状态应写明本平台不用快照: %v %q", err, status.StatSnapshot)
+		}
+		if err := e5.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		after, err := os.ReadFile(path)
+		if err != nil || string(after) != string(before) {
+			t.Fatalf("不支持的平台不应改写快照文件: %v", err)
+		}
+	})
+
 	t.Run("absent snapshot keeps first-touch fast path", func(t *testing.T) {
 		if err := os.Remove(path); err != nil {
 			t.Fatal(err)

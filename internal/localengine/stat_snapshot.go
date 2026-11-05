@@ -18,12 +18,18 @@ import (
 //   - stat 缓存首次创建时加载；归属或规则版本不符整份作废，单条内容哈希与 active manifest
 //     不一致只丢这一条（workspace.LoadStatSnapshot）；
 //   - 加载到条目的工作区，第一次检索走普通流程（扫描、按需 delta、有界等待），不再走首触
-//     快路径；没有快照或整份作废时保持首触快路径。
+//     快路径；没有快照或整份作废时保持首触快路径；
+//   - Windows 原生等取不到 ctime 与 inode 的平台既不加载也不保存（statSnapshotSupported），
+//     重启后的第一次检索保持首触快路径。
 // 快照丢失或损坏只多一次重新哈希，不影响正确性，也不属于索引格式。
 
 // statSnapshotInterval 是同一工作区两次保存快照的最短间隔。进程崩溃最多丢最近这段时间的
 // 条目，对应文件在下次启动后重新哈希。
 const statSnapshotInterval = 10 * time.Minute
+
+// statSnapshotSupported 是本平台能否使用快照（workspace.StatSnapshotSupported，Windows 原生
+// 为 false）；为 false 时既不加载也不保存。变量形式只为测试能模拟不支持的平台。
+var statSnapshotSupported = workspace.StatSnapshotSupported
 
 // statSnapshotState 是本进程对一个工作区快照的加载与保存记录，字段读写都在 e.mu 下。
 type statSnapshotState struct {
@@ -46,6 +52,10 @@ func (e *Engine) statSnapshotMeta(canonical string) workspace.StatSnapshotMeta {
 // revision 时快照无从核对，按不存在处理（首建本来就要读全部文件）。
 func (e *Engine) loadStatCache(workspaceKey string, root pathutil.WorkspaceRoot) (*workspace.StatCache, *statSnapshotState) {
 	state := &statSnapshotState{canonical: root.CanonicalPath, status: "absent"}
+	if !statSnapshotSupported {
+		state.status = "unsupported"
+		return workspace.NewStatCache(), state
+	}
 	store, err := e.storeFor(workspaceKey)
 	if err != nil {
 		return workspace.NewStatCache(), state
@@ -95,7 +105,7 @@ func (e *Engine) maybeSaveStatSnapshot(workspaceKey string, lock *index.ProcessL
 		lock = e.locks[workspaceKey]
 	}
 	var canonical string
-	skip := cache == nil || state == nil || store == nil || lock == nil
+	skip := cache == nil || state == nil || store == nil || lock == nil || state.status == "unsupported"
 	if !skip {
 		canonical = state.canonical
 		skip = cache.Generation() == state.savedGen ||
@@ -134,6 +144,8 @@ func (e *Engine) statSnapshotSummary(workspaceKey string) string {
 		}
 	case "ignored":
 		text = "ignored: " + state.reason
+	case "unsupported":
+		return "not used on this platform (file metadata has no ctime or inode, so a persisted snapshot could keep missing same-size rewrites that preserve the modification time)"
 	default:
 		text = "absent at startup"
 	}
