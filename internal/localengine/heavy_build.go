@@ -36,16 +36,83 @@ const (
 	// （mailyn-cli 一半副本 188,146 个 chunk，1,007 MiB），复用向量的全量构建实测约
 	// 5.7 KiB/chunk（E1），两者已接近，统一按较大的值估算。
 	estimatedPeakBytesPerChunk = 5837
+	// estimatedExistingPeakBytesPerChunk 是 delta 构建随既有索引规模多出的峰值（约 0.9 KiB/chunk）：
+	// delta 要打开既有分段读取旧向量（行映射条目表随段的行数增长），needed 集合与新旧两份 Files 表
+	// 也随之增长。只按改动文件估算时，mailyn-cli 规模的 delta 比实测少 10% 以上，在 1 GiB 阈值附近
+	// 会漏掉排队。系数按 2026-11-05 三组原型读数拟合：峰值约 107 MiB + 每个既有 chunk 0.9 KiB +
+	// 每个新段 chunk 4.7 KiB；新段项沿用 5.7 KiB，估算略偏高。
+	estimatedExistingPeakBytesPerChunk = 922
 )
 
 // buildEstimate 是一次构建开始切分前的规模估算：mode 为 full 或 delta，bytes 是要切分的
-// 文件字节数（全量为全部文件，delta 为新增与修改的文件），peak 是估算的匿名内存峰值。
+// 文件字节数（全量为全部文件，delta 为新增与修改的文件），chunks 是要写进新段的 chunk 数
+// （delta 含小段合并搬运的 chunk），existing 是 delta 要打开的既有分段 chunk 数，peak 是估算的
+// 匿名内存峰值。
 type buildEstimate struct {
-	mode   string
-	files  int
-	bytes  int64
-	chunks int64
-	peak   int64
+	mode     string
+	files    int
+	bytes    int64
+	chunks   int64
+	existing int64
+	peak     int64
+}
+
+// withDeltaBase 给 delta 估算加上既有索引与小段搬运两项：existing 是 delta 要打开的既有分段
+// chunk 总数（priorSegmentChunks），carried 是小段合并搬进新段的 chunk 数（carriedChunkCount），
+// 它们与改动文件的 chunk 一样要切分好的记录、词法索引与向量行写进新段。
+func (b buildEstimate) withDeltaBase(existing, carried int64) buildEstimate {
+	b.existing = existing
+	b.chunks += carried
+	b.peak = b.chunks*estimatedPeakBytesPerChunk + existing*estimatedExistingPeakBytesPerChunk
+	return b
+}
+
+// priorSegmentChunks 返回 active 与 previous 两个 revision 去重后的分段 chunk 总数，与
+// loadPriorVectors 打开的段一致（同一段被两个 revision 共用时只算一次）。previous 的 manifest
+// 读不出时只算 active。
+func priorSegmentChunks(store *index.Store, active *index.Manifest) int64 {
+	seen := make(map[string]bool)
+	var total int64
+	manifest := active
+	for hop := 0; manifest != nil && hop < 2; hop++ {
+		for _, segment := range manifest.Segments {
+			if !seen[segment.ID] {
+				seen[segment.ID] = true
+				total += int64(segment.Counts.Chunks)
+			}
+		}
+		if manifest.PreviousRevision == "" {
+			break
+		}
+		older, err := store.LoadManifest(manifest.PreviousRevision)
+		if err != nil {
+			break
+		}
+		manifest = older
+	}
+	return total
+}
+
+// carriedChunkCount 返回小段合并要搬进新段的 chunk 数：当前版本位于被合并小段、本次没有改动
+// 或删除的文件的 ChunkCount 之和，取舍与 loadSmallSegmentCarry 相同。
+func carriedChunkCount(previous *index.Manifest, mergeSmall map[string]bool, changed []workspace.ContextAsset, removed []string) int64 {
+	if len(mergeSmall) == 0 {
+		return 0
+	}
+	skip := make(map[string]bool, len(changed)+len(removed))
+	for _, asset := range changed {
+		skip[asset.RelPath] = true
+	}
+	for _, path := range removed {
+		skip[path] = true
+	}
+	var total int64
+	for path, entry := range previous.Files {
+		if mergeSmall[entry.SegmentID] && !skip[path] {
+			total += int64(entry.ChunkCount)
+		}
+	}
+	return total
 }
 
 func (b buildEstimate) heavy() bool { return b.peak >= heavyBuildPeakThreshold }

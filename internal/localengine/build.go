@@ -333,6 +333,10 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	// 重型构建排队（heavy_build.go）：选路之后、切分之前按估算峰值内存判定，重型构建先取
 	// 跨进程名额，名额被占时状态为 queued；构建结束（含失败与取消）时释放。
 	estimate := estimateBuild(useDelta, assets, changedAssets)
+	if useDelta {
+		// delta 的峰值还随既有分段规模与小段合并的搬运量增长，见 withDeltaBase。
+		estimate = estimate.withDeltaBase(priorSegmentChunks(store, previous), carriedChunkCount(previous, mergeSmall, changedAssets, removedPaths))
+	}
 	releaseSlot, err := e.waitHeavySlot(ctx, status, root, estimate)
 	if err != nil {
 		return engine.Result{}, nil, err
