@@ -32,15 +32,16 @@ func pinnedFingerprintOptions() map[string]Options {
 	}
 }
 
-// TestFingerprintPinnedValues 固定四组配置的指纹值（取自改为按组成项计算之前
-// 的实现）。指纹值一变，已部署的 wrapper 会把同样配置的新 daemon 判成配置
-// 不一致，所以组成项的重构不得改变指纹。
+// TestFingerprintPinnedValues 固定四组配置的指纹值。指纹值一变，已部署的 wrapper
+// 会把同样配置的新 daemon 判成配置不一致，所以组成项的重构不得改变指纹。精排组成项
+// 加入精排地址、前缀升到 engine-profile-v6 时四个值有意改变（v5 时依次为
+// df9c1c8cf029、055a5e4ca404、ba2a154434d6、0b5b293478d5）。
 func TestFingerprintPinnedValues(t *testing.T) {
 	want := map[string]string{
-		"lexical":          "df9c1c8cf029",
-		"embedding+rerank": "055a5e4ca404",
-		"rerank-deny":      "ba2a154434d6",
-		"bulk+strict":      "0b5b293478d5",
+		"lexical":          "775af2f24878",
+		"embedding+rerank": "194d9cd0fed3",
+		"rerank-deny":      "0420be5025c1",
+		"bulk+strict":      "4c192432ce84",
 	}
 	for name, opts := range pinnedFingerprintOptions() {
 		if got := opts.Fingerprint(); got != want[name] {
@@ -104,5 +105,31 @@ func TestFingerprintComponents(t *testing.T) {
 	}
 	if label == components["embedding"] {
 		t.Fatalf("a different endpoint must change the embedding component: %q", label)
+	}
+}
+
+// TestFingerprintRerankEndpoint：只改精排地址、模型 id 不变时，指纹与 rerank 组成项都要
+// 变，其余组成项不变，说明里不带地址中的用户信息与查询参数。精排地址不进指纹时，换了地址
+// 的新会话会复用按旧地址运行的 daemon，检索候选继续发往旧地址。
+func TestFingerprintRerankEndpoint(t *testing.T) {
+	base := pinnedFingerprintOptions()["embedding+rerank"]
+	moved := base
+	moved.Rerank.BaseURL = "https://user:pass@rerank-gateway.example/v1?token=abc"
+	if base.Fingerprint() == moved.Fingerprint() {
+		t.Fatalf("changing only the rerank endpoint must change the fingerprint: %s", base.Fingerprint())
+	}
+	before, after := base.FingerprintComponents(), moved.FingerprintComponents()
+	for _, name := range FingerprintComponentNames() {
+		if (before[name] != after[name]) != (name == "rerank") {
+			t.Fatalf("changing only the rerank endpoint must change only the rerank component; %s: %q vs %q", name, before[name], after[name])
+		}
+	}
+	if label := after["rerank"]; strings.Contains(label, "pass") || strings.Contains(label, "token=abc") || !strings.Contains(label, "rerank-gateway.example") {
+		t.Fatalf("rerank component must name the endpoint without user info or query: %q", label)
+	}
+	otherQuery := moved
+	otherQuery.Rerank.BaseURL = "https://user:pass@rerank-gateway.example/v1?token=xyz"
+	if otherQuery.FingerprintComponents()["rerank"] == after["rerank"] || otherQuery.Fingerprint() == moved.Fingerprint() {
+		t.Fatalf("endpoints that differ only in the query must still give different components and fingerprints")
 	}
 }

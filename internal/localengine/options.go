@@ -222,9 +222,11 @@ func (o Options) Fingerprint() string {
 	// 未设置评分模型、实际按 TF-IDF 评分的旧 daemon 与 BM25 的 wrapper 即使
 	// env 完全相同也不能互相复用。加入该项时前缀从 v3 升到 v4，纯词法零值
 	// 配置的指纹同样随之改变。检索降级开关退役后前缀升到 v5：旧 daemon 在
-	// 语义路失败时返回纯词法结果，新 wrapper 不能复用它。前缀在组成项变化
-	// 时升版，旧版 daemon 与新版 wrapper 不会算出相同指纹。
-	inputs := []string{"engine-profile-v5"}
+	// 语义路失败时返回纯词法结果，新 wrapper 不能复用它。精排组成项加入精排
+	// 地址后前缀升到 v6：没有配置精排的配置输入不变，不升版的话这类配置的旧
+	// daemon 与新 wrapper 会算出相同指纹。前缀在组成项变化时升版，旧版 daemon
+	// 与新版 wrapper 不会算出相同指纹。
+	inputs := []string{"engine-profile-v6"}
 	for _, part := range o.fingerprintParts() {
 		inputs = append(inputs, part.input)
 	}
@@ -280,14 +282,22 @@ func (o Options) fingerprintParts() []fingerprintPart {
 	}
 	rr := fingerprintPart{name: "rerank", input: "off", label: "off"}
 	if o.Rerank.Enabled {
-		rr.input = o.Rerank.Identity()
-		rr.label = rr.input
+		endpoint := displayEndpoint(o.Rerank.BaseURL)
 		if o.Rerank.Model == "" {
 			// 没有模型 id 时 Identity 带原始地址，label 改用去掉用户信息与查询
 			// 参数的地址，并附 input 的短哈希保持一一对应。
-			sum := sha256.Sum256([]byte(rr.input))
-			rr.label = fmt.Sprintf("%s@%s id=%s", o.Rerank.ProviderType, displayEndpoint(o.Rerank.BaseURL), hex.EncodeToString(sum[:])[:8])
+			rr.input = o.Rerank.Identity()
+			rr.label = fmt.Sprintf("%s@%s", o.Rerank.ProviderType, endpoint)
+		} else {
+			// 有模型 id 时 Identity 只有 adapter 与模型，地址另行加入：地址决定检索
+			// 候选发往哪个服务，与 embedding 一侧一样要进指纹，否则只改地址的新会话
+			// 会复用按旧地址运行的 daemon。input 带完整地址（只参与哈希），label 用
+			// 去掉用户信息与查询参数的地址并附 input 的短哈希。
+			rr.input = o.Rerank.Identity() + "@" + o.Rerank.BaseURL
+			rr.label = fmt.Sprintf("%s endpoint=%s", o.Rerank.Identity(), endpoint)
 		}
+		sum := sha256.Sum256([]byte(rr.input))
+		rr.label += " id=" + hex.EncodeToString(sum[:])[:8]
 	}
 	// QualityStrict 改变检索语义（缺口报错还是降级放行），与降级开关同类，
 	// 必须进指纹：否则一个 strict=on 与一个 strict=off 的 wrapper 会复用
