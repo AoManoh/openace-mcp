@@ -728,6 +728,23 @@ func liveRejected(files map[string]index.FileEntry) int {
 	return total
 }
 
+// rejectionChanged 报告本次构建按存活记录统计的逐文件被拒绝 chunk 数是否与 previous
+// 记录的不同。内容没变、也没有新增向量的补缺，provider 仍可能拒绝缺口里的内容（返回
+// 零向量或 NaN）：这时要发布，manifest 才会记下拒绝、把它们移出覆盖率分母；不发布的话
+// previous 一直显示语义不完整，之后每次内容不变的同步与检索都会再走一遍全量构建，
+// 被拒绝的内容也一直按可补的缺口列出。
+func rejectionChanged(previous *index.Manifest, recordsByFile map[string][]chunkRecord, seman semanticOutcome) bool {
+	if !seman.enabled || (len(seman.rejectedKeys) == 0 && previous.RejectedCount == 0) {
+		return false
+	}
+	for path, fileRecords := range recordsByFile {
+		if coveredPerFile(fileRecords, seman.rejectedKeys) != previous.Files[path].RejectedChunks {
+			return true
+		}
+	}
+	return false
+}
+
 func coveredPerFile(fileRecords []chunkRecord, coveredHash map[string]bool) int {
 	covered := 0
 	for _, record := range fileRecords {
@@ -750,8 +767,9 @@ func coveredPerFile(fileRecords []chunkRecord, coveredHash map[string]bool) int 
 //   - 装载既有向量：active 与 previous revision 的向量优先；只在首建、语义
 //     未完整或 active 段物理不全时并入同工作区旧 chunk profile 子树的
 //     向量。
-//   - 内容未变、词法可用且向量没有实质增加时不发布新 revision，返回现有
-//     revision，缺口留在状态里，避免堆积没有变化的 revision。
+//   - 内容未变、词法可用、向量没有实质增加且被拒绝 chunk 的统计也没变时
+//     不发布新 revision，返回现有 revision，缺口留在状态里，避免堆积没有
+//     变化的 revision。
 //   - 其余情况写 staging、组装单段 manifest v2、原子发布。
 func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, assets workspace.AssetSet, contentChanged bool, needsLexicalRebuild bool, buildMode string) (engine.Result, *index.Manifest, error) {
 	// syncStart 是本次同步开始时的 active revision，Deleted 相对它计算；
@@ -864,9 +882,10 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 	// revision，缺口留在状态里，避免堆积没有变化的 revision。全量构建覆盖
 	// 全部存活 chunk，迁移暂停原因（seman.migrationBlock）就是本次的完整
 	// 判定；它与现有 revision 记录的不同（出现、换成别的原因或已解除）时
-	// 照常发布，持久化的原因跟着更新，重启后不会读到过期的原因。
+	// 照常发布，持久化的原因跟着更新，重启后不会读到过期的原因。被拒绝
+	// chunk 的逐文件统计与现有 revision 不同时同样发布（见 rejectionChanged）。
 	if previous != nil && !contentChanged && !needsLexicalRebuild && !seman.improved() &&
-		seman.migrationBlock == previous.SemanticMigrationBlock {
+		seman.migrationBlock == previous.SemanticMigrationBlock && !rejectionChanged(previous, recordsByFile, seman) {
 		status.setSemanticOutcome(seman.rejected, seman.lastError)
 		status.setSharedVectors(seman.sharedReused, seman.sharedError)
 		status.ready(previous, revisionCount(store, previous))
