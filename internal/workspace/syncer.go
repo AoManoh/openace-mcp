@@ -101,6 +101,11 @@ func scanWithProgress(ctx context.Context, root string, cache *StatCache, progre
 	}
 	maxBytes := int64(maxFileBytes())
 	textMaxBytes := int64(maxTextFileBytes())
+	// admitBytes 是当前上限下能收录的最大文件（readIndexableContent 按两个上限中
+	// 较大的一个判超限，内容门禁与大小无关）。stat 缓存命中只说明内容没变，收录与否
+	// 还要按当前上限判定：上限来自进程环境变量，同一进程里不变，但 stat 快照跨重启
+	// 装入，重启时调小了上限，旧条目照样命中。
+	admitBytes := max(maxBytes, textMaxBytes)
 	// F6 扫描器债修复:ignore 规则按目录栈管理,而非在整个 walk 期单调
 	// 累积——旧实现里已完成兄弟子树的规则(经 base 检查必然空转)仍被
 	// 每个后续文件逐条求值,大仓深处一次 Match 扫上千条规则(sealed
@@ -154,11 +159,15 @@ func scanWithProgress(ctx context.Context, root string, cache *StatCache, progre
 		if cache != nil {
 			if info, infoErr := d.Info(); infoErr == nil {
 				key := statKeyOf(info)
-				if hit, ok := cache.lookup(rel, key, scanStart); ok {
-					seen[rel] = true
-					files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: hit, Size: info.Size()})
-					report()
-					return nil
+				// 超过 admitBytes 的文件不走命中，交给 readScanBlob 按超限跳过并计数
+				// （它先看 stat 大小，不读内容）。
+				if info.Size() <= admitBytes {
+					if hit, ok := cache.lookup(rel, key, scanStart); ok {
+						seen[rel] = true
+						files = append(files, fileBlob{AbsPath: path, RelPath: rel, BlobName: hit, Size: info.Size()})
+						report()
+						return nil
+					}
 				}
 				content, ok, err := readScanBlob(ctx, path, maxBytes, textMaxBytes, &stats)
 				if err != nil || !ok {
