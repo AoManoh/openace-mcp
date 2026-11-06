@@ -415,6 +415,10 @@ func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
 		return ok(req.ID, map[string]any{"tools": tools})
 	case "tools/call":
 		return s.callTool(ctx, req)
+	case "ping":
+		// MCP 2025-11-25 规范（basic/utilities/ping）：收到 ping 立即回空 result，客户端
+		// 用它检查连接是否还活着；落到 method not found 会被当成服务不可用。
+		return ok(req.ID, map[string]any{})
 	default:
 		return fail(req.ID, -32601, "method not found: "+req.Method)
 	}
