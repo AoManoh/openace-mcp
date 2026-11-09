@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -182,6 +183,62 @@ func TestQueryBuildWaitDetachesEarlyOnLongETA(t *testing.T) {
 	// 提前脱离的证据:远早于 8s 预算返回(留足调度余量)。
 	if elapsed > 5*time.Second {
 		t.Fatalf("ETA 超预算应提前脱离等待,实际 %v", elapsed)
+	}
+}
+
+// TestFirstBuildQueryKeepsWaitingWhenInterimRevisionCannotAnswer 回归 2026-11-09
+// 的生产实例（docs/debug/2026-11-09-first-build-query-refused.md）：
+// 新工作区的第一次检索触发首次构建，第一个嵌入请求立即返回，其余请求 0.6 秒后才一起
+// 返回，早期按已完成数估出的 ETA 远超剩余等待预算，而构建实际约 0.7 秒完成。首次构建
+// 先发布的词法中间 revision 没有向量，配置了 embedding 时一定被拒绝作答；查询应继续
+// 等到构建完成并正常作答，不能按 ETA 提前放弃等待、再以 semantic-index-empty 报错。
+func TestFirstBuildQueryKeepsWaitingWhenInterimRevisionCannotAnswer(t *testing.T) {
+	const dim = 8
+	server := newEmbedServer(t, dim)
+	defer server.ts.Close()
+	release := make(chan struct{})
+	var startRelease sync.Once
+	var requests int64
+	inner := server.ts.Config.Handler
+	server.ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt64(&requests, 1) > 1 {
+			startRelease.Do(func() { time.AfterFunc(600*time.Millisecond, func() { close(release) }) })
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		inner.ServeHTTP(w, r)
+	})
+	opts := embedOptions(server.ts.URL, dim, 1, "fake-model") // batch=1:每个 chunk 一个请求
+	opts.QueryBuildWait = 3 * time.Second
+	e := newTestEngineWith(t, opts)
+	e.buildWaitSlice = 100 * time.Millisecond
+	root := newFixtureWorkspace(t)
+	var b strings.Builder
+	b.WriteString("package app\n")
+	for i := 0; i < 26; i++ {
+		b.WriteString("\n// Widget 声明。\nfunc Widget")
+		b.WriteByte(byte('A' + i))
+		b.WriteString("() {}\n")
+	}
+	writeFixture(t, root, "widgets.go", b.String())
+
+	start := time.Now()
+	res, err := e.Search(context.Background(), searchRequest(root, "HandleLogin"))
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("构建能在等待预算内完成时，第一次检索应等到结果（实际 %v 后返回）: %v", elapsed, err)
+	}
+	if res.SemanticCoverage != "100%" || res.DegradedReason != "" {
+		t.Fatalf("应以构建完成后的 revision 作答: coverage=%s degraded=%q", res.SemanticCoverage, res.DegradedReason)
+	}
+	if !strings.Contains(res.Text, "HandleLogin") {
+		t.Fatalf("结果应命中 HandleLogin: %q", res.Text)
+	}
+	if elapsed >= opts.QueryBuildWait {
+		t.Fatalf("构建约 0.7 秒完成，检索不应等满 %s，实际 %v", opts.QueryBuildWait, elapsed)
 	}
 }
 

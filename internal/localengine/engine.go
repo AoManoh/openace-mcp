@@ -626,10 +626,11 @@ var errFirstTouchRefresh = errors.New("first touch refresh in background")
 // firstTouchFastPath 判定是否走首触快路径，需要时启动后台同步。返回
 // (errFirstTouchRefresh, true) 表示走快路径；本进程内最近一次已结束的刷新
 // 失败时返回 (该次失败的原文错误, true)，上层按 stale-index 应答。条件：
-// 本 daemon 生命周期内该工作区还没有成功同步过，且磁盘上已有可服务的
-// revision。后台同步 goroutine 每个工作区最多一个（firstTouchKicks 登记），
-// 完成后清除登记；同步失败时下一次查询会再启动一次，与内联同步失败后的
-// 重试一致，失败原因经状态的 last_error 可见，不会一直静默用旧索引。
+// 本 daemon 生命周期内该工作区还没有成功同步过，且磁盘上的 revision 按现行
+// 政策能作答（answerableRevision）。后台同步 goroutine 每个工作区最多一个
+// （firstTouchKicks 登记），完成后清除登记；同步失败时下一次查询会再启动
+// 一次，与内联同步失败后的重试一致，失败原因经状态的 last_error 可见，不会
+// 一直静默用旧索引。
 func (e *Engine) firstTouchFastPath(ref engine.WorkspaceRef) (error, bool) {
 	root, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
 	if err != nil {
@@ -639,7 +640,7 @@ func (e *Engine) firstTouchFastPath(ref engine.WorkspaceRef) (error, bool) {
 	_, synced := e.lastSyncOK[workspaceKey]
 	failure, failed := e.refreshFailures[workspaceKey]
 	e.mu.Unlock()
-	if synced || !e.hasServableRevision(ref) {
+	if synced || !e.answerableRevision(ref, "index-refreshing") {
 		return nil, false
 	}
 	// stat 快照装入了条目时，扫描只重新哈希停机期间变化的文件，第一次检索走普通流程
@@ -690,8 +691,9 @@ func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.Workspace
 	// 让上层用旧 revision 应答（原因 index-refreshing，进 [DEGRADED] 横幅；
 	// 本进程最近一次刷新失败时返回该次失败的错误，原因为 stale-index），
 	// 同时后台启动一次真实同步；同步成功后 lastSyncOK 置位，本路径不再
-	// 触发。不走的情况：显式 Sync；没有任何 revision 的工作区；严格档（它
-	// 会把任何降级原因判为违规，走快路径只会必然报错）。
+	// 触发。不走的情况：显式 Sync；没有任何 revision 的工作区；磁盘上的
+	// revision 不能作答（例如首次构建中途重启留下的、没有向量的词法中间
+	// revision）；严格档（它会把任何降级原因判为违规，走快路径只会必然报错）。
 	if !e.qualityStrict {
 		if err, ok := e.firstTouchFastPath(ref); ok {
 			return engine.Result{}, err
@@ -743,7 +745,7 @@ func (e *Engine) syncWorkspaceForQuery(ctx context.Context, ref engine.Workspace
 			// 拿到结果、调用方取消、或非超时的真实构建错误：原样返回。
 			return res, err
 		}
-		if eta := e.buildETASeconds(ref); eta > 0 && time.Duration(eta)*time.Second > time.Until(deadline) && e.hasServableRevision(ref) {
+		if eta := e.buildETASeconds(ref); eta > 0 && time.Duration(eta)*time.Second > time.Until(deadline) && e.answerableRevision(ref, "index-building") {
 			return engine.Result{}, e.queryBuildWaitError(ref, fmt.Sprintf("构建 ETA 超出 %s=%s 预算,提前以既有索引应答,构建继续后台推进", EnvQueryBuildWait, e.queryBuildWait))
 		}
 	}
@@ -777,9 +779,10 @@ func (e *Engine) buildETASeconds(ref engine.WorkspaceRef) int {
 	return eta
 }
 
-// hasServableRevision 报告该工作区是否有可以应答的 revision。提前放弃等待
-// 只在有旧索引可答时发生：没有 revision 时提前放弃只是把错误提前返回，
-// 小仓首建本来可能在预算内等到结果。
+// hasServableRevision 报告该工作区是否已有能取得句柄的 revision，不判断它能否
+// 按现行政策作答。只供重型构建的提前返回使用：重型构建要几分钟到几十分钟，
+// 等满上限也等不到结果，现有 revision 能作答时立即降级作答，不能作答时立即
+// 返回带构建进度的错误，都比等满上限再返回好。
 func (e *Engine) hasServableRevision(ref engine.WorkspaceRef) bool {
 	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
 	if err != nil {
@@ -791,6 +794,34 @@ func (e *Engine) hasServableRevision(ref engine.WorkspaceRef) bool {
 	}
 	e.releaseHandle(handle)
 	return true
+}
+
+// answerableRevision 报告该工作区现有 revision 能否按现行政策作答：能取得句柄，
+// 而且以它作答时带上的原因 reason（index-building 或 index-refreshing）、它的
+// manifest 已能说明的缺口（manifestGaps）与缺向量文件过多的缺口
+// （coverageListing）都不被 policyError 拒绝，与检索最后的判定是同一套规则。
+// ETA 提前放弃等待与首触快路径只在它为真时生效。没有 revision 时提前放弃只是
+// 把错误提前返回；首次构建先发布的词法中间 revision 没有向量，配置了 embedding
+// 时一定被拒绝，按它放弃等待同样只是提前报错，而小仓首建本来能在上限内等到
+// 结果（2026-11-09 生产实例：4,257 个 chunk 的新工作区，检索第 10 秒报
+// semantic-index-empty，构建在第 38.7 秒完成，上限 40 秒）。
+func (e *Engine) answerableRevision(ref engine.WorkspaceRef, reason string) bool {
+	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
+	if err != nil {
+		return false
+	}
+	handle, err := e.acquireHandle(workspaceKey)
+	if err != nil {
+		return false
+	}
+	defer e.releaseHandle(handle)
+	gaps := append([]qualityGap{{reason: reason}}, e.manifestGaps(handle.manifest)...)
+	if e.semanticEnabled() && (handle.manifest.RejectedCount > 0 || !handle.manifest.SemanticComplete()) {
+		if _, _, _, listGap := coverageListing(handle.manifest); listGap != nil {
+			gaps = append(gaps, *listGap)
+		}
+	}
+	return e.policyError(gaps) == nil
 }
 
 // buildProgressLabel 把构建进度快照格式化为错误文本里的一段：阶段、已嵌

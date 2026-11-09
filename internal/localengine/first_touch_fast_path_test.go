@@ -2,9 +2,11 @@ package localengine
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -199,6 +201,70 @@ func TestFirstTouchSkippedWhenStrictOrCold(t *testing.T) {
 			t.Fatalf("真冷仓不得披露 refreshing: %q", result.DegradedReason)
 		}
 	})
+}
+
+// TestFirstTouchSkipsInterimRevisionWithoutVectors（docs/debug/2026-11-09-first-build-query-refused.md
+// 第 4.3 节）：首次构建发布词法中间 revision 后中断，模拟 daemon 在首次构建中途重启；
+// 磁盘上的 active revision 没有向量，stat 快照也没有写出。配置了 embedding 时这个
+// revision 一定被拒绝作答，重启后的第一次检索不应走首触快路径立即报 semantic-index-empty，
+// 应同步补齐后正常作答。
+func TestFirstTouchSkipsInterimRevisionWithoutVectors(t *testing.T) {
+	const dim = 8
+	server := newEmbedServer(t, dim)
+	defer server.ts.Close()
+	var delayMs int64 = 200
+	inner := server.ts.Config.Handler
+	server.ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if d := atomic.LoadInt64(&delayMs); d > 0 {
+			time.Sleep(time.Duration(d) * time.Millisecond)
+		}
+		inner.ServeHTTP(w, r)
+	})
+	opts := embedOptions(server.ts.URL, dim, 1, "t1-interim")
+	t.Setenv("OPENACE_CACHE_DIR", t.TempDir())
+	t.Setenv("OPENACE_CACHE_NAMESPACE", "t1interim")
+	root := newFixtureWorkspace(t)
+
+	e1, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := e1.Sync(ctx, syncRequest(root))
+		done <- err
+	}()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		status, err := e1.WorkspaceStatus(context.Background(), engineRef(root))
+		if err == nil && status.IndexRevision != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("词法中间 revision 未发布")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	if err := e1.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	atomic.StoreInt64(&delayMs, 0)
+
+	e2 := restartedEngine(t, opts)
+	interim, _ := loadActiveManifest(t, e2, root)
+	if interim.VectorCount != 0 || interim.Counts.Chunks == 0 {
+		t.Fatalf("磁盘上的 active 应是没有向量的词法中间 revision: vectors=%d chunks=%d", interim.VectorCount, interim.Counts.Chunks)
+	}
+	result, err := e2.Search(context.Background(), searchRequest(root, "parse_config"))
+	if err != nil {
+		t.Fatalf("磁盘上只有不能作答的 revision 时，首次检索应同步补齐后作答: %v", err)
+	}
+	if result.SemanticCoverage != "100%" || strings.Contains(result.DegradedReason, "index-refreshing") {
+		t.Fatalf("不应走首触快路径: coverage=%s degraded=%q", result.SemanticCoverage, result.DegradedReason)
+	}
 }
 
 // TestUnchangedWorkspaceSyncIsNoOp 回归 T1-churn 的引擎面:含纯空白文件

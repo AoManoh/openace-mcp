@@ -18,24 +18,29 @@ import (
 // 显式 Sync 语义不变(阻塞到最终发布,返回 100% 覆盖)。
 
 // TestColdBuildPublishesLexicalFirst:慢嵌入冷仓,后台 Sync;词法
-// revision 应在 embedding 完成前可服务,查询拿到降级词法结果;放行后
-// Sync 返回语义完整。
+// revision 应在 embedding 完成前发布,构建中的查询返回带构建进度的错误;
+// 放行后 Sync 返回语义完整。
 func TestColdBuildPublishesLexicalFirst(t *testing.T) {
 	const dim = 8
 	server := newEmbedServer(t, dim)
 	defer server.ts.Close()
-	var delayMs int64 = 300 // 每批嵌入 300ms,batch=1 逐 chunk 慢嵌
+	// 嵌入请求在查询返回前全部挂起(batch=1 逐 chunk),构建不可能在查询
+	// 预算内完成,与吞吐治理器扩窗快慢无关。
+	hold := make(chan struct{})
 	inner := server.ts.Config.Handler
 	server.ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if d := atomic.LoadInt64(&delayMs); d > 0 {
-			time.Sleep(time.Duration(d) * time.Millisecond)
+		select {
+		case <-hold:
+		case <-r.Context().Done():
+			return
 		}
 		inner.ServeHTTP(w, r)
 	})
 	opts := embedOptions(server.ts.URL, dim, 1, "fake-model")
-	// 预算 2s << 嵌入总时长(≈35 chunks × 300ms ≈ 10s):查询经 ETA
-	// 提前脱离,以词法中间 revision 降级应答。
-	opts.QueryBuildWait = 2 * time.Second
+	// 预算 300ms,远短于 2s 的请求超时,挂起的请求不会超时失败。词法中间
+	// revision 没有向量、不能作答,查询不按 ETA 提前放弃,等满预算后返回
+	// 带构建进度的错误。
+	opts.QueryBuildWait = 300 * time.Millisecond
 	e := newTestEngineWith(t, opts)
 	e.buildWaitSlice = 100 * time.Millisecond
 	root := newFixtureWorkspace(t)
@@ -82,7 +87,7 @@ func TestColdBuildPublishesLexicalFirst(t *testing.T) {
 	}
 
 	// 放行嵌入,Sync 返回语义完整;最终 revision 覆盖 100%。
-	atomic.StoreInt64(&delayMs, 0)
+	close(hold)
 	select {
 	case final := <-syncDone:
 		if err := <-syncErr; err != nil {
