@@ -128,6 +128,11 @@ type Engine struct {
 	// 持有它的句柄数引用计数，归零即释放。
 	vectorMu       sync.Mutex
 	vectorSegments map[string]*sharedVectorIndex
+	// vectorRetained 记录每个工作区（键为 workspaceKey）在最近一次发布时留下的向量段
+	// 引用：新 active revision 仍引用、当时已加载的 mmap 分段的缓存键。下一次检索打开
+	// 新 revision 的句柄时这些分段直接命中段缓存，不重新映射与校验；下一次发布按新
+	// manifest 重新核对，引擎关闭时全部释放。见 retainActiveVectorSegments。
+	vectorRetained map[string][]string
 	// segmentMetaMu 保护 segmentMetaCache：各分段 chunks.jsonl 解码出的按文件
 	// 分组的元数据，键为分段目录加 chunks 校验和，见 segment_meta_cache.go。
 	segmentMetaMu    sync.Mutex
@@ -202,6 +207,7 @@ func New(opts Options) (*Engine, error) {
 		stores:          make(map[string]*index.Store),
 		handles:         make(map[string]*revisionHandle),
 		vectorSegments:  make(map[string]*sharedVectorIndex),
+		vectorRetained:  make(map[string][]string),
 		repair:          make(map[string]bool),
 		gapFillPause:    make(map[string]string),
 		journals:        make(map[string]*index.Journal),
@@ -1076,6 +1082,16 @@ func (e *Engine) Close(ctx context.Context) error {
 			delete(e.handles, revision)
 		}
 	}
+	// 发布时为各工作区留下的向量段引用一并释放；closed 已置位，此后的发布收尾不会
+	// 再留新的引用（retainActiveVectorSegments）。
+	e.vectorMu.Lock()
+	var retainedKeys []string
+	for workspaceKey, keys := range e.vectorRetained {
+		retainedKeys = append(retainedKeys, keys...)
+		delete(e.vectorRetained, workspaceKey)
+	}
+	e.vectorMu.Unlock()
+	e.releaseVectorSegments(retainedKeys)
 	// 分段元数据缓存只服务后续打开的句柄，引擎关闭后不会再有新句柄，随之释放。
 	e.segmentMetaMu.Lock()
 	e.segmentMetaCache = nil

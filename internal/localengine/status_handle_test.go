@@ -37,7 +37,7 @@ func TestWorkspaceStatusDoesNotOpenHandle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.retireHandles(workspaceKey, "", "")
+	e.retireHandles(workspaceKey, "", nil)
 	if n := openHandles(e, workspaceKey); n != 0 {
 		t.Fatalf("setup: %d handles still cached", n)
 	}

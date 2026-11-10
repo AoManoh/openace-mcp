@@ -1561,12 +1561,88 @@ func (e *Engine) releaseHandle(handle *revisionHandle) {
 	}
 }
 
+// manifestVectorKeys 返回 manifest 里带向量的各分段在段缓存中的键，与
+// revisionHandle.vectorIndexes 加载这些分段时用的键相同（同一目录、维度与两个
+// checksum）。没有配置 embedding 或 manifest 为 nil 时返回 nil。
+func (e *Engine) manifestVectorKeys(store *index.Store, manifest *index.Manifest) []string {
+	if manifest == nil || !e.semanticEnabled() {
+		return nil
+	}
+	keys := make([]string, 0, len(manifest.Segments))
+	for _, segment := range manifest.Segments {
+		if segment.VectorsChecksum == "" {
+			continue
+		}
+		keys = append(keys, vectorSegmentKey(store.SegmentPathFor(segment.ID), e.embedCfg.Dimension,
+			segment.VectorsChecksum, segment.VectorsIndexChecksum))
+	}
+	return keys
+}
+
+// retainActiveVectorSegments 在发布新 revision、关闭旧句柄之前调用：activeKeys 是新
+// active revision 各向量段的缓存键，其中已经加载完成的段各加一个记在该工作区名下
+// 的引用，上一次发布留下的引用随后释放。
+//
+// 为什么要留：新 revision 的句柄到下一次检索才打开，向量也到那时才加载。不留引用
+// 时，旧句柄一关闭，段缓存里的引用归零，映射被解除；下一次检索要把新旧 revision
+// 共用的分段重新映射并整读校验 checksum。delta 发布只新增一个小分段，其余分段
+// 原样沿用，24 万个 1024 维向量（约 940 MiB）的工作区每个新 revision 的第一次
+// 检索因此多花 0.75 至 1 秒，文件页不在内存里时更久；而文件经常变动的工作区
+// 几乎每次检索面对的都是新 revision。
+//
+// 留哪些、不留哪些：
+//   - 只留 activeKeys 里的段。全量重建或合并后被替换的旧分段不在其中，随本次发布
+//     释放，新旧两套完整向量不会同时留在缓存里；GC 只删除 active 与 previous 之外
+//     的 revision 独有的分段，留下的段不会挡住它删除目录。
+//   - 只留已加载完成的段，不为此加载任何文件：没有被检索过的工作区不产生读盘与
+//     校验，还在加载的段结果未知，也不留。
+//   - 只留 mmap 驻留的段。映射是文件后备页，内存紧张时内核可以回收；heap 形态
+//     （OPENACE_VECTOR_MMAP=off 或文件系统不支持映射）是匿名内存，保持发布即释放。
+//   - 引擎已关闭时不留，并释放已有的引用。
+//
+// 锁顺序与 Close 一致：先 e.mu 再 e.vectorMu。
+func (e *Engine) retainActiveVectorSegments(workspaceKey string, activeKeys []string) {
+	var retained []string
+	e.mu.Lock()
+	e.vectorMu.Lock()
+	if !e.closed {
+		for _, key := range activeKeys {
+			shared, ok := e.vectorSegments[key]
+			if !ok {
+				continue
+			}
+			select {
+			case <-shared.ready:
+			default:
+				continue
+			}
+			if shared.err != nil || shared.ix == nil || !shared.ix.Mapped() {
+				continue
+			}
+			shared.refs++
+			retained = append(retained, key)
+		}
+	}
+	previous := e.vectorRetained[workspaceKey]
+	if len(retained) > 0 {
+		e.vectorRetained[workspaceKey] = retained
+	} else {
+		delete(e.vectorRetained, workspaceKey)
+	}
+	e.vectorMu.Unlock()
+	e.mu.Unlock()
+	e.releaseVectorSegments(previous)
+}
+
 // retireHandles 在新 revision 发布后把该工作区除 activeRevision 之外的句柄
 // 全部标记退役：没有引用的立即关闭，正在被查询使用的等 releaseHandle 归
 // 零后关闭。previous revision 的磁盘数据仍由 GC 保留，需要回退时重新打开
 // 即可；不保留其句柄是因为闲置的 previous 句柄会让 compaction 前后两套
-// 完整向量同时常驻内存。第三个参数保留形参位，当前未使用。
-func (e *Engine) retireHandles(workspaceKey string, activeRevision string, _ string) {
+// 完整向量同时常驻内存。activeVectorKeys 是新 active revision 各向量段的缓存键
+// （manifestVectorKeys）：关闭旧句柄之前先为其中已加载的段留一个引用，见
+// retainActiveVectorSegments；传 nil 表示新 revision 不沿用任何已加载的向量段。
+func (e *Engine) retireHandles(workspaceKey string, activeRevision string, activeVectorKeys []string) {
+	e.retainActiveVectorSegments(workspaceKey, activeVectorKeys)
 	keep := map[string]bool{
 		handleKey(workspaceKey, activeRevision): true,
 	}

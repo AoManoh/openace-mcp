@@ -464,7 +464,7 @@ func (e *Engine) publishLexicalInterim(ctx context.Context, store *index.Store, 
 		discard()
 		return nil
 	}
-	e.retireHandles(workspaceKey, manifest.Revision, "")
+	e.retireHandles(workspaceKey, manifest.Revision, e.manifestVectorKeys(store, manifest))
 	status.publishedInterim(manifest, revisionCount(store, manifest))
 	return manifest
 }
@@ -665,7 +665,7 @@ func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKe
 		}
 		return engine.Result{}, nil, fmt.Errorf("发布索引: %w", err)
 	}
-	e.retireHandles(workspaceKey, manifest.Revision, manifest.PreviousRevision)
+	e.retireHandles(workspaceKey, manifest.Revision, e.manifestVectorKeys(store, manifest))
 	e.gcRevisions(store, status, workspaceKey, manifest.Revision, manifest.PreviousRevision)
 	// 已随 revision 入盘的向量从 journal 清除；失败不影响发布，条目留到
 	// 下次发布再清。清理按偏移把剩余记录复制到新文件，复制时可能发现校验失败

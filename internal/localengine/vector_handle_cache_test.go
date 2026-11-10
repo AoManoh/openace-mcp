@@ -79,7 +79,7 @@ func TestRevisionHandlesShareImmutableVectorSegments(t *testing.T) {
 	e.releaseHandle(current)
 	// 下一次 full/compaction 发布后旧 active 不再留作内存句柄；previous
 	// 磁盘 revision 仍在，需要回退时可重新打开。
-	e.retireHandles(workspaceKey, "future-revision", "")
+	e.retireHandles(workspaceKey, "future-revision", nil)
 	e.vectorMu.Lock()
 	cached = len(e.vectorSegments)
 	e.vectorMu.Unlock()
