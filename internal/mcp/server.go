@@ -589,8 +589,10 @@ func retrievalDiagnosticsText(result engine.Result) string {
 	}
 	if result.Timings != nil {
 		t := result.Timings
-		parts = append(parts, fmt.Sprintf("timings_ms[total=%d sync=%d lexical=%d embed=%d vector=%d fuse=%d rerank=%d render=%d]",
-			t.TotalMs, t.SyncMs, t.LexicalMs, t.QueryEmbedMs, t.VectorMs, t.FuseMs, t.RerankMs, t.RenderMs))
+		// vector_load 是为所用 revision 加载向量段的耗时（见 engine.RetrievalTimings），
+		// 与其余分项相加才对得上 total。
+		parts = append(parts, fmt.Sprintf("timings_ms[total=%d sync=%d lexical=%d embed=%d vector_load=%d vector=%d fuse=%d rerank=%d render=%d]",
+			t.TotalMs, t.SyncMs, t.LexicalMs, t.QueryEmbedMs, t.VectorLoadMs, t.VectorMs, t.FuseMs, t.RerankMs, t.RenderMs))
 		// 精排的尝试次数、重试等待与最长单次耗时：精排慢时据此区分服务商单次
 		// 响应慢与客户端在重试。没有发出精排请求时不写。
 		if t.RerankAttempts > 0 {

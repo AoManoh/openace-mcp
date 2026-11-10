@@ -143,6 +143,10 @@ type sharedVectorIndex struct {
 	refs  int
 }
 
+// loadVectorSegmentHook 在段缓存里没有某个分段、即将用 vector.Load 读取并校验它的
+// 向量文件时调用，参数为分段目录。只供测试统计加载次数或插入延迟，生产路径为 nil。
+var loadVectorSegmentHook func(dir string)
+
 func vectorSegmentKey(dir string, dimension int, dataChecksum string, indexChecksum string) string {
 	return fmt.Sprintf("%s\x00%d\x00%s\x00%s", dir, dimension, dataChecksum, indexChecksum)
 }
@@ -173,6 +177,9 @@ func (e *Engine) acquireVectorSegment(dir string, dimension int, dataChecksum st
 	e.vectorSegments[key] = shared
 	e.vectorMu.Unlock()
 
+	if hook := loadVectorSegmentHook; hook != nil {
+		hook(dir)
+	}
 	ix, err := vector.Load(dir, dimension, dataChecksum, indexChecksum)
 	e.vectorMu.Lock()
 	shared.ix, shared.err = ix, err
@@ -1047,7 +1054,13 @@ func filterRankedByPathPrefix(handle *revisionHandle, ordered []rankedHit, prefi
 //
 // 只有 ctx 取消、政策拒绝与向量检索本身出错才返回 error。
 func (e *Engine) denseRoute(ctx context.Context, workspaceKey string, handle *revisionHandle, query string, depth int, timings *engine.RetrievalTimings, pathPrefix string) ([]string, error) {
+	// 加载向量段要映射文件并整读校验 checksum，大工作区是秒级。它单独计时：不计入
+	// 任何分项时，结果里的 total 会比各分项之和多出这段时间，调用方无从归因。
+	loadStart := time.Now()
 	ixs, loadErr := handle.vectorIndexes(e.embedCfg.Dimension)
+	if timings != nil {
+		timings.VectorLoadMs = time.Since(loadStart).Milliseconds()
+	}
 	total := 0
 	for _, ix := range ixs {
 		total += ix.Count()

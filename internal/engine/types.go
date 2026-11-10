@@ -189,10 +189,17 @@ type DisplayStats struct {
 // RetrievalTimings 是单次检索各阶段耗时(毫秒)。SyncMs 含查询前置
 // (内联同步/有界等待/句柄获取);QueryEmbedMs/VectorMs 仅语义路;
 // FuseMs 为 RRF 融合本体;RenderMs 含合并与预算渲染。
+//
+// VectorLoadMs 是本次检索为所用 revision 加载向量段的耗时:映射向量文件并整读
+// 校验 checksum,耗时随向量文件大小增长(24 万个 1024 维向量约 940 MiB,文件页都在
+// 内存里时实测 0.75 至 1 秒,不在内存里时更久)。只有某个 revision 的第一次语义
+// 检索需要加载,且只加载段缓存里没有的分段;同一 revision 的后续检索为 0。它单独
+// 成项,各分项之和才与 TotalMs 对得上。
 type RetrievalTimings struct {
 	SyncMs       int64 `json:"sync_ms"`
 	LexicalMs    int64 `json:"lexical_ms"`
 	QueryEmbedMs int64 `json:"query_embed_ms,omitempty"`
+	VectorLoadMs int64 `json:"vector_load_ms,omitempty"`
 	VectorMs     int64 `json:"vector_ms,omitempty"`
 	FuseMs       int64 `json:"fuse_ms,omitempty"`
 	RerankMs     int64 `json:"rerank_ms,omitempty"`
