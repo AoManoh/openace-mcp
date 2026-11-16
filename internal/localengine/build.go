@@ -245,7 +245,8 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 
 	// 跨进程写锁：构建、GC、journal 都是写路径，必须独占；查询只读不经
 	// 此处。锁在引擎生命周期内持有并跨构建复用。
-	if _, err := e.acquireWriteLock(workspaceKey, store); err != nil {
+	writeLock, err := e.acquireWriteLock(workspaceKey, store)
+	if err != nil {
 		return engine.Result{}, nil, err
 	}
 
@@ -343,7 +344,7 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 	}
 	defer releaseSlot()
 	if useDelta {
-		deltaResult, deltaManifest, deltaErr := e.buildDelta(ctx, store, status, root, workspaceKey, previous, assets, mergeSmall)
+		deltaResult, deltaManifest, deltaErr := e.buildDelta(ctx, store, writeLock, status, root, workspaceKey, previous, assets, mergeSmall)
 		if !errors.Is(deltaErr, errSmallMergeUnavailable) {
 			// delta 只在把覆盖补完整时解除暂停（例如删掉了一直被拒的文件），
 			// 否则状态会在覆盖 100% 时仍显示暂停。delta 让缺口变小但没补完
@@ -363,7 +364,7 @@ func (e *Engine) runBuild(ctx context.Context, root pathutil.WorkspaceRoot, work
 			defer releaseFull()
 		}
 	}
-	result, manifest, err = e.buildFull(ctx, store, status, root, workspaceKey, previous, assets, contentChanged, needsLexicalRebuild,
+	result, manifest, err = e.buildFull(ctx, store, writeLock, status, root, workspaceKey, previous, assets, contentChanged, needsLexicalRebuild,
 		fullBuildReason(previous, contentChanged, needsLexicalRebuild, repairRequested, garbage, gapFill))
 	if err == nil {
 		e.noteGapFillOutcome(workspaceKey, previous, manifest, gapFill)
@@ -424,17 +425,17 @@ func (e *Engine) noteGapFillOutcome(workspaceKey string, previous *index.Manifes
 // publishLexicalInterim 在首次构建的嵌入开始前发布一个只有词法索引的中间
 // revision，与最终发布共用 staging、manifest 与原子发布机制。向量文件为
 // 空集，这是合法状态：向量索引载入后 Count=0，查询的向量路按覆盖为空
-// 直接跳过，不会登记修复。任何一步失败都返回 nil 且不影响主构建：中间
-// 发布只是让仓库更早可检索，最终发布才是正确性路径。发布前复验写锁，
-// 失锁即放弃。
-func (e *Engine) publishLexicalInterim(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, records []chunkRecord, files map[string]index.FileEntry, capabilities map[string]string, totalBytes int64) *index.Manifest {
+// 直接跳过，不会登记修复。一般中间发布失败返回 nil，不影响主构建。
+// 写锁失效必须返回错误并终止整次构建；最终发布也只能验证本次构建
+// 最初取得的锁，不能重新取锁后发布基于旧快照的结果。
+func (e *Engine) publishLexicalInterim(ctx context.Context, store *index.Store, writeLock *index.ProcessLock, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, records []chunkRecord, files map[string]index.FileEntry, capabilities map[string]string, totalBytes int64) (*index.Manifest, error) {
 	if err := ctx.Err(); err != nil {
-		return nil
+		return nil, nil
 	}
 	interim := semanticOutcome{enabled: true}
 	artifacts, discard, err := e.buildSegmentStaging(ctx, store, records, interim)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	manifest := e.newManifestSkeleton(root, "rev-"+artifacts.buildID, nil)
 	manifest.ChunkerCapabilities = capabilities
@@ -452,21 +453,18 @@ func (e *Engine) publishLexicalInterim(ctx context.Context, store *index.Store, 
 		VectorsIndexChecksum: artifacts.vectorsIndexChecksum,
 		Counts:               manifest.Counts,
 	}}
-	// 发布前复验写锁：失锁说明所有权已被其他进程接管，放弃中间发布。
-	if lock, err := e.acquireWriteLock(workspaceKey, store); err != nil {
+	// 只验证构建最初取得的锁；失锁后不能继续嵌入或重新获取锁发布。
+	if err := e.verifyWriteLock(workspaceKey, writeLock); err != nil {
 		discard()
-		return nil
-	} else if err := lock.Verify(); err != nil {
-		discard()
-		return nil
+		return nil, err
 	}
 	if err := store.Publish(manifest, artifacts.staging); err != nil {
 		discard()
-		return nil
+		return nil, nil
 	}
 	e.retireHandles(workspaceKey, manifest.Revision, e.manifestVectorKeys(store, manifest))
 	status.publishedInterim(manifest, revisionCount(store, manifest))
-	return manifest
+	return manifest, nil
 }
 
 // fullBuildReason 给出全量路径的成因标签，随 Result.BuildMode 返回给调用
@@ -642,18 +640,13 @@ func (e *Engine) newManifestSkeleton(root pathutil.WorkspaceRoot, revision strin
 //     形态与成因；其余状态字段由 revisionResult 从本 revision 得出，配置了
 //     embedding 时覆盖不完整给出 semantic-coverage-partial（与查询路径同名），
 //     同步成功也不隐藏缺口。返回的 manifest 就是结果描述的 revision。
-func (e *Engine) finishPublish(store *index.Store, status *wsStatus, workspaceKey string, manifest *index.Manifest, staging string, discard func(), seman semanticOutcome, skippedFiles int, added int, buildMode string, syncStart *index.Manifest) (engine.Result, *index.Manifest, error) {
+func (e *Engine) finishPublish(store *index.Store, writeLock *index.ProcessLock, status *wsStatus, workspaceKey string, manifest *index.Manifest, staging string, discard func(), seman semanticOutcome, skippedFiles int, added int, buildMode string, syncStart *index.Manifest) (engine.Result, *index.Manifest, error) {
 	// 语义覆盖完整就没有被暂停的缺口，迁移暂停原因随本 revision 清除。
 	if manifest.SemanticComplete() {
 		manifest.SemanticMigrationBlock = ""
 	}
 	// 发布前复验写锁：失锁说明所有权已被其他进程接管，本次构建作废。
-	if lock, err := e.acquireWriteLock(workspaceKey, store); err != nil {
-		if discard != nil {
-			discard()
-		}
-		return engine.Result{}, nil, err
-	} else if err := lock.Verify(); err != nil {
+	if err := e.verifyWriteLock(workspaceKey, writeLock); err != nil {
 		if discard != nil {
 			discard()
 		}
@@ -771,7 +764,7 @@ func coveredPerFile(fileRecords []chunkRecord, coveredHash map[string]bool) int 
 //     不发布新 revision，返回现有 revision，缺口留在状态里，避免堆积没有
 //     变化的 revision。
 //   - 其余情况写 staging、组装单段 manifest v2、原子发布。
-func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, assets workspace.AssetSet, contentChanged bool, needsLexicalRebuild bool, buildMode string) (engine.Result, *index.Manifest, error) {
+func (e *Engine) buildFull(ctx context.Context, store *index.Store, writeLock *index.ProcessLock, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, assets workspace.AssetSet, contentChanged bool, needsLexicalRebuild bool, buildMode string) (engine.Result, *index.Manifest, error) {
 	// syncStart 是本次同步开始时的 active revision，Deleted 相对它计算；
 	// 首建的词法中间发布会把 previous 换成中间 revision，不影响这里。
 	syncStart := previous
@@ -845,12 +838,16 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 	// 不可检索，大仓 30 分钟不可用。只在首建（previous==nil）触发：嵌入
 	// 开始前先发布只有词法索引的 revision（空向量文件合法，覆盖率 0%，
 	// 查询按既有降级语义标记），嵌入结束后按实际向量覆盖发布，缺口显式报告。
-	// 词法 revision 成为其 previous，GC 链不变。中间发布失败不影响主构建；
+	// 词法 revision 成为其 previous，GC 链不变。一般中间发布失败不影响主构建，失锁则终止；
 	// 显式 Sync 仍阻塞到最终发布；嵌入中途崩溃时词法 revision 继续可
 	// 服务，下次同步无论内容是否变化都按语义补齐路径完成（runBuild 的
 	// gapFill；熔断器退避与“内容变化时暂停全量补缺”期间除外）。
 	if previous == nil && e.semanticEnabled() && len(records) > 0 && e.lexicalFirst {
-		if lexManifest := e.publishLexicalInterim(ctx, store, status, root, workspaceKey, records, files, capabilities, totalBytes); lexManifest != nil {
+		lexManifest, err := e.publishLexicalInterim(ctx, store, writeLock, status, root, workspaceKey, records, files, capabilities, totalBytes)
+		if err != nil {
+			return engine.Result{}, nil, err
+		}
+		if lexManifest != nil {
 			previous = lexManifest
 		}
 	}
@@ -930,7 +927,7 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 		manifest.RejectedCount = liveRejected(files)
 	}
 	manifest.SemanticMigrationBlock = seman.migrationBlock
-	return e.finishPublish(store, status, workspaceKey, manifest, artifacts.staging, discard, seman, skippedFiles, len(records), buildMode, syncStart)
+	return e.finishPublish(store, writeLock, status, workspaceKey, manifest, artifacts.staging, discard, seman, skippedFiles, len(records), buildMode, syncStart)
 }
 
 // buildDelta 是增量构建：只为变更文件切分、嵌入并产出一个 delta segment，
@@ -947,7 +944,7 @@ func (e *Engine) buildFull(ctx context.Context, store *index.Store, status *wsSt
 //     其余段原样保留、不重写。搬运的记录只复用既有向量、不送审；记录或
 //     向量读不全时返回 errSmallMergeUnavailable，此时还没有发出任何送审
 //     请求，runBuild 改走全量合并。
-func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, assets workspace.AssetSet, mergeSmall map[string]bool) (engine.Result, *index.Manifest, error) {
+func (e *Engine) buildDelta(ctx context.Context, store *index.Store, writeLock *index.ProcessLock, status *wsStatus, root pathutil.WorkspaceRoot, workspaceKey string, previous *index.Manifest, assets workspace.AssetSet, mergeSmall map[string]bool) (engine.Result, *index.Manifest, error) {
 	status.setStage(engine.IndexStageChunking)
 	changed, removed, currentPaths := diffDeltaAssets(previous, assets)
 	delta, err := e.chunkChangedAssets(ctx, changed)
@@ -1158,7 +1155,7 @@ func (e *Engine) buildDelta(ctx context.Context, store *index.Store, status *wsS
 	if len(mergeSmall) > 0 {
 		buildMode = "delta:merge-small-segments"
 	}
-	return e.finishPublish(store, status, workspaceKey, manifest, staging, discard, seman, delta.skippedFiles, len(segmentRecords), buildMode, previous)
+	return e.finishPublish(store, writeLock, status, workspaceKey, manifest, staging, discard, seman, delta.skippedFiles, len(segmentRecords), buildMode, previous)
 }
 
 // diffDeltaAssets 对比 previous manifest 与当前资产集，返回变更文件（新增

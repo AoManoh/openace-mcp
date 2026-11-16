@@ -522,9 +522,13 @@ func (e *Engine) storeFor(workspaceKey string) (*index.Store, error) {
 // 已关闭或已有并发调用登记了锁，释放自己刚拿到的这把。
 func (e *Engine) acquireWriteLock(workspaceKey string, store *index.Store) (*index.ProcessLock, error) {
 	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return nil, errors.New("engine 已关闭")
+	}
 	if lock, ok := e.locks[workspaceKey]; ok {
 		e.mu.Unlock()
-		if err := lock.Verify(); err != nil {
+		if err := e.verifyWriteLock(workspaceKey, lock); err != nil {
 			return nil, err
 		}
 		return lock, nil
@@ -557,6 +561,33 @@ func (e *Engine) acquireWriteLock(workspaceKey string, store *index.Store) (*ind
 	e.locks[workspaceKey] = lock
 	e.mu.Unlock()
 	return lock, nil
+}
+
+// verifyWriteLock 验证本次作业取得的同一把锁；失效时回收本进程缓存，
+// 返回错误让当前作业停止，后续新作业才允许重新获取并读取磁盘状态。
+func (e *Engine) verifyWriteLock(workspaceKey string, lock *index.ProcessLock) error {
+	if err := lock.Verify(); err != nil {
+		// 失效对象不能继续跨构建复用；只摘除本次验证的对象，避免误删
+		// 并发调用已经取得的新锁。当前调用仍失败，后续新作业再获取。
+		e.mu.Lock()
+		var journal *index.Journal
+		if e.locks[workspaceKey] == lock {
+			delete(e.locks, workspaceKey)
+			journal = e.journals[workspaceKey]
+			delete(e.journals, workspaceKey)
+		}
+		e.mu.Unlock()
+		// 接管者可能改写 journal 文件或追加了已付费向量，旧句柄和
+		// 偏移表不可复用。关闭只释放本进程句柄，不改写接管者的数据。
+		if journal != nil {
+			if closeErr := journal.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("关闭失锁后的 embedding journal: %w", closeErr))
+			}
+		}
+		lock.Release()
+		return err
+	}
+	return nil
 }
 
 // Sync 实现 engine.Service：同步工作区索引，阻塞到构建完成。
