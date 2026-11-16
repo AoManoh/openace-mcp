@@ -102,9 +102,9 @@ type Engine struct {
 	// heavySlots 是同一用户跨进程共享的重型构建名额（OPENACE_HEAVY_BUILD_SLOTS，
 	// 见 heavy_build.go）；目录在 New 时按当时的系统临时目录定下。
 	heavySlots *index.HeavyBuildSlots
-	// freshnessWindow 大于 0 时，上次成功同步距今不足该时长的查询跳过
-	// 内联扫描，直接用现有 revision；该时长只限定跳过扫描的时间，构建失败
-	// 或尚未完成时返回的旧索引仍可能更早。
+	// freshnessWindow 大于 0 时，最近一次成功构建的开始时刻（lastSyncOK）
+	// 距今不足该时长的查询跳过内联扫描，直接用现有 revision；该时长只限定
+	// 跳过扫描的时间，构建失败或尚未完成时返回的旧索引仍可能更早。
 	freshnessWindow time.Duration
 	// lexicalFirst 控制首次构建时是否先发布只有词法索引的中间 revision，
 	// 生产默认 true；只能经 Options.DisableLexicalFirst 在程序内关闭，不
@@ -159,8 +159,11 @@ type Engine struct {
 	// firstTouchKicks 记录正在后台做首触同步的工作区（首触：daemon 启动后
 	// 某工作区的第一次查询），每个工作区最多一个后台同步 goroutine。
 	firstTouchKicks sync.Map
-	// lastSyncOK 是每个工作区最近一次成功同步的完成时刻，只在成功路径
-	// 刷新，是新鲜度窗口与首触判定的依据。
+	// lastSyncOK 是每个工作区最近一次成功构建的开始时刻（buildCall.startedAt），
+	// 只在构建成功后写入，失败的构建不改动它，是新鲜度窗口与首触判定的依据。
+	// 记开始时刻而不记完成时刻：扫描在构建开始之后进行，扫描结束到构建完成
+	// 之间写入的文件不在这次发布的 revision 里；按完成时刻计算窗口，嵌入耗时
+	// 超过窗口的构建结束后，查询还会再跳过一个完整窗口才扫描到这些文件。
 	lastSyncOK      map[string]time.Time
 	refreshFailures map[string]string
 	// locks 是每个工作区的跨进程写锁，首次构建时获取、Close 时释放。有了
@@ -889,8 +892,10 @@ func (e *Engine) syncWorkspace(ctx context.Context, ref engine.WorkspaceRef) (en
 }
 
 // freshnessShortcut 在新鲜度窗口内用当前 revision 直接应答，只供查询期的
-// 内联同步使用，显式 Sync 不经此路。判断依据是 lastSyncOK 中最近一次
-// 成功同步的时间。失败不会刷新或删除该时间，窗口内仍可能返回旧索引。
+// 内联同步使用，显式 Sync 不经此路。判断依据是 lastSyncOK 记下的最近一次
+// 成功构建的开始时刻，距今不足窗口才跳过扫描；该次扫描在这个时刻之后进行，
+// 此前完成的写入都在扫描范围内。失败不会刷新或删除该时间，窗口内仍可能返回
+// 旧索引。
 func (e *Engine) freshnessShortcut(ref engine.WorkspaceRef) (engine.Result, bool) {
 	_, workspaceKey, err := e.resolveRoot(ref.DirectoryPath)
 	if err != nil {
@@ -980,7 +985,7 @@ func (e *Engine) syncWorkspaceOutcome(ctx context.Context, ref engine.WorkspaceR
 			result, manifest, err := e.runBuild(runCtx, root, workspaceKey)
 			if err == nil {
 				e.mu.Lock()
-				e.lastSyncOK[workspaceKey] = time.Now()
+				e.lastSyncOK[workspaceKey] = call.startedAt
 				delete(e.refreshFailures, workspaceKey)
 				e.mu.Unlock()
 				e.maybeSaveStatSnapshot(workspaceKey, nil, false)

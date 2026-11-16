@@ -37,10 +37,9 @@ const (
 	// 不新鲜照常作答并写明原因，需要它们也报错时用 OPENACE_QUALITY_STRICT=on。
 	EnvRetrievalDegrade = "OPENACE_RETRIEVAL_DEGRADE"
 	EnvRerankDegrade    = "OPENACE_RERANK_DEGRADE"
-	// EnvFreshnessWindow 是查询期的新鲜度窗口：上次成功同步距今不足该
-	// 时长的查询跳过内联扫描，直接用现有 revision，索引最多比工作区落后
-	// 一个窗口；空或 0 表示每次查询都扫描（默认）。大仓里查询延迟主要花
-	// 在内容未变时的全量扫描上，窗口把这部分省掉。后台同步与显式 sync
+	// EnvFreshnessWindow 是查询期跳过内联扫描的窗口，从最近一次成功构建
+	// 的开始时刻计算。它不限制扫描与嵌入耗时，也不保证文件在一个窗口内
+	// 可检索。留空时每次查询都扫描，显式 0 无效；后台同步与显式 sync
 	// 不受窗口约束。
 	EnvFreshnessWindow = "OPENACE_FRESHNESS_WINDOW"
 	// EnvQualityStrict 是质量严格档：on 时语义链路的任一缺口（覆盖率不足
