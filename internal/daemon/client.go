@@ -136,7 +136,7 @@ func (c *Client) ensureProviderProfiles(ctx context.Context, providerProfileID s
 		return err
 	}
 	if !health.Capabilities["provider_profiles"] {
-		return fmt.Errorf("daemon does not advertise provider profile support; restart the openACE daemon")
+		return fmt.Errorf("daemon does not advertise provider profile support; provider_profile_id is only supported by the retired legacy ACE engine; remove this parameter")
 	}
 	c.providerProfilesSupported = true
 	return nil

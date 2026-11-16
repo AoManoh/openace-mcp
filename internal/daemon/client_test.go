@@ -114,7 +114,7 @@ func TestClientRequiresProviderCapabilityBeforeProviderRequest(t *testing.T) {
 	defer server.Close()
 
 	_, err := NewClient(server.URL).Sync(context.Background(), syncReqP("/tmp/project", "standby"))
-	if err == nil || !strings.Contains(err.Error(), "provider profile support") {
+	if err == nil || !strings.Contains(err.Error(), "provider_profile_id") || !strings.Contains(err.Error(), "remove") || strings.Contains(err.Error(), "restart") {
 		t.Fatalf("expected provider capability error, got %v", err)
 	}
 }
