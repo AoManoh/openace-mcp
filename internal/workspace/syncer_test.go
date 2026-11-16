@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestScanSkipsInvalidUTF8(t *testing.T) {
@@ -69,6 +70,60 @@ func TestScanSkipsSecretLikeFiles(t *testing.T) {
 	}
 	if len(scanned) != 1 || scanned[0].RelPath != "main.go" {
 		t.Fatalf("expected only main.go to be scanned, got %#v", scanned)
+	}
+}
+
+func TestScanExcludesGitCredentialsWithOverridesAndCachedEntries(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		".openaceignore":                 "!.git-credentials\n!nested/\n!nested/**\n",
+		".git-credentials":               "https://fake:synthetic-marker@example.invalid\n",
+		"nested/.GIT-CREDENTIALS":        "https://fake:synthetic-marker@example.invalid\n",
+		"nested/.netrc":                  "machine example.invalid password synthetic-marker\n",
+		"keep.go":                        "package keep\n",
+		"notes/.git-credentials.example": "example documentation\n",
+	}
+	cache := NewStatCache()
+	for rel, content := range files {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 模拟旧版本已收录的条目，确保新增排除规则不能被缓存绕过。
+		cache.entries[rel] = statEntry{key: statKeyOf(info), blobName: blobName(rel, []byte(content))}
+	}
+	for _, entry := range cache.entries {
+		if wait := racyWindow + 100*time.Millisecond - time.Since(entry.key.changedAt()); wait > 0 {
+			time.Sleep(wait)
+		}
+	}
+	for _, rel := range []string{".git-credentials", "nested/.GIT-CREDENTIALS"} {
+		entry := cache.entries[rel]
+		if _, hit := cache.lookup(rel, entry.key, time.Now()); !hit {
+			t.Fatalf("前置条件：旧条目 %s 应可命中缓存", rel)
+		}
+	}
+	for _, test := range []struct {
+		name  string
+		cache *StatCache
+	}{{"cold", nil}, {"cached", cache}} {
+		t.Run(test.name, func(t *testing.T) {
+			scanned, err := scanWithCache(context.Background(), root, test.cache)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := ".openaceignore,keep.go,notes/.git-credentials.example"
+			if got := scannedRelPaths(scanned); got != want {
+				t.Fatalf("敏感文件必须排除，相近的文档文件名应保留：got %s; want %s", got, want)
+			}
+		})
 	}
 }
 

@@ -312,7 +312,7 @@ func shouldAlwaysSkipFile(rel string, name string) bool {
 		return true
 	}
 	switch name {
-	case ".npmrc", ".pypirc", ".netrc", ".dockercfg", "session.json", "credentials", "credentials.json", "service-account.json", "token", "tokens.json", "secret.json", "secrets.json", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519":
+	case ".npmrc", ".pypirc", ".netrc", ".git-credentials", ".dockercfg", "session.json", "credentials", "credentials.json", "service-account.json", "token", "tokens.json", "secret.json", "secrets.json", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519":
 		return true
 	}
 	switch strings.ToLower(filepath.Ext(name)) {

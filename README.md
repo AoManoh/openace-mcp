@@ -243,7 +243,7 @@ embedding 地址、模型、维度和内置嵌入模板都没变时,新子树只
 
 ## 索引范围与安全边界
 
-默认尊重 `.gitignore` / `.ignore`,并跳过 `.env*`、credentials、私钥、证书、keystore 等敏感文件(hard denylist,不可绕过)。
+默认尊重 `.gitignore` / `.ignore`,并跳过 `.env*`、`.git-credentials`、`.netrc`、credentials、私钥、证书、keystore 等敏感文件(hard denylist,不可绕过)。已有索引中的这些文件在下一次同步后不再返回;这不代表旧缓存副本或模型服务已收到的数据被物理擦除。
 
 项目知识资产在 Git ignore 里、但希望 AI 能检索时,用 `.openaceignore` 显式纳入(gitignore 语法,支持 `!` re-include;只影响 openACE 扫描,不改变 Git 状态):
 
