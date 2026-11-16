@@ -278,7 +278,7 @@ embedding 地址、模型、维度和内置嵌入模板都没变时,新子树只
 | `OPENACE_FULL_RESULTS` | `detail=full` 时带正文返回的候选块数(按排名取前 N 个,其余只给标题行),默认 `20`;`0`=全部只给标题行。这是使用者侧配置,不是 AI 的调用参数;改动后重启 MCP 会话生效,不需要重启 daemon |
 | `OPENACE_FRESHNESS_WINDOW` | 查询前复用最近一次扫描结果的时长(如 `30s`),期间不重扫工作区;留空(默认)每次查询都扫描;不接受 `0` |
 | `OPENACE_VECTOR_MEMORY_BUDGET` | 已移除。向量数据默认以 mmap 驻留，内存紧张时由内核回收文件页，检索只会变慢、结果不变。设置为非空且非 `0` 的值时启动报错，删除该行即可 |
-| `OPENACE_MAX_FILE_BYTES` / `OPENACE_MAX_TEXT_FILE_BYTES` | 单文件索引上限:一般文件默认 1 MiB,纯文本文件默认 4 MiB,超过整篇不索引 |
+| `OPENACE_MAX_FILE_BYTES` / `OPENACE_MAX_TEXT_FILE_BYTES` | 只收录通过二进制与 UTF-8 检查的文本文件,大小上限取两项的较大值;默认分别为 1 MiB、4 MiB,因此默认上限为 4 MiB。要降到 1 MiB 以下须同时调小两项,值为正整数字节数;非法值使用各自默认值。超过上限整篇不索引 |
 | `OPENACE_CACHE_DIR` | 索引缓存根目录;默认用户缓存目录下的 `openace-mcp` |
 | `OPENACE_TOOL_TIMEOUT` | 单次 MCP 工具调用的处理超时,默认 `110s` |
 | `OPENACE_WATCH_*` / `OPENACE_RECONCILE_CONCURRENCY` | daemon 对已服务过的工作区做变更监测:`OPENACE_WATCH_MODE` `seen`(默认)/`off`;间隔默认 30s、去抖 2s、单次同步超时 5m、探测出错后退避 5s–2m、最多 64 个工作区;并行 reconcile worker 默认 2 |
@@ -290,16 +290,14 @@ embedding 地址、模型、维度和内置嵌入模板都没变时,新子树只
 | `OPENACE_CACHE_NAMESPACE` | cache 命名空间,隔离账号/tenant/测试批次 |
 | `OPENACE_DAEMON_ADDR` / `OPENACE_DAEMON_LISTEN_ADDR` | shim 连接地址 / daemon 监听地址(默认 `127.0.0.1:8765`) |
 | `OPENACE_DAEMON_TOKEN` | daemon HTTP 凭据。**默认自动生成随机 token**(0600 文件,wrapper 自动读取)——零配置即防多用户机上其他本地用户经回环端口读取你的索引;`off` 显式关闭(自担风险) |
-| `OPENACE_RECONCILE_CONCURRENCY` | daemon 后台 workspace 监测并发度(默认 `2`) |
 | `OPENACE_TASK_WORKERS` | daemon 异步任务 worker 数(默认 `4`) |
-| `OPENACE_TOOL_TIMEOUT` | 同步 MCP 工具超时(默认 `110s`) |
 
 daemon 只监听 loopback,不要直接暴露公网。引擎固定为 local-hybrid;legacy ACE 引擎已于 2026-08-04 删除,历史 `OPENACE_ENGINE=ace` 设置会得到明确报错。
 
 wrapper 与 daemon 的一致性分两层,行为刻意不同:
 
 - **build 过期**:升级后的 wrapper 在连接时自动接管旧 daemon——SIGTERM 请求优雅停机,等它退出,再启动新的,全程实测 0.1 秒;嵌入进度有断点日志,付过费的向量一条不丢。接管前先判断谁新谁旧:源码构建比较 vcs 提交时间,`go install` 装的模块构建比较伪版本里的提交时间或正式 tag 的版本序;两边判断不出先后(例如 `v0.2.0` 之前装的 `@main` 二进制,版本号以 `v0.0.0-` 开头,对上 tag 版本的新 wrapper)就不接管,错误文本给出旧 daemon 的 pid,手动停一次即可。Windows 没有对应的信号语义,保持显式报错,错误文本里同样带 pid 和一条可复制的修复命令。
-- **provider/降级 env 变了**:这是你改了配置意图,不是版本过期,wrapper 不会替你猜。它按配置指纹拒绝复用并明确报错,按提示重启 daemon 即生效。
+- **provider/降级 env 变了**:wrapper 按配置指纹拒绝复用并列出差异。将本会话配置改成与共享 daemon 一致,或使用独立的 `OPENACE_DAEMON_ADDR`;只有所有会话都要切换配置时才停共享 daemon。
 
 **升级不打断 IDE 会话**(Unix)。升级后,开着的 MCP 会话在下一次调用时发现 daemon 已换代,wrapper 就原地 exec 磁盘上的新版自身:进程号不变,标准流不断,触发的那条请求被保存下来由新进程重放,管线里排队的请求也一并带过去。你看到的只是一次正常应答。自愈失败时——比如磁盘二进制反而旧于 daemon——按原样返回可行动硬错,30 秒冷却防止 exec 打转。Windows 无 exec 语义,保持"重启 MCP 会话"提示。
 
@@ -307,7 +305,7 @@ wrapper 与 daemon 的一致性分两层,行为刻意不同:
 
 环境变量的说明见上表与 `.env.example`,这里只给三组常用组合。
 
-- **结果完整性优先**——审计、事实核查这类"宁可报错,不要部分结果"的任务。配置了 embedding 后,语义路跑不了本来就报错;再设 `OPENACE_QUALITY_STRICT=on`,语义覆盖不足、索引不是最新、精排没有生效也直接报错。只想让精排失败报错时设 `OPENACE_RERANK_DEGRADE=deny`。代价是含被模型服务永久拒绝片段的工作区在 strict 下会持续报错。
+- **结果完整性优先**——审计、事实核查这类"宁可报错,不要部分结果"的任务。配置了 embedding 后,语义路跑不了本来就报错;再设 `OPENACE_QUALITY_STRICT=on`,语义覆盖不足、已发现的索引陈旧、精排没有生效也直接报错。只想让精排失败报错时设 `OPENACE_RERANK_DEGRADE=deny`。模型服务永久拒绝的片段不计入覆盖率分母,在 `provider_rejected_files` 中单独列出;因此 100% 覆盖率和 strict 检索成功都不代表这些片段已取得向量。
 - **大仓高频查询**——每次查询前有一轮内联重扫,成本随文件数线性涨,接近十万文件的仓库实测 1.5 秒起步。设 `OPENACE_FRESHNESS_WINDOW=30s`,窗口内的查询跳过重扫,同档实测 p50 降到 0.4 秒。窗口从最近一次成功构建的开始时刻起算:构建超过窗口时,下一次查询会重新扫描;构建较短时,扫描之后发生的改动仍可能要等窗口到期后再次扫描和构建才可见。扫描与嵌入也需要时间,不能保证落盘后 30 秒内能检索到。窗口内尚未扫描到的改动也不会显示陈旧标记;需要立即核对改动时先显式同步工作区。
 - **候选被噪声淹没**——运行日志、构建产物、实验残留这类目录一多,宽泛查询的候选位就被它们挤掉。用 `.openaceignore` 逐目录排掉,偶尔要查再用 `!pattern` 精确放行。这些规则决定索引面,比事后在查询里过滤省得多。
 
